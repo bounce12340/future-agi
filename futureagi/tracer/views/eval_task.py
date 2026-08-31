@@ -79,7 +79,17 @@ from tracer.utils.eval import _walk_dotted_path  # noqa: E402, F401
 _INPUT_VAR_MAX_BYTES = 8 * 1024
 
 
-def _extract_partial_input_warnings(output_metadata):
+_WARNING_FALLBACK_MESSAGES = {
+    "partial_input": (
+        "Eval ran with some inputs empty. "
+        "Result may be less reliable. "
+        "Ignore if this is intentional."
+    ),
+}
+
+
+def _extract_run_warnings(output_metadata):
+    """Every typed warning on one EvalLogger row, whatever its type."""
     if not isinstance(output_metadata, dict):
         return []
     warnings = output_metadata.get("warnings") or []
@@ -90,7 +100,7 @@ def _extract_partial_input_warnings(output_metadata):
     return [
         warning
         for warning in warnings
-        if isinstance(warning, dict) and warning.get("type") == "partial_input"
+        if isinstance(warning, dict) and warning.get("type")
     ]
 
 
@@ -591,10 +601,9 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
                 # was absent). Counted separately so it stays out of the
                 # success and failure tallies.
                 skipped_count=Count("id", filter=Q(status=EvalEntryStatus.SKIPPED)),
-                # Partial-input warnings live in
-                # output_metadata.warnings as a JSON array. has_key on
-                # the JSONField gives us a cheap "any warnings?" filter
-                # without scanning the contents.
+                # Run warnings live in output_metadata.warnings as a JSON
+                # array. has_key on the JSONField gives us a cheap "any
+                # warnings?" filter without scanning the contents.
                 warnings_count=Count(
                     "id", filter=Q(output_metadata__has_key="warnings")
                 ),
@@ -665,21 +674,18 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
                 ]
             )
             for output_metadata in warning_logs_qs:
-                for warning in _extract_partial_input_warnings(output_metadata):
+                for warning in _extract_run_warnings(output_metadata):
+                    warning_type = warning["type"]
                     empty_keys = sorted(warning.get("empty_keys") or [])
                     filled_keys = sorted(warning.get("filled_keys") or [])
-                    key = tuple(empty_keys)
+                    key = (warning_type, tuple(empty_keys))
                     if key not in warning_groups_by_key:
                         warning_groups_by_key[key] = {
-                            "type": "partial_input",
+                            "type": warning_type,
                             "empty_keys": empty_keys,
                             "filled_keys": filled_keys,
                             "message": warning.get("message")
-                            or (
-                                "Eval ran with some inputs empty. "
-                                "Result may be less reliable. "
-                                "Ignore if this is intentional."
-                            ),
+                            or _WARNING_FALLBACK_MESSAGES.get(warning_type, ""),
                             "count": 0,
                         }
                     warning_groups_by_key[key]["count"] += 1

@@ -150,26 +150,84 @@ def _walk_raw_log(raw_log: dict, path: str):
 _MISSING = object()
 
 
-def _build_apicall_output(result, partial_input_warning):
+def _build_apicall_output(result, run_warnings):
     """Build the ``APICallLog.config.output`` payload for an eval success.
 
-    Bundles ``partial_input_warning`` into the same payload so the single
-    save below carries both the result and the warning — avoids the
-    earlier double-save (which silently dropped the warning if the
-    second save raised).
+    Bundles the run warnings into the same payload so the single save below
+    carries both the result and the warnings — avoids the earlier
+    double-save (which silently dropped the warning if the second save
+    raised).
     """
     payload = {"output": result.value, "reason": result.reason}
-    if partial_input_warning:
-        payload["warnings"] = [partial_input_warning]
+    if run_warnings:
+        payload["warnings"] = list(run_warnings)
     return payload
 
 
-def _attach_warning_to_metadata(response, output_metadata, partial_input_warning):
-    """Mirror a partial-input warning onto the response and EvalLogger metadata."""
-    if not partial_input_warning:
+def _attach_warnings_to_metadata(response, output_metadata, run_warnings):
+    """Mirror the run warnings onto the response and EvalLogger metadata."""
+    if not run_warnings:
         return
-    response["warnings"] = [partial_input_warning]
-    output_metadata["warnings"] = [partial_input_warning]
+    response["warnings"] = list(run_warnings)
+    output_metadata["warnings"] = list(run_warnings)
+
+
+GROUND_TRUTH_NOT_APPLIED_WARNING_TYPE = "ground_truth_not_applied"
+
+GROUND_TRUTH_NOT_APPLIED_MESSAGE = (
+    "Ground Truth is enabled on this eval template but is not applied to "
+    "evals run from Observe, so this result is uncalibrated. Ground Truth "
+    "adds few-shot reference examples to the judge prompt and never supplies "
+    "'expected_value' — to provide one here, emit it as a span attribute and "
+    "map 'expected_value' to that attribute name."
+)
+
+
+def _ground_truth_not_applied_warning(eval_template, *, organization_id, workspace_id):
+    """Warning when GT is switched on for this template, else ``None``.
+
+    Nothing on this path calls ``GroundTruthService.inject_context``, so an
+    enabled GT row is configured-but-unused rather than merely unlucky.
+    Fail-open: a lookup failure returns ``None`` so GT can never block a run.
+    """
+    try:
+        from model_hub.services.ground_truth_service import GroundTruthService
+
+        if not GroundTruthService.is_enabled_for_template(
+            eval_template=eval_template,
+            organization_id=organization_id,
+            workspace_id=workspace_id,
+        ):
+            return None
+    except Exception as exc:
+        logger.warning(
+            "ground_truth_not_applied_check_failed",
+            template_id=str(getattr(eval_template, "id", "") or ""),
+            error=str(exc),
+        )
+        return None
+
+    return {
+        "type": GROUND_TRUTH_NOT_APPLIED_WARNING_TYPE,
+        "message": GROUND_TRUTH_NOT_APPLIED_MESSAGE,
+    }
+
+
+def _collect_run_warnings(
+    partial_input_warning, eval_template, *, organization_id, workspace_id
+):
+    """Every warning this eval run should carry, in display order."""
+    run_warnings = []
+    if partial_input_warning:
+        run_warnings.append(partial_input_warning)
+    gt_warning = _ground_truth_not_applied_warning(
+        eval_template,
+        organization_id=organization_id,
+        workspace_id=workspace_id,
+    )
+    if gt_warning:
+        run_warnings.append(gt_warning)
+    return run_warnings
 
 
 def _resolve_attr(span_attrs: dict, candidate: str):
@@ -1579,6 +1637,13 @@ def _execute_evaluation(
         else None
     )
 
+    run_warnings = _collect_run_warnings(
+        partial_input_warning,
+        eval_model,
+        organization_id=org_id,
+        workspace_id=ws_id,
+    )
+
     # --- Cost tracking (caller-side) ---
     source_config = {
         "reference_id": observation_span.id,
@@ -1662,15 +1727,15 @@ def _execute_evaluation(
             )
         )
 
-        # Build the output payload up front so the partial-input warning
-        # rides on the single save below — avoids losing the warning if a
-        # follow-up save were to fail (see _build_apicall_output).
+        # Build the output payload up front so the run warnings ride on the
+        # single save below — avoids losing them if a follow-up save were to
+        # fail (see _build_apicall_output).
         if api_call_log_row is not None:
             config_dict = json.loads(api_call_log_row.config)
             config_dict.update(
                 {
                     "input": result.data,
-                    "output": _build_apicall_output(result, partial_input_warning),
+                    "output": _build_apicall_output(result, run_warnings),
                 }
             )
             api_call_log_row.config = json.dumps(config_dict)
@@ -1716,7 +1781,7 @@ def _execute_evaluation(
         }
 
         _output_metadata = {**metadata}
-        _attach_warning_to_metadata(response, _output_metadata, partial_input_warning)
+        _attach_warnings_to_metadata(response, _output_metadata, run_warnings)
 
         logger_kwargs = {
             "trace": observation_span.trace,
@@ -3258,6 +3323,13 @@ def _execute_evaluation_for_trace(
         )
     ws_id = str(workspace.id) if workspace else None
 
+    run_warnings = _collect_run_warnings(
+        partial_input_warning,
+        eval_template,
+        organization_id=org_id,
+        workspace_id=ws_id,
+    )
+
     source_config = {
         "reference_id": str(trace.id),
         "is_futureagi_eval": futureagi_eval,
@@ -3349,7 +3421,7 @@ def _execute_evaluation_for_trace(
             config_dict.update(
                 {
                     "input": result.data,
-                    "output": _build_apicall_output(result, partial_input_warning),
+                    "output": _build_apicall_output(result, run_warnings),
                 }
             )
             api_call_log_row.config = json.dumps(config_dict)
@@ -3393,7 +3465,7 @@ def _execute_evaluation_for_trace(
             "duration": result.duration,
         }
         _output_metadata = {**metadata}
-        _attach_warning_to_metadata(response, _output_metadata, partial_input_warning)
+        _attach_warnings_to_metadata(response, _output_metadata, run_warnings)
         logger_kwargs = {
             "target_type": EvalTargetType.TRACE.value,
             "trace": trace,
@@ -3494,6 +3566,13 @@ def _execute_evaluation_for_session(
         )
     ws_id = str(workspace.id) if workspace else None
 
+    run_warnings = _collect_run_warnings(
+        partial_input_warning,
+        eval_template,
+        organization_id=org_id,
+        workspace_id=ws_id,
+    )
+
     source_config = {
         "reference_id": str(trace_session.id),
         "is_futureagi_eval": futureagi_eval,
@@ -3584,7 +3663,7 @@ def _execute_evaluation_for_session(
             config_dict.update(
                 {
                     "input": result.data,
-                    "output": _build_apicall_output(result, partial_input_warning),
+                    "output": _build_apicall_output(result, run_warnings),
                 }
             )
             api_call_log_row.config = json.dumps(config_dict)
@@ -3628,7 +3707,7 @@ def _execute_evaluation_for_session(
             "duration": result.duration,
         }
         _output_metadata = {**metadata}
-        _attach_warning_to_metadata(response, _output_metadata, partial_input_warning)
+        _attach_warnings_to_metadata(response, _output_metadata, run_warnings)
         logger_kwargs = {
             "target_type": EvalTargetType.SESSION.value,
             "trace": None,

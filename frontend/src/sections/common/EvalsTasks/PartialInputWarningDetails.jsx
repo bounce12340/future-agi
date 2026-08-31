@@ -4,7 +4,9 @@ import { alpha } from "@mui/material/styles";
 
 import Iconify from "src/components/iconify";
 
-export const PARTIAL_INPUT_WARNING_TYPE = "partial_input";
+import { PARTIAL_INPUT_WARNING_TYPE } from "./warningTypes";
+
+export { PARTIAL_INPUT_WARNING_TYPE };
 
 const DEFAULT_MESSAGE =
   "Eval ran with some inputs empty. Result may be less reliable. Ignore if this is intentional.";
