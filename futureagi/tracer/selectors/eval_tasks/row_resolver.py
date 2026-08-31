@@ -20,6 +20,11 @@ from typing import TYPE_CHECKING, Any
 
 from tracer.models.eval_task import RunType
 from tracer.services.clickhouse.v2 import get_reader
+from tracer.services.clickhouse.v2.id_remap_sql import (
+    remap_left_join,
+    resolved_id_expr,
+)
+from tracer.utils.eval_task_filters import id_filter
 
 if TYPE_CHECKING:
     from tracer.models.eval_task import EvalTask
@@ -31,6 +36,13 @@ _BUILDER_BY_ROW_TYPE = {
     "traces": ("TRACE_LIST", "trace_id"),
     "sessions": ("SESSION_LIST", "session_id"),
 }
+
+# Predicate for a filter that is set but can match no row.
+_MATCH_NOTHING = "AND 1 = 0"
+
+# Join alias for the session id-remap inside the scope subquery. Distinct from
+# the builders' own ``ts_remap`` so the two never collide in one statement.
+_SCOPE_REMAP_ALIAS = "scope_ts_remap"
 
 
 def iter_desired_rows(
@@ -117,18 +129,35 @@ def _build_sample_query(
     inner_sql, params = builder.build_id_query(
         created_at_floor=created_at_floor, created_at_ceiling=created_at_ceiling
     )
-    params = {**params, "salt": str(salt), "rate": float(sampling_rate)}
+    params = {
+        **params,
+        "salt": str(salt),
+        "rate": float(sampling_rate),
+        "scope_project_id": str(project_id),
+    }
 
-    # observation_type is a legacy top-level key, not a filter-builder column;
-    # constrain the id set against spans directly.
-    ot_pred = ""
+    # observation_type / trace_id / span_id are legacy top-level keys, not
+    # filter-builder columns; constrain the id set against spans directly.
+    # ``src`` is the expression on a span row that carries this row_type's
+    # identity. A session's is read through the id-remap, because SESSION_LIST
+    # projects the resolved (survivor) id — matching a raw ``trace_session_id``
+    # against it would drop every cross-cutover straddler. No other row_type's
+    # identity is re-keyed, so they need no join.
+    if row_type == "sessions":
+        scope_join = remap_left_join(
+            "spans.trace_session_id", "trace_session_id_remap", _SCOPE_REMAP_ALIAS
+        )
+        src = resolved_id_expr("spans.trace_session_id", _SCOPE_REMAP_ALIAS)
+    else:
+        scope_join = ""
+        src = id_col
+    scope_preds: list[str] = []
+
     ot = f.get("observation_type")
     if ot:
         params["otypes"] = tuple(
             str(o) for o in (ot if isinstance(ot, list | tuple | set) else [ot])
         )
-        params["ot_project_id"] = str(project_id)
-        src = "toString(trace_session_id)" if row_type == "sessions" else id_col
         # For traces, the trace list derives observation_type from the ROOT span
         # (it scans parent_span_id IS NULL), so match root spans only for parity.
         root_pred = (
@@ -136,14 +165,28 @@ def _build_sample_query(
             if row_type == "traces"
             else ""
         )
-        # Scope the subquery like the outer scan (project + not-deleted) so it
-        # can't match ids from another project or soft-deleted rows.
-        ot_pred = (
-            f"AND {id_col} IN "
-            f"(SELECT {src} FROM spans "
-            f"WHERE observation_type IN %(otypes)s "
-            f"AND project_id = %(ot_project_id)s AND is_deleted = 0"
-            f"{root_pred})"
+        scope_preds.append(
+            _span_scope_pred(
+                id_col, src, scope_join, f"observation_type IN %(otypes)s{root_pred}"
+            )
+        )
+
+    for key, column, param in (
+        ("trace_id", "trace_id", "f_trace_ids"),
+        ("span_id", "id", "f_span_ids"),
+    ):
+        ids = id_filter(f, key)
+        if ids is None:
+            continue
+        if not ids:
+            # An explicitly empty id list scopes the task to nothing; dropping
+            # it would widen the run back to the whole project. Mirrors
+            # ``Q(trace_id__in=[])`` and ``count_with_filters(trace_ids=[])``.
+            scope_preds.append(_MATCH_NOTHING)
+            continue
+        params[param] = tuple(ids)
+        scope_preds.append(
+            _span_scope_pred(id_col, src, scope_join, f"{column} IN %({param})s")
         )
 
     limit_sql = ""
@@ -156,7 +199,24 @@ def _build_sample_query(
     sql = (
         f"SELECT {id_col} FROM ({inner_sql}) "
         f"WHERE modulo(cityHash64(%(salt)s, toString({id_col})), 100) < %(rate)s "
-        f"{ot_pred} "
+        f"{' '.join(scope_preds)} "
         f"ORDER BY {id_col} {limit_sql}"
     )
     return sql, params
+
+
+def _span_scope_pred(id_col: str, src: str, join: str, predicate: str) -> str:
+    """``AND <id_col> IN (SELECT <src> FROM spans <join> WHERE <predicate> …)``.
+
+    Scoped like the outer scan (project + not-deleted) so a top-level key can
+    never match ids from another project or from soft-deleted rows. ``join`` is
+    the id-remap join the session identity needs and is empty otherwise; the
+    remap map carries only ``any_id``/``survivor_id``, so the span columns stay
+    unqualified and unambiguous under it.
+    """
+    return (
+        f"AND {id_col} IN "
+        f"(SELECT {src} FROM spans {join} "
+        f"WHERE {predicate} "
+        f"AND project_id = %(scope_project_id)s AND is_deleted = 0)"
+    )

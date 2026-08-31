@@ -30,6 +30,7 @@ from tracer.utils.eval import (
     evaluate_trace_session_observe,
 )
 from tracer.utils.annotations import build_annotation_subqueries
+from tracer.utils.eval_task_filters import id_filter
 from tracer.utils.filters import FilterEngine
 
 logger = structlog.get_logger(__name__)
@@ -242,6 +243,15 @@ def parsing_evaltask_filters(
         elif key == "session_id":
             traces = Trace.objects.filter(session_id=value).values_list("id", flat=True)
             combined_q &= Q(trace_id__in=list(traces))
+        elif key == "trace_id":
+            trace_ids = id_filter(filters, key)
+            if trace_ids is not None:
+                combined_q &= Q(trace_id__in=trace_ids)
+        elif key == "span_id":
+            # ``ObservationSpan.id`` IS the span id (CharField primary key).
+            span_ids = id_filter(filters, key)
+            if span_ids is not None:
+                combined_q &= Q(id__in=span_ids)
         elif key == "date_range":
             if isinstance(value, list) and len(value) == 2:
                 start_date, end_date = value

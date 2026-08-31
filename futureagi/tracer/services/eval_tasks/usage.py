@@ -285,9 +285,14 @@ def build_log_item(log: EvalLogger, input_variables: dict) -> dict:
 
     metadata = log.output_metadata or {}
     warnings = (metadata.get("warnings") if isinstance(metadata, dict) else None) or []
-    span_id = str(obs_span.id) if obs_span else None
-    trace_id = str(obs_span.trace_id) if obs_span and obs_span.trace_id else None
-    session_id = str(trace_session.id) if trace_session else None
+    # Read the ids off the log row's own FK columns, not off the related
+    # objects. The eval engine resolves an entry's target from ClickHouse and
+    # the FKs are ``db_constraint=False``, so a row can legitimately reference a
+    # span that has no PG ``ObservationSpan`` — dereferencing it then yields
+    # ``None`` and the row loses the only handle back to what was evaluated.
+    span_id = str(log.observation_span_id) if log.observation_span_id else None
+    trace_id = str(log.trace_id) if log.trace_id else None
+    session_id = str(log.trace_session_id) if log.trace_session_id else None
 
     return {
         "id": str(log.id),

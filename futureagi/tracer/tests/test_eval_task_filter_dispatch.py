@@ -14,15 +14,25 @@ The bug this guards against: until 2026-06-04 the dispatcher only handled
 ``ANNOTATION`` annotator filter behind the prod task
 ``f8481965-cd74-44b1-9b6d-f4bb66ec2218``. See plan
 ``~/.claude/plans/shift-to-fix-nightly-dev-27-05-and-zazzy-eagle.md``.
+
+The two top-level id keys (``trace_id`` / ``span_id``) are the exception to
+the structural rule: a ``repr`` cannot tell a key that was translated from one
+that was silently dropped, so those are asserted on the rows the ``Q`` selects
+and on the kwargs the ClickHouse companion produces.
 """
 
 import uuid
+from datetime import timedelta
 from unittest import mock
 
 import pytest
 from django.db.models import OuterRef, Q
+from django.utils import timezone
 
 from tracer.models.eval_task import RowType
+from tracer.models.observation_span import ObservationSpan
+from tracer.models.trace import Trace
+from tracer.services.clickhouse.v2.span_reader import CHSpanReader
 from tracer.utils.eval_tasks import (
     annotation_source_q_for_row_type,
     parsing_evaltask_filters,
@@ -79,6 +89,45 @@ def _label_value_item(label_uuid, value):
             "filter_value": value,
         },
     }
+
+
+def _trace(project, name):
+    return Trace.objects.create(project=project, name=name)
+
+
+def _span(project, trace, prefix="s"):
+    return ObservationSpan.objects.create(
+        id=f"{prefix}-{uuid.uuid4().hex[:12]}",
+        project=project,
+        trace=trace,
+        name="span",
+        observation_type="llm",
+        start_time=timezone.now() - timedelta(seconds=5),
+    )
+
+
+class _RecordingClient:
+    """Captures the SQL + params of the last query; returns no rows."""
+
+    def __init__(self):
+        self.sql = None
+        self.params = None
+
+    def query(self, sql, parameters=None, settings=None):
+        self.sql = sql
+        self.params = parameters or {}
+
+        class _Result:
+            result_rows = []
+
+        return _Result()
+
+
+def _reader_with(client) -> CHSpanReader:
+    # Bypass __init__ (which opens a real CH connection) and inject the fake.
+    reader = CHSpanReader.__new__(CHSpanReader)
+    reader._client = client
+    return reader
 
 
 def _system_metric_item(column_id="cost", op="greater_than", value=0.5):
@@ -429,3 +478,153 @@ class TestUnrecognisedColType:
         q, anns = parsing_evaltask_filters(_wrap(items), row_type=RowType.SPANS)
         assert isinstance(q, Q)
         assert anns == {}
+
+
+# ---------------------------------------------------------------------------
+# trace_id / span_id — the rows the Q actually selects
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+@pytest.mark.django_db
+class TestLinkedSourceIdRows:
+    """The behavioural half of the two top-level id keys: the Q they build must
+    narrow the queryset to the linked rows, and an id matching nothing must
+    select no rows rather than the whole table."""
+
+    @staticmethod
+    def _ids(filters):
+        q, _ = parsing_evaltask_filters(filters, row_type=RowType.SPANS)
+        return set(ObservationSpan.objects.filter(q).values_list("id", flat=True))
+
+    def test_trace_id_selects_only_that_traces_spans(self, project):
+        picked = _trace(project, "picked")
+        wanted = [_span(project, picked), _span(project, picked)]
+        _span(project, _trace(project, "rest"))
+        assert self._ids({"trace_id": [str(picked.id)]}) == {s.id for s in wanted}
+
+    def test_span_id_selects_only_that_span(self, project):
+        trace = _trace(project, "t")
+        picked = _span(project, trace)
+        _span(project, trace)
+        assert self._ids({"span_id": [picked.id]}) == {picked.id}
+
+    def test_scalar_trace_id_selects_that_traces_spans(self, project):
+        picked = _trace(project, "picked")
+        wanted = _span(project, picked)
+        _span(project, _trace(project, "rest"))
+        assert self._ids({"trace_id": str(picked.id)}) == {wanted.id}
+
+    def test_unknown_trace_id_selects_no_rows(self, project):
+        _span(project, _trace(project, "t"))
+        assert self._ids({"trace_id": [str(uuid.uuid4())]}) == set()
+
+    def test_unknown_span_id_selects_no_rows(self, project):
+        _span(project, _trace(project, "t"))
+        assert self._ids({"span_id": ["absent-span-id"]}) == set()
+
+    def test_empty_trace_id_list_selects_no_rows(self, project):
+        _span(project, _trace(project, "t"))
+        assert self._ids({"trace_id": []}) == set()
+
+    def test_empty_span_id_list_selects_no_rows(self, project):
+        _span(project, _trace(project, "t"))
+        assert self._ids({"span_id": []}) == set()
+
+    def test_null_id_keys_leave_the_queryset_unnarrowed(self, project):
+        span = _span(project, _trace(project, "t"))
+        selected = self._ids(
+            {"project_id": str(project.id), "trace_id": None, "span_id": None}
+        )
+        assert selected == {span.id}
+
+
+# ---------------------------------------------------------------------------
+# ClickHouse companion — the same two keys as reader kwargs
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestClickHouseIdKwargs:
+    def test_trace_id_and_span_id_become_id_kwargs(self):
+        out = CHSpanReader.parsing_evaltask_filters_for_ch(
+            {"trace_id": ["t-1", "t-2"], "span_id": ["s-1"]}
+        )
+        assert out["trace_ids"] == ["t-1", "t-2"]
+        assert out["span_ids"] == ["s-1"]
+
+    def test_scalar_ids_are_normalised_to_lists(self):
+        out = CHSpanReader.parsing_evaltask_filters_for_ch(
+            {"trace_id": "t-1", "span_id": "s-1"}
+        )
+        assert out["trace_ids"] == ["t-1"]
+        assert out["span_ids"] == ["s-1"]
+
+    def test_id_kwargs_follow_key_presence_not_truthiness(self):
+        # An emptied id list is "match nothing", so it has to reach the reader;
+        # an absent key is "no constraint" and must not.
+        emptied = CHSpanReader.parsing_evaltask_filters_for_ch(
+            {"trace_id": [], "span_id": []}
+        )
+        assert emptied["trace_ids"] == []
+        assert emptied["span_ids"] == []
+
+        absent = CHSpanReader.parsing_evaltask_filters_for_ch(
+            {"observation_type": ["llm"]}
+        )
+        assert "trace_ids" not in absent
+        assert "span_ids" not in absent
+
+    def test_null_id_keys_carry_no_constraint(self):
+        out = CHSpanReader.parsing_evaltask_filters_for_ch(
+            {"trace_id": None, "span_id": None}
+        )
+        assert "trace_ids" not in out
+        assert "span_ids" not in out
+
+
+@pytest.mark.unit
+class TestClickHouseSpanIdPredicate:
+    """``span_ids`` mirrors the ``trace_ids`` contract on both readers the
+    eval-task filter kwargs feed: None is no filter, [] is match-nothing."""
+
+    def test_session_ids_binds_the_span_id_predicate(self):
+        client = _RecordingClient()
+        _reader_with(client).distinct_session_ids_with_filters(
+            project_id="p", span_ids=["s-1", "s-2"]
+        )
+        assert "id IN %(spids)s" in client.sql
+        assert client.params["spids"] == ("s-1", "s-2")
+
+    def test_session_ids_empty_span_ids_returns_nothing_without_querying(self):
+        client = _RecordingClient()
+        result = _reader_with(client).distinct_session_ids_with_filters(
+            project_id="p", span_ids=[]
+        )
+        assert result == []
+        assert client.sql is None
+
+    def test_session_ids_none_span_ids_adds_no_predicate(self):
+        client = _RecordingClient()
+        _reader_with(client).distinct_session_ids_with_filters(
+            project_id="p", span_ids=None
+        )
+        assert "%(spids)s" not in client.sql
+        assert "spids" not in client.params
+
+    def test_count_binds_the_span_id_predicate(self):
+        client = _RecordingClient()
+        _reader_with(client).count_with_filters(project_id="p", span_ids=["s-1", "s-2"])
+        assert "id IN %(spids)s" in client.sql
+        assert client.params["spids"] == ("s-1", "s-2")
+
+    def test_count_empty_span_ids_returns_zero_without_querying(self):
+        client = _RecordingClient()
+        assert _reader_with(client).count_with_filters(project_id="p", span_ids=[]) == 0
+        assert client.sql is None
+
+    def test_count_none_span_ids_adds_no_predicate(self):
+        client = _RecordingClient()
+        _reader_with(client).count_with_filters(project_id="p", span_ids=None)
+        assert "%(spids)s" not in client.sql
+        assert "spids" not in client.params

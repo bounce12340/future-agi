@@ -78,6 +78,24 @@ def _make_spans(
     return spans
 
 
+def _make_child_span(project, trace, parent, *, prefix="child"):
+    """A non-root span under ``parent``. The trace list scans root spans only,
+    so a child is the shape that tells a root-only predicate apart from one
+    that matches any span of the trace."""
+    span = ObservationSpan.objects.create(
+        id=f"{prefix}-{uuid.uuid4().hex[:8]}",
+        project=project,
+        trace=trace,
+        parent_span_id=parent.id,
+        name=f"span-{prefix}",
+        observation_type="llm",
+        start_time=datetime.now(UTC) - timedelta(minutes=1),
+    )
+    span.created_at = datetime.now(UTC) - timedelta(minutes=1)
+    seed_ch_spans([span])
+    return span
+
+
 @pytest.mark.integration
 @pytest.mark.django_db
 class TestSamplingAndDeterminism:
@@ -223,6 +241,125 @@ class TestScopingAndFilters:
         spans = _make_spans(project, 5)
         task = _make_task(project, filters={"observation_type": []})
         assert set(_ids(task)) == {s.id for s in spans}
+
+
+@pytest.mark.integration
+@pytest.mark.django_db
+class TestLinkedSourceIdFilters:
+    """``trace_id`` / ``span_id`` are stored top-level on a task's filters and
+    must scope the resolved row set to those ids, for every row_type. An id
+    that matches nothing resolves to no rows — never to the whole project."""
+
+    def test_spans_scoped_to_one_trace(self, project):
+        picked = Trace.objects.create(project=project, name="picked")
+        wanted = _make_spans(project, 3, shared_trace=picked, prefix="picked")
+        _make_spans(project, 4, prefix="rest")
+        task = _make_task(project, filters={"trace_id": [str(picked.id)]})
+        assert set(_ids(task)) == {s.id for s in wanted}
+
+    def test_spans_scoped_to_one_span(self, project):
+        spans = _make_spans(project, 5)
+        task = _make_task(project, filters={"span_id": [spans[2].id]})
+        assert _ids(task) == [spans[2].id]
+
+    def test_traces_scoped_to_one_trace(self, project):
+        picked = Trace.objects.create(project=project, name="picked")
+        _make_spans(project, 2, shared_trace=picked, prefix="picked")
+        _make_spans(project, 3, prefix="rest")
+        task = _make_task(
+            project, row_type=RowType.TRACES, filters={"trace_id": [str(picked.id)]}
+        )
+        assert _ids(task) == [str(picked.id)]
+
+    def test_traces_scoped_by_a_non_root_span(self, project):
+        # The span_id predicate matches any span of the trace, unlike the
+        # root-only observation_type one.
+        picked = Trace.objects.create(project=project, name="picked")
+        root = _make_spans(project, 1, shared_trace=picked, prefix="root")[0]
+        child = _make_child_span(project, picked, root)
+        _make_spans(project, 3, prefix="rest")
+        task = _make_task(
+            project, row_type=RowType.TRACES, filters={"span_id": [child.id]}
+        )
+        assert _ids(task) == [str(picked.id)]
+
+    def test_sessions_scoped_to_the_traces_session(self, project):
+        picked_session = TraceSession.objects.create(project=project, name="picked")
+        other_session = TraceSession.objects.create(project=project, name="other")
+        picked_trace = Trace.objects.create(
+            project=project, name="picked", session=picked_session
+        )
+        _make_spans(project, 2, shared_trace=picked_trace, prefix="picked")
+        _make_spans(project, 2, session=other_session, prefix="other")
+        task = _make_task(
+            project,
+            row_type=RowType.SESSIONS,
+            filters={"trace_id": [str(picked_trace.id)]},
+        )
+        assert _ids(task) == [str(picked_session.id)]
+
+    def test_unknown_trace_id_selects_no_rows(self, project):
+        _make_spans(project, 6)
+        task = _make_task(project, filters={"trace_id": [str(uuid.uuid4())]})
+        assert _ids(task) == []
+
+    def test_unknown_span_id_selects_no_rows(self, project):
+        _make_spans(project, 6)
+        task = _make_task(project, filters={"span_id": ["absent-span-id"]})
+        assert _ids(task) == []
+
+    def test_empty_trace_id_list_matches_nothing(self, project):
+        # Contrast with test_empty_observation_type_is_no_constraint: an id list
+        # the user emptied scopes the task to nothing rather than widening back
+        # to the project.
+        _make_spans(project, 4)
+        task = _make_task(project, filters={"trace_id": []})
+        assert _ids(task) == []
+
+    def test_empty_span_id_list_matches_nothing(self, project):
+        _make_spans(project, 4)
+        task = _make_task(project, filters={"span_id": []})
+        assert _ids(task) == []
+
+    def test_null_id_keys_are_no_constraint(self, project):
+        # The filters field skips a null id key rather than validating it, so a
+        # stored null means "not set" — not the emptied list above.
+        spans = _make_spans(project, 4)
+        task = _make_task(project, filters={"trace_id": None, "span_id": None})
+        assert set(_ids(task)) == {s.id for s in spans}
+
+    def test_trace_id_and_observation_type_intersect(self, project):
+        picked = Trace.objects.create(project=project, name="picked")
+        llm = _make_spans(
+            project, 2, shared_trace=picked, observation_type="llm", prefix="llm"
+        )
+        _make_spans(
+            project, 2, shared_trace=picked, observation_type="tool", prefix="tool"
+        )
+        _make_spans(project, 2, observation_type="llm", prefix="elsewhere")
+        task = _make_task(
+            project,
+            filters={"trace_id": [str(picked.id)], "observation_type": ["llm"]},
+        )
+        assert set(_ids(task)) == {s.id for s in llm}
+
+    def test_scalar_trace_id_scopes_like_a_one_item_list(self, project):
+        # Rows stored before the filters field coerced scalars still hold a
+        # bare string.
+        picked = Trace.objects.create(project=project, name="picked")
+        wanted = _make_spans(project, 2, shared_trace=picked, prefix="picked")
+        _make_spans(project, 3, prefix="rest")
+        task = _make_task(project, filters={"trace_id": str(picked.id)})
+        assert set(_ids(task)) == {s.id for s in wanted}
+
+    def test_trace_id_of_another_project_selects_no_rows(
+        self, project, observe_project
+    ):
+        theirs = Trace.objects.create(project=observe_project, name="theirs")
+        _make_spans(observe_project, 3, shared_trace=theirs, prefix="theirs")
+        _make_spans(project, 3, prefix="mine")
+        task = _make_task(project, filters={"trace_id": [str(theirs.id)]})
+        assert _ids(task) == []
 
 
 def _builder_ids(builder):

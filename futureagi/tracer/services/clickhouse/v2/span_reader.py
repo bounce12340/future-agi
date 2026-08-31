@@ -44,6 +44,7 @@ from tracer.services.clickhouse.v2.id_remap_sql import (
     resolved_id_expr,
 )
 from tracer.services.clickhouse.v2.query_settings import current_settings
+from tracer.utils.eval_task_filters import id_filter
 
 
 # Field list that the eval runner actually reads off of an ObservationSpan.
@@ -1862,6 +1863,7 @@ class CHSpanReader:
         *,
         project_id: str | None = None,
         trace_ids: list[str] | None = None,
+        span_ids: list[str] | None = None,
         observation_type: list[str] | str | None = None,
         session_id: str | list[str] | None = None,
         created_at_gte: datetime | None = None,
@@ -1902,6 +1904,13 @@ class CHSpanReader:
                 return 0
             where.append("trace_id IN %(tids)s")
             params["tids"] = tuple(trace_ids)
+        if span_ids is not None:
+            # Same empty-list semantic as trace_ids: an explicit empty list is
+            # "match nothing", not "no filter".
+            if len(span_ids) == 0:
+                return 0
+            where.append("id IN %(spids)s")
+            params["spids"] = tuple(span_ids)
         if observation_type:
             if isinstance(observation_type, list | tuple | set):
                 if len(observation_type) == 0:
@@ -1954,6 +1963,7 @@ class CHSpanReader:
         *,
         project_id: str | None = None,
         trace_ids: list[str] | None = None,
+        span_ids: list[str] | None = None,
         observation_type: list[str] | str | None = None,
         session_id: str | list[str] | None = None,
         created_at_gte: datetime | None = None,
@@ -2004,6 +2014,13 @@ class CHSpanReader:
                 return []
             where.append("trace_id IN %(tids)s")
             params["tids"] = tuple(trace_ids)
+        if span_ids is not None:
+            # Same empty-list semantic as trace_ids: an explicit empty list is
+            # "match nothing", not "no filter".
+            if len(span_ids) == 0:
+                return []
+            where.append("id IN %(spids)s")
+            params["spids"] = tuple(span_ids)
         if observation_type:
             if isinstance(observation_type, list | tuple | set):
                 if len(observation_type) == 0:
@@ -2200,8 +2217,17 @@ class CHSpanReader:
             out["created_at_gte"] = cag
         if pid := filters.get("project_id"):
             out["project_id"] = str(pid)
-        # `trace_ids` derived from `session_id` (Trace lookup) is the
-        # caller's responsibility; this helper stays narrow.
+        # An explicitly empty id list is "match nothing" (both consumers
+        # short-circuit on it) and has to reach the reader; a key that carries
+        # no constraint must not, or dropping it would widen the task back to
+        # the whole project.
+        if (trace_ids := id_filter(filters, "trace_id")) is not None:
+            out["trace_ids"] = trace_ids
+        if (span_ids := id_filter(filters, "span_id")) is not None:
+            out["span_ids"] = span_ids
+        # Deriving `trace_ids` from `session_id` (a Trace lookup) is still the
+        # caller's responsibility; this helper only translates the keys the
+        # eval-task filter schema stores directly.
         return out
 
     def stream_query(

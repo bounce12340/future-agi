@@ -7,8 +7,12 @@ A window that excludes every run widens to all-time so the user is not left
 staring at an empty chart. That fallback resets *both* bounds: leaving
 ``end_date`` pinned to an empty custom window that sits before the runs would
 make ``start_date > end_date``, and the zero-fill loop would emit nothing.
+
+Also covers the cross-reference ids each returned log row carries back to
+observe, which are built by the same ``usage.build_log_item``.
 """
 
+import uuid
 from datetime import datetime, timedelta, timezone as utc
 from unittest import mock
 
@@ -20,6 +24,11 @@ from django.utils import timezone
 import model_hub.tasks  # noqa: F401
 from tracer.constants.eval_task_usage import (  # noqa: E402
     MAX_USAGE_CHART_BUCKETS,
+)
+from tracer.models.observation_span import (  # noqa: E402
+    EvalLogger,
+    EvalTargetType,
+    ObservationSpan,
 )
 
 from tracer.tests.eval_task_factories import (  # noqa: E402
@@ -392,3 +401,85 @@ class TestBucketAlignment:
         assert result["stats"]["runs_period"] == 2
         assert _chart_calls(result) == 2
         assert len(result["chart"]) <= MAX_USAGE_CHART_BUCKETS + 1
+
+
+# ── Log row cross-references ───────────────────────────────────────────
+
+
+@pytest.mark.integration
+@pytest.mark.api
+@pytest.mark.django_db
+class TestLogItemCrossReferences:
+    """Each log row carries the ids the side panel jumps back to observe with.
+
+    The eval engine resolves a run's target from ClickHouse and the target FKs
+    are unconstrained, so a run can legitimately point at a span, trace or
+    session that has no Postgres row. The row must still report what it
+    evaluated.
+    """
+
+    def _one_row(self, auth_client, task):
+        results = _result(_get(auth_client, task, period="30d"))["logs"]["results"]
+        assert len(results) == 1
+        return results[0]
+
+    def _cfg(self, project, organization, workspace):
+        return _config(
+            project=project,
+            template=_template(organization=organization, workspace=workspace),
+            name="Toxicity",
+        )
+
+    def test_span_row_reports_ids_for_a_target_absent_from_postgres(
+        self, auth_client, project, organization, workspace
+    ):
+        task = _task(project=project)
+        span_id = f"span_{uuid.uuid4().hex[:16]}"
+        trace_id = uuid.uuid4()
+        EvalLogger.objects.create(
+            target_type=EvalTargetType.SPAN,
+            observation_span_id=span_id,
+            trace_id=trace_id,
+            custom_eval_config=self._cfg(project, organization, workspace),
+            eval_task_id=str(task.id),
+            output_bool=True,
+        )
+        assert not ObservationSpan.objects.filter(id=span_id).exists()
+
+        row = self._one_row(auth_client, task)
+        assert row["span_id"] == span_id
+        assert row["trace_id"] == str(trace_id)
+        assert row["detail"]["span_id"] == span_id
+        assert row["detail"]["trace_id"] == str(trace_id)
+
+    def test_session_row_reports_its_session_id_without_a_postgres_row(
+        self, auth_client, project, organization, workspace
+    ):
+        task = _task(project=project)
+        session_id = uuid.uuid4()
+        EvalLogger.objects.create(
+            target_type=EvalTargetType.SESSION,
+            trace_session_id=session_id,
+            custom_eval_config=self._cfg(project, organization, workspace),
+            eval_task_id=str(task.id),
+            output_bool=True,
+        )
+
+        row = self._one_row(auth_client, task)
+        assert row["session_id"] == str(session_id)
+        assert row["detail"]["session_id"] == str(session_id)
+
+    def test_span_row_still_reports_ids_when_the_target_is_in_postgres(
+        self, auth_client, project, organization, workspace, observation_span
+    ):
+        task = _task(project=project)
+        _row(
+            span=observation_span,
+            cfg=self._cfg(project, organization, workspace),
+            task=task,
+            output_bool=True,
+        )
+
+        row = self._one_row(auth_client, task)
+        assert row["span_id"] == observation_span.id
+        assert row["trace_id"] == str(observation_span.trace_id)
