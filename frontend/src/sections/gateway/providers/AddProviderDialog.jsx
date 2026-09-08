@@ -23,7 +23,12 @@ import {
   useUpdateProvider,
   useFetchProviderModels,
 } from "./hooks/useGatewayConfig";
-import { parseTimeoutSeconds } from "./utils";
+import {
+  DEFAULT_API_PATH_PREFIX,
+  getApiPathPrefix,
+  parseTimeoutSeconds,
+  withApiPathPrefix,
+} from "./utils";
 
 const PROVIDER_PRESETS = {
   openai: {
@@ -186,6 +191,7 @@ const AddProviderDialog = ({ open, onClose, gatewayId, provider }) => {
   const [baseUrl, setBaseUrl] = useState(PROVIDER_PRESETS.openai.baseUrl);
   const [apiKey, setApiKey] = useState("");
   const [apiFormat, setApiFormat] = useState("openai");
+  const [apiPathPrefix, setApiPathPrefix] = useState(DEFAULT_API_PATH_PREFIX);
   const [models, setModels] = useState([]);
   const [timeoutVal, setTimeoutVal] = useState("");
   const [maxConcurrent, setMaxConcurrent] = useState("");
@@ -291,6 +297,7 @@ const AddProviderDialog = ({ open, onClose, gatewayId, provider }) => {
       setBaseUrl(c.base_url ?? c.baseUrl ?? "");
       setApiKey("");
       setApiFormat(c.api_format ?? c.apiFormat ?? "openai");
+      setApiPathPrefix(getApiPathPrefix(c));
       setModels(normalizeModels(c.models));
       const timeoutRaw = c.default_timeout ?? c.defaultTimeout;
       setTimeoutVal(timeoutRaw != null ? String(timeoutRaw) : "");
@@ -381,6 +388,7 @@ const AddProviderDialog = ({ open, onClose, gatewayId, provider }) => {
     setBaseUrl(defaultPreset.baseUrl);
     setApiKey("");
     setApiFormat(defaultPreset.apiFormat);
+    setApiPathPrefix(DEFAULT_API_PATH_PREFIX);
     setModels([]);
     setModelOptions([]);
     setFetchError("");
@@ -428,6 +436,7 @@ const AddProviderDialog = ({ open, onClose, gatewayId, provider }) => {
     setGcpProject("");
     setGcpLocation("us-central1");
     setServiceAccountJSON("");
+    setApiPathPrefix(DEFAULT_API_PATH_PREFIX);
     // Clear models since provider changed
     setModels([]);
     setModelOptions([]);
@@ -547,7 +556,11 @@ const AddProviderDialog = ({ open, onClose, gatewayId, provider }) => {
       return;
     }
 
-    const config = { base_url: baseUrl, api_format: apiFormat };
+    const config = withApiPathPrefix(
+      { base_url: baseUrl, api_format: apiFormat },
+      apiFormat,
+      apiPathPrefix,
+    );
     if (isVertexAuth) {
       config.gcp_project = gcpProject.trim();
       config.gcp_location = gcpLocation.trim();
@@ -873,6 +886,16 @@ const AddProviderDialog = ({ open, onClose, gatewayId, provider }) => {
               </TextField>
             );
           })()}
+
+          {apiFormat === "openai" && (
+            <TextField
+              label="API Path Prefix"
+              fullWidth
+              value={apiPathPrefix}
+              onChange={(e) => setApiPathPrefix(e.target.value)}
+              helperText="Leave blank when the provider endpoint is not versioned, such as Perplexity Sonar."
+            />
+          )}
 
           <Box>
             <Stack

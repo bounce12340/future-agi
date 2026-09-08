@@ -7,7 +7,12 @@ import {
   userEvent,
   waitFor,
 } from "src/utils/test-utils";
-import { parseTimeoutSeconds } from "./utils";
+import {
+  DEFAULT_API_PATH_PREFIX,
+  getApiPathPrefix,
+  parseTimeoutSeconds,
+  withApiPathPrefix,
+} from "./utils";
 import AddProviderDialog from "./AddProviderDialog";
 
 const { updateMutate, fetchMutate, fetchState } = vi.hoisted(() => ({
@@ -531,5 +536,36 @@ describe("AddProviderDialog validation", () => {
 
     const save = await screen.findByRole("button", { name: "Save Changes" });
     expect(save.disabled).toBe(false);
+  });
+});
+
+describe("getApiPathPrefix", () => {
+  it("preserves an explicitly empty prefix", () => {
+    expect(getApiPathPrefix({ api_path_prefix: "" })).toBe("");
+  });
+
+  it("uses the default for providers saved before the field existed", () => {
+    expect(getApiPathPrefix({})).toBe(DEFAULT_API_PATH_PREFIX);
+  });
+
+  it("includes an explicit empty prefix in the saved OpenAI config", () => {
+    expect(
+      withApiPathPrefix(
+        { base_url: "https://api.perplexity.ai" },
+        "openai",
+        "",
+      ),
+    ).toEqual({
+      base_url: "https://api.perplexity.ai",
+      api_path_prefix: "",
+    });
+  });
+
+  it("does not add a path prefix for non-OpenAI formats", () => {
+    const config = { base_url: "https://api.anthropic.com" };
+    expect(withApiPathPrefix(config, "anthropic", "")).toEqual(config);
+    expect(withApiPathPrefix(config, "anthropic", "")).not.toHaveProperty(
+      "api_path_prefix",
+    );
   });
 });
