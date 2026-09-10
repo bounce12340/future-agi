@@ -946,6 +946,7 @@ const AddProviderDialog = ({ open, onClose, gatewayId, provider }) => {
               fullWidth
               value={apiPathPrefix}
               onChange={(e) => setApiPathPrefix(e.target.value)}
+              placeholder="/v1"
               helperText="Leave blank when the provider endpoint is not versioned, such as Perplexity Sonar."
             />
           )}
