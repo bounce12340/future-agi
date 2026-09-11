@@ -1,6 +1,8 @@
 /* eslint-disable react/prop-types */
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { act, render } from "@testing-library/react";
 import { useAgentPlaygroundStore } from "../../store";
+import GraphView from "../GraphView";
 
 // Since GraphView uses ReactFlow internally (which requires a DOM provider),
 // we test the callback logic extracted from GraphViewInner via the store
@@ -9,20 +11,76 @@ import { useAgentPlaygroundStore } from "../../store";
 // ---------------------------------------------------------------------------
 // Mocks
 // ---------------------------------------------------------------------------
-const mockScreenToFlowPosition = vi.fn((pos) => pos);
+const mocks = vi.hoisted(() => ({
+  mockScreenToFlowPosition: vi.fn((pos) => pos),
+  mockEnsureDraft: vi.fn(),
+  mockUpdateNodeApi: vi.fn(),
+  mockEnqueueSnackbar: vi.fn(),
+  mockSaveDraft: vi.fn(),
+  reactFlowProps: null,
+}));
+const {
+  mockScreenToFlowPosition,
+  mockEnsureDraft,
+  mockUpdateNodeApi,
+  mockEnqueueSnackbar,
+  mockSaveDraft,
+} = mocks;
 vi.mock("@xyflow/react", () => ({
-  ReactFlow: ({ children }) => <div data-testid="react-flow">{children}</div>,
+  ReactFlow: ({ children, ...props }) => {
+    mocks.reactFlowProps = props;
+    return <div data-testid="react-flow">{children}</div>;
+  },
   Controls: () => <div data-testid="controls" />,
   ConnectionLineType: { SmoothStep: "smoothstep" },
   useReactFlow: () => ({
     screenToFlowPosition: mockScreenToFlowPosition,
   }),
   ReactFlowProvider: ({ children }) => <div>{children}</div>,
+  addEdge: (edge, edges) => [...edges, edge],
+  applyEdgeChanges: (changes, edges) => edges,
+  applyNodeChanges: (changes, nodes) =>
+    changes.reduce(
+      (currentNodes, change) =>
+        change.type === "position"
+          ? currentNodes.map((node) =>
+              node.id === change.id
+                ? { ...node, position: change.position }
+                : node,
+            )
+          : currentNodes,
+      nodes,
+    ),
 }));
 
-const mockSaveDraft = vi.fn();
 vi.mock("../saveDraftContext", () => ({
-  useSaveDraftContext: () => ({ saveDraft: mockSaveDraft }),
+  useSaveDraftContext: () => ({
+    saveDraft: mocks.mockSaveDraft,
+    ensureDraft: mocks.mockEnsureDraft,
+  }),
+}));
+
+vi.mock("src/api/agent-playground/agent-playground", () => ({
+  createConnectionApi: vi.fn(),
+  deleteConnectionApi: vi.fn(),
+  updateNodeApi: mocks.mockUpdateNodeApi,
+  deleteNodeApi: vi.fn(),
+}));
+
+vi.mock("../../hooks/useCanEditAgent", () => ({
+  default: () => ({ isReadOnly: false }),
+}));
+
+vi.mock("../hooks/useAddNodeOptimistic", () => ({
+  default: () => ({ addNode: vi.fn() }),
+}));
+
+vi.mock("@tanstack/react-query", () => ({
+  useQueryClient: () => ({ invalidateQueries: vi.fn() }),
+}));
+
+vi.mock("notistack", () => ({
+  enqueueSnackbar: mocks.mockEnqueueSnackbar,
 }));
 
 vi.mock("../nodes", () => ({
@@ -56,6 +114,10 @@ describe("GraphView – callback logic", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     useAgentPlaygroundStore.getState().reset();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   // ---- onBeforeDelete ----
@@ -213,9 +275,101 @@ describe("GraphView – callback logic", () => {
 
   // ---- onNodeDragStop ----
   describe("onNodeDragStop logic", () => {
-    it("calls saveDraft on node drag stop", () => {
-      mockSaveDraft();
-      expect(mockSaveDraft).toHaveBeenCalled();
+    const originalNode = {
+      id: "n1",
+      type: "llm_prompt",
+      position: { x: 10, y: 20 },
+      data: { label: "Prompt" },
+    };
+    const movedNode = {
+      ...originalNode,
+      position: { x: 100, y: 200 },
+    };
+
+    const renderGraphView = (isDraft) => {
+      useAgentPlaygroundStore.setState({
+        currentAgent: {
+          id: "graph-1",
+          version_id: "version-1",
+          is_draft: isDraft,
+        },
+        nodes: [originalNode],
+        edges: [],
+      });
+      render(<GraphView />);
+    };
+
+    const dragNode = () => {
+      act(() => {
+        mocks.reactFlowProps.onNodeDragStart(null, originalNode, [originalNode]);
+        useAgentPlaygroundStore.setState({ nodes: [movedNode] });
+        mocks.reactFlowProps.onNodeDragStop(null, movedNode, [movedNode]);
+      });
+    };
+
+    it("promotes a saved agent and includes the moved position in draft creation", async () => {
+      vi.useFakeTimers();
+      mockEnsureDraft.mockImplementation(async () => {
+        useAgentPlaygroundStore.setState((state) => ({
+          currentAgent: { ...state.currentAgent, is_draft: true },
+        }));
+        return "created";
+      });
+      renderGraphView(false);
+      dragNode();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(500);
+      });
+
+      expect(mockEnsureDraft).toHaveBeenCalledOnce();
+      expect(useAgentPlaygroundStore.getState().currentAgent.is_draft).toBe(
+        true,
+      );
+      expect(useAgentPlaygroundStore.getState().nodes[0].position).toEqual(
+        movedNode.position,
+      );
+      expect(mockUpdateNodeApi).not.toHaveBeenCalled();
+    });
+
+    it("saves the moved position directly when the agent is already a draft", async () => {
+      vi.useFakeTimers();
+      mockEnsureDraft.mockResolvedValue(true);
+      mockUpdateNodeApi.mockResolvedValue({});
+      renderGraphView(true);
+      dragNode();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(500);
+      });
+
+      expect(mockEnsureDraft).toHaveBeenCalledOnce();
+      expect(mockUpdateNodeApi).toHaveBeenCalledWith({
+        graphId: "graph-1",
+        versionId: "version-1",
+        nodeId: "n1",
+        data: { position: movedNode.position },
+      });
+    });
+
+    it("rolls the node back when saving its position fails", async () => {
+      vi.useFakeTimers();
+      mockEnsureDraft.mockResolvedValue(true);
+      mockUpdateNodeApi.mockRejectedValue(new Error("save failed"));
+      renderGraphView(true);
+      dragNode();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(500);
+      });
+
+      expect(useAgentPlaygroundStore.getState().nodes[0].position).toEqual(
+        originalNode.position,
+      );
+      expect(mockEnqueueSnackbar).toHaveBeenCalledWith(
+        "Failed to save positions",
+        { variant: "error" },
+      );
     });
   });
 
