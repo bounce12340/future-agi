@@ -83,6 +83,10 @@ vi.mock("notistack", () => ({
   enqueueSnackbar: mocks.mockEnqueueSnackbar,
 }));
 
+vi.mock("src/utils/logger", () => ({
+  default: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+}));
+
 vi.mock("../nodes", () => ({
   PromptNode: () => <div />,
   AgentNode: () => <div />,
@@ -309,7 +313,9 @@ describe("GraphView – callback logic", () => {
 
     it("promotes a saved agent and includes the moved position in draft creation", async () => {
       vi.useFakeTimers();
+      let draftSnapshot;
       mockEnsureDraft.mockImplementation(async () => {
+        draftSnapshot = useAgentPlaygroundStore.getState().nodes;
         useAgentPlaygroundStore.setState((state) => ({
           currentAgent: { ...state.currentAgent, is_draft: true },
         }));
@@ -323,6 +329,7 @@ describe("GraphView – callback logic", () => {
       });
 
       expect(mockEnsureDraft).toHaveBeenCalledOnce();
+      expect(draftSnapshot[0].position).toEqual(movedNode.position);
       expect(useAgentPlaygroundStore.getState().currentAgent.is_draft).toBe(
         true,
       );
