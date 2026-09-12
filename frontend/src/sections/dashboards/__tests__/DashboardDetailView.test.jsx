@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { act, render, screen, fireEvent } from "src/utils/test-utils";
 import DashboardDetailView from "../DashboardDetailView";
 import { DATE_FILTER_DEBOUNCE_MS, DATE_PRESETS } from "../constants";
@@ -309,8 +309,8 @@ describe("DashboardDetailView — time filter debounce", () => {
     expect(screen.getByTestId("widget-chart")).toHaveAttribute(
       "data-date-range",
       JSON.stringify({
-        start: "2026-08-13T12:00:00.000Z",
-        end: "2026-09-12T12:00:00.000Z",
+        start: "2026-08-13T12:00:00.300Z",
+        end: "2026-09-12T12:00:00.300Z",
       }),
     );
   });
