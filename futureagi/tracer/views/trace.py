@@ -6397,11 +6397,13 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         # internal finite-scan stop as a data error. A checkpoint that proved
         # no row is not an answer and keeps its degraded status. Numbered
         # allow_sampled compatibility retains its degraded metadata below
-        # because it has no exact continuation contract.
+        # because it has no exact continuation contract. Simulator calls are
+        # dropped from ``results`` after classification, so the published list
+        # -- not the selector's own rows -- is what the caller actually sees.
         public_chunk_complete = bounded_chunk_complete(
             read_complete=bounded_page.complete,
             cursor_has_more=cursor_has_more,
-            published_rows=len(bounded_page.rows),
+            published_rows=len(results),
         )
         response_data = {
             "count": total_count,
