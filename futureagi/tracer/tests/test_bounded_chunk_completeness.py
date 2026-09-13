@@ -282,3 +282,112 @@ def test_session_checkpoint_with_classified_rows_stays_a_complete_chunk() -> Non
     assert metadata["query_status"] == "complete"
     assert metadata["query_error_code"] is None
     assert metadata["has_more"] is True
+
+
+def _voice_simulator_row() -> dict[str, Any]:
+    """One voice root row whose caller number is a simulator number."""
+
+    from tracer.tests.test_trace_root_physical_replay import complete_root_row
+
+    return complete_root_row(
+        {
+            "project_id": PROJECT_ID,
+            "trace_id": "trace-sim",
+            "root_span_id": "root-sim",
+            "span_id": "root-sim",
+            "_root_observation_type": "conversation",
+            "start_time": CHECKPOINT,
+            "end_time": CHECKPOINT + timedelta(seconds=9),
+            "provider": "vapi",
+        },
+        project_id=PROJECT_ID,
+    )
+
+
+def _read_voice_page(bounded: BoundedFilterPage) -> Any:
+    """Drive the voice list with every published row filtered out in Python."""
+
+    from tracer.services.clickhouse.query_builders.voice_call_list import (
+        VAPI_PHONE_NUMBERS,
+    )
+    from tracer.services.clickhouse.query_service import QueryResult
+    from tracer.views.trace import TraceView
+
+    hydrated = [
+        {
+            **row,
+            "span_attributes": {
+                "raw_log": {"customer": {"number": VAPI_PHONE_NUMBERS[0]}}
+            },
+            "attrs_string": {},
+            "attrs_number": {},
+            "attrs_bool": {},
+        }
+        for row in bounded.rows
+    ]
+    analytics = mock.MagicMock()
+    analytics.execute_ch_query.return_value = QueryResult(
+        data=hydrated,
+        row_count=len(hydrated),
+        backend_used="clickhouse",
+        query_time_ms=1.0,
+    )
+
+    organization = SimpleNamespace(pk="org-a")
+    request = SimpleNamespace(
+        organization=organization,
+        user=SimpleNamespace(pk="user-a", organization=organization),
+        query_params={"cursor_mode": "true"},
+    )
+    view = TraceView.__new__(TraceView)
+    view._gm = SimpleNamespace(
+        custom_error_response=lambda *args, **kwargs: ("error", args, kwargs),
+    )
+
+    with (
+        mock.patch(
+            "tracer.views.trace.get_project_eval_configs", return_value=([], [])
+        ),
+        mock.patch(
+            "tracer.views.trace.get_annotation_labels_for_project", return_value=[]
+        ),
+        mock.patch(
+            "tracer.views.trace._build_annotation_map_from_scores", return_value={}
+        ),
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+            return_value=bounded,
+        ),
+    ):
+        return view._list_voice_calls_clickhouse(
+            request,
+            project_id=PROJECT_ID,
+            validated_data={
+                "filters": [_time_filter(), _absent_attribute_filter()],
+                "page": 1,
+                "page_size": 25,
+                "cursor_mode": True,
+            },
+            remove_simulation_calls=True,
+            analytics=analytics,
+        )
+
+
+def test_voice_checkpoint_whose_published_list_is_empty_is_not_a_complete_chunk() -> (
+    None
+):
+    """Simulator calls are dropped after classification, so the selector's own
+    row count is not what the caller received: a chunk that published nothing
+    keeps the degraded status of the unfinished read behind it."""
+
+    response = _read_voice_page(
+        _checkpointed_page(rows=[_voice_simulator_row()], before_id="trace-sim")
+    )
+
+    assert response.status_code == 200
+    assert response.data["results"] == []
+    assert response.data["query_complete"] is False
+    assert response.data["query_status"] == "degraded"
+    assert response.data["query_error_code"] == "scan_budget_exceeded"
+    assert response.data["has_more"] is True
+    assert isinstance(response.data["next_cursor"], str)
