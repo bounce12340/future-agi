@@ -137,7 +137,22 @@ def test_documented_list_metadata_declares_exactness(definition):
 
 
 def test_documented_voice_list_envelope_declares_exactness_and_statement_count():
-    properties = _swagger()["definitions"]["TraceVoiceCallListResponse"]["properties"]
+    definition = _swagger()["definitions"]["TraceVoiceCallListResponse"]
+    properties = definition["properties"]
     assert properties["query_exact"]["type"] == "boolean"
     assert properties["ordering_exact"]["type"] == "boolean"
     assert properties["query_count"]["type"] == "integer"
+
+
+def test_documented_voice_list_additions_do_not_become_required():
+    """A client built from this branch must still read a pre-deploy backend.
+
+    The three fields are additive on an envelope that already ships, so making
+    them required would turn the generated zod contract non-optional and make
+    ``.parse()`` throw on any voice list served before this change deploys.
+    """
+
+    definition = _swagger()["definitions"]["TraceVoiceCallListResponse"]
+    assert not {"query_exact", "ordering_exact", "query_count"} & set(
+        definition.get("required", ())
+    )

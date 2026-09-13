@@ -1761,8 +1761,8 @@ def test_string_page_public_dispatch_and_old_order_token(org, cursor, kind, pref
         analytics.execute_ch_query.assert_not_called()
 
 
-def _session_list_metadata(*, complete: bool, seed_is_sampled: bool) -> dict:
-    """Drive one bounded session page and return the metadata it published."""
+def _session_list_outcome(*, complete: bool, seed_is_sampled: bool):
+    """Drive one bounded session page and return the view's raw outcome."""
     from tracer.views.trace_session import TraceSessionView
 
     view, request = _view_and_request()
@@ -1807,7 +1807,10 @@ def _session_list_metadata(*, complete: bool, seed_is_sampled: bool) -> dict:
     bounded = _bounded_page(
         rows=[{"session_id": session_id, "start_time": start_time}],
         complete=complete,
-        continuation_slice_end=None if complete else start_time,
+        # No continuation: an unfinished read that can still be resumed is
+        # published as a complete cursor page with ``has_more``, so the truly
+        # degraded page is the one with nowhere left to go.
+        continuation_slice_end=None,
         total_rows_lower_bound=1,
     )
     with (
@@ -1824,7 +1827,7 @@ def _session_list_metadata(*, complete: bool, seed_is_sampled: bool) -> dict:
             return_value=[],
         ),
     ):
-        status, payload = TraceSessionView._list_sessions_clickhouse(
+        outcome = TraceSessionView._list_sessions_clickhouse(
             view,
             request,
             project_id=str(uuid.uuid4()),
@@ -1838,8 +1841,15 @@ def _session_list_metadata(*, complete: bool, seed_is_sampled: bool) -> dict:
                 "cursor_mode": True,
             },
         )
-    assert status == "ok"
-    return payload["metadata"]
+    return outcome
+
+
+def _session_list_metadata(*, complete: bool, seed_is_sampled: bool) -> dict:
+    """The metadata a bounded session page published, or the failure it raised."""
+
+    outcome = _session_list_outcome(complete=complete, seed_is_sampled=seed_is_sampled)
+    assert outcome[0] == "ok", outcome
+    return outcome[1]["metadata"]
 
 
 @pytest.mark.unit
@@ -1860,3 +1870,22 @@ def test_sampled_candidate_seed_page_states_it_is_inexact():
     assert metadata["query_exact"] is False
     assert metadata["ordering_exact"] is False
     assert metadata["query_provenance"] == "spans_per_session_candidate"
+
+
+@pytest.mark.unit
+def test_unfinished_session_read_is_refused_rather_than_published_as_exact():
+    """The session list is the one list that cannot publish an unfinished page.
+
+    An incomplete bounded read with nowhere to continue is refused with 503
+    (``trace_session.py`` ``session_list_bounded_read_incomplete``), and one
+    that can continue is published as a complete cursor page with
+    ``has_more``.  So no session page reaches the exactness publisher with
+    ``complete=False``, and the degraded case that does change CSV output is
+    the trace/span/voice one, pinned in ``test_bounded_trace_filter_reads``.
+    """
+
+    outcome = _session_list_outcome(complete=False, seed_is_sampled=False)
+
+    assert outcome[0] == "error"
+    assert outcome[1] == 503
+    assert outcome[3] == "service_unavailable"

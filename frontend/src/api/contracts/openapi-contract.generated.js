@@ -74231,9 +74231,6 @@ export const OPENAPI_CONTRACT = Object.freeze({
         "has_more",
         "query_complete",
         "query_status",
-        "query_exact",
-        "ordering_exact",
-        "query_count",
       ],
       type: "object",
       properties: {

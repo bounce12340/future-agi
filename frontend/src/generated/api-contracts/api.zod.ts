@@ -59666,10 +59666,13 @@ export const TracerTraceListVoiceCallsResponse = zod.object({
     .nullish(),
   query_complete: zod.boolean(),
   query_status: zod.enum(["complete", "degraded"]),
-  query_exact: zod.boolean(),
-  ordering_exact: zod.boolean(),
+  query_exact: zod.boolean().optional(),
+  ordering_exact: zod.boolean().optional(),
   query_error_code: zod.string().min(1).optional(),
-  query_count: zod.number().min(tracerTraceListVoiceCallsResponseQueryCountMin),
+  query_count: zod
+    .number()
+    .min(tracerTraceListVoiceCallsResponseQueryCountMin)
+    .optional(),
   query_applied_filter_version: zod
     .enum(["canonical-json-sha256-v1"])
     .optional(),

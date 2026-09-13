@@ -138617,10 +138617,7 @@
                 "config",
                 "has_more",
                 "query_complete",
-                "query_status",
-                "query_exact",
-                "ordering_exact",
-                "query_count"
+                "query_status"
             ],
             "type": "object",
             "properties": {
