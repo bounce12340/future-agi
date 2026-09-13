@@ -1417,6 +1417,8 @@ def _dashboard_degraded_payload(
                 "aggregation": metric.get("aggregation", "avg"),
                 "unit": metric.get("unit") or METRIC_UNITS.get(metric_key, ""),
                 "series": [],
+                "series_total": 0,
+                "series_truncated": False,
                 "query_complete": False,
                 "query_status": "degraded",
                 "query_sampled": False,
@@ -7180,11 +7182,7 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
             ) from exc
 
         # Format using DatasetQueryBuilder (compatible format_results)
-        formatter_config = {
-            **query_config,
-            "workspace_id": str(workspace.id),
-            "require_complete_series": True,
-        }
+        formatter_config = {**query_config, "workspace_id": str(workspace.id)}
         formatter = DatasetQueryBuilder(formatter_config)
 
         if trace_metrics and not dataset_metrics and not simulation_metrics:

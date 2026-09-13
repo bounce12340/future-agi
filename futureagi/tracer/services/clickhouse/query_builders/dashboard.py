@@ -19,6 +19,8 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
+from django.conf import settings
+
 from tracer.constants.dashboard import DASHBOARD_NUMERIC_ONLY_AGGREGATIONS
 from tracer.services.clickhouse.eval_expressions import (
     EVAL_FALSY_OUTPUTS,
@@ -2925,18 +2927,9 @@ class DashboardQueryBuilder:
             if not series_data:
                 series_data["total"] = {}
 
-            # Rank all returned series; presentation limits belong to the UI.
-            # The executor's throwing row/byte caps bound this result. Dropping
-            # series here would publish a truncated payload as an exact result.
-            if "total" not in series_data:
-                ranked = sorted(
-                    series_data.items(),
-                    key=lambda kv: sum(v for v in kv[1].values() if v is not None),
-                    reverse=True,
-                )
-                series_data = dict(ranked)
+            series_data, series_total = rank_and_cap_series(series_data)
 
-            # Preserve volume order from ``series_data``.
+            # Preserve the ranked order from ``series_data``.
             series = []
             for name, data_map in series_data.items():
                 filled = []
@@ -2957,6 +2950,8 @@ class DashboardQueryBuilder:
                 "aggregation": metric_info.get("aggregation", "avg"),
                 "unit": unit,
                 "series": series,
+                "series_total": series_total,
+                "series_truncated": len(series) < series_total,
             }
             for metadata_field in DASHBOARD_QUERY_METADATA_FIELDS:
                 if metadata_field in metric_info:
@@ -3748,6 +3743,30 @@ def _generate_time_buckets(
             cur += delta
 
     return buckets
+
+
+def rank_and_cap_series(
+    series_data: dict[str, dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], int]:
+    """Order breakdown series by summed value, largest first, and cap the count.
+
+    A breakdown groups by an attribute whose distinct-value count the request
+    does not bound, and every returned series carries every time bucket, so the
+    response grows as ``series x buckets`` with nothing to stop it. Bound the
+    published series count here.
+
+    Returns the ordered mapping together with the number of distinct series
+    before the cap, so the response can say that it was truncated.
+    """
+    total = len(series_data)
+    if "total" in series_data:
+        return series_data, total
+    ranked = sorted(
+        series_data.items(),
+        key=lambda kv: sum(v for v in kv[1].values() if v is not None),
+        reverse=True,
+    )
+    return dict(ranked[: settings.DASHBOARD_BREAKDOWN_MAX_SERIES]), total
 
 
 def _get_operator_symbol(op: str) -> str | None:
