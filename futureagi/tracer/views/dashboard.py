@@ -1417,8 +1417,6 @@ def _dashboard_degraded_payload(
                 "aggregation": metric.get("aggregation", "avg"),
                 "unit": metric.get("unit") or METRIC_UNITS.get(metric_key, ""),
                 "series": [],
-                "series_total": 0,
-                "series_truncated": False,
                 "query_complete": False,
                 "query_status": "degraded",
                 "query_sampled": False,
