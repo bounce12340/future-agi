@@ -123,7 +123,13 @@ def mock_ch_client():
         mock_client.execute_read.return_value = (rows, columns, 5.0)
         # ``execute_ch_query`` reads through the progress-reporting transport
         # (rows, columns, elapsed, rows read, bytes read).
-        mock_client.execute_read_with_progress.return_value = (rows, columns, 5.0, 2, 128)
+        mock_client.execute_read_with_progress.return_value = (
+            rows,
+            columns,
+            5.0,
+            2,
+            128,
+        )
         mock_get.return_value = mock_client
         yield mock_client
 
