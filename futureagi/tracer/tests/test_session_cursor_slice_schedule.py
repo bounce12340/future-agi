@@ -6,6 +6,11 @@ twelve-month session walk hand out checkpoint page after checkpoint page - each
 answering ``rows: 0, has_more: true`` long after the whole result had been
 delivered.  These tests pin the builder contract that removes the cap, the
 halving valve that keeps one widened read safe, and the end-to-end walk.
+
+They also pin the third consumer of these hooks - the eval-task session lane -
+on the *other* side of the same contract: it reads a single fully buffered
+page with no continuation and never passes the valve, so it must not receive
+the widening either.
 """
 
 from __future__ import annotations
@@ -19,7 +24,12 @@ import pytest
 from clickhouse_driver.errors import Error as ClickHouseError
 from clickhouse_driver.errors import ErrorCodes
 
-from tracer.selectors.trace_filter_reads import read_bounded_filter_page
+from tracer.models.eval_task import RowType
+from tracer.selectors.eval_tasks import row_resolver
+from tracer.selectors.trace_filter_reads import (
+    BoundedFilterPage,
+    read_bounded_filter_page,
+)
 from tracer.services.clickhouse.v2.query_builders.session_list import (
     SessionListQueryBuilderV2,
 )
@@ -214,3 +224,66 @@ def test_session_filter_page_read_carries_its_slice_schedule_across_a_cursor():
     assert cursor_call.kwargs["retry_wide_read_budget"] is True
     assert numbered_call.kwargs["carry_continuation_slice_width"] is False
     assert numbered_call.kwargs["retry_wide_read_budget"] is True
+
+
+@pytest.mark.unit
+def test_eval_task_session_lane_gets_neither_the_widening_nor_the_valve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The eval-task session lane is the third consumer of these two hooks.
+
+    ``tracer/selectors/eval_tasks/row_resolver.py`` builds ``SESSION_LIST`` for
+    ``row_type=sessions`` and reads one fully buffered page: no
+    ``bounded_continuation``, no ``include_incomplete_rows`` and no
+    ``retry_wide_read_budget``.  A widened seed there could only raise
+    ``EvalTaskReadBudgetExceeded`` for the whole task, because there is no
+    checkpoint to fall back to - the exact half-a-fix
+    ``test_widened_session_seed_that_exceeds_its_read_budget_still_terminates``
+    declares unsafe.  That lane always constructs the builder with a
+    sampling salt/rate pair, so both hooks stay off together and its slice
+    ceiling is exactly what it was before this PR.  Pin the pairing so the
+    combination cannot appear by accident.
+    """
+
+    captured: dict = {}
+
+    def fake_read(**kwargs):
+        captured.update(kwargs)
+        return BoundedFilterPage(
+            rows=[{"session_id": SESSION_ID, "start_time": MATCH_AT}],
+            has_more=False,
+            complete=True,
+            status="complete",
+            error_code=None,
+            total_rows_lower_bound=1,
+            elapsed_ms=10,
+            query_count=1,
+            rows_returned=1,
+            result_payload_bytes=20,
+            attempts=(),
+        )
+
+    monkeypatch.setattr(
+        "tracer.selectors.trace_filter_reads.read_bounded_filter_page", fake_read
+    )
+
+    ids = row_resolver._resolve_bounded_historical_span_ids(
+        object(),
+        sql="must-not-run-legacy-id-order",
+        params={"start_date": NOW - WINDOW, "end_date": NOW},
+        project_id=PROJECT,
+        salt="task-salt",
+        sampling_rate=100.0,
+        filters={"filters": _filters(), "date_range": [NOW - WINDOW, NOW]},
+        limit=25,
+        batch_size=200,
+        row_type=RowType.SESSIONS,
+    )
+
+    assert ids == [SESSION_ID]
+    builder = captured["builder"]
+    assert builder.recommended_filter_max_slice_width() is None
+    assert builder.should_retry_filter_wide_read_budget() is False
+    assert captured.get("retry_wide_read_budget", False) is False
+    assert captured.get("bounded_continuation", False) is False
+    assert captured.get("include_incomplete_rows", False) is False

@@ -858,8 +858,17 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         logarithmic number of reads without changing membership, order, or the
         exact latest-state classifier, and a wide read that exceeds its server
         side budget is halved by ``should_retry_filter_wide_read_budget``.
-        Sampled internal lanes keep the conservative shared ceiling: an
-        under-full sampled slice is not evidence that the interval is sparse.
+
+        Lanes constructed with a sampling salt/rate pair keep the conservative
+        shared ceiling, and there are two of them.  A genuinely sampled read
+        must: an under-full sampled slice is not evidence that the interval is
+        sparse.  The eval-task resolver
+        (``tracer/selectors/eval_tasks/row_resolver.py``) must for a different
+        reason - it always pairs salt and rate, at any rate, and reads a single
+        fully buffered page with no continuation and no valve, so one widened
+        over-budget seed there would have no checkpoint to fall back on and
+        would fail the whole task.  Widening and valve therefore switch
+        together, never apart.
         """
 
         if self._bounded_sampling_rate is not None:
@@ -878,7 +887,9 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         walk reaches a dense region of history.  Retrying that unpublished
         identity-only seed on narrower adjacent slices changes neither
         membership nor order, and without it the widened schedule would return
-        the same non-advancing checkpoint on every request.
+        the same non-advancing checkpoint on every request.  It is off for
+        exactly the lanes that keep the shared ceiling above, so no caller can
+        receive the widening without the valve.
         """
 
         return self._bounded_sampling_rate is None
