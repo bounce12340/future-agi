@@ -133,3 +133,57 @@ def test_dataset_builder_shares_one_ceiling_with_the_trace_builder(count):
 
     assert len(capped) == settings.DASHBOARD_BREAKDOWN_MAX_SERIES
     assert total == settings.DASHBOARD_BREAKDOWN_MAX_SERIES + count
+
+
+def test_a_breakdown_value_of_the_sentinel_string_does_not_lift_the_ceiling():
+    """A group whose attribute value is literally ``total`` is still capped.
+
+    ``total`` is the key the formatter uses for a read with no breakdown, so a
+    grouping that happens to contain that value collides with the sentinel. The
+    collision must not switch the ceiling off.
+    """
+    ceiling = settings.DASHBOARD_BREAKDOWN_MAX_SERIES
+    count = ceiling * 20
+    rows = _rows(count - 1)
+    rows.extend(
+        {
+            "time_bucket": datetime(2025, 9, 15 + (bucket % 14)),
+            "value": float(count),
+            "breakdown_value": "total",
+        }
+        for bucket in range(BUCKETS)
+    )
+
+    metric = _format(_config(_attribute_breakdown()), rows)["metrics"][0]
+
+    assert len(metric["series"]) == ceiling
+    assert metric["series_total"] == count
+    assert metric["series_truncated"] is True
+
+
+def test_a_project_named_like_the_sentinel_does_not_lift_the_ceiling():
+    """The same collision through project-name resolution is still capped."""
+    ceiling = settings.DASHBOARD_BREAKDOWN_MAX_SERIES
+    count = ceiling * 2
+    rows = [
+        {
+            "time_bucket": datetime(2025, 9, 15 + (bucket % 14)),
+            "value": float(index),
+            "breakdown_value": f"00000000-0000-4000-8000-{index:012d}",
+        }
+        for index in range(count)
+        for bucket in range(BUCKETS)
+    ]
+    metric_info = {"id": "latency", "name": "latency", "aggregation": "avg"}
+
+    result = DashboardQueryBuilder(
+        _config([{"name": "project", "type": "system_metric"}])
+    ).format_results(
+        [(metric_info, rows)],
+        project_name_map={"00000000-0000-4000-8000-000000000000": "total"},
+    )
+    metric = result["metrics"][0]
+
+    assert len(metric["series"]) == ceiling
+    assert metric["series_total"] == count
+    assert metric["series_truncated"] is True

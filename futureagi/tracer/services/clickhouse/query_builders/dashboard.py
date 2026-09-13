@@ -3759,7 +3759,12 @@ def rank_and_cap_series(
     before the cap, so the response can say that it was truncated.
     """
     total = len(series_data)
-    if "total" in series_data:
+    # ``total`` is the key a read with no breakdown lands every row on, so an
+    # unbroken-down result is one series named exactly that and there is
+    # nothing to rank or cut. Test the whole key set, not membership: a
+    # breakdown whose values merely *include* the string "total" (or a project
+    # of that name) is a sentinel collision, and must still be capped.
+    if set(series_data) == {"total"}:
         return series_data, total
     ranked = sorted(
         series_data.items(),
