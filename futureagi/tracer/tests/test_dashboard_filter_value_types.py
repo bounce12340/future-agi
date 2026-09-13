@@ -100,12 +100,16 @@ def annotation_label_type(monkeypatch):
     """Serve one annotation label type without touching PostgreSQL."""
 
     def _serve(label_type):
+        # ``raising=False`` keeps this module runnable against a tree without
+        # the resolver, so every assertion below is an assertion about the
+        # compiled SQL rather than about the patch target existing.
         monkeypatch.setattr(
             dashboard_builder,
             "resolve_annotation_label_output_type",
             lambda label_id, organization_id=None: (
                 label_type if label_id == LABEL_ID else None
             ),
+            raising=False,
         )
 
     return _serve
@@ -127,6 +131,7 @@ def eval_output_type(monkeypatch):
             lambda eval_id, project_ids: EvalFilterMetadata(
                 config_ids=(eval_id,), output_type=output_type
             ),
+            raising=False,
         )
 
     return _serve
@@ -308,7 +313,10 @@ def test_a_bare_legacy_annotation_leaf_keeps_the_numeric_default(monkeypatch):
     # resolve. A leaf assembled in-process keeps the builder's documented
     # default rather than turning the compiler into a PostgreSQL client.
     monkeypatch.setattr(
-        dashboard_builder, "resolve_annotation_label_output_type", _refuse_database
+        dashboard_builder,
+        "resolve_annotation_label_output_type",
+        _refuse_database,
+        raising=False,
     )
 
     sql = _build(
@@ -330,7 +338,10 @@ def test_a_bare_legacy_annotation_leaf_keeps_the_numeric_default(monkeypatch):
 @pytest.mark.unit
 def test_a_bare_legacy_eval_leaf_keeps_the_score_default(monkeypatch):
     monkeypatch.setattr(
-        dashboard_builder, "resolve_eval_filter_metadata", _refuse_database
+        dashboard_builder,
+        "resolve_eval_filter_metadata",
+        _refuse_database,
+        raising=False,
     )
 
     sql = _build(
