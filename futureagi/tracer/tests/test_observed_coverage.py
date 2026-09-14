@@ -508,7 +508,9 @@ def test_unmappable_project_id_fails_closed_not_open():
     miss ``indexOf`` returns 0, and ClickHouse's ``arrayElement(arr, 0)`` yields
     the type default -- an empty string -- whose comparison is false. Without the
     guard that silently reports the project COVERED, which is the single
-    direction this check must never fail in.
+    direction this check must never fail in. The guard is unconditional with
+    respect to the arrival and eligibility gates; it does sit under the
+    scope-wide pruning bound, which every mappable row's own bound implies.
 
     Verified against ClickHouse 25.3: indexOf(['a','b'],'missing') = 0,
     arrayElement(['x','y'],0) = '' (empty() = 1), and a `<` against it is false.

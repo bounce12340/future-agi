@@ -145,7 +145,9 @@ _SETTLED_BEFORE = f"now64(6, 'UTC') - {_COVERAGE_MARGIN}"
 # nothing missing however old it is. Without this, the first such project in
 # a workspace turned every workspace-scoped picker ``partial`` for good once
 # its spans were an hour old. The map arms read only the maps' size
-# subcolumns; attributes_extra is read for rows the other arms reject.
+# subcolumns; attributes_extra is read for every scanned row (ClickHouse reads
+# the column for the block, it does not skip I/O for rows the map arms accept)
+# and only its serialisation is short-circuited.
 #
 # The cost falls on a project made ONLY of such spans with no index rows: the
 # index-less probe reads it end to end looking for one indexable span. That

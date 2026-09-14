@@ -271,3 +271,48 @@ def test_a_covered_project_costs_zero_rows_on_the_floor_probe(live):
     result = _coverage(live, _scope(project))
     assert (result.complete, result.reason) == (True, "covered")
     assert live.reads[-1] == 0, live.reads
+
+
+def test_an_old_bare_span_below_the_floor_is_not_a_gap_but_an_attributed_one_is(live):
+    """The eligibility arm on the FLOOR probe, judged by the real statement."""
+    now = datetime.now(UTC)
+    project = str(uuid4())
+    _index(live, project, now - timedelta(minutes=10))
+    _spans(live, [[project, now - timedelta(minutes=10), now - timedelta(minutes=10)]])
+    _spans(
+        live, [[project, now - timedelta(days=1), now - timedelta(hours=3)]], bare=True
+    )
+    assert _coverage(live, _scope(project)).reason == "covered"
+
+    _spans(live, [[project, now - timedelta(days=1), now - timedelta(hours=3)]])
+    assert _coverage(live, _scope(project)).reason == "source_predates_index"
+
+
+def test_the_scope_wide_bound_is_the_largest_floor_not_the_smallest(live):
+    """A bound below any project's own floor would hide that project's gap.
+
+    Two projects: the first indexed from long ago, the second only from ten
+    minutes ago but holding an attributed span that arrived hours ago and
+    sits between the two floors. Under the largest floor that span is found;
+    under the smallest it is excluded before the per-project arm ever sees
+    it, and the scope reads covered -- open, the one direction this module
+    must never fail in.
+    """
+    now = datetime.now(UTC)
+    old, young = str(uuid4()), str(uuid4())
+    _index(live, old, now - timedelta(days=30))
+    _spans(live, [[old, now - timedelta(days=30), now - timedelta(days=30)]])
+    _index(live, young, now - timedelta(minutes=10))
+    _spans(
+        live,
+        [
+            [young, now - timedelta(minutes=10), now - timedelta(minutes=10)],
+            [
+                young,
+                now - timedelta(days=2),
+                now - timedelta(hours=3),
+            ],  # below young's floor, above old's
+        ],
+    )
+    result = _coverage(live, _scope(old, young))
+    assert (result.complete, result.reason) == (False, "source_predates_index")
