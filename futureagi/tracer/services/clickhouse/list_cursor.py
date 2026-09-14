@@ -583,9 +583,12 @@ def pin_filter_seed_witness_slack(builder, cursor_state) -> None:
     The slack decides candidacy, so an operator turning the runtime knob
     between two hops of one cursor would move the boundary under a
     half-published page - duplicating rows that stop being candidates and
-    losing rows that start being them. A legacy token carries no slack; the
-    pin then clears and the builder falls back to the current setting, which
-    is exactly what that token got before.
+    losing rows that start being them. A token that carries no slack field is
+    passed on as ``None`` and each lane resolves it by what such a token can
+    mean there: the short exact-string lane writes its own slack into every
+    cursor, so an absent field is a pre-field token and returns to the
+    setting; the wide lanes emit no field until the setting is on, so an
+    absent field means that chain ran unbounded and finishes unbounded.
     """
 
     if cursor_state is None:
