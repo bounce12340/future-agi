@@ -91,9 +91,20 @@ cd <repo root>
 COMPOSE="docker compose --env-file deploy/.env.production \
   -f docker-compose.yml -f deploy/docker-compose.production.yml"
 
-# 1. PostgreSQL schema.
-$COMPOSE run --rm --entrypoint python postgres-schema-bootstrap \
-  manage.py migrate --noinput
+# 1. PostgreSQL schema, system evals and Temporal schedules.
+#    Run the image's own entrypoint with SERVICE_TYPE=bootstrap rather than a
+#    hand-written `manage.py migrate`: the bootstrap path is what also seeds
+#    system evals and registers Temporal schedules, and ordinary startup now
+#    deliberately does neither. All three overrides are required; together
+#    they are the explicit operator authorization -- the overlay pins this job to
+#    `migrate --check` with NO_STARTUP_DB_MUTATIONS=true, and both the
+#    entrypoint and Django's own startup guard refuse a bare `migrate` without
+#    them.
+$COMPOSE run --rm \
+  -e SERVICE_TYPE=bootstrap \
+  -e STARTUP_DB_MUTATION_MODE=operator \
+  -e NO_STARTUP_DB_MUTATIONS=false \
+  --entrypoint bash postgres-schema-bootstrap ./entrypoint.sh
 
 # 2. Native ClickHouse objects.
 $COMPOSE run --rm clickhouse-native-bootstrap --phase native --apply
@@ -130,6 +141,11 @@ Order matters: PostgreSQL migrations, then native ClickHouse tables, then the
 PeerDB snapshot/CDC pair, then the observed indexes. Step 4 depends on step 3's
 mirrors existing, which is why it waits rather than assuming.
 
+Step 1 prints the commands it runs. It must reach `migrate`, `seed_system_evals`
+and `register_temporal_schedules` and exit 0 with "One-shot database bootstrap
+completed successfully"; an install whose step 1 stopped at `migrate` has no
+system evals and no registered schedules.
+
 Then boot normally. From that point the overlay is check-only for the lifetime of
 the install, and `--confirm-initialized` is your acknowledgement that the steps
 above were completed and reviewed:
@@ -154,30 +170,56 @@ read the observed indexes exclusively, and those indexes contain only what has b
 ingested since they were created.
 
 So on an existing installation, immediately after upgrade, every custom-attribute
-key and value picker is **empty for all history** — and the API reports
-`query_complete: true`, so an un-backfilled index looks exactly like a workspace
-that genuinely has no custom attributes. Live ingestion starts filling it from the
-moment the new collector runs, but nothing recovers the past on its own.
+key and value picker is **empty for all history**. The API does say so rather than
+passing the gap off as an answer — `filter_values` returns
+`query_complete: false` with a `coverage_reason` and, where one can be derived, a
+`coverage_floor` naming the oldest indexed observation — but nothing recovers the
+past on its own. Live ingestion starts filling the index from the moment the new
+collector runs; everything older than that stays missing until you backfill.
 
 Run the span backfill for each project over your retention window before you rely
-on the new pickers:
+on the new pickers.
+
+The backfill binary does not reuse the collector's own ClickHouse or PostgreSQL
+settings. It reads its span source from `FI_OBSERVED_BACKFILL_CH_*` and verifies
+project ownership through `FI_PG_DSN`, and it refuses to start if either is
+missing. It also writes its resume checkpoint to a path you supply, and the
+collector image runs with a read-only root filesystem, so that path must be a
+writable mount that survives `--rm`.
 
 ```bash
+# Durable, survives --rm, and owned by the image's runtime user (nonroot, uid
+# 65532): a root-owned directory is not writable from inside the container.
+sudo install -d -o 65532 -g 65532 -m 0750 /var/lib/futureagi/backfill
+
 docker compose --env-file deploy/.env.production \
   -f docker-compose.yml -f deploy/docker-compose.production.yml \
-  run --rm --entrypoint /usr/local/bin/fi-observed-catalog-backfill fi-collector \
+  run --rm \
+  -v /var/lib/futureagi/backfill:/backfill \
+  -e FI_OBSERVED_BACKFILL_CH_URL=http://clickhouse:8123 \
+  -e FI_OBSERVED_BACKFILL_CH_DATABASE=<the native span database, e.g. $CH25_DATABASE> \
+  -e FI_OBSERVED_BACKFILL_CH_USERNAME=<a read-only ClickHouse user on that database> \
+  -e FI_OBSERVED_BACKFILL_CH_PASSWORD=<its password> \
+  -e FI_PG_DSN="postgres://<pg user>:<pg password>@postgres:5432/<pg db>?sslmode=disable" \
+  --entrypoint /usr/local/bin/fi-observed-catalog-backfill fi-collector \
   --source spans \
   --project <project uuid> \
   --since  <RFC3339, e.g. the oldest span you intend to keep filterable> \
   --until  <RFC3339, now> \
-  --checkpoint /backfill/progress.json \
+  --checkpoint /backfill/<project uuid>.json \
   --apply
 ```
 
+The source credential only ever runs one bounded `SELECT` per page against the
+span table, so give it a read-only login rather than the writer. Kafka
+destination and per-span limits are inherited from the `fi-collector` service
+environment and need no override.
+
 It takes one project per invocation and pages one hour-bucket at a time, so budget
 roughly one page per hour of range and re-run with the same `--checkpoint` to
-resume. Without `--apply` it previews and publishes nothing, which is the right way
-to check scope first.
+resume — give each project its own checkpoint file, since a checkpoint is bound to
+the exact project, range and Kafka destination that created it. Without `--apply`
+it previews and publishes nothing, which is the right way to check scope first.
 
 A fresh install needs none of this: there is no history to recover.
 

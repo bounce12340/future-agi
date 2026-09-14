@@ -44,6 +44,16 @@ SHAPES = [
 ]
 
 
+# The one bounded pre-filter an eval-choice read may apply. Kept whole on
+# purpose: each arm is what makes it a provable superset of the decoded match
+# (see test_choice_prefilter_is_a_superset_of_the_decoded_match).
+CHOICE_SEARCH_SUPERSET = (
+    "AND (positionCaseInsensitiveUTF8(value, %(choice_search)s) > 0 "
+    "OR position(value, char(92)) > 0 "
+    "OR lengthUTF8(value) != length(value)) "
+)
+
+
 class DeadlineExceeded(Exception):
     pass
 
@@ -398,6 +408,11 @@ def test_scope_search_deadline_and_cursor_are_forwarded_unchanged(reader, origin
     assert ("positionCaseInsensitiveUTF8(value, %(search)s) > 0" in sql) == (
         origin == "others"
     )
+    # The eval-choice arm may bound the read, but never by the plain search
+    # parameter that the generic arm uses: its predicate is the full escape-
+    # and-non-ASCII-safe disjunction, so the decoded filter below still owns
+    # the verdict.
+    assert (CHOICE_SEARCH_SUPERSET in sql) == (origin == "evaluation")
     assert ("groupBitOr(if(literal_choice, 2, 1)) AS choice_modes" in sql) == (
         origin == "evaluation"
     )
@@ -411,6 +426,7 @@ def test_scope_search_deadline_and_cursor_are_forwarded_unchanged(reader, origin
         "column_id": COLUMN,
         "search": "we",
         "result_limit": 5001,
+        **({"choice_search": "we"} if origin == "evaluation" else {}),
     }
     assert reader.manager.select_related.return_value.get.call_args.kwargs == {
         "id": COLUMN,
@@ -496,10 +512,75 @@ def test_search_matches_decoded_label_not_escaped_storage(reader, label, page_si
     response = reader.invoke([stored, "unrelated"], search=label, page_size=page_size)
     assert response["values"] == [{"value": label, "label": label}]
     assert reader.invoke([stored], search="0.2", page_size=page_size)["values"] == []
-    assert (
-        "positionCaseInsensitiveUTF8"
-        not in reader.analytics.execute_ch_query.call_args.args[0]
-    )
+    # "0.2" occurs in the stored score text but is not a decoded label, so a
+    # row the bounded pre-filter keeps is still dropped by the decoder. The
+    # pre-filter may narrow the read; it may never decide the answer.
+    sql = reader.analytics.execute_ch_query.call_args.args[0]
+    assert "positionCaseInsensitiveUTF8(value, %(search)s) > 0" not in sql
+    assert CHOICE_SEARCH_SUPERSET in sql
+
+
+def test_a_narrow_search_bounds_the_read_instead_of_scanning_everything(reader):
+    """The read an oversized inventory gets must depend on the search.
+
+    Before the pre-filter, an eval-choice column above the cap answered 422
+    for every search, so the error's own advice — "enter a more specific
+    search" — could not resolve it.
+    """
+
+    reader.invoke(["west"], search="")
+    unfiltered = reader.analytics.execute_ch_query.call_args.args[0]
+    reader.invoke(["west"], search="west")
+    narrowed, params = reader.analytics.execute_ch_query.call_args.args
+    assert CHOICE_SEARCH_SUPERSET not in unfiltered
+    assert CHOICE_SEARCH_SUPERSET in narrowed
+    assert params["choice_search"] == "west"
+
+
+@pytest.mark.parametrize("search", ["雪", " 雪 ", "café", "İ", ""])
+def test_a_search_clickhouse_cannot_bound_safely_reads_everything(reader, search):
+    """Fail open to the full bounded inventory, never to a wrong answer.
+
+    ``positionCaseInsensitiveUTF8`` agrees with Python's ``casefold`` only
+    while both sides stay ASCII, so a non-ASCII needle may not be matchable in
+    ClickHouse at all. The read then stays unfiltered and the cap still applies.
+    """
+
+    reader.invoke(["west"], search=search)
+    sql, params = reader.analytics.execute_ch_query.call_args.args
+    assert CHOICE_SEARCH_SUPERSET not in sql
+    assert "choice_search" not in params
+
+
+def test_the_prefilter_never_narrows_a_generic_array_column(reader):
+    """Only decoded eval choices use it; every other column keeps its reader."""
+
+    reader.column.source = "others"
+    reader.invoke(['["west"]'], search="west")
+    sql, params = reader.analytics.execute_ch_query.call_args.args
+    assert CHOICE_SEARCH_SUPERSET not in sql
+    assert "choice_search" not in params
+    assert "positionCaseInsensitiveUTF8(value, %(search)s) > 0" in sql
+
+
+@pytest.mark.parametrize(
+    "arm",
+    [
+        "OR position(value, char(92)) > 0 ",
+        "OR lengthUTF8(value) != length(value)) ",
+    ],
+)
+def test_every_arm_of_the_prefilter_is_load_bearing(reader, arm):
+    """Deleting either safety arm must be visible here, not only in review.
+
+    Each arm is what keeps the predicate a superset: escaped storage can decode
+    to characters it does not literally contain, and a non-ASCII cell can
+    casefold differently than ClickHouse lowercases it.
+    """
+
+    reader.invoke(["west"], search="west")
+    sql = reader.analytics.execute_ch_query.call_args.args[0]
+    assert arm in sql
 
 
 def test_same_storage_text_can_have_distinct_literal_and_container_meanings(reader):

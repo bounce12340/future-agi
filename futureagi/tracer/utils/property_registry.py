@@ -5,6 +5,16 @@ store.  Callers decode an identity to the existing system/eval/annotation/
 attribute/dataset adapter and keep authorization scope in the request.
 """
 
+from uuid import UUID
+
+# The annotation identity whose metric name names a pseudo-column, not a label.
+ANNOTATOR_METRIC_NAME = "annotator"
+
+# Kinds whose metric name is a definition row's primary key.
+_DEFINITION_PROPERTY_KINDS = frozenset(
+    {"eval", "eval_config", "eval_template", "annotation"}
+)
+
 PROPERTY_KIND_TO_METRIC_TYPE = {
     "system_attribute": "system_metric",
     "custom_attribute": "custom_attribute",
@@ -230,6 +240,32 @@ def validate_property_source_binding(
     return decoded
 
 
+def names_a_stored_definition(property_kind: str, metric_name: str) -> bool:
+    """Return whether an identity addresses a definition row by primary key.
+
+    Eval and annotation identities usually carry a definition UUID, but a few
+    name a pseudo-column instead: ``annotation:annotator`` selects Score rows by
+    their author across every label, and ``label_name``, ``my_annotations``,
+    ``status`` and ``trace_id`` are similar cross-label selectors served by
+    dedicated native readers.  Resolving one of those as a definition filters
+    the definition table on a non-UUID primary key, which raises Django's
+    ``ValidationError`` -- not a ``ValueError`` -- so it escapes the definition
+    branch's handlers as a 500 before its real reader is ever reached.
+
+    The test is the primary-key shape rather than a list of known pseudo-column
+    names, so an identity added later fails closed onto its native reader
+    instead of crashing.
+    """
+
+    if str(property_kind or "") not in _DEFINITION_PROPERTY_KINDS:
+        return False
+    try:
+        UUID(str(metric_name))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return True
+
+
 def validate_property_filter_binding(
     property_id: str,
     *,
@@ -270,7 +306,7 @@ def validate_property_filter_binding(
     if column_type and column_type != expected_column_type:
         is_annotator_adapter = (
             decoded["property_kind"] == "annotation"
-            and decoded["metric_name"] == "annotator"
+            and decoded["metric_name"] == ANNOTATOR_METRIC_NAME
             and column_type == "SYSTEM_METRIC"
         )
         if not is_annotator_adapter:

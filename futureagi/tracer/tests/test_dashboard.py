@@ -7884,6 +7884,155 @@ class TestDashboardQueryExecution:
         ]
 
     @pytest.mark.django_db
+    @pytest.mark.parametrize(
+        "name", ["label_name", "my_annotations", "status", "trace_id"]
+    )
+    def test_filter_values_annotation_pseudo_columns_never_resolve_as_definitions(
+        self, auth_client, observe_project, name
+    ):
+        """Every non-UUID annotation identity the pickers send, not just one.
+
+        These are cross-label selectors served by native readers. Resolving any
+        of them as a definition filters AnnotationsLabels on a non-UUID primary
+        key, which raises Django's ValidationError -- not a ValueError -- so it
+        escapes the definition branch's handlers as an uncaught 500.
+        """
+        from tracer.services.clickhouse.v2.property_catalog.source_adapters import (
+            CurrentDefinitionSource,
+        )
+
+        with patch.object(
+            CurrentDefinitionSource,
+            "resolve",
+            autospec=True,
+            side_effect=AssertionError(
+                f"annotation:{name} must not be resolved as a label definition"
+            ),
+        ):
+            response = auth_client.get(
+                "/tracer/dashboard/filter_values/",
+                {
+                    "source": "traces",
+                    "property_id": f"annotation:{name}",
+                    "metric_name": name,
+                    "metric_type": "annotation_metric",
+                    "project_ids": str(observe_project.id),
+                },
+            )
+
+        assert response.status_code < 500
+
+    @pytest.mark.django_db
+    def test_filter_values_annotator_by_registry_id_reaches_the_annotator_reader(
+        self, auth_client, observe_project, user, organization, workspace
+    ):
+        """`annotation:annotator` is the identity the pickers actually send.
+
+        It shares the annotation kind but names a pseudo-column, not a label,
+        so resolving it as a definition filters AnnotationsLabels on a non-UUID
+        primary key. That raises Django's ValidationError -- not a ValueError --
+        which escapes the definition branch's handlers as a 500 before the
+        dedicated annotator reader is ever reached.
+        """
+        from tracer.services.annotation_label_source import (
+            AnnotationLabelScoresProjectPG,
+        )
+        from tracer.services.clickhouse.v2.property_catalog.source_adapters import (
+            CurrentDefinitionSource,
+        )
+
+        with (
+            patch.object(
+                AnnotationLabelScoresProjectPG,
+                "annotator_ids_for_projects",
+                return_value=[str(user.id)],
+            ),
+            patch.object(
+                CurrentDefinitionSource,
+                "resolve",
+                autospec=True,
+                side_effect=AssertionError(
+                    "the annotator must not be resolved as a label definition"
+                ),
+            ),
+        ):
+            response = auth_client.get(
+                "/tracer/dashboard/filter_values/",
+                {
+                    "source": "traces",
+                    "property_id": "annotation:annotator",
+                    "metric_name": "annotator",
+                    "metric_type": "annotation_metric",
+                    "project_ids": str(observe_project.id),
+                },
+            )
+
+        assert response.status_code == 200
+        assert response.json()["result"]["values"] == [
+            {
+                "value": str(user.id),
+                "label": user.name,
+                "name": user.name,
+                "email": user.email,
+                "description": user.email,
+            }
+        ]
+
+    @pytest.mark.django_db
+    def test_filter_values_annotation_label_by_registry_id_still_uses_definitions(
+        self, auth_client, observe_project, organization, workspace
+    ):
+        """Routing the annotator away must not take real labels with it."""
+        from model_hub.models.choices import AnnotationTypeChoices
+        from model_hub.models.develop_annotations import AnnotationsLabels
+
+        label = AnnotationsLabels.objects.create(
+            name="Matrix",
+            type=AnnotationTypeChoices.CATEGORICAL.value,
+            organization=organization,
+            workspace=workspace,
+            project=observe_project,
+            settings={
+                "options": [{"label": "accuracy"}, {"label": "coverage"}],
+                "strategy": None,
+                "auto_annotate": False,
+                "multi_choice": True,
+                "rule_prompt": "",
+            },
+        )
+
+        from tracer.services.clickhouse.v2.property_catalog.source_adapters import (
+            CurrentDefinitionSource,
+        )
+
+        resolve = CurrentDefinitionSource.resolve
+        with patch.object(
+            CurrentDefinitionSource,
+            "resolve",
+            autospec=True,
+            side_effect=lambda self, **kw: resolve(self, **kw),
+        ) as resolved:
+            response = auth_client.get(
+                "/tracer/dashboard/filter_values/",
+                {
+                    "source": "traces",
+                    "property_id": f"annotation:{label.id}",
+                    "metric_name": str(label.id),
+                    "metric_type": "annotation_metric",
+                    "project_ids": str(observe_project.id),
+                },
+            )
+
+        # Routing the annotator away must not take real labels with it: a label
+        # identity still reaches the definition resolver.
+        assert resolved.call_args.kwargs["property_id"] == f"annotation:{label.id}"
+        assert response.status_code == 200
+        assert response.json()["result"]["values"] == [
+            {"value": "accuracy", "label": "accuracy"},
+            {"value": "coverage", "label": "coverage"},
+        ]
+
+    @pytest.mark.django_db
     def test_filter_values_annotation_categorical_uses_only_configured_values(
         self, auth_client, project, organization, workspace
     ):

@@ -151,7 +151,10 @@ from tracer.services.exact_aggregation_cache import (
 )
 from tracer.services.postgres_read_policy import application_postgres_reads
 from tracer.utils.helper import get_annotation_labels_by_project
-from tracer.utils.property_registry import parse_property_registry_id
+from tracer.utils.property_registry import (
+    names_a_stored_definition,
+    parse_property_registry_id,
+)
 from tracer.utils.workspace_scope import (
     project_queryset_for_request,
     project_workspace_scope_q,
@@ -2963,6 +2966,14 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
             property_id
             and property_kind in {"eval_template", "eval_config", "annotation"}
             and source != "simulation"
+            # Only route identities this branch can actually resolve. Eval and
+            # annotation kinds are looked up by definition primary key, but a
+            # few -- `annotation:annotator`, `label_name`, `my_annotations` --
+            # name a cross-label pseudo-column instead. Those filter the
+            # definition table on a non-UUID primary key, which raises Django's
+            # ValidationError, not a ValueError, so it escapes this block's
+            # handlers as a 500 and their real readers below are never reached.
+            and names_a_stored_definition(property_kind, metric_name)
         ):
             try:
                 projects = resolve_property_catalog_project_scope(
@@ -5480,10 +5491,36 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                 "value AS val, groupBitOr(if(literal_choice, 2, 1)) AS choice_modes"
                 if evaluation_choices else "DISTINCT value AS val"
             )
-            search_clause = "" if evaluation_choices else (
-                "AND (%(search)s = '' OR "
-                "positionCaseInsensitiveUTF8(value, %(search)s) > 0) "
-            )
+            # Choice labels are decoded in Python, so an eval-choice search
+            # cannot be answered by matching the stored text. It can still be
+            # *bounded* by it. A decoded label differs from its storage only at
+            # a backslash escape, and ClickHouse's case-insensitive match
+            # agrees with Python's casefold only while both sides stay ASCII,
+            # so keeping every row that satisfies any of those three arms can
+            # never drop a row the decoded filter below would have kept.
+            # Without it a narrow search still reads the whole inventory and a
+            # column above the cap answers 422 no matter what the user types,
+            # which the error's own advice cannot resolve.
+            choice_search = search.strip()
+            if evaluation_choices:
+                search_clause = (
+                    (
+                        "AND (positionCaseInsensitiveUTF8(value, %(choice_search)s) > 0 "
+                        # char(92) is a backslash: escaped storage may decode to
+                        # a label whose characters are not literally present.
+                        "OR position(value, char(92)) > 0 "
+                        # A non-ASCII cell may casefold differently than it
+                        # lowercases; never let this arm decide such a row.
+                        "OR lengthUTF8(value) != length(value)) "
+                    )
+                    if choice_search and choice_search.isascii()
+                    else ""
+                )
+            else:
+                search_clause = (
+                    "AND (%(search)s = '' OR "
+                    "positionCaseInsensitiveUTF8(value, %(search)s) > 0) "
+                )
             sql = (CHOICE_INTERPRETATION_CTE if evaluation_choices else "") + (
                 f"SELECT {projection} "
                 "FROM model_hub_cell FINAL "
@@ -5496,14 +5533,17 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                 "ORDER BY val "
                 "LIMIT %(result_limit)s"
             )
+            params = {
+                "dataset_id": str(dataset_id),
+                "column_id": str(column_id),
+                "search": search,
+                "result_limit": result_limit,
+            }
+            if evaluation_choices and search_clause:
+                params["choice_search"] = choice_search
             result = analytics.execute_ch_query(
                 sql,
-                {
-                    "dataset_id": str(dataset_id),
-                    "column_id": str(column_id),
-                    "search": search,
-                    "result_limit": result_limit,
-                },
+                params,
                 timeout_ms=deadline.remaining_ms(_FILTER_VALUES_INTERACTIVE_TIMEOUT_MS),
                 settings={
                     "max_result_rows": result_limit,
