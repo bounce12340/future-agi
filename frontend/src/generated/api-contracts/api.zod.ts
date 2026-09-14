@@ -52325,7 +52325,6 @@ export const TracerObservationSpanCreateOtelSpanBody = zod.object({
  */
 
 export const tracerObservationSpanGetEvalAttributesListQueryRowTypeDefault = `spans`;
-export const tracerObservationSpanGetEvalAttributesListQueryQMax = 512;
 
 export const TracerObservationSpanGetEvalAttributesListQueryParams = zod.object(
   {
@@ -52343,9 +52342,10 @@ export const TracerObservationSpanGetEvalAttributesListQueryParams = zod.object(
       .default(tracerObservationSpanGetEvalAttributesListQueryRowTypeDefault),
     q: zod
       .string()
-      .min(1)
-      .max(tracerObservationSpanGetEvalAttributesListQueryQMax)
-      .optional(),
+      .optional()
+      .describe(
+        "Nonempty exact attribute key, at most 4096 UTF-8 bytes. Whitespace, controls and case are preserved.",
+      ),
   },
 );
 

@@ -33812,8 +33812,6 @@ export const OPENAPI_CONTRACT = Object.freeze({
             required: false,
             schema: {
               type: "string",
-              minLength: 1,
-              maxLength: 512,
             },
           },
         },

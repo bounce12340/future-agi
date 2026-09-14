@@ -31454,8 +31454,7 @@ export type TracerObservationSpanGetEvalAttributesListParams = {
   filters: string;
   row_type?: TracerObservationSpanGetEvalAttributesListRowType;
   /**
-   * @minLength 1
-   * @maxLength 512
+   * Nonempty exact attribute key, at most 4096 UTF-8 bytes. Whitespace, controls and case are preserved.
    */
   q?: string;
 };
