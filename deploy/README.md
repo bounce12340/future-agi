@@ -177,6 +177,13 @@ passing the gap off as an answer — `filter_values` returns
 past on its own. Live ingestion starts filling the index from the moment the new
 collector runs; everything older than that stays missing until you backfill.
 
+That verdict is derived from the source `spans` table's `created_at` (arrival time,
+schema `002_spans_v2.sql`), not from the spans' own timestamps: a span that arrived
+within the last hour is treated as still on its way to the index rather than as a
+gap, so a freshly created project or a late-arriving trace does not flip the picker
+to incomplete for the seconds the consumer needs. A span that arrived over an hour
+ago and is still not indexed is a real gap and is reported as one.
+
 Run the span backfill for each project over your retention window before you rely
 on the new pickers.
 

@@ -47,13 +47,22 @@ class _Client:
     ``below`` names the projects that have spans older than their index floor.
     """
 
-    def __init__(self, below=(), raises=None, any_span=None):
+    def __init__(self, below=(), raises=None, any_span=None, in_flight=()):
         self.below = set(below)
         # Projects that have at least one span. Defaults to "the ones below",
         # so an empty project is the default for anything unindexed.
         self.any_span = set(below) if any_span is None else set(any_span)
+        # Projects whose every span ARRIVED within the margin (created_at is
+        # recent). The real table would exclude them under the arrival
+        # predicate and include them without it, so the double does the same:
+        # it honours the gate only when the statement actually carries it.
+        self.in_flight = set(in_flight)
         self.raises = raises
         self.calls = []
+
+    def _settled(self, sql, project):
+        gated = "created_at < now64(6, 'UTC') - INTERVAL 1 HOUR" in sql
+        return not (gated and project in self.in_flight)
 
     def execute_read(self, sql, params=None, timeout_ms=None, settings=None):
         self.calls.append({"sql": sql, "parameters": params, "settings": settings,
@@ -62,10 +71,14 @@ class _Client:
             raise self.raises
         ids = list((params or {}).get("project_ids") or ())
         if "start_time" not in sql:
-            # The index-less probe asks only "do any of these have spans".
-            rows = [(1,)] if any(p in self.any_span for p in ids) else []
+            # The index-less probe asks "do any of these hold a settled span".
+            rows = [(1,)] if any(
+                p in self.any_span and self._settled(sql, p) for p in ids
+            ) else []
         else:
-            hit = next((p for p in ids if p in self.below), None)
+            hit = next(
+                (p for p in ids if p in self.below and self._settled(sql, p)), None
+            )
             rows = [(hit,)] if hit else []
         # execute_read returns (rows, column_types, elapsed).
         return rows, [], 0.0
@@ -130,6 +143,82 @@ def test_unindexed_project_without_spans_is_not_a_gap():
     result = _coverage(rows=[], scope=SCOPE, client=_Client(any_span=()))
     assert result.complete is True
     assert result.reason == "covered"
+
+
+@pytest.mark.unit
+def test_unindexed_project_with_only_in_flight_spans_is_not_a_gap():
+    """A project created seconds ago is ingestion in flight, not a missing backfill.
+
+    Its spans are in the source (the collector wrote them) and not yet in the
+    index (the consumer is seconds behind). Reporting that as ``partial`` made
+    every freshly created project answer incomplete for the length of the
+    consumer lag -- whatever the spans' own timestamps said, because e2e
+    fixtures plant yesterday's spans into a project created today. The
+    Playwright trace of the failing flow read exactly:
+
+        query_complete=false reason=project_unindexed values=[]
+
+    on the first poll after ingest, and the same flow passed on the next run.
+    """
+    result = _coverage(
+        rows=[], scope=SCOPE, client=_Client(any_span=("p1",), in_flight=("p1",))
+    )
+    assert result.complete is True
+    assert result.reason == "covered"
+
+
+@pytest.mark.unit
+def test_in_flight_project_does_not_mask_a_settled_gap_in_the_same_scope():
+    """One IN-query, LIMIT 1: the fresh project must not hide the stale one."""
+    scope = {**SCOPE, "project_ids": ["fresh", "stale"]}
+    result = _coverage(
+        rows=[],
+        scope=scope,
+        client=_Client(any_span=("fresh", "stale"), in_flight=("fresh",)),
+    )
+    assert result.complete is False
+    assert result.reason == "project_unindexed"
+
+
+@pytest.mark.unit
+def test_late_arrival_below_the_floor_is_not_a_gap_until_it_settles():
+    """An indexed project receiving yesterday's trace from a client buffer.
+
+    By its own clock the span is below the floor the moment it lands; by
+    arrival it is seconds old and still on its way to the index. Only once it
+    has been in the source for the margin without being indexed is it a gap.
+    """
+    rows = [{"project_id": "p1", "floor": "2026-01-02 00:00:00"}]
+    settling = _coverage(rows=rows, client=_Client(below=("p1",), in_flight=("p1",)))
+    assert settling.complete is True
+    assert settling.reason == "covered"
+
+    settled = _coverage(rows=rows, client=_Client(below=("p1",)))
+    assert settled.complete is False
+    assert settled.reason == "source_predates_index"
+
+
+@pytest.mark.unit
+def test_both_probes_gate_on_arrival_not_the_spans_own_clock():
+    """The gate is created_at (server-assigned at insert), on both statements.
+
+    start_time is the producer's clock and is routinely days old for a span
+    that arrived a second ago, so it cannot tell "in flight" from "missing".
+    """
+    # p2 is index-less but empty, so the index-less probe finds nothing and the
+    # floor probe for p1 still runs: both statements are then on record.
+    client = _Client(below=(), any_span=())
+    scope = {**SCOPE, "project_ids": ["p1", "p2"]}
+    _coverage(
+        rows=[{"project_id": "p1", "floor": "2026-01-01 00:00:00"}],
+        scope=scope,
+        client=client,
+    )
+    gate = "created_at < now64(6, 'UTC') - INTERVAL 1 HOUR"
+    assert len(client.calls) == 2
+    unindexed, floor = client.calls[0]["sql"], client.calls[1]["sql"]
+    assert "start_time" not in unindexed and gate in unindexed
+    assert "start_time <" in floor and gate in floor
 
 
 @pytest.mark.unit
@@ -322,8 +411,15 @@ def test_unmappable_project_id_fails_closed_not_open():
     sql = client.calls[-1]["sql"]
     assert "indexOf(%(project_ids)s, toString(project_id)) = 0" in sql
     # The guard must be an OR arm of the predicate, so an unmappable row matches
-    # and is reported as a gap rather than skipped.
-    assert " OR start_time <" in sql
+    # and is reported as a gap rather than skipped -- and it must stay
+    # unconditional: the arrival gate belongs to the predates-floor arm only,
+    # never to the backstop, or an unmappable row that arrived recently would
+    # be silently skipped.
+    guard = sql.index("= 0")
+    arm = sql.index("OR (", guard)
+    assert "start_time <" in sql[arm:]
+    assert "created_at <" not in sql[:arm]
+    assert "created_at <" in sql[arm:]
 
 
 @pytest.mark.unit

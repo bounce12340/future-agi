@@ -81718,7 +81718,24 @@ export const OPENAPI_CONTRACT = Object.freeze({
         query_status: {
           title: "Query status",
           type: "string",
-          enum: ["complete", "sampled", "degraded"],
+          enum: ["complete", "sampled", "degraded", "partial"],
+        },
+        coverage_reason: {
+          title: "Coverage reason",
+          type: "string",
+          enum: [
+            "empty_scope",
+            "covered",
+            "floor_unavailable",
+            "project_unindexed",
+            "source_predates_index",
+            "probe_unavailable",
+          ],
+        },
+        coverage_floor: {
+          title: "Coverage floor",
+          type: "string",
+          minLength: 1,
         },
         query_error_code: {
           title: "Query error code",
@@ -81882,7 +81899,24 @@ export const OPENAPI_CONTRACT = Object.freeze({
         query_status: {
           title: "Query status",
           type: "string",
-          enum: ["complete"],
+          enum: ["complete", "partial"],
+        },
+        coverage_reason: {
+          title: "Coverage reason",
+          type: "string",
+          enum: [
+            "empty_scope",
+            "covered",
+            "floor_unavailable",
+            "project_unindexed",
+            "source_predates_index",
+            "probe_unavailable",
+          ],
+        },
+        coverage_floor: {
+          title: "Coverage floor",
+          type: "string",
+          minLength: 1,
         },
         query_provenance: {
           title: "Query provenance",

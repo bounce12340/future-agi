@@ -21,6 +21,12 @@ Replaying oldest-first publishes the oldest span in page one and every verdict
 here reads complete for the rest of the run. If that order ever changes, this
 module stops being correct -- ``TestSpanScanReplaysNewestHourFirst`` pins it.
 
+Both probes ignore spans that ARRIVED within ``_COVERAGE_MARGIN`` (``created_at``,
+server-assigned at insert), whatever the span's own ``start_time`` says: a source
+row the consumer has not caught up to yet is ingestion in flight, not a gap.
+Without that, every freshly created project answered ``partial`` for the length
+of the consumer lag -- a race the e2e suite hit on roughly one run in two.
+
 Two limits are worth stating plainly. ``_COVERAGE_MARGIN`` below means the last
 hour of a scan is not distinguishable from a finished one. And ``--source
 legacy`` pages by identity cursor rather than by time, so it has no such
@@ -115,6 +121,31 @@ _PROBE_WALL_MS = 1500
 # months, orders of magnitude past this.
 _COVERAGE_MARGIN = "INTERVAL 1 HOUR"
 
+# The margin is measured on ARRIVAL, not on the span's own clock. ``created_at``
+# is assigned by the server at insert (002_spans_v2.sql: DEFAULT now64) and the
+# collector never sets it, whereas ``start_time`` is whatever the producer said
+# and is routinely hours or days in the past for a span that landed a second
+# ago. A span that arrived within the margin has been written to the source but
+# may not yet have been written to the index -- that is the collector-to-
+# consumer window, and it closes on its own -- so neither probe below counts it
+# as a gap. A span that arrived an hour ago and is still not indexed is one.
+# 024_spans_created_at_index.sql already floors on arrival for the same reason
+# and gives this predicate a minmax skip index.
+_SETTLED_BEFORE = f"now64(6, 'UTC') - {_COVERAGE_MARGIN}"
+
+
+# The public vocabulary of ``coverage_reason``. The response serializers declare
+# exactly this tuple, and ``Coverage`` refuses any other value, so the wire
+# contract and the verdicts cannot drift apart.
+COVERAGE_REASONS = (
+    "empty_scope",
+    "covered",
+    "floor_unavailable",
+    "project_unindexed",
+    "source_predates_index",
+    "probe_unavailable",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class Coverage:
@@ -130,6 +161,10 @@ class Coverage:
     complete: bool
     reason: str
     floor: str | None = None
+
+    def __post_init__(self):
+        if self.reason not in COVERAGE_REASONS:
+            raise ValueError(f"undeclared coverage reason: {self.reason!r}")
 
     @property
     def status(self) -> str:
@@ -206,16 +241,27 @@ def _has_span_below(client, settings, project_id: str, floor) -> bool:
     )
 
 
-def _any_project_with_spans(client, settings, project_ids) -> bool:
-    """Do any of these (index-less) projects actually have spans?
+def _any_project_with_settled_spans(client, settings, project_ids) -> bool:
+    """Do any of these (index-less) projects hold a span that arrived before the margin?
+
+    A project whose every span arrived within ``_COVERAGE_MARGIN`` is ingestion
+    in flight: the source row exists, the index row is seconds behind. Treating
+    that as a gap made every freshly created project report ``partial`` for the
+    length of the consumer lag, whatever its spans' own timestamps. A project
+    holding a span that arrived an hour ago and still has no index row is the
+    un-backfilled upgrade this module exists to catch.
 
     One query for the whole set: ``project_id`` is the sorting-key prefix, so
-    the IN-set is an index lookup and ``LIMIT 1`` stops at the first hit.
+    the IN-set is an index lookup, the ``created_at`` minmax index prunes a
+    fresh project's parts outright, and ``LIMIT 1`` stops at the first hit.
     """
     if not project_ids:
         return False
     rows, _, _ = client.execute_read(
-        "SELECT 1 FROM spans WHERE project_id IN %(project_ids)s LIMIT 1",
+        "SELECT 1 FROM spans "
+        "WHERE project_id IN %(project_ids)s "
+        f"AND created_at < {_SETTLED_BEFORE} "
+        "LIMIT 1",
         {"project_ids": list(project_ids)},
         timeout_ms=_PROBE_WALL_MS,
         settings=settings,
@@ -250,9 +296,16 @@ def _any_project_predating_its_floor(client, settings, floors) -> str | None:
         # should make this unreachable; it is a fail-closed backstop, not an
         # expected path.
         "    indexOf(%(project_ids)s, toString(project_id)) = 0"
-        "    OR start_time < arrayElement(%(floors)s, "
-        "        indexOf(%(project_ids)s, toString(project_id))) "
-        f"        - {_COVERAGE_MARGIN} "
+        "    OR ("
+        "        start_time < arrayElement(%(floors)s, "
+        "            indexOf(%(project_ids)s, toString(project_id))) "
+        f"            - {_COVERAGE_MARGIN} "
+        # A late-arriving span (a client buffer flushing yesterday's trace) is
+        # below the floor by its own clock the moment it lands, and is in
+        # flight to the index for the next few seconds. Arrival decides
+        # whether it is a gap; see _SETTLED_BEFORE.
+        f"        AND created_at < {_SETTLED_BEFORE} "
+        "    )"
         ") "
         "LIMIT 1",
         {
@@ -303,7 +356,7 @@ def observed_scope_coverage(*, scope, deadline, observed=None, client=None) -> C
         # an empty project has nothing to index, and treating it as suspicious
         # dragged every scope containing one to "partial".
         unindexed = [pid for pid in project_ids if pid not in floors]
-        if _any_project_with_spans(client, probe_settings, unindexed):
+        if _any_project_with_settled_spans(client, probe_settings, unindexed):
             return Coverage(False, "project_unindexed")
 
         uncovered = _any_project_predating_its_floor(client, probe_settings, floors)
