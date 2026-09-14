@@ -20,6 +20,7 @@ from tfc.temporal.schedules.enterprise_heartbeat import (
     ENTERPRISE_HEARTBEAT_SCHEDULES,
 )
 from tfc.temporal.schedules.integrations import INTEGRATION_SCHEDULES
+from tfc.temporal.schedules.marketplace import MARKETPLACE_SCHEDULES
 from tfc.temporal.schedules.model_hub import MODEL_HUB_SCHEDULES
 from tfc.temporal.schedules.retention import RETENTION_SCHEDULES
 from tfc.temporal.schedules.simulate import SIMULATE_SCHEDULES
@@ -32,6 +33,7 @@ ALL_SCHEDULES = [
     *SIMULATE_SCHEDULES,
     *INTEGRATION_SCHEDULES,
     *BILLING_SCHEDULES,
+    *MARKETPLACE_SCHEDULES,
     *RETENTION_SCHEDULES,
     *DEPLOYMENT_TELEMETRY_SCHEDULES,
     *ENTERPRISE_HEARTBEAT_SCHEDULES,
@@ -73,6 +75,7 @@ __all__ = [
     "SIMULATE_SCHEDULES",
     "INTEGRATION_SCHEDULES",
     "BILLING_SCHEDULES",
+    "MARKETPLACE_SCHEDULES",
     "RETENTION_SCHEDULES",
     "DEPLOYMENT_TELEMETRY_SCHEDULES",
     "ALL_SCHEDULES",
