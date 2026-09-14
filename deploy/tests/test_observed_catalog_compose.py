@@ -22,12 +22,24 @@ PRODUCTION_PINS = {key: "contract-test" for key in (
 )}
 
 
+# The dev overlay carries an unrelated agent-harness sandbox whose credentials
+# are declared required, so the overlay cannot be rendered at all without them.
+# These contracts are about the catalog's deployment shape, not that service.
+DEV_OVERLAY_ENV = {
+    "ALK_HOST_WORKSPACE_ROOT": "/compose-contract/workspace",
+    "FI_API_KEY": "compose-contract-api-key",
+    "FI_SECRET_KEY": "compose-contract-secret-key",
+}
+
+
 def compose(
     *overlays: str, base_file: str = "docker-compose.yml", **overrides: str
 ) -> dict:
     # Do not inherit credentials, .env contents or another running project's
     # transport configuration. 'config' does not contact the Docker daemon.
     env = {key: value for key, value in os.environ.items() if key in ("PATH", "HOME")}
+    if "docker-compose.dev.yml" in overlays:
+        env.update(DEV_OVERLAY_ENV)
     env.update(overrides)
     args = ["docker", "compose", "--env-file", os.devnull, "-f", base_file]
     for overlay in overlays:

@@ -87,8 +87,21 @@ OPERATOR_OVERRIDES = {
 }
 
 
+# The dev overlay carries an unrelated agent-harness sandbox whose credentials
+# are declared required. Rendering the overlay at all needs them, so supply
+# synthetic values: these contracts are about the catalog's startup graph, not
+# that service, and compose() otherwise inherits no environment at all.
+DEV_OVERLAY_ENV = {
+    "ALK_HOST_WORKSPACE_ROOT": "/startup-contract/workspace",
+    "FI_API_KEY": "startup-contract-api-key",
+    "FI_SECRET_KEY": "startup-contract-secret-key",
+}
+
+
 def render(variant, *, full=False, overrides=None):
     env = dict(PRODUCTION_ENV) if variant == "production" else {}
+    if variant == "dev":
+        env.update(DEV_OVERLAY_ENV)
     env.update(overrides or {})
     if full:
         env["COMPOSE_PROFILES"] = "full"
