@@ -26,6 +26,12 @@ from tracer.selectors.filter_seed_width import (
     EmptyDensityEstimate,
     FilterSeedWidthPolicy,
 )
+from tracer.services.clickhouse.query_builders.filter_seed_witness import (
+    MAX_WITNESS_SLACK_HOURS,
+    ceil_hour,
+    floor_hour,
+    witness_envelope_sql,
+)
 from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
     _TRACE_ANY_SPAN_COLUMNS,
 )
@@ -87,10 +93,6 @@ _SHORT_TEXT_PREFIX_CLASSIFY_FLOOR = 64
 _SHORT_TEXT_PREFIX_CLASSIFY_CEILING = 200
 _SHORT_TEXT_PREFIX_CLASSIFY_HEADROOM_NUMERATOR = 5
 _SHORT_TEXT_PREFIX_CLASSIFY_HEADROOM_DENOMINATOR = 4
-
-# One week, the same ceiling ``FILTER_SELECTOR_TEXT_SEED_WITNESS_SLACK_HOURS``
-# declares: beyond it the envelope stops bounding this lane's own windows.
-_MAX_WITNESS_SLACK_HOURS = 168
 
 # The same two widths once a slack setting bounds the witness. There the
 # statement's cost is linear in the envelope's hours, so a narrower slice
@@ -179,15 +181,6 @@ def _short_text_prefix_classify_batch_size(prefix_needed: int) -> int:
         _SHORT_TEXT_PREFIX_CLASSIFY_CEILING,
         max(_SHORT_TEXT_PREFIX_CLASSIFY_FLOOR, with_headroom),
     )
-
-
-def _floor_hour(moment: datetime) -> datetime:
-    return moment.replace(minute=0, second=0, microsecond=0)
-
-
-def _ceil_hour(moment: datetime) -> datetime:
-    floored = _floor_hour(moment)
-    return floored if floored == moment else floored + timedelta(hours=1)
 
 
 def _caseless_ascii_ngram_anchor(value: str) -> str | None:
@@ -942,7 +935,7 @@ class _TraceListQueryBuilderV2Core(_TraceRootReplayV2, TraceListQueryBuilder):
             return
         if isinstance(hours, bool) or not isinstance(hours, int):
             raise ValueError("pinned witness slack must be whole hours")
-        if not 0 <= hours <= _MAX_WITNESS_SLACK_HOURS:
+        if not 0 <= hours <= MAX_WITNESS_SLACK_HOURS:
             raise ValueError("pinned witness slack is outside the supported range")
         self._pinned_witness_slack_hours = hours
         self._witness_slack_pin_applied = True
@@ -1017,7 +1010,7 @@ class _TraceListQueryBuilderV2Core(_TraceRootReplayV2, TraceListQueryBuilder):
         if pinned is None and getattr(self, "_witness_slack_pin_applied", False):
             pinned = absent_field_pin
         hours = pinned if pinned is not None else int(setting)
-        return timedelta(hours=min(max(hours, 0), _MAX_WITNESS_SLACK_HOURS))
+        return timedelta(hours=min(max(hours, 0), MAX_WITNESS_SLACK_HOURS))
 
     def _scalar_candidate_witness_envelope(
         self, *, root_start: datetime, root_end: datetime
@@ -1026,21 +1019,21 @@ class _TraceListQueryBuilderV2Core(_TraceRootReplayV2, TraceListQueryBuilder):
 
         Off - slack zero, which is the legacy escape hatch on the short
         exact-string lane (default 1 h) and the DEFAULT on the numeric and
-        long-text lanes - this emits nothing and the statement is
-        byte-identical to the unbounded contract. On, the witness must start
+        long-text lanes - the shared envelope emits nothing and the statement
+        is byte-identical to the unbounded contract. On, the witness must start
         inside ``[hour_floor(root_start) - slack, hour_ceil(root_end) + slack)``
         where ``[root_start, root_end]`` is the interval of roots the calling
         statement can publish. Every root it publishes therefore keeps any
         witness within ``slack`` of itself, and the hour alignment matches the
         immutable ``toStartOfHour`` primary-key prefix the bound prunes on.
 
-        The bound is spelled exactly like the sibling root-population subquery
-        in the same CTE - epoch microseconds through
-        ``fromUnixTimestamp64Micro`` - rather than as a datetime literal, so
+        The fragment itself comes from ``witness_envelope_sql``, the module
+        the session list's seed gate compiles its envelope through too, so
+        both lanes are spelled exactly like the sibling root-population
+        subquery in the same CTE - epoch microseconds through
+        ``fromUnixTimestamp64Micro`` - rather than as a datetime literal, and
         neither bound depends on how the driver or the server resolves a
-        timezone. Because both ends are whole hours this is identical in
-        meaning to the measured shape, which additionally spelled the
-        hour-aligned prefix out.
+        timezone.
 
         This narrows candidacy only. The exact latest-state classifier is a
         separate statement and stays unbounded, so a published row is still an
@@ -1050,26 +1043,11 @@ class _TraceListQueryBuilderV2Core(_TraceRootReplayV2, TraceListQueryBuilder):
         so this bounds *when* a witness row starts, never which versions count.
         """
 
-        slack = self._candidate_seed_witness_slack()
-        if not slack:
-            return "", {}
-        witness_start = _floor_hour(root_start) - slack
-        witness_end = _ceil_hour(root_end) + slack
-        fragment = (
-            "\n              AND start_time >= "
-            "fromUnixTimestamp64Micro(%(filter_witness_start_us)s)"
-            "\n              AND start_time < "
-            "fromUnixTimestamp64Micro(%(filter_witness_end_us)s)"
+        return witness_envelope_sql(
+            root_start=root_start,
+            root_end=root_end,
+            slack=self._candidate_seed_witness_slack(),
         )
-        return fragment, {
-            # The datetime pair is bound for the orchestration contract only,
-            # exactly as ``filter_slice_start``/``_end`` are; SQL reads the
-            # microsecond pair so a boundary microsecond cannot be rounded off.
-            "filter_witness_start": witness_start,
-            "filter_witness_end": witness_end,
-            "filter_witness_start_us": _unix_microseconds(witness_start),
-            "filter_witness_end_us": _unix_microseconds(witness_end),
-        }
 
     def recommended_filter_classify_batch_size(self) -> int | None:
         if self._uses_short_text_candidate_seed():
@@ -1711,8 +1689,8 @@ class _TraceListQueryBuilderV2Core(_TraceRootReplayV2, TraceListQueryBuilder):
             raise ValueError("seed density probe must stay inside the request window")
         if not self.supports_filter_seed_density_probe():
             raise ValueError("seed density probe is unavailable")
-        probe_start = max(request_start, _floor_hour(slice_start))
-        probe_end = min(request_end, _ceil_hour(slice_end))
+        probe_start = max(request_start, floor_hour(slice_start))
+        probe_end = min(request_end, ceil_hour(slice_end))
         params = {
             **self.params,
             "seed_density_start_us": _unix_microseconds(probe_start),
