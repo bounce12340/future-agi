@@ -284,7 +284,10 @@ func runSpans(ctx context.Context, cfg options, scopes scopeReader, publisher ob
 			return err
 		}
 		defer lock.Close()
-		progress, err = loadCheckpoint(cfg.checkpointPath, progress.Binding, cfg.until)
+		// Seed a fresh checkpoint at the newest bucket that can hold rows, not at
+		// --until itself: an --until exactly on the hour selects no rows in its own
+		// bucket, and seeding there puts the scan outside its own bounds.
+		progress, err = loadCheckpoint(cfg.checkpointPath, progress.Binding, lastHour(cfg.until))
 		if err != nil {
 			return err
 		}

@@ -266,3 +266,48 @@ func TestExclusiveUntilSelectsTheLastHourThatCanHoldRows(t *testing.T) {
 		}
 	}
 }
+
+// A resumable scan has to accept its own freshly-seeded checkpoint. --until on
+// an exact hour selects no rows in its own bucket, so seeding there put the
+// scan outside its own bounds and it refused to start:
+//
+//	checkpoint hour is outside requested scan
+//
+// Only the integration suite exercised --apply, so unit coverage missed it.
+func TestApplyAcceptsItsOwnFreshCheckpoint(t *testing.T) {
+	scope := exampleScope()
+	row := exampleSpan(scope).Row
+	row["is_deleted"], row["_version"] = 0, "1"
+	row["observation_type"], row["service_name"], row["trace_id"], row["id"] = "span", "s", "t", "a"
+	payload, _ := json.Marshal(row)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("param_limit") != "" {
+			w.Write([]byte(`{"observation_type":"span","service_name":"s","trace_id":"t","id":"a"}`))
+			return
+		}
+		w.Write(payload)
+	}))
+	defer server.Close()
+	reader, _ := newSourceReader(server.URL, "source", "readonly", "test")
+
+	for _, until := range []time.Time{
+		time.Date(2026, 1, 1, 13, 0, 0, 0, time.UTC),  // exactly on the hour
+		time.Date(2026, 1, 1, 13, 30, 0, 0, time.UTC), // mid-hour
+	} {
+		t.Run(until.Format("15:04"), func(t *testing.T) {
+			cfg := options{
+				project: scope.ProjectID, source: reader,
+				since: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC), until: until,
+				apply: true, checkpointPath: filepath.Join(t.TempDir(), "progress.json"),
+				maxPages: 20, pageSize: 2, limits: observedcatalog.DefaultLimits(),
+			}
+			if err := runSpans(context.Background(), cfg, &testScopeReader{scope: scope}, &testPublisher{}, &bytes.Buffer{}); err != nil {
+				t.Fatalf("fresh --apply scan refused to run: %v", err)
+			}
+			// And the checkpoint it wrote must be resumable by the same command.
+			if err := runSpans(context.Background(), cfg, &testScopeReader{scope: scope}, &testPublisher{}, &bytes.Buffer{}); err != nil {
+				t.Fatalf("resume from own checkpoint failed: %v", err)
+			}
+		})
+	}
+}
