@@ -161,7 +161,10 @@ func (p *postgresScope) Scope(ctx context.Context, project string) (observedcata
 func scanBinding(cfg options, scope observedcatalog.Scope) string {
 	// Never persist credentials. Include the destination to prevent resuming a
 	// different Kafka cluster/topic with already-published progress.
-	data, _ := json.Marshal([]any{1, cfg.mode, cfg.source.url, cfg.source.database, scope, cfg.since, cfg.until, cfg.kafka.Brokers, cfg.kafka.Topic, cfg.legacyEpoch, cfg.legacyRevision, cfg.legacyBuild, cfg.limits})
+	// The leading element versions the binding. It is bumped to 2 because spans
+	// are now replayed newest-hour-first: a checkpoint written by the ascending
+	// scan records a completely different meaning for the same Hour field.
+	data, _ := json.Marshal([]any{2, cfg.mode, cfg.source.url, cfg.source.database, scope, cfg.since, cfg.until, cfg.kafka.Brokers, cfg.kafka.Topic, cfg.legacyEpoch, cfg.legacyRevision, cfg.legacyBuild, cfg.limits})
 	digest := sha256.Sum256(data)
 	return hex.EncodeToString(digest[:])
 }
@@ -252,23 +255,40 @@ func nonnullMap[T any](input map[string]*T) (map[string]T, error) {
 	return result, nil
 }
 
+// Spans are replayed newest hour first. The read path derives coverage from
+// min(first_seen) in the index, so the floor must only reach the oldest span
+// once the scan has actually finished: ascending order published the oldest
+// hour in page one, which made an index that is still hours or days from
+// complete report itself as covering all retained history for the whole run.
+// Descending, an unfinished scan always leaves source spans below the floor,
+// which is exactly the condition that read path already tests for.
+func lastHour(until time.Time) time.Time {
+	bucket := until.Truncate(time.Hour)
+	// --until is exclusive, so a value exactly on the hour selects no rows in
+	// its own bucket.
+	if bucket.Equal(until) {
+		bucket = bucket.Add(-time.Hour)
+	}
+	return bucket
+}
+
 func runSpans(ctx context.Context, cfg options, scopes scopeReader, publisher observedcatalog.Publisher, output io.Writer) error {
 	scope, err := scopes.Scope(ctx, cfg.project)
 	if err != nil {
 		return err
 	}
-	progress := checkpoint{Binding: scanBinding(cfg, scope), Hour: cfg.since.Truncate(time.Hour)}
+	progress := checkpoint{Binding: scanBinding(cfg, scope), Hour: lastHour(cfg.until)}
 	if cfg.apply {
 		lock, err := lockCheckpoint(cfg.checkpointPath)
 		if err != nil {
 			return err
 		}
 		defer lock.Close()
-		progress, err = loadCheckpoint(cfg.checkpointPath, progress.Binding, cfg.since)
+		progress, err = loadCheckpoint(cfg.checkpointPath, progress.Binding, cfg.until)
 		if err != nil {
 			return err
 		}
-		if progress.Hour.Before(cfg.since.Truncate(time.Hour)) || progress.Hour.After(cfg.until.Truncate(time.Hour).Add(time.Hour)) {
+		if progress.Hour.Before(cfg.since.Truncate(time.Hour).Add(-time.Hour)) || progress.Hour.After(lastHour(cfg.until)) {
 			return errors.New("checkpoint hour is outside requested scan")
 		}
 	}
@@ -301,12 +321,12 @@ func runSpans(ctx context.Context, cfg options, scopes scopeReader, publisher ob
 		progress.Pages++
 		progress.Rows += uint64(len(rows))
 		if len(keys) < cfg.pageSize {
-			progress.Hour = progress.Hour.Add(time.Hour)
+			progress.Hour = progress.Hour.Add(-time.Hour)
 			progress.After = physicalKey{}
 		} else {
 			progress.After = keys[len(keys)-1]
 		}
-		progress.Complete = !progress.Hour.Before(cfg.until)
+		progress.Complete = progress.Hour.Before(cfg.since.Truncate(time.Hour))
 		if cfg.apply {
 			if err := saveCheckpoint(cfg.checkpointPath, progress); err != nil {
 				return err

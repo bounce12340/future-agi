@@ -11,6 +11,20 @@ The verdict is derived from data, never from operator-managed state: no flag, no
 revision, no epoch. When an operator runs the backfill the floors move back on
 their own and the endpoints start reporting complete without anyone toggling
 anything.
+
+This depends on one property of the backfill: ``--source spans`` replays the
+NEWEST hour first and works backwards (cmd/fi-observed-catalog-backfill,
+``lastHour``/``progress.Hour.Add(-time.Hour)``). Only then does the floor reach
+the oldest span at the moment the scan actually finishes, which is what makes
+the check below mean "covered" rather than merely "something old was indexed".
+Replaying oldest-first publishes the oldest span in page one and every verdict
+here reads complete for the rest of the run. If that order ever changes, this
+module stops being correct -- ``TestSpanScanReplaysNewestHourFirst`` pins it.
+
+Two limits are worth stating plainly. ``_COVERAGE_MARGIN`` below means the last
+hour of a scan is not distinguishable from a finished one. And ``--source
+legacy`` pages by identity cursor rather than by time, so it has no such
+ordering and this check cannot bound its progress.
 """
 
 from __future__ import annotations

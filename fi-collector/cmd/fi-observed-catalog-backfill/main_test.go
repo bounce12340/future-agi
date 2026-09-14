@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -188,5 +189,80 @@ func TestSourceURLsCannotCarrySecretsOrQueryOverrides(t *testing.T) {
 	_, err := reader.selectRows(context.Background(), "SELECT 1", url.Values{"param_bad": {"one", "two"}})
 	if err == nil || strings.Contains(err.Error(), "one") {
 		t.Fatal("invalid parameters accepted or exposed", err)
+	}
+}
+
+// The read path derives coverage from min(first_seen) in the index. Replaying
+// the oldest hour first drives that floor to its final value on page one, so a
+// scan that is still hours from done reports the index as covering all retained
+// history. Descending keeps source spans below the floor until the scan really
+// has finished, which is the condition the read path already checks. Nothing
+// else pins the direction: every other case here spans a single hour, where
+// ascending and descending are indistinguishable.
+func TestSpanScanReplaysNewestHourFirst(t *testing.T) {
+	scope := exampleScope()
+	row := exampleSpan(scope).Row
+	row["is_deleted"], row["_version"] = 0, "1"
+	row["observation_type"], row["service_name"], row["trace_id"], row["id"] = "span", "s", "t", "a"
+	payload, _ := json.Marshal(row)
+
+	var mu sync.Mutex
+	var requested []time.Time
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if start := r.URL.Query().Get("param_start"); start != "" {
+			if hour, err := time.Parse("2006-01-02 15:04:05.000000", start); err == nil {
+				mu.Lock()
+				if len(requested) == 0 || !requested[len(requested)-1].Equal(hour) {
+					requested = append(requested, hour)
+				}
+				mu.Unlock()
+			}
+		}
+		if r.URL.Query().Get("param_limit") != "" {
+			w.Write([]byte(`{"observation_type":"span","service_name":"s","trace_id":"t","id":"a"}`))
+			return
+		}
+		w.Write(payload)
+	}))
+	defer server.Close()
+
+	reader, _ := newSourceReader(server.URL, "source", "readonly", "test")
+	since := time.Date(2026, 1, 1, 9, 0, 0, 0, time.UTC)
+	until := since.Add(5 * time.Hour)
+	cfg := options{
+		project: scope.ProjectID, source: reader, since: since, until: until,
+		checkpointPath: filepath.Join(t.TempDir(), "progress.json"),
+		maxPages:       50, pageSize: 2, limits: observedcatalog.DefaultLimits(),
+	}
+	if err := runSpans(context.Background(), cfg, &testScopeReader{scope: scope}, &testPublisher{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("scan failed: %v", err)
+	}
+
+	want := []time.Time{
+		since.Add(4 * time.Hour), since.Add(3 * time.Hour), since.Add(2 * time.Hour),
+		since.Add(time.Hour), since,
+	}
+	if len(requested) != len(want) {
+		t.Fatalf("scanned %d hours, want %d: %v", len(requested), len(want), requested)
+	}
+	for i, hour := range want {
+		if !requested[i].Equal(hour) {
+			t.Fatalf("hour %d was %s, want %s (full order: %v)", i, requested[i], hour, requested)
+		}
+	}
+}
+
+// --until is exclusive, so a value exactly on the hour must not start the scan
+// in a bucket that can hold no rows.
+func TestExclusiveUntilSelectsTheLastHourThatCanHoldRows(t *testing.T) {
+	base := time.Date(2026, 1, 1, 9, 0, 0, 0, time.UTC)
+	for _, c := range []struct{ until, want time.Time }{
+		{base, base.Add(-time.Hour)},
+		{base.Add(time.Second), base},
+		{base.Add(59 * time.Minute), base},
+	} {
+		if got := lastHour(c.until); !got.Equal(c.want) {
+			t.Fatalf("lastHour(%s) = %s, want %s", c.until, got, c.want)
+		}
 	}
 }

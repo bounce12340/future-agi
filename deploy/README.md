@@ -221,6 +221,19 @@ resume — give each project its own checkpoint file, since a checkpoint is boun
 the exact project, range and Kafka destination that created it. Without `--apply`
 it previews and publishes nothing, which is the right way to check scope first.
 
+It replays the **newest hour first** and works backwards. That order is what lets
+the pickers tell you the truth while it runs: `filter_values` decides
+completeness by asking whether the source still holds spans older than anything
+the index knows about, so a scan that has not reached your `--since` yet keeps
+reporting `query_complete: false`. It flips to complete when the run genuinely
+finishes. Replaying oldest-first would publish the very oldest span in the first
+page and make the index claim it covered everything from then on.
+
+So expect the pickers to stay marked incomplete for the whole backfill, and do
+not treat that as a failure — it is the signal working. Resuming with the same
+`--checkpoint` is safe; a checkpoint written by an older oldest-first build is
+rejected rather than resumed in the wrong direction.
+
 A fresh install needs none of this: there is no history to recover.
 
 ## 1. Generate secrets
