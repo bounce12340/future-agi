@@ -182,7 +182,17 @@ schema `002_spans_v2.sql`), not from the spans' own timestamps: a span that arri
 within the last hour is treated as still on its way to the index rather than as a
 gap, so a freshly created project or a late-arriving trace does not flip the picker
 to incomplete for the seconds the consumer needs. A span that arrived over an hour
-ago and is still not indexed is a real gap and is reported as one.
+ago and is still not indexed is a real gap and is reported as one. Only spans that
+carry something the catalog indexes count — custom attributes or a model — so a
+project of bare spans is not a gap at any age.
+
+The check is designed to read nothing on a healthy install (it bounds the probe by
+the oldest indexed observation, so partition pruning skips every part it would
+otherwise scan). One part of that depends on you: schema `024` adds a minmax index
+on `spans.created_at` but, as that file says, only parts written afterwards are
+indexed until you run `ALTER TABLE spans MATERIALIZE INDEX
+auto_minmax_index_created_at` off-peak. Until then a project created in the last
+hour is scanned — bounded by its own size, and by definition under an hour old.
 
 Run the span backfill for each project over your retention window before you rely
 on the new pickers.

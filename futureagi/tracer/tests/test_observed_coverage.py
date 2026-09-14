@@ -11,8 +11,10 @@ from types import SimpleNamespace
 import pytest
 
 from tracer.services.clickhouse.v2.property_catalog.coverage import (
+    _INDEXABLE,
     _PROBE_SETTINGS,
     _PROBE_WALL_MS,
+    _SETTLED_BEFORE,
     Coverage,
     observed_scope_coverage,
 )
@@ -47,37 +49,50 @@ class _Client:
     ``below`` names the projects that have spans older than their index floor.
     """
 
-    def __init__(self, below=(), raises=None, any_span=None, in_flight=()):
+    def __init__(self, below=(), raises=None, any_span=None, in_flight=(), bare=()):
         self.below = set(below)
         # Projects that have at least one span. Defaults to "the ones below",
         # so an empty project is the default for anything unindexed.
         self.any_span = set(below) if any_span is None else set(any_span)
         # Projects whose every span ARRIVED within the margin (created_at is
-        # recent). The real table would exclude them under the arrival
-        # predicate and include them without it, so the double does the same:
-        # it honours the gate only when the statement actually carries it.
+        # recent), and projects whose spans carry nothing the catalog indexes.
+        # The real table excludes each only under its own predicate, so the
+        # double honours a gate only when the statement actually carries it --
+        # detected by the module's own constants, not a retyped literal.
         self.in_flight = set(in_flight)
+        self.bare = set(bare)
         self.raises = raises
         self.calls = []
 
-    def _settled(self, sql, project):
-        gated = "created_at < now64(6, 'UTC') - INTERVAL 1 HOUR" in sql
-        return not (gated and project in self.in_flight)
+    def _counts(self, sql, project):
+        if f"created_at < {_SETTLED_BEFORE}" in sql and project in self.in_flight:
+            return False
+        if _INDEXABLE in sql and project in self.bare:
+            return False
+        return True
 
     def execute_read(self, sql, params=None, timeout_ms=None, settings=None):
-        self.calls.append({"sql": sql, "parameters": params, "settings": settings,
-                           "timeout_ms": timeout_ms})
+        self.calls.append(
+            {
+                "sql": sql,
+                "parameters": params,
+                "settings": settings,
+                "timeout_ms": timeout_ms,
+            }
+        )
         if self.raises:
             raise self.raises
         ids = list((params or {}).get("project_ids") or ())
         if "start_time" not in sql:
             # The index-less probe asks "do any of these hold a settled span".
-            rows = [(1,)] if any(
-                p in self.any_span and self._settled(sql, p) for p in ids
-            ) else []
+            rows = (
+                [(1,)]
+                if any(p in self.any_span and self._counts(sql, p) for p in ids)
+                else []
+            )
         else:
             hit = next(
-                (p for p in ids if p in self.below and self._settled(sql, p)), None
+                (p for p in ids if p in self.below and self._counts(sql, p)), None
             )
             rows = [(hit,)] if hit else []
         # execute_read returns (rows, column_types, elapsed).
@@ -199,6 +214,64 @@ def test_late_arrival_below_the_floor_is_not_a_gap_until_it_settles():
 
 
 @pytest.mark.unit
+def test_a_project_of_spans_the_catalog_would_never_index_is_not_a_gap():
+    """Bare spans -- no custom attributes, no model -- produce no index row.
+
+    The collector publishes nothing for them by design, so a project made only
+    of such spans has nothing missing at any age. Treating it as a gap turned
+    every workspace-scoped picker ``partial`` for good once its spans settled.
+    """
+    result = _coverage(
+        rows=[], scope=SCOPE, client=_Client(any_span=("p1",), bare=("p1",))
+    )
+    assert (result.complete, result.reason) == (True, "covered")
+
+    attributed = _coverage(rows=[], scope=SCOPE, client=_Client(any_span=("p1",)))
+    assert attributed.reason == "project_unindexed"
+
+
+@pytest.mark.unit
+def test_an_old_bare_span_below_the_floor_is_not_a_gap():
+    rows = [{"project_id": "p1", "floor": "2026-01-02 00:00:00"}]
+    bare = _coverage(rows=rows, client=_Client(below=("p1",), bare=("p1",)))
+    assert (bare.complete, bare.reason) == (True, "covered")
+
+    attributed = _coverage(rows=rows, client=_Client(below=("p1",)))
+    assert attributed.reason == "source_predates_index"
+
+
+@pytest.mark.unit
+def test_floor_probe_carries_one_scope_wide_bound_so_a_covered_project_prunes_to_nothing():
+    """The per-project bound is opaque to partition pruning; the max floor is not.
+
+    ``start_time < max(floor) - margin`` is a plain constant that
+    ``toDate(start_time)`` partitioning can use, and it is a superset of every
+    per-project arm, so it changes no verdict. Without it a covered project is
+    read end to end on every request; the live contract measures that at zero
+    rows.
+    """
+    client = _Client(below=())
+    scope = {**SCOPE, "project_ids": ["p1", "p2"]}
+    _coverage(
+        rows=[
+            {"project_id": "p1", "floor": "2026-01-01 00:00:00"},
+            {"project_id": "p2", "floor": "2026-03-01 00:00:00"},
+        ],
+        scope=scope,
+        client=client,
+    )
+    call = client.calls[-1]
+    sql, params = call["sql"], call["parameters"]
+    assert params["max_floor"] == "2026-03-01 00:00:00"
+    bound = sql.index("start_time < toDateTime64(%(max_floor)s, 6, 'UTC')")
+    assert bound < sql.index("AND (")
+    # The bound floors are cast the same way; a bare String minus INTERVAL is
+    # read in the session time zone.
+    assert "toDateTime64(arrayElement(%(floors)s," in sql
+    assert _INDEXABLE in sql
+
+
+@pytest.mark.unit
 def test_both_probes_gate_on_arrival_not_the_spans_own_clock():
     """The gate is created_at (server-assigned at insert), on both statements.
 
@@ -214,7 +287,7 @@ def test_both_probes_gate_on_arrival_not_the_spans_own_clock():
         scope=scope,
         client=client,
     )
-    gate = "created_at < now64(6, 'UTC') - INTERVAL 1 HOUR"
+    gate = f"created_at < {_SETTLED_BEFORE}"
     assert len(client.calls) == 2
     unindexed, floor = client.calls[0]["sql"], client.calls[1]["sql"]
     assert "start_time" not in unindexed and gate in unindexed
@@ -288,7 +361,9 @@ def test_probe_is_pinned_to_bounded_read_settings():
     settings reintroduces the cost this feature exists to remove.
     """
     client = _Client(below=())
-    _coverage(rows=[{"project_id": "p1", "floor": "2026-01-01 00:00:00"}], client=client)
+    _coverage(
+        rows=[{"project_id": "p1", "floor": "2026-01-01 00:00:00"}], client=client
+    )
 
     assert client.calls, "the source probe never ran"
     settings = client.calls[-1]["settings"]
@@ -298,10 +373,36 @@ def test_probe_is_pinned_to_bounded_read_settings():
 
 
 @pytest.mark.unit
+def test_the_index_less_probe_is_bounded_and_walled_too():
+    """The settings pin must hold on BOTH statements.
+
+    The un-backfilled state runs the index-less probe on every picker open, and
+    the settings-drop regression has already happened once in this module; the
+    existing pins only ever inspected the floor probe.
+    """
+    client = _Client(any_span=("p2",))
+    scope = {**SCOPE, "project_ids": ["p1", "p2"]}
+    _coverage(
+        rows=[{"project_id": "p1", "floor": "2026-01-01 00:00:00"}],
+        scope=scope,
+        client=client,
+    )
+    index_less = client.calls[0]
+    assert "start_time" not in index_less["sql"] and "LIMIT 1" in index_less["sql"]
+    for key, value in _PROBE_SETTINGS.items():
+        assert index_less["settings"][key] == value, (
+            f"{key} must stay pinned to {value}"
+        )
+    assert index_less["timeout_ms"] == _PROBE_WALL_MS and _PROBE_WALL_MS > 0
+
+
+@pytest.mark.unit
 def test_probe_is_scoped_and_bounded_by_construction():
     """The probe must ask only about one project, below its own floor, LIMIT 1."""
     client = _Client(below=())
-    _coverage(rows=[{"project_id": "p1", "floor": "2026-01-01 00:00:00"}], client=client)
+    _coverage(
+        rows=[{"project_id": "p1", "floor": "2026-01-01 00:00:00"}], client=client
+    )
 
     call = client.calls[-1]
     assert "LIMIT 1" in call["sql"]
@@ -328,7 +429,12 @@ def test_tz_aware_floor_is_rendered_without_an_offset():
 
     client = _Client(below=())
     observed = _Observed(
-        [{"project_id": "p1", "floor": datetime(2026, 1, 1, 12, 30, 45, 123456, tzinfo=UTC)}]
+        [
+            {
+                "project_id": "p1",
+                "floor": datetime(2026, 1, 1, 12, 30, 45, 123456, tzinfo=UTC),
+            }
+        ]
     )
     result = _coverage(observed=observed, client=client)
 
@@ -358,7 +464,9 @@ def test_probe_ignores_sub_floor_jitter_but_not_real_absence():
     )
 
     client = _Client(below=())
-    _coverage(rows=[{"project_id": "p1", "floor": "2026-01-01 00:00:00"}], client=client)
+    _coverage(
+        rows=[{"project_id": "p1", "floor": "2026-01-01 00:00:00"}], client=client
+    )
 
     # The margin is applied in SQL, so a span a microsecond below the floor can
     # no longer match; only data older than the margin can.
@@ -406,15 +514,19 @@ def test_unmappable_project_id_fails_closed_not_open():
     arrayElement(['x','y'],0) = '' (empty() = 1), and a `<` against it is false.
     """
     client = _Client(below=())
-    _coverage(rows=[{"project_id": "p1", "floor": "2026-01-01 00:00:00"}], client=client)
+    _coverage(
+        rows=[{"project_id": "p1", "floor": "2026-01-01 00:00:00"}], client=client
+    )
 
     sql = client.calls[-1]["sql"]
     assert "indexOf(%(project_ids)s, toString(project_id)) = 0" in sql
     # The guard must be an OR arm of the predicate, so an unmappable row matches
-    # and is reported as a gap rather than skipped -- and it must stay
-    # unconditional: the arrival gate belongs to the predates-floor arm only,
-    # never to the backstop, or an unmappable row that arrived recently would
-    # be silently skipped.
+    # and is reported as a gap rather than skipped -- and the arrival and
+    # eligibility gates belong to the predates-floor arm only, never to the
+    # backstop, or an unmappable row that arrived recently would be silently
+    # skipped. The one thing that does sit above the backstop is the scope-wide
+    # pruning bound (start_time below the largest floor), which is a superset
+    # of every mappable row's own bound; see the pruning test.
     guard = sql.index("= 0")
     arm = sql.index("OR (", guard)
     assert "start_time <" in sql[arm:]
@@ -438,7 +550,9 @@ def test_probe_uses_the_guarded_read_path_that_preserves_settings():
     triple return, so the same mistake fails here instead of in production.
     """
     client = _Client(below=())
-    _coverage(rows=[{"project_id": "p1", "floor": "2026-01-01 00:00:00"}], client=client)
+    _coverage(
+        rows=[{"project_id": "p1", "floor": "2026-01-01 00:00:00"}], client=client
+    )
 
     call = client.calls[-1]
     assert call["settings"]["max_threads"] == 1

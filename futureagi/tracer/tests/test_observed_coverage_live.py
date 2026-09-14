@@ -69,11 +69,16 @@ ORDER BY (organization_id, workspace_id, project_id, source_kind, attribute_key,
 CREATE TABLE {database}.spans (
     project_id String,
     start_time DateTime64(6, 'UTC'),
-    created_at DateTime64(6, 'UTC') DEFAULT now64(6, 'UTC'))
+    created_at DateTime64(6, 'UTC') DEFAULT now64(6, 'UTC'),
+    attrs_string Map(LowCardinality(String), String),
+    attrs_number Map(LowCardinality(String), Float64),
+    attrs_bool Map(LowCardinality(String), UInt8),
+    model LowCardinality(String) DEFAULT '',
+    attributes_extra JSON(max_dynamic_paths=0))
 ENGINE = MergeTree PARTITION BY toDate(start_time) ORDER BY (project_id, start_time)
 """
         )
-        yield SimpleNamespace(client=client, database=database)
+        yield SimpleNamespace(client=client, database=database, reads=[])
     finally:
         client.command(f"DROP DATABASE IF EXISTS {database}")
 
@@ -97,8 +102,14 @@ def _coverage(live, scope):
             result = live.client.query(
                 sql.replace("FROM spans", f"FROM {live.database}.spans"),
                 parameters=params or {},
+                settings={"max_threads": 1, "max_block_size": 1024},
             )
-            return list(result.result_rows), result.column_names, len(result.result_rows)
+            live.reads.append(int((result.summary or {}).get("read_rows", -1)))
+            return (
+                list(result.result_rows),
+                result.column_names,
+                len(result.result_rows),
+            )
 
         def execute(self, *args, **kwargs):
             raise AssertionError("coverage must use execute_read")
@@ -107,18 +118,28 @@ def _coverage(live, scope):
     return observed_scope_coverage(
         scope=scope,
         deadline=deadline,
-        observed=ObservedRead(Executor(), catalog_database=live.database, deadline=deadline),
+        observed=ObservedRead(
+            Executor(), catalog_database=live.database, deadline=deadline
+        ),
         client=Client(),
     )
 
 
 def _scope(*projects):
-    return {"organization_id": "org", "workspace_id": "ws", "project_ids": list(projects)}
+    return {
+        "organization_id": "org",
+        "workspace_id": "ws",
+        "project_ids": list(projects),
+    }
 
 
-def _spans(live, rows):
+def _spans(live, rows, *, bare=False):
+    """Insert (project, start_time, created_at) rows; attributed unless ``bare``."""
+    attrs = {} if bare else {"k": "v"}
     live.client.insert(
-        f"{live.database}.spans", rows, column_names=["project_id", "start_time", "created_at"]
+        f"{live.database}.spans",
+        [[*row, attrs] for row in rows],
+        column_names=["project_id", "start_time", "created_at", "attrs_string"],
     )
 
 
@@ -134,10 +155,13 @@ def test_a_project_whose_spans_all_arrived_within_the_margin_is_not_a_gap(live):
     """Spans planted yesterday by their own clock, arrived seconds ago: in flight."""
     now = datetime.now(UTC)
     fresh = str(uuid4())
-    _spans(live, [
-        [fresh, now - timedelta(days=1), now - timedelta(seconds=20)],
-        [fresh, now - timedelta(days=1, hours=-2), now - timedelta(minutes=30)],
-    ])
+    _spans(
+        live,
+        [
+            [fresh, now - timedelta(days=1), now - timedelta(seconds=20)],
+            [fresh, now - timedelta(days=1, hours=-2), now - timedelta(minutes=30)],
+        ],
+    )
     result = _coverage(live, _scope(fresh))
     assert (result.complete, result.reason) == (True, "covered")
 
@@ -150,10 +174,13 @@ def test_a_span_that_arrived_before_the_margin_and_is_unindexed_is_a_gap(live):
     """
     now = datetime.now(UTC)
     stale = str(uuid4())
-    _spans(live, [
-        [stale, now - timedelta(days=1), now - timedelta(hours=3)],
-        [stale, now - timedelta(seconds=5), now - timedelta(seconds=5)],
-    ])
+    _spans(
+        live,
+        [
+            [stale, now - timedelta(days=1), now - timedelta(hours=3)],
+            [stale, now - timedelta(seconds=5), now - timedelta(seconds=5)],
+        ],
+    )
     result = _coverage(live, _scope(stale))
     assert (result.complete, result.reason) == (False, "project_unindexed")
 
@@ -161,10 +188,13 @@ def test_a_span_that_arrived_before_the_margin_and_is_unindexed_is_a_gap(live):
 def test_an_in_flight_project_does_not_mask_a_settled_gap_in_the_same_scope(live):
     now = datetime.now(UTC)
     fresh, stale = str(uuid4()), str(uuid4())
-    _spans(live, [
-        [fresh, now - timedelta(days=1), now - timedelta(seconds=20)],
-        [stale, now - timedelta(days=1), now - timedelta(hours=3)],
-    ])
+    _spans(
+        live,
+        [
+            [fresh, now - timedelta(days=1), now - timedelta(seconds=20)],
+            [stale, now - timedelta(days=1), now - timedelta(hours=3)],
+        ],
+    )
     result = _coverage(live, _scope(fresh, stale))
     assert (result.complete, result.reason) == (False, "project_unindexed")
 
@@ -174,10 +204,13 @@ def test_a_late_arrival_below_the_floor_is_tolerated_until_it_settles(live):
     now = datetime.now(UTC)
     project = str(uuid4())
     _index(live, project, now - timedelta(minutes=10))
-    _spans(live, [
-        [project, now - timedelta(minutes=10), now - timedelta(minutes=10)],
-        [project, now - timedelta(days=1), now - timedelta(seconds=10)],
-    ])
+    _spans(
+        live,
+        [
+            [project, now - timedelta(minutes=10), now - timedelta(minutes=10)],
+            [project, now - timedelta(days=1), now - timedelta(seconds=10)],
+        ],
+    )
     assert _coverage(live, _scope(project)).complete is True
 
     # The same span, had it arrived two hours ago and still not been indexed.
@@ -188,3 +221,53 @@ def test_a_late_arrival_below_the_floor_is_tolerated_until_it_settles(live):
     )
     settled = _coverage(live, _scope(project))
     assert (settled.complete, settled.reason) == (False, "source_predates_index")
+
+
+def test_a_project_of_bare_spans_is_not_a_gap_but_one_attributed_span_makes_it_one(
+    live,
+):
+    """Nothing the catalog would index means nothing is missing, at any age."""
+    now = datetime.now(UTC)
+    project = str(uuid4())
+    _spans(
+        live, [[project, now - timedelta(days=2), now - timedelta(hours=3)]], bare=True
+    )
+    assert _coverage(live, _scope(project)).reason == "covered"
+
+    _spans(live, [[project, now - timedelta(days=2), now - timedelta(hours=3)]])
+    assert _coverage(live, _scope(project)).reason == "project_unindexed"
+
+
+def test_a_span_carrying_only_extra_attributes_still_counts(live):
+    """attributes_extra feeds the catalog too; an old unindexed one is a gap."""
+    project = str(uuid4())
+    live.client.command(
+        f"INSERT INTO {live.database}.spans (project_id, start_time, created_at, attributes_extra) "
+        f"VALUES ('{project}', now64(6, 'UTC') - INTERVAL 2 DAY, now64(6, 'UTC') - INTERVAL 3 HOUR, "
+        '\'{"nested": {"a": 1}}\')'
+    )
+    assert _coverage(live, _scope(project)).reason == "project_unindexed"
+
+
+def test_a_covered_project_costs_zero_rows_on_the_floor_probe(live):
+    """The steady state of a healthy install must not scan history.
+
+    Two days of hourly spans, all indexed from the oldest one: the floor probe
+    has nothing below the floor to find, and with the scope-wide bound the
+    partitions it would have to read do not exist. Measured through the
+    server's own read_rows, so a bound that merely looks right cannot pass.
+    """
+    now = datetime.now(UTC)
+    project = str(uuid4())
+    oldest = (now - timedelta(days=2)).replace(minute=0, second=0, microsecond=0)
+    _spans(
+        live,
+        [
+            [project, oldest + timedelta(hours=h), oldest + timedelta(hours=h)]
+            for h in range(48)
+        ],
+    )
+    _index(live, project, oldest)
+    result = _coverage(live, _scope(project))
+    assert (result.complete, result.reason) == (True, "covered")
+    assert live.reads[-1] == 0, live.reads
