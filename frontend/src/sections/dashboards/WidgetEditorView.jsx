@@ -2122,7 +2122,17 @@ export function FilterValuePickerPopup({
       placement="bottom-start"
       sx={{ zIndex: 1400 }}
     >
-      <ClickAwayListener onClickAway={onClose}>
+      <ClickAwayListener
+        onClickAway={(event) => {
+          // A newly added filter auto-opens this picker ~150 ms after it
+          // renders. A click on the trigger that lands after that would
+          // otherwise close the popup (click-away) in the same event that
+          // re-opens it, and the later state update wins: the picker vanishes.
+          // The trigger owns the popup, so a click on it is never "away".
+          if (anchorEl?.contains?.(event.target)) return;
+          onClose?.(event);
+        }}
+      >
         <Paper
           elevation={8}
           sx={{

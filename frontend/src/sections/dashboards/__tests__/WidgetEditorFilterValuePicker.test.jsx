@@ -726,6 +726,51 @@ describe("WidgetEditor filter-value picker", () => {
     document.body.removeChild(anchorEl);
   });
 
+  it("stays open when its own trigger is clicked, and closes on a click elsewhere", async () => {
+    // WidgetEditorView auto-opens the picker ~150 ms after a filter is added.
+    // A user (or a Playwright flow) clicking "Select value..." just after that
+    // must not end up with no picker at all: the trigger's onClick re-opens
+    // and the click-away closes in the same event, and the close won.
+    useResolvedFilterOptionsMock.mockReturnValue({
+      options: [{ value: "alpha", label: "Alpha" }],
+      isLoading: false,
+      isError: false,
+      fetchNextPage: vi.fn(),
+      hasNextPage: false,
+      continuationKey: null,
+      isFetchingNextPage: false,
+      isFetchNextPageError: false,
+      queryReadState: "complete",
+      refetch: vi.fn(),
+    });
+    const anchorEl = document.createElement("button");
+    anchorEl.textContent = "Select value...";
+    const elsewhere = document.createElement("div");
+    document.body.append(anchorEl, elsewhere);
+    const onClose = vi.fn();
+
+    render(
+      <FilterValuePickerPopup
+        anchorEl={anchorEl}
+        filter={{ field: "project", value: [] }}
+        onClose={onClose}
+        onApply={vi.fn()}
+        source="traces"
+      />,
+    );
+    // ClickAwayListener arms itself on the next macrotask after mounting.
+    await act(() => new Promise((done) => setTimeout(done, 0)));
+    expect(screen.getByPlaceholderText("Search...")).toBeInTheDocument();
+
+    fireEvent.click(anchorEl);
+    expect(onClose).not.toHaveBeenCalled();
+
+    fireEvent.click(elsewhere);
+    expect(onClose).toHaveBeenCalledTimes(1);
+    anchorEl.remove();
+    elsewhere.remove();
+  });
+
   it("bounds oversized exact attribute values before lookup or selection", () => {
     useResolvedFilterOptionsMock.mockReturnValue({
       options: [],
