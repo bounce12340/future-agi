@@ -9,6 +9,7 @@ Django ORM querysets.
 
 import math
 import re
+import uuid
 from collections.abc import Callable
 from typing import Any, NamedTuple
 
@@ -2230,6 +2231,11 @@ class ClickHouseFilterBuilder:
     # equality, and membership work — ClickHouse rejects direct UUID-vs-String
     # comparisons. Ops absent here (is_null/is_not_null, ranges) operate on
     # the bare column.
+    #
+    # ``end_user_id`` with ``equals``/``in`` is the one carve-out: those two
+    # ops are compiled against the bare column and ``toUUID`` literals by
+    # ``_end_user_uuid_equality`` so ``idx_end_user_id`` stays eligible. See
+    # that method for why the remaining ops keep the cast.
     _UUID_TEXT_FILTER_OPS = frozenset(
         {
             "equals",
@@ -2243,6 +2249,77 @@ class ClickHouseFilterBuilder:
         }
     )
 
+    @staticmethod
+    def _canonical_uuid_literal(value: Any) -> str | None:
+        """Return ``value`` as canonical UUID text, or ``None`` if it is not one.
+
+        Only the canonical 8-4-4-4-12 spelling is accepted, in either case. A
+        literal spelled any other way that ``uuid.UUID`` would still parse
+        (braces, a ``urn:uuid:`` prefix, 32 bare hex digits) does not equal
+        ``toString(<uuid>)`` today either, so it keeps folding to no rows
+        instead of silently matching more rows than before. Case is the one
+        deliberate difference: ClickHouse renders a UUID in lower case, so an
+        upper-case literal matches nothing under the cast and matches its own
+        row under ``toUUID``.
+        """
+
+        if isinstance(value, uuid.UUID):
+            return str(value)
+        if not isinstance(value, str):
+            return None
+        text = value.lower()
+        try:
+            canonical = str(uuid.UUID(text))
+        except (AttributeError, TypeError, ValueError):
+            return None
+        return canonical if canonical == text else None
+
+    def _end_user_uuid_equality(
+        self,
+        filter_op: str,
+        filter_value: Any,
+        first_param: str,
+    ) -> str:
+        """Compile ``end_user_id`` equality/membership so the bloom index prunes.
+
+        ``toString(end_user_id) IN (...)`` hides the column behind a function,
+        so ClickHouse can use neither the ``idx_end_user_id`` bloom filter nor
+        the primary key: the statement reads every span of the project on every
+        window. Comparing the bare column against ``toUUID`` literals keeps
+        both eligible and is otherwise the same predicate.
+
+        A literal that is not a UUID can never equal a UUID, so under these two
+        positive ops it contributes no rows: ``equals`` folds to ``0 = 1`` and
+        an invalid member of an ``in`` set is dropped (all of them invalid
+        folds the whole condition to ``0 = 1``). The negations are deliberately
+        left on the cast — a bloom filter cannot serve ``NOT IN`` so they gain
+        no pruning, while the same fold would have to invert and their NULL
+        handling would have to be re-argued.
+        """
+
+        if not isinstance(filter_value, list):
+            values = [filter_value]
+        elif filter_op == "in":
+            values = list(filter_value)
+        else:
+            # ``equals`` is scalar; tolerate a one-element list from callers
+            # that reuse an ``in`` payload.
+            values = list(filter_value)[:1]
+
+        placeholders: list[str] = []
+        for value in values:
+            canonical = self._canonical_uuid_literal(value)
+            if canonical is None:
+                continue
+            param = first_param if not placeholders else self._next_param("col")
+            self._params[param] = canonical
+            placeholders.append(f"toUUID(%({param})s)")
+
+        if not placeholders:
+            # Empty set, or no literal that could ever equal a UUID.
+            return "0 = 1"
+        return f"end_user_id IN ({', '.join(placeholders)})"
+
     def _build_column_condition(
         self,
         column: str,
@@ -2253,6 +2330,8 @@ class ClickHouseFilterBuilder:
         """Build a condition for a direct column reference."""
         param = self._next_param("col")
         case_insensitive = column in self._CASE_INSENSITIVE_COLUMNS
+        if column == "end_user_id" and filter_op in ("equals", "in"):
+            return self._end_user_uuid_equality(filter_op, filter_value, param)
         comparison_column = (
             f"toString({column})"
             if column in self._NULLABLE_UUID_COLUMNS
