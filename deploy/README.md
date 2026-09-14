@@ -177,8 +177,10 @@ passing the gap off as an answer — `filter_values` returns
 past on its own. Live ingestion starts filling the index from the moment the new
 collector runs; everything older than that stays missing until you backfill.
 
-That verdict is derived from the source `spans` table's `created_at` (arrival time,
-schema `002_spans_v2.sql`), not from the spans' own timestamps: a span that arrived
+That verdict is derived from the source `spans` table as the current schema leaves it
+(`002_spans_v2.sql` and later: `created_at`, the three `attrs_*` maps, `attributes_extra`,
+`model`, `is_deleted`), using `created_at` (arrival time), not the spans' own
+timestamps: a span that arrived
 within the last hour is treated as still on its way to the index rather than as a
 gap, so a freshly created project or a late-arriving trace does not flip the picker
 to incomplete for the seconds the consumer needs. A span that arrived over an hour
@@ -186,13 +188,15 @@ ago and is still not indexed is a real gap and is reported as one. Only spans th
 carry something the catalog indexes count — custom attributes or a model — so a
 project of bare spans is not a gap at any age.
 
-The check is designed to read nothing on a healthy install (it bounds the probe by
-the oldest indexed observation, so partition pruning skips every part it would
-otherwise scan). One part of that depends on you: schema `024` adds a minmax index
-on `spans.created_at` but, as that file says, only parts written afterwards are
-indexed until you run `ALTER TABLE spans MATERIALIZE INDEX
-auto_minmax_index_created_at` off-peak. Until then a project created in the last
-hour is scanned — bounded by its own size, and by definition under an hour old.
+The check is designed to cost a covered project a handful of index granules, not its
+history: each project is probed below its own oldest indexed observation, which the
+table's key can prune. No migration is required. One optional step helps the other
+probe, the one that runs for a project with no index rows yet: schema `024` adds a
+minmax index on `spans.created_at` but, as that file says, only parts written
+afterwards are indexed until you run `ALTER TABLE spans MATERIALIZE INDEX
+auto_minmax_index_created_at` off-peak (add the cluster clause on a replicated
+cluster). Until then a project created in the last hour is scanned when a picker
+opens on it — bounded by its own size, and by definition under an hour old.
 
 Run the span backfill for each project over your retention window before you rely
 on the new pickers.
@@ -410,6 +414,10 @@ For incremental backups to S3, see [`clickhouse-backup`](https://github.com/Alti
 For internal MinIO, configure `mc mirror` to an off-host bucket, or replace the bundled `minio` service with managed S3 (set `STORAGE_BACKEND=s3` and supply AWS creds).
 
 ## Upgrades
+
+> Upgrading onto this release from one without the observed catalog is not just an
+> image bump: read [Upgrading an existing install: backfill before you cut over](#upgrading-an-existing-install-backfill-before-you-cut-over)
+> first, or every custom-attribute picker is empty for all history until you backfill.
 
 ```bash
 # bump the relevant version variable(s) in deploy/.env.production

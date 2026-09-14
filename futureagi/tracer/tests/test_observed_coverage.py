@@ -6,6 +6,7 @@ visible instead of silently indistinguishable from "this project has no custom
 attributes".
 """
 
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -82,7 +83,12 @@ class _Client:
         )
         if self.raises:
             raise self.raises
-        ids = list((params or {}).get("project_ids") or ())
+        params = params or {}
+        # The index-less probe binds one array; the floor probe binds one
+        # (p<i>, f<i>) pair per arm.
+        ids = list(params.get("project_ids") or ()) or [
+            params[key] for key in sorted(params) if re.fullmatch(r"p\d+", key)
+        ]
         if "start_time" not in sql:
             # The index-less probe asks "do any of these hold a settled span".
             rows = (
@@ -241,34 +247,25 @@ def test_an_old_bare_span_below_the_floor_is_not_a_gap():
 
 
 @pytest.mark.unit
-def test_floor_probe_carries_one_scope_wide_bound_so_a_covered_project_prunes_to_nothing():
-    """The per-project bound is opaque to partition pruning; the max floor is not.
+def test_a_wide_scope_is_probed_in_chunks_and_stops_at_the_first_gap():
+    from tracer.services.clickhouse.v2.property_catalog.coverage import (
+        _FLOOR_ARMS_PER_STATEMENT as per_statement,
+    )
 
-    ``start_time < max(floor) - margin`` is a plain constant that
-    ``toDate(start_time)`` partitioning can use, and it is a superset of every
-    per-project arm, so it changes no verdict. Without it a covered project is
-    read end to end on every request; the live contract measures that at zero
-    rows.
-    """
-    client = _Client(below=())
-    scope = {**SCOPE, "project_ids": ["p1", "p2"]}
-    _coverage(
-        rows=[
-            {"project_id": "p1", "floor": "2026-01-01 00:00:00"},
-            {"project_id": "p2", "floor": "2026-03-01 00:00:00"},
-        ],
-        scope=scope,
+    ids = [f"p{n}" for n in range(per_statement * 2 + 5)]
+    gap = ids[per_statement + 3]  # second chunk
+    client = _Client(below=(gap,))
+    result = _coverage(
+        rows=[{"project_id": pid, "floor": "2026-01-01 00:00:00"} for pid in ids],
+        scope={**SCOPE, "project_ids": ids},
         client=client,
     )
-    call = client.calls[-1]
-    sql, params = call["sql"], call["parameters"]
-    assert params["max_floor"] == "2026-03-01 00:00:00"
-    bound = sql.index("start_time < toDateTime64(%(max_floor)s, 6, 'UTC')")
-    assert bound < sql.index("AND (")
-    # The bound floors are cast the same way; a bare String minus INTERVAL is
-    # read in the session time zone.
-    assert "toDateTime64(arrayElement(%(floors)s," in sql
-    assert _INDEXABLE in sql
+    assert (result.complete, result.reason) == (False, "source_predates_index")
+    floor_calls = [c for c in client.calls if "start_time" in c["sql"]]
+    assert len(floor_calls) == 2, "the third chunk must not run once a gap is found"
+    assert all(
+        len(re.findall(r"%\(p\d+\)s", c["sql"])) <= per_statement for c in floor_calls
+    )
 
 
 @pytest.mark.unit
@@ -406,12 +403,12 @@ def test_probe_is_scoped_and_bounded_by_construction():
 
     call = client.calls[-1]
     assert "LIMIT 1" in call["sql"]
-    assert "project_id IN %(project_ids)s" in call["sql"]
+    assert "project_id = %(p0)s" in call["sql"]
     assert "INTERVAL 1 HOUR" in call["sql"]
     # Values are bound, never interpolated into SQL text.
-    assert call["parameters"]["project_ids"] == ["p1"]
-    assert call["parameters"]["floors"] == ["2026-01-01 00:00:00"]
-    assert "p1" not in call["sql"]
+    assert call["parameters"]["p0"] == "p1"
+    assert call["parameters"]["f0"] == "2026-01-01 00:00:00"
+    assert "p1" not in call["sql"] and "2026-01-01" not in call["sql"]
 
 
 @pytest.mark.unit
@@ -438,7 +435,7 @@ def test_tz_aware_floor_is_rendered_without_an_offset():
     )
     result = _coverage(observed=observed, client=client)
 
-    floor = client.calls[-1]["parameters"]["floors"][0]
+    floor = client.calls[-1]["parameters"]["f0"]
     assert floor == "2026-01-01 12:30:45.123456"
     assert "+00:00" not in floor and "T" not in floor and not floor.endswith("Z")
     # The surfaced floor is rendered the same way, so callers see one format.
@@ -496,44 +493,57 @@ def test_probe_cost_is_flat_in_scope_size():
     )
 
     assert len(client.calls) <= 2, f"{len(client.calls)} queries for 40 projects"
-    assert len(client.calls[-1]["parameters"]["project_ids"]) == 40
+    assert (
+        len([k for k in client.calls[-1]["parameters"] if re.fullmatch(r"p\d+", k)])
+        == 40
+    )
 
 
 @pytest.mark.unit
-def test_unmappable_project_id_fails_closed_not_open():
-    """A row whose id does not map back into the bound array is UNCOVERED.
+def test_every_project_is_its_own_arm_bound_to_its_own_floor():
+    """No per-row floor lookup, no shared bound, nothing left unbound.
 
-    The probe locates each row's own floor with
-    ``arrayElement(floors, indexOf(project_ids, toString(project_id)))``. On a
-    miss ``indexOf`` returns 0, and ClickHouse's ``arrayElement(arr, 0)`` yields
-    the type default -- an empty string -- whose comparison is false. Without the
-    guard that silently reports the project COVERED, which is the single
-    direction this check must never fail in. The guard is unconditional with
-    respect to the arrival and eligibility gates; it does sit under the
-    scope-wide pruning bound, which every mappable row's own bound implies.
-
-    Verified against ClickHouse 25.3: indexOf(['a','b'],'missing') = 0,
-    arrayElement(['x','y'],0) = '' (empty() = 1), and a `<` against it is false.
+    An earlier shape located each row's floor with
+    ``arrayElement(floors, indexOf(ids, project_id))``. That needed a
+    fail-closed backstop for an unmappable row, and -- worse -- it was a
+    per-row bound ClickHouse's key analysis cannot prune on, so a covered
+    project was read end to end. Explicit arms have neither problem: each
+    project's rows are selected by equality and bounded by that project's own
+    floor, so there is no row whose floor could be looked up wrongly.
     """
     client = _Client(below=())
+    scope = {**SCOPE, "project_ids": ["p1", "p2", "p3"]}
     _coverage(
-        rows=[{"project_id": "p1", "floor": "2026-01-01 00:00:00"}], client=client
+        rows=[
+            {"project_id": "p1", "floor": "2026-01-01 00:00:00"},
+            {"project_id": "p2", "floor": "2026-03-01 00:00:00"},
+            {"project_id": "p3", "floor": "2026-02-01 00:00:00"},
+        ],
+        scope=scope,
+        client=client,
     )
-
-    sql = client.calls[-1]["sql"]
-    assert "indexOf(%(project_ids)s, toString(project_id)) = 0" in sql
-    # The guard must be an OR arm of the predicate, so an unmappable row matches
-    # and is reported as a gap rather than skipped -- and the arrival and
-    # eligibility gates belong to the predates-floor arm only, never to the
-    # backstop, or an unmappable row that arrived recently would be silently
-    # skipped. The one thing that does sit above the backstop is the scope-wide
-    # pruning bound (start_time below the largest floor), which is a superset
-    # of every mappable row's own bound; see the pruning test.
-    guard = sql.index("= 0")
-    arm = sql.index("OR (", guard)
-    assert "start_time <" in sql[arm:]
-    assert "created_at <" not in sql[:arm]
-    assert "created_at <" in sql[arm:]
+    sql, params = client.calls[-1]["sql"], client.calls[-1]["parameters"]
+    assert "arrayElement" not in sql and "indexOf" not in sql
+    arms = re.findall(
+        r"\(project_id = %\((p\d+)\)s AND start_time < toDateTime64\(%\((f\d+)\)s, 6, 'UTC'\) - INTERVAL 1 HOUR\)",
+        sql,
+    )
+    assert len(arms) == 3
+    bound = {params[p]: params[f] for p, f in arms}
+    assert bound == {
+        "p1": "2026-01-01 00:00:00",
+        "p2": "2026-03-01 00:00:00",
+        "p3": "2026-02-01 00:00:00",
+    }
+    # The cheap predicates sit in PREWHERE; the attribute columns behind the
+    # eligibility predicate are read only for rows that pass them.
+    assert (
+        sql.index("PREWHERE")
+        < sql.index(_SETTLED_BEFORE)
+        < sql.index(" WHERE ")
+        < sql.index(_INDEXABLE)
+    )
+    assert "is_deleted = 0" in sql[: sql.index(" WHERE ")]
 
 
 @pytest.mark.unit

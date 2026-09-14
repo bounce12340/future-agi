@@ -1,25 +1,31 @@
-"""Live-ClickHouse contract for the coverage probes' arrival-time gate.
+"""Live-ClickHouse contract for the coverage probes.
 
 ``test_observed_coverage.py`` drives ``observed_scope_coverage`` with doubles
-that decide "in flight" versus "settled" by looking for the gate's literal text
-in the statement. That pins the shape of the SQL; it cannot tell whether the
-predicate ClickHouse actually evaluates does what the text says. A gate that is
-present but silently always-false would make every unindexed project read as
-covered -- the one direction this module must never fail in -- and every unit
-test would stay green. So the verdicts here come from the real
-``observed_scope_coverage`` reading real tables, with ``created_at`` set
-explicitly so arrival and the span's own clock can disagree.
+that decide "in flight" versus "settled" and "bare" versus "indexable" by
+looking for the gates' text in the statement. That pins the shape of the SQL;
+it cannot tell whether the predicate ClickHouse actually evaluates does what
+the text says. A gate that is present but silently always-false would make
+every unindexed project read as covered -- the one direction this module must
+never fail in -- and every unit test would stay green. So the verdicts here
+come from the real ``observed_scope_coverage`` reading the real ``spans``
+table as the schema applier leaves it, with ``created_at`` set explicitly so
+arrival and the span's own clock can disagree.
 
 Gated on the same explicitly isolated test ClickHouse as the other live catalog
 contracts: unset, it skips; configured, a wrong verdict is a failure.
 """
 
 import os
+import re
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+
+SCHEMA_DIR = Path(__file__).resolve().parents[1] / "services/clickhouse/v2/schema"
+GRANULE = 8192
 
 KEY_COLUMNS = (
     "organization_id",
@@ -32,6 +38,35 @@ KEY_COLUMNS = (
     "first_seen",
     "last_seen",
 )
+
+
+def _real_spans_ddl(database):
+    """The production spans table, as the applier leaves it, in a scratch database.
+
+    002 creates it, 013 turns attributes_extra into a String, 024 adds the
+    arrival minmax index. Only the tiered storage policy and its TTLs are
+    stripped -- a scratch server has one volume -- so the sorting key, the
+    partitioning, the projections and every skip index (including the
+    ``mapKeys`` bloom filters that change how the maps are read) are the real
+    ones. A pruning claim proved on a simplified key is not a claim about
+    production.
+    """
+    text = (SCHEMA_DIR / "002_spans_v2.sql").read_text()
+    start = text.index("CREATE TABLE IF NOT EXISTS spans")
+    end = text.index(";", text.index("SETTINGS", start)) + 1
+    create = text[start:end]
+    create = re.sub(r"\nTTL\s.*?(?=\nSETTINGS)", "", create, flags=re.S)
+    create = re.sub(r"\n\s*storage_policy\s*=\s*'tiered',", "", create)
+    create = create.replace(
+        "CREATE TABLE IF NOT EXISTS spans", f"CREATE TABLE {database}.spans", 1
+    )
+    return [
+        create,
+        f"ALTER TABLE {database}.spans MODIFY COLUMN attributes_extra String "
+        "DEFAULT '{}' CODEC(ZSTD(3))",
+        f"ALTER TABLE {database}.spans ADD INDEX IF NOT EXISTS "
+        "auto_minmax_index_created_at created_at TYPE minmax() GRANULARITY 1",
+    ]
 
 
 @pytest.fixture
@@ -63,21 +98,8 @@ ENGINE = AggregatingMergeTree
 ORDER BY (organization_id, workspace_id, project_id, source_kind, attribute_key, attribute_type)
 """
         )
-        # The columns the probes touch, with the production default for arrival.
-        client.command(
-            f"""
-CREATE TABLE {database}.spans (
-    project_id String,
-    start_time DateTime64(6, 'UTC'),
-    created_at DateTime64(6, 'UTC') DEFAULT now64(6, 'UTC'),
-    attrs_string Map(LowCardinality(String), String),
-    attrs_number Map(LowCardinality(String), Float64),
-    attrs_bool Map(LowCardinality(String), UInt8),
-    model LowCardinality(String) DEFAULT '',
-    attributes_extra JSON(max_dynamic_paths=0))
-ENGINE = MergeTree PARTITION BY toDate(start_time) ORDER BY (project_id, start_time)
-"""
-        )
+        for statement in _real_spans_ddl(database):
+            client.command(statement)
         yield SimpleNamespace(client=client, database=database, reads=[])
     finally:
         client.command(f"DROP DATABASE IF EXISTS {database}")
@@ -97,12 +119,17 @@ def _coverage(live, scope):
             )
 
     class Client:
-        # The probes name the bare ``spans`` table; point them at the fixture.
+        # The probes name the bare ``spans`` table; point them at the fixture,
+        # run them under the settings and wall they were handed, and record
+        # what the server says it read.
         def execute_read(self, sql, params=None, timeout_ms=None, settings=None):
             result = live.client.query(
                 sql.replace("FROM spans", f"FROM {live.database}.spans"),
                 parameters=params or {},
-                settings={"max_threads": 1, "max_block_size": 1024},
+                settings={
+                    **(settings or {}),
+                    "max_execution_time": timeout_ms / 1000.0,
+                },
             )
             live.reads.append(int((result.summary or {}).get("read_rows", -1)))
             return (
@@ -133,13 +160,40 @@ def _scope(*projects):
     }
 
 
-def _spans(live, rows, *, bare=False):
-    """Insert (project, start_time, created_at) rows; attributed unless ``bare``."""
+def _spans(live, rows, *, bare=False, deleted=False):
+    """Insert (project, start_time, created_at) rows into the real table.
+
+    Attributed unless ``bare``; a tombstone (``is_deleted = 1``) if ``deleted``.
+    Every other column takes the production default.
+    """
     attrs = {} if bare else {"k": "v"}
     live.client.insert(
         f"{live.database}.spans",
-        [[*row, attrs] for row in rows],
-        column_names=["project_id", "start_time", "created_at", "attrs_string"],
+        [
+            [
+                project,
+                "span",
+                start,
+                created,
+                str(uuid4()),
+                str(uuid4()),
+                "n",
+                attrs,
+                1 if deleted else 0,
+            ]
+            for project, start, created in rows
+        ],
+        column_names=[
+            "project_id",
+            "observation_type",
+            "start_time",
+            "created_at",
+            "trace_id",
+            "id",
+            "name",
+            "attrs_string",
+            "is_deleted",
+        ],
     )
 
 
@@ -149,6 +203,20 @@ def _index(live, project, seen):
         [["org", "ws", project, "custom_attribute", "k", "string", "k", seen, seen]],
         column_names=list(KEY_COLUMNS),
     )
+
+
+def _covered_big_project(live, now, rows=40_000, days=5):
+    """Several days and several granules of history, indexed from the oldest span."""
+    project = str(uuid4())
+    oldest = (now - timedelta(days=days)).replace(minute=0, second=0, microsecond=0)
+    step = timedelta(days=days) / rows
+    _spans(live, [[project, oldest + step * n, oldest + step * n] for n in range(rows)])
+    live.client.command(f"OPTIMIZE TABLE {live.database}.spans FINAL")
+    _index(live, project, oldest)
+    return project, rows
+
+
+# --- arrival ------------------------------------------------------------------
 
 
 def test_a_project_whose_spans_all_arrived_within_the_margin_is_not_a_gap(live):
@@ -223,6 +291,9 @@ def test_a_late_arrival_below_the_floor_is_tolerated_until_it_settles(live):
     assert (settled.complete, settled.reason) == (False, "source_predates_index")
 
 
+# --- eligibility --------------------------------------------------------------
+
+
 def test_a_project_of_bare_spans_is_not_a_gap_but_one_attributed_span_makes_it_one(
     live,
 ):
@@ -242,35 +313,13 @@ def test_a_span_carrying_only_extra_attributes_still_counts(live):
     """attributes_extra feeds the catalog too; an old unindexed one is a gap."""
     project = str(uuid4())
     live.client.command(
-        f"INSERT INTO {live.database}.spans (project_id, start_time, created_at, attributes_extra) "
-        f"VALUES ('{project}', now64(6, 'UTC') - INTERVAL 2 DAY, now64(6, 'UTC') - INTERVAL 3 HOUR, "
+        f"INSERT INTO {live.database}.spans "
+        "(project_id, observation_type, start_time, created_at, trace_id, id, name, attributes_extra) "
+        f"VALUES ('{project}', 'span', now64(6, 'UTC') - INTERVAL 2 DAY, "
+        f"now64(6, 'UTC') - INTERVAL 3 HOUR, '{uuid4()}', '{uuid4()}', 'n', "
         '\'{"nested": {"a": 1}}\')'
     )
     assert _coverage(live, _scope(project)).reason == "project_unindexed"
-
-
-def test_a_covered_project_costs_zero_rows_on_the_floor_probe(live):
-    """The steady state of a healthy install must not scan history.
-
-    Two days of hourly spans, all indexed from the oldest one: the floor probe
-    has nothing below the floor to find, and with the scope-wide bound the
-    partitions it would have to read do not exist. Measured through the
-    server's own read_rows, so a bound that merely looks right cannot pass.
-    """
-    now = datetime.now(UTC)
-    project = str(uuid4())
-    oldest = (now - timedelta(days=2)).replace(minute=0, second=0, microsecond=0)
-    _spans(
-        live,
-        [
-            [project, oldest + timedelta(hours=h), oldest + timedelta(hours=h)]
-            for h in range(48)
-        ],
-    )
-    _index(live, project, oldest)
-    result = _coverage(live, _scope(project))
-    assert (result.complete, result.reason) == (True, "covered")
-    assert live.reads[-1] == 0, live.reads
 
 
 def test_an_old_bare_span_below_the_floor_is_not_a_gap_but_an_attributed_one_is(live):
@@ -288,15 +337,59 @@ def test_an_old_bare_span_below_the_floor_is_not_a_gap_but_an_attributed_one_is(
     assert _coverage(live, _scope(project)).reason == "source_predates_index"
 
 
-def test_the_scope_wide_bound_is_the_largest_floor_not_the_smallest(live):
-    """A bound below any project's own floor would hide that project's gap.
+def test_a_tombstoned_span_the_backfill_would_skip_is_not_a_gap(live):
+    """Deleted before the upgrade: never replayed, so never missing."""
+    now = datetime.now(UTC)
+    project = str(uuid4())
+    _spans(
+        live,
+        [[project, now - timedelta(days=2), now - timedelta(hours=3)]],
+        deleted=True,
+    )
+    assert _coverage(live, _scope(project)).reason == "covered"
+
+    _spans(live, [[project, now - timedelta(days=2), now - timedelta(hours=3)]])
+    assert _coverage(live, _scope(project)).reason == "project_unindexed"
+
+
+# --- cost and per-project bounds ----------------------------------------------
+
+
+def test_a_covered_project_costs_granules_not_its_history(live):
+    """The steady state of a healthy install must not scan history.
+
+    On the production key (project_id, observation_type, service_name, hour,
+    ...) the hour range cannot be decided for a granule that straddles a type
+    or service boundary, so the honest bound is a few granules, not zero --
+    and it must hold whatever OTHER floors sit in the scope. An earlier
+    revision bounded the whole scope by its largest floor, which read the big
+    tenant end to end whenever any newer project shared the scope.
+    """
+    now = datetime.now(UTC)
+    big, rows = _covered_big_project(live, now)
+    young = str(uuid4())
+    _spans(live, [[young, now - timedelta(minutes=5), now - timedelta(minutes=5)]])
+    _index(live, young, now - timedelta(minutes=5))
+
+    alone = _coverage(live, _scope(big))
+    assert (alone.complete, alone.reason) == (True, "covered")
+    assert live.reads[-1] <= 2 * GRANULE, live.reads
+
+    mixed = _coverage(live, _scope(big, young))
+    assert (mixed.complete, mixed.reason) == (True, "covered")
+    assert live.reads[-1] <= 2 * GRANULE, live.reads
+    assert live.reads[-1] < rows // 4
+
+
+def test_each_project_is_judged_against_its_own_floor(live):
+    """A shared bound taken from the oldest floor would hide a younger project's gap.
 
     Two projects: the first indexed from long ago, the second only from ten
     minutes ago but holding an attributed span that arrived hours ago and
-    sits between the two floors. Under the largest floor that span is found;
-    under the smallest it is excluded before the per-project arm ever sees
-    it, and the scope reads covered -- open, the one direction this module
-    must never fail in.
+    sits between the two floors. Bound to its own floor that span is found;
+    bound to the older project's floor it is excluded before it is ever
+    compared, and the scope reads covered -- open, the one direction this
+    module must never fail in.
     """
     now = datetime.now(UTC)
     old, young = str(uuid4()), str(uuid4())
@@ -307,11 +400,7 @@ def test_the_scope_wide_bound_is_the_largest_floor_not_the_smallest(live):
         live,
         [
             [young, now - timedelta(minutes=10), now - timedelta(minutes=10)],
-            [
-                young,
-                now - timedelta(days=2),
-                now - timedelta(hours=3),
-            ],  # below young's floor, above old's
+            [young, now - timedelta(days=2), now - timedelta(hours=3)],
         ],
     )
     result = _coverage(live, _scope(old, young))

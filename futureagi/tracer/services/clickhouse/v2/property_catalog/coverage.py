@@ -144,24 +144,40 @@ _SETTLED_BEFORE = f"now64(6, 'UTC') - {_COVERAGE_MARGIN}"
 # produces no index row by design, so a project made only of such spans has
 # nothing missing however old it is. Without this, the first such project in
 # a workspace turned every workspace-scoped picker ``partial`` for good once
-# its spans were an hour old. The map arms read only the maps' size
-# subcolumns; attributes_extra is read for every scanned row (ClickHouse reads
-# the column for the block, it does not skip I/O for rows the map arms accept)
-# and only its serialisation is short-circuited.
+# its spans were an hour old.
+#
+# The map arms name the ``.size0`` subcolumn explicitly: ``length(map)`` is
+# normally rewritten to it, but not on this table, whose ``mapKeys()`` bloom
+# indexes block the rewrite, and the difference measured tenfold in bytes read.
+# Both probes keep this predicate in WHERE behind a PREWHERE of the cheap
+# columns, so the maps and attributes_extra are read only for rows that the
+# time and arrival predicates already accept -- on a covered scope, none.
 #
 # The cost falls on a project made ONLY of such spans with no index rows: the
-# index-less probe reads it end to end looking for one indexable span. That
-# scan measured 112 ms per million rows at max_threads=1, so it stays inside
-# _PROBE_WALL_MS up to roughly ten million bare spans and fails closed
-# (probe_unavailable, still partial) beyond -- the same verdict such a project
-# produced before, at a latency cost. Every attributed span stops the scan at
-# its own block; production spans average ~300 bytes of attributes each.
+# index-less probe reads it end to end looking for one indexable span,
+# measured at 43-77 ms per million rows at max_threads=1 (String and JSON
+# attributes_extra respectively), failing closed at _PROBE_WALL_MS. That is
+# the same ``partial`` verdict such a project produced before, at a latency
+# cost; every attributed span stops the scan at its own block.
 _INDEXABLE = (
     "("
-    "length(attrs_string) > 0 OR length(attrs_number) > 0 OR length(attrs_bool) > 0 "
+    "attrs_string.size0 > 0 OR attrs_number.size0 > 0 OR attrs_bool.size0 > 0 "
     "OR model != '' OR toString(attributes_extra) != '{}'"
     ")"
 )
+
+# Tombstones are source rows the backfill never replays
+# (cmd/fi-observed-catalog-backfill buildPage skips is_deleted = 1), so a span
+# deleted before the upgrade can never be indexed and must not count as a
+# gap. Without FINAL the pre-merge original still matches until parts merge;
+# that turns "forever" into "until the next merge", which is the honest cost
+# of not paying for FINAL on every request.
+_LIVE_ROW = "is_deleted = 0"
+
+# Floor arms per statement. Each project gets its own arm, so a workspace of a
+# few hundred projects is one statement of a few hundred arms; wider scopes
+# are probed in chunks rather than in one unbounded statement.
+_FLOOR_ARMS_PER_STATEMENT = 200
 
 
 # The public vocabulary of ``coverage_reason``. The response serializers declare
@@ -198,11 +214,10 @@ class Coverage:
 
     @property
     def status(self) -> str:
-        # `partial` is a new member of the existing query_status vocabulary
-        # (complete/sampled/pending/degraded/stale). The frontend's
-        # getQueryReadState already maps any `query_complete: false` that is not
-        # `sampled` to its degraded presentation, so this renders as a visible
-        # caveat without a frontend change.
+        # `partial` is a member of the query_status vocabulary
+        # (complete/sampled/pending/degraded/partial), declared by the response
+        # serializers and by the frontend's status-pair validator
+        # (utils/queryReadState.js), which renders it as the degraded caveat.
         return "complete" if self.complete else "partial"
 
 
@@ -255,12 +270,14 @@ def _any_project_with_settled_spans(client, settings, project_ids) -> bool:
     A project whose every span arrived within ``_COVERAGE_MARGIN`` is ingestion
     in flight: the source row exists, the index row is seconds behind. Treating
     that as a gap made every freshly created project report ``partial`` for the
-    length of the consumer lag, whatever its spans' own timestamps. A project
-    holding a span that arrived an hour ago and still has no index row is the
-    un-backfilled upgrade this module exists to catch.
+    length of the consumer lag, whatever the spans' own timestamps said. A
+    project holding an indexable, live span that arrived an hour ago and still
+    has no index row is the un-backfilled upgrade this module exists to catch.
 
     One query for the whole set: ``project_id`` is the sorting-key prefix, so
     the IN-set is an index lookup and ``LIMIT 1`` stops at the first hit. The
+    cheap columns sit in PREWHERE so the attribute columns behind
+    ``_INDEXABLE`` are read only for rows that arrived before the margin. The
     ``created_at`` minmax index (024) prunes a fresh project's recent parts
     once it has been materialised; until then a fresh project is scanned, and
     a fresh project is by definition under an hour of ingest.
@@ -269,9 +286,10 @@ def _any_project_with_settled_spans(client, settings, project_ids) -> bool:
         return False
     rows, _, _ = client.execute_read(
         "SELECT 1 FROM spans "
-        "WHERE project_id IN %(project_ids)s "
+        "PREWHERE project_id IN %(project_ids)s "
         f"AND created_at < {_SETTLED_BEFORE} "
-        f"AND {_INDEXABLE} "
+        f"AND {_LIVE_ROW} "
+        f"WHERE {_INDEXABLE} "
         "LIMIT 1",
         {"project_ids": list(project_ids)},
         timeout_ms=_PROBE_WALL_MS,
@@ -283,66 +301,55 @@ def _any_project_with_settled_spans(client, settings, project_ids) -> bool:
 def _any_project_predating_its_floor(client, settings, floors) -> str | None:
     """Is any project holding spans materially older than its own floor?
 
-    One query for every project in scope rather than one per project. The
-    previous per-project loop was linear in scope size -- measured at 765 ms for
-    one project, 2.0 s for five and 5.3 s for fifteen -- which is exactly the
-    interactive cost this feature exists to remove.
+    One statement for a chunk of projects rather than one per project. The
+    earlier per-project loop was linear in scope size -- 765 ms for one
+    project, 5.3 s for fifteen -- which is exactly the interactive cost this
+    feature exists to remove.
 
-    Parallel arrays keep the comparison per-project: ``indexOf`` locates each
-    row's own floor. That per-row bound is opaque to ClickHouse's partition
-    and primary-key analysis, so on its own the statement reads every row of
-    every project in scope on every request -- measured at 1M rows per
-    covered project, which puts the largest tenant past ``_PROBE_WALL_MS`` and
-    reports it ``partial`` permanently. The scope-wide bound
-    ``start_time < max(floor) - margin`` is a plain constant, so
-    ``toDate(start_time)`` partition pruning and the sorting key apply, and a
-    covered project reads zero rows. It is a superset of every per-project
-    arm (each floor is at most the maximum), so it changes no verdict.
+    Every project is its own arm, ``project_id = p AND start_time < floor_p -
+    margin``, with its floor bound as a parameter and cast to
+    ``DateTime64(6, 'UTC')`` (a bare ``String - INTERVAL`` is read in the
+    session time zone). That shape matters: an earlier revision located each
+    row's floor with ``arrayElement(floors, indexOf(ids, project_id))``, a
+    per-row bound that ClickHouse's partition and primary-key analysis cannot
+    see through, so a COVERED project was read end to end on every request.
+    Explicit arms are key-prefix ranges the analysis does understand: on the
+    real key (project_id, observation_type, service_name, hour, ...) a covered
+    project costs a handful of granules at type and service boundaries, not
+    its history, whatever the other floors in the scope are.
 
-    Both bounds cast the bound floor text to ``DateTime64(6, 'UTC')``: a bare
-    ``String - INTERVAL`` yields a session-timezone DateTime64 and misreads
-    the floor under any non-UTC session.
+    Arrival and eligibility gate the match (see ``_SETTLED_BEFORE`` and
+    ``_INDEXABLE``); ``_LIVE_ROW`` keeps tombstones out. The cheap columns sit
+    in PREWHERE so the attribute columns are read only for rows below a floor.
     """
     if not floors:
         return None
     ids = list(floors)
-    rows, _, _ = client.execute_read(
-        "SELECT toString(project_id) FROM spans "
-        "WHERE project_id IN %(project_ids)s "
-        "AND start_time < toDateTime64(%(max_floor)s, 6, 'UTC') "
-        f"    - {_COVERAGE_MARGIN} "
-        "AND ("
-        # A row whose id does not map back into the bound array would get
-        # indexOf = 0, and arrayElement(arr, 0) is ClickHouse's DEFAULT (empty
-        # string), whose comparison is false -- silently reporting the project
-        # COVERED. That is the one direction this check must never fail in, so
-        # an unmappable row counts as uncovered instead. The IN clause above
-        # should make this unreachable; it is a fail-closed backstop, not an
-        # expected path.
-        "    indexOf(%(project_ids)s, toString(project_id)) = 0"
-        "    OR ("
-        "        start_time < toDateTime64(arrayElement(%(floors)s, "
-        "            indexOf(%(project_ids)s, toString(project_id))), 6, 'UTC') "
-        f"            - {_COVERAGE_MARGIN} "
-        # A late-arriving span (a client buffer flushing yesterday's trace) is
-        # below the floor by its own clock the moment it lands, and is in
-        # flight to the index for the next few seconds. Arrival decides
-        # whether it is a gap; see _SETTLED_BEFORE. And a span the catalog
-        # would never index is not a gap at any age; see _INDEXABLE.
-        f"        AND created_at < {_SETTLED_BEFORE} "
-        f"        AND {_INDEXABLE} "
-        "    )"
-        ") "
-        "LIMIT 1",
-        {
-            "project_ids": ids,
-            "floors": [_ch_timestamp(floors[pid]) for pid in ids],
-            "max_floor": _ch_timestamp(max(floors[pid] for pid in ids)),
-        },
-        timeout_ms=_PROBE_WALL_MS,
-        settings=settings,
-    )
-    return str(rows[0][0]) if rows else None
+    for start in range(0, len(ids), _FLOOR_ARMS_PER_STATEMENT):
+        chunk = ids[start : start + _FLOOR_ARMS_PER_STATEMENT]
+        params = {}
+        arms = []
+        for i, pid in enumerate(chunk):
+            params[f"p{i}"] = pid
+            params[f"f{i}"] = _ch_timestamp(floors[pid])
+            arms.append(
+                f"(project_id = %(p{i})s "
+                f"AND start_time < toDateTime64(%(f{i})s, 6, 'UTC') - {_COVERAGE_MARGIN})"
+            )
+        rows, _, _ = client.execute_read(
+            "SELECT toString(project_id) FROM spans "
+            "PREWHERE (" + " OR ".join(arms) + ") "
+            f"AND created_at < {_SETTLED_BEFORE} "
+            f"AND {_LIVE_ROW} "
+            f"WHERE {_INDEXABLE} "
+            "LIMIT 1",
+            params,
+            timeout_ms=_PROBE_WALL_MS,
+            settings=settings,
+        )
+        if rows:
+            return str(rows[0][0])
+    return None
 
 
 def observed_scope_coverage(*, scope, deadline, observed=None, client=None) -> Coverage:
