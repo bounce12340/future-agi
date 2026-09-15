@@ -15,7 +15,6 @@ The two result sets are merged in Python.
 
 import math
 import re
-import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -785,80 +784,15 @@ class TraceListQueryBuilder(BaseQueryBuilder):
 
         return plan.source_metric in _CLASSIFIER_ONLY_ROOT_SEED_METRICS
 
-    @staticmethod
-    def _canonical_uuid_text(value: Any) -> str | None:
-        """Return the value only when it is already canonical UUID text.
-
-        ``toString`` on a UUID emits the lowercase hyphenated form and nothing
-        else, so it is injective onto exactly those strings. A value that
-        parses as a UUID but is spelled some other way — uppercase, braced,
-        ``urn:uuid:`` — matches no row through ``toString`` today, and would
-        begin matching through ``toUUID``. Those spellings are therefore not
-        eligible for the native comparison.
-        """
-
-        text = value if isinstance(value, str) else None
-        if not text:
-            return None
-        try:
-            if str(uuid.UUID(text)) != text:
-                return None
-        except (AttributeError, TypeError, ValueError):
-            return None
-        return text
-
-    def _native_end_user_uuid_predicate(
-        self,
-        filter_builder: Any,
-        operation: str | None,
-        value: Any,
-    ) -> str:
-        """Compare the indexed UUID column directly when that is exact.
-
-        The candidate CTE this feeds reads ``spans`` by ``end_user_id``, which
-        carries both a bloom-filter skip index and the
-        ``(project_id, end_user_id, start_time)`` projection prefix. Wrapping
-        the column in ``toString`` costs it both, leaving the CTE to read the
-        project's whole window to find one user's traces.
-
-        Exactness: ``toString`` on a UUID is injective onto canonical text, so
-        for canonical ``s`` a row satisfies ``toString(u) = s`` exactly when it
-        satisfies ``u = toUUID(s)``; NULL propagates to NULL on both sides, so
-        both ops below select the identical rows. Anything not provably
-        canonical returns empty and the caller keeps the textual predicate.
-
-        Only the two operations ``_positive_exact_end_user_seed_filter``
-        admits reach here: a non-empty ``equals`` string and a non-empty
-        ``in`` list of strings.
-        """
-
-        if operation == "equals":
-            canonical = self._canonical_uuid_text(value)
-            if canonical is None:
-                return ""
-            param = filter_builder._next_param("end_user_uuid")
-            filter_builder._params[param] = canonical
-            return f"end_user_id = toUUID(%({param})s)"
-        if operation != "in" or not isinstance(value, list) or not value:
-            return ""
-        canonical_values = [self._canonical_uuid_text(item) for item in value]
-        if any(item is None for item in canonical_values):
-            return ""
-        in_list = filter_builder._uuid_in_clause(canonical_values, "end_user_uuid")
-        if not in_list:
-            return ""
-        return f"end_user_id IN ({in_list})"
-
     def _positive_exact_end_user_span_seed(self) -> tuple[str, dict[str, Any]]:
         """Compile the direct span predicate for candidate-first user seeding.
 
         ``user``/``user_id`` values are external identifiers, so resolve them
         through the existing curated end-user/remap expansion before probing
         the indexed span UUID. ``end_user_id`` is already a physical structural
-        UUID, so it is compared on its own type whenever the supplied value is
-        canonical UUID text, and falls back to the direct-column compiler's
-        textual form otherwise. Either way the predicate carries the
-        membership envelope, because the CTE it seeds spans the whole table.
+        UUID and uses the normal direct-column compiler. Whatever comparison
+        that compiler chooses, the predicate carries the membership envelope
+        here, because the CTE it seeds spans the whole table.
 
         The returned predicate is a necessary candidate condition only; the
         existing finite latest-state classifier remains authoritative for
@@ -901,9 +835,7 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                 ")"
             )
         else:
-            predicate = self._native_end_user_uuid_predicate(
-                filter_builder, operation, value
-            ) or filter_builder._build_column_condition(
+            predicate = filter_builder._build_column_condition(
                 "end_user_id",
                 "text",
                 operation,

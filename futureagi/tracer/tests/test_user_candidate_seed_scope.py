@@ -1,19 +1,15 @@
 """Scope rules for the user-detail trace candidate seed.
 
 ``matching_user_trace_identities`` is a trace-membership superset read over
-the whole ``spans`` table. Two properties keep it both exact and affordable,
-and each has a way of quietly regressing:
+the whole ``spans`` table, so it needs an event-time bound or it rescans the
+project's entire span history for a one-day page. The bound has to be the
+**request window** plus the adjacent-day envelope: narrowing it to the slice
+would drop a witness that a keyset continuation still needs, and dropping it
+altogether is the read this module exists to prevent.
 
-* it is bounded by the **request window** plus the adjacent-day envelope —
-  not by the narrower slice, which would drop a witness a keyset
-  continuation still needs, and not by nothing at all, which rescans the
-  project's entire span history for a one-day page;
-* it compares ``end_user_id`` on its own type whenever the supplied value is
-  already canonical UUID text, which is what lets the read use the column's
-  skip index and the ``(project_id, end_user_id, start_time)`` projection
-  prefix. Any other spelling stays on the textual comparison, because
-  ``toString`` only ever emits canonical text and a native comparison would
-  match rows the textual one does not.
+How ``end_user_id`` itself is compared belongs to the shared column compiler
+and is covered by that compiler's own tests, not here. What this module pins
+is that whichever comparison it chooses, the seed still carries the envelope.
 """
 
 from __future__ import annotations
@@ -109,60 +105,6 @@ def test_external_user_candidate_cte_carries_the_same_envelope():
     assert params["col_1"] == "10000004"
 
 
-def test_canonical_uuid_membership_compares_the_native_column():
-    builder = _builder(
-        [
-            _time_filter(REQUEST_START, END),
-            _user_filter([CANONICAL_USER, SECOND_USER]),
-        ]
-    )
-    _sql, cte, params = _seed(builder)
-
-    assert (
-        "end_user_id IN (toUUID(%(end_user_uuid_1)s), toUUID(%(end_user_uuid_2)s))"
-        in cte
-    )
-    assert "toString(end_user_id)" not in cte
-    assert params["end_user_uuid_1"] == CANONICAL_USER
-    assert params["end_user_uuid_2"] == SECOND_USER
-
-
-def test_canonical_uuid_equality_compares_the_native_column():
-    builder = _builder(
-        [
-            _time_filter(REQUEST_START, END),
-            _user_filter(CANONICAL_USER, operation="equals"),
-        ]
-    )
-    _sql, cte, params = _seed(builder)
-
-    assert "end_user_id = toUUID(%(end_user_uuid_1)s)" in cte
-    assert params["end_user_uuid_1"] == CANONICAL_USER
-
-
-@pytest.mark.parametrize(
-    "spelling",
-    [
-        CANONICAL_USER.upper(),
-        "{" + CANONICAL_USER + "}",
-        "urn:uuid:" + CANONICAL_USER,
-        CANONICAL_USER.replace("-", ""),
-    ],
-)
-def test_non_canonical_uuid_spelling_keeps_the_textual_predicate(spelling):
-    # These all parse as the same UUID, but ``toString(end_user_id)`` never
-    # emits them, so today they match nothing. Comparing natively would start
-    # matching the user's rows — a different result set, not a faster one.
-    builder = _builder(
-        [_time_filter(REQUEST_START, END), _user_filter([spelling])]
-    )
-    _sql, cte, params = _seed(builder)
-
-    assert "toString(end_user_id) IN %(col_1)s" in cte
-    assert "toUUID(" not in cte
-    assert params["col_1"] == (spelling,)
-
-
 @pytest.mark.parametrize(
     "operation", ["contains", "starts_with", "ends_with", "not_equals", "not_in"]
 )
@@ -184,19 +126,6 @@ def test_negated_and_substring_user_filters_never_reach_the_candidate_seed(
     assert builder.supports_filter_candidate_seed_page() is False
 
 
-def test_mixed_canonical_and_free_text_membership_stays_textual():
-    builder = _builder(
-        [
-            _time_filter(REQUEST_START, END),
-            _user_filter([CANONICAL_USER, "not-a-uuid"]),
-        ]
-    )
-    _sql, cte, params = _seed(builder)
-
-    assert "toString(end_user_id) IN %(col_1)s" in cte
-    assert params["col_1"] == (CANONICAL_USER, "not-a-uuid")
-
-
 def test_legacy_builder_membership_uses_its_own_event_time_column():
     builder = _builder(
         [_time_filter(REQUEST_START, END), _user_filter([CANONICAL_USER])],
@@ -207,4 +136,4 @@ def test_legacy_builder_membership_uses_its_own_event_time_column():
     # The legacy physical table prunes on ``created_at``; only the bound's
     # column differs, never its presence.
     assert "created_at >= %(start_date)s - INTERVAL 1 DAY" in cte
-    assert "end_user_id IN (toUUID(%(end_user_uuid_1)s))" in cte
+    assert "start_time" not in cte

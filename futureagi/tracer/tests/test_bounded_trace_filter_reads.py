@@ -941,14 +941,9 @@ def test_structural_end_user_id_candidate_seed_uses_direct_uuid_predicate(
     assert builder.filter_seed_proves_result_order() is True
     assert builder.filter_candidate_seed_proves_result_order() is True
     assert "matching_user_trace_identities AS" in candidate_sql
-    # Direct, as the name says: the structural UUID column is compared on its
-    # own type, so the CTE keeps its skip index and projection prefix.
-    assert "end_user_id = toUUID(%(end_user_uuid_1)s)" in candidate_sql
-    assert "toString(end_user_id)" not in candidate_sql
-    assert "start_time >= %(start_date)s - INTERVAL 1 DAY" in candidate_sql
-    assert "start_time < %(end_date)s + INTERVAL 1 DAY" in candidate_sql
+    assert "toString(end_user_id) = %(col_1)s" in candidate_sql
     assert "FROM end_users" not in candidate_sql
-    assert params["end_user_uuid_1"] == end_user_id
+    assert params["col_1"] == end_user_id
 
 
 def test_voice_annotator_and_turn_count_use_positive_candidate_seed() -> None:
