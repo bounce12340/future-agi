@@ -93,6 +93,14 @@ from tracer.services.clickhouse.read_budget import ReadDeadline
 # CTEs and touches the window about four times. One million index rows is
 # therefore roughly three and a half million statement rows, a slice the
 # measured replay rate finishes inside a second.
+#
+# This budget bounds the ROOT scan and nothing else. On a shape whose filter
+# membership is proved by spans rather than roots, the same statement also
+# reads the request window for that evidence, so its cost is the unsliced
+# membership scan plus a bounded root scan - never more than the unsliced
+# statement, but the widening loop re-issues it once per attempt, so a page
+# that widens pays that membership scan again. Unmeasured; a shorter attempt
+# budget for those shapes is the obvious follow-up.
 _CANDIDATE_SLICE_TARGET_INDEX_ROWS = 1_000_000
 # The narrowest width the search considers, and the unit the primary key's
 # ``toStartOfHour(start_time)`` component prunes on.
