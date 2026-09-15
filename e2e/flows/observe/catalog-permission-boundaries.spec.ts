@@ -57,8 +57,10 @@ test('OBS-E2E-009: catalog permissions follow explicit scope and membership remo
   }),
 }, async ({ browser, scopeActors: scopes, scopeProbe: probe }, testInfo) => {
   // Approved shared lifecycle: 60 provisioning/import + 15 spans + 180 CDC +
-  // 60 catalog readiness + six bounded UI_READY stages + 45 headroom = 720s.
-  test.setTimeout(720_000);
+  // 60 catalog readiness + 15 UI_READY steps (three seed inspections of three
+  // families + a dataset page each, one workspace switch, two later stages)
+  // + 45 headroom = 1260s.
+  test.setTimeout(1_260_000);
   const prefix = `e2e-obs9-${testInfo.workerIndex}-${Date.now().toString(36)}`;
   const customKeys = [`${prefix}-region-a`, `${prefix}-region-b`];
   const witness = `${prefix}-foreign-only`;
@@ -339,8 +341,12 @@ test('OBS-E2E-009: catalog permissions follow explicit scope and membership remo
       organizationId: a1.organizationId, workspaceId: a1.workspaceId });
     await page.evaluate(org => sessionStorage.setItem('workspaceOrgId', org), a1.organizationId);
 
+    // UI_READY is one browser action's first-paint budget. An inspection chains several page
+    // loads and pickers per seed, so each family and the dataset page is its own step under
+    // that budget; the stage is bounded by the flow's test.setTimeout ceiling. (CI cut the
+    // single 60 s stage at exactly 60.0 s, at whichever action happened to be running.)
     const inspect = async (s: Seed) => {
-      for (const f of families(s).filter(f => f.kind !== 'dataset')) {
+      for (const f of families(s).filter(f => f.kind !== 'dataset')) await test.step(`${s.label}: ${f.kind} family`, async () => {
         await page.goto(`/dashboard/observe/${s.projectId}/llm-tracing?tab=traces&selectedTab=spans`, { waitUntil: 'domcontentloaded' });
         await page.getByRole('button', { name: 'Filter', exact: true }).click();
         await page.getByRole('button', { name: 'Property', exact: true }).first().click();
@@ -368,30 +374,32 @@ test('OBS-E2E-009: catalog permissions follow explicit scope and membership remo
           expect((await list.json()).result.table.map((r: { span_id: string }) => r.span_id)).toEqual([s.traces[1].spanIds[0]]);
           await expect(page.locator('.clean-data-table:visible .ag-row [col-id="span_name"]')).toHaveText([`${s.name}-1`], { timeout: UI_READY });
         }
-      }
-      await page.goto(`/dashboard/develop/${s.datasetId}`, { waitUntil: 'domcontentloaded' });
-      const cells = page.locator(`.ag-row [col-id="${s.columnId}"]`);
-      await expect(cells).toHaveText(['catalog-west', 'catalog-east', 'catalog-west'], { timeout: UI_READY });
-      await page.getByRole('button', { name: 'Filter', exact: true }).click();
-      await page.getByRole('button', { name: 'Property', exact: true }).first().click();
-      await page.locator(`[data-filter-property-option="${s.columnId}"]`).click();
-      const values = page.waitForResponse(r => new URL(r.url()).pathname === VALUES, { timeout: UI_READY });
-      await page.getByPlaceholder('Value', { exact: true }).click();
-      const response = await values;
-      await headers(response, s.reader);
-      expect((await response.json()).result.values.map((v: Option) => v.value).sort()).toEqual(CHOICES);
-      await expect(page.getByRole('option')).toHaveText(CHOICES, { timeout: UI_READY });
-      const filtered = page.waitForResponse(r => r.url().includes(`/${s.datasetId}/get-dataset-table/`) &&
-        r.request().method() !== 'OPTIONS' && decodeURIComponent(r.url()).includes('catalog-west'), { timeout: UI_READY });
-      await page.getByRole('option', { name: 'catalog-west', exact: true }).click();
-      expect((await (await filtered).json()).result.table.map((r: { row_id: string }) => r.row_id).sort())
-        .toEqual(s.cells.filter(c => c.value === 'catalog-west').map(c => c.row_id).sort());
-      await expect(cells).toHaveText(['catalog-west', 'catalog-west'], { timeout: UI_READY });
-      // The value option closes its own menu, but the enclosing filter Popover
-      // remains modal. Dismiss it normally before using the workspace sidebar.
-      await page.keyboard.press('Escape');
-      await expect(page.getByRole('button', { name: 'Property', exact: true })).toHaveCount(0, { timeout: UI_READY });
-      await testInfo.attach(`${s.label}-picker`, { body: await page.screenshot(), contentType: 'image/png' });
+      }, { timeout: UI_READY });
+      await test.step(`${s.label}: dataset page`, async () => {
+        await page.goto(`/dashboard/develop/${s.datasetId}`, { waitUntil: 'domcontentloaded' });
+        const cells = page.locator(`.ag-row [col-id="${s.columnId}"]`);
+        await expect(cells).toHaveText(['catalog-west', 'catalog-east', 'catalog-west'], { timeout: UI_READY });
+        await page.getByRole('button', { name: 'Filter', exact: true }).click();
+        await page.getByRole('button', { name: 'Property', exact: true }).first().click();
+        await page.locator(`[data-filter-property-option="${s.columnId}"]`).click();
+        const values = page.waitForResponse(r => new URL(r.url()).pathname === VALUES, { timeout: UI_READY });
+        await page.getByPlaceholder('Value', { exact: true }).click();
+        const response = await values;
+        await headers(response, s.reader);
+        expect((await response.json()).result.values.map((v: Option) => v.value).sort()).toEqual(CHOICES);
+        await expect(page.getByRole('option')).toHaveText(CHOICES, { timeout: UI_READY });
+        const filtered = page.waitForResponse(r => r.url().includes(`/${s.datasetId}/get-dataset-table/`) &&
+          r.request().method() !== 'OPTIONS' && decodeURIComponent(r.url()).includes('catalog-west'), { timeout: UI_READY });
+        await page.getByRole('option', { name: 'catalog-west', exact: true }).click();
+        expect((await (await filtered).json()).result.table.map((r: { row_id: string }) => r.row_id).sort())
+          .toEqual(s.cells.filter(c => c.value === 'catalog-west').map(c => c.row_id).sort());
+        await expect(cells).toHaveText(['catalog-west', 'catalog-west'], { timeout: UI_READY });
+        // The value option closes its own menu, but the enclosing filter Popover
+        // remains modal. Dismiss it normally before using the workspace sidebar.
+        await page.keyboard.press('Escape');
+        await expect(page.getByRole('button', { name: 'Property', exact: true })).toHaveCount(0, { timeout: UI_READY });
+        await testInfo.attach(`${s.label}-picker`, { body: await page.screenshot(), contentType: 'image/png' });
+      }, { timeout: UI_READY });
     };
     // WorkspaceSwitcher trigger -> current-workspace hover -> SelectWorkspace.
     const switchWorkspace = async (from: ScopeActor, to: ScopeActor) => {
@@ -439,11 +447,12 @@ test('OBS-E2E-009: catalog permissions follow explicit scope and membership remo
       await expect(page).toHaveURL(/\/dashboard\/develop/, { timeout: UI_READY });
       await expect.poll(() => page.evaluate(() => sessionStorage.getItem('workspaceId')), { timeout: UI_READY }).toBe(to.workspaceId);
     };
-    await test.step('UI stage 2: A1/P1 and dataset D1', () => inspect(seeds[0]), { timeout: UI_READY });
-    await test.step('UI stage 3: sibling P2 and dataset D2', () => inspect(seeds[1]), { timeout: UI_READY });
+    await test.step('UI stage 2: A1/P1 and dataset D1', () => inspect(seeds[0]));
+    await test.step('UI stage 3: sibling P2 and dataset D2', () => inspect(seeds[1]));
     await test.step('UI stage 4: real switch to A2/P3 and D3', async () => {
-      await switchWorkspace(scopes.member, memberA2); await inspect(seeds[2]);
-    }, { timeout: UI_READY });
+      await test.step('switch workspace', () => switchWorkspace(scopes.member, memberA2), { timeout: UI_READY });
+      await inspect(seeds[2]);
+    });
 
     await test.step('check 4: real pages reject authorized scope changes', async () => {
       for (const [index, f] of families(seeds[0]).entries()) {

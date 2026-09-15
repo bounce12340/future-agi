@@ -99,8 +99,9 @@ test('OBS-E2E-008: native and custom voice filters select only the current proje
     ],
   }),
 }, async ({ page, actor, probe }, testInfo) => {
-  // 15 source + 60 catalog + 15*60 UI (opening, eligibility, 7 native, 5 custom, final scope) + 45 headroom.
-  test.setTimeout(1_020_000); // Every individual UI stage/case still has UI_READY=60s.
+  // 15 source + 60 catalog + 41*60 UI (opening, picker open, 25 property searches, picker
+  // close, 7 native, 5 custom, final scope) + 45 headroom = 2580s. Every UI step is UI_READY.
+  test.setTimeout(2_580_000);
   page.setDefaultTimeout(UI_READY);
   const prefix = `e2e-obs8-${testInfo.workerIndex}-${Date.now().toString(36)}`;
   const routeKey = `${prefix}.route`, childKey = `${prefix}.child`;
@@ -630,8 +631,10 @@ test('OBS-E2E-008: native and custom voice filters select only the current proje
     await test.step('UI 1a: call table and identity columns', () => open(primary), { timeout: UI_READY });
     await test.step('UI 1b: native/custom property eligibility', async () => {
       const mark = captures.length;
-      await page.getByRole('button', { name: 'Filter', exact: true }).click();
-      await page.getByRole('button', { name: 'Property', exact: true }).first().click();
+      await test.step('open the property picker', async () => {
+        await page.getByRole('button', { name: 'Filter', exact: true }).click();
+        await page.getByRole('button', { name: 'Property', exact: true }).first().click();
+      }, { timeout: UI_READY });
       const checkPropertySearch = async (searchMark: number, name: string) => {
         const matching = (c: Capture) => (c.query.search ?? '') === name;
         const response = await readCapture(searchMark, METRICS, matching); // Fresh only; no cache fallback.
@@ -675,16 +678,23 @@ test('OBS-E2E-008: native and custom voice filters select only the current proje
         evidence.push({ phase: 'completed property search', name, category, visible, response });
         return response;
       };
-      for (const name of STATIC_FIELDS) await completePropertySearch(name, 'system');
+      // UI_READY is one browser action's first-paint budget. This stage chains 25 debounced
+      // searches, so each search is its own step under that budget; the stage is bounded by
+      // the flow's test.setTimeout ceiling. (CI cut the single 60 s stage at exactly 60.0 s.)
+      const searchStep = <T>(name: string, run: () => Promise<T>) =>
+        test.step(`property search: ${name}`, run, { timeout: UI_READY });
+      for (const name of STATIC_FIELDS) await searchStep(name, () => completePropertySearch(name, 'system'));
       // Search each excluded canonical alias/foreign system key to ensure
       // absence isn't merely a not-yet-rendered first property page.
       for (const name of [...ALIASES, 'dataset', 'eval_source', 'span_count', 'active_users']) {
-        const response = await completePropertySearch(name, 'system', false);
+        const response = await searchStep(name, () => completePropertySearch(name, 'system', false));
         evidence.push({ phase: 'completed excluded-property search', name, response });
       }
-      for (const name of [routeKey, childKey]) await completePropertySearch(name, 'attribute');
-      await page.keyboard.press('Escape'); await page.keyboard.press('Escape');
-      await expect(page.getByRole('tab', { name: 'Basic', exact: true })).toBeHidden({ timeout: UI_READY });
+      for (const name of [routeKey, childKey]) await searchStep(name, () => completePropertySearch(name, 'attribute'));
+      await test.step('close the property picker', async () => {
+        await page.keyboard.press('Escape'); await page.keyboard.press('Escape');
+        await expect(page.getByRole('tab', { name: 'Basic', exact: true })).toBeHidden({ timeout: UI_READY });
+      }, { timeout: UI_READY });
       await Promise.all(pending);
       const discovery = captures.slice(mark).filter(c => c.path === METRICS && c.query.project_ids === primary.id && String(c.query.cursor_mode) === 'true');
       expect(discovery.length).toBeGreaterThan(0);
@@ -693,7 +703,7 @@ test('OBS-E2E-008: native and custom voice filters select only the current proje
       // Compatibility attributes, when requested, must use spans independently
       // of voice definitions and trace value transport. No request is forced.
       for (const c of captures.slice(mark).filter(c => c.path === '/tracer/eval-attributes/')) expect(c.query.source).toBe('spans');
-    }, { timeout: UI_READY });
+    });
     await test.step('UI 2: root-native status, call ID, latency and cost', async () => {
       const cases: Case[] = [
         { name: 'completed', leaf: leaf('call_status', 'text', 'in', ['completed']), expected: [a], control: 'choices' },

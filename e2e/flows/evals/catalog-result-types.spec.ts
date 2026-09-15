@@ -153,10 +153,11 @@ test('EVAL-E2E-003: typed executed evaluations retain exact native results and r
     ],
   }),
 }, async ({ page, actor, probe, mockModel }, testInfo) => {
-  test.setTimeout(2_520_000);
+  test.setTimeout(3_120_000);
   // Approved ceiling: source 30 + valid task 90 + CDC 180 + UI edit 60 +
   // 5*(detail + 4 filters)*60 + graph selection 120 + invalid tasks 180 +
-  // invalid CDC 180 + invalid UI 120 + setup/source-invalid headroom 60.
+  // invalid CDC 180 + invalid UI (60 malformed + 60 API replays + 2 seeds *
+  // 5 families * 60 detail inspections = 720) + setup/source-invalid headroom 60.
   page.setDefaultTimeout(UI_READY);
   const req = await request.newContext();
   const suffix = `${testInfo.workerIndex}-${Date.now().toString(36)}`;
@@ -796,6 +797,9 @@ test('EVAL-E2E-003: typed executed evaluations retain exact native results and r
       await test.step('UI/API: every invalid family is Error and excluded from successful matches', async () => {
         // Reuse the exact union/range requests captured from supported native UI.
         // New invalid trace IDs may NEVER enter the former valid result set.
+        // UI_READY is one browser action's budget: the replays share one, and each detail
+        // inspection below gets its own. (CI cut the single 60 s step at exactly 60.0 s.)
+        await test.step('API: invalid traces never enter a former valid result set', async () => {
         for (const saved of positiveRequests) {
           const replay = await actor.api.post<ListBody>(LIST, saved.params);
           complete(replay, true);
@@ -817,10 +821,12 @@ test('EVAL-E2E-003: typed executed evaluations retain exact native results and r
           await attach(`invalid-nonnull-exclusion-${saved.family.key}`, { provenance: 'source-pinned API predicate',
             params: broadParams, body: broad, expectedIds: saved.ids });
         }
+        }, { timeout: UI_READY });
         for (const i of [0, 1]) for (const [index, f] of families.entries()) {
-          await inspectDetail(f, invalidSeeds[i], invalidNames[i], null, null, true, index > 0);
+          await test.step(`UI: ${invalidNames[i]} shows ${f.key} as Error`, () =>
+            inspectDetail(f, invalidSeeds[i], invalidNames[i], null, null, true, index > 0), { timeout: UI_READY });
         }
-      }, { timeout: UI_READY });
+      });
     });
   } finally {
     // Preserve background evidence even if a native UI assertion stops the flow.

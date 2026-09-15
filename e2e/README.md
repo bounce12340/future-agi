@@ -353,6 +353,14 @@ case in point: it waits out `EVAL_RESULT` (90 s) for the task to complete and th
 (180 s) for the row to reach ClickHouse — 270 s worst case before seeding and the UI step — so it
 sets `test.setTimeout(300_000)`.
 
+`UI_READY` (60 s in the observe flows) is **one browser action's** first-paint budget, not a
+stage's. A stage that chains many actions — a property picker exercised for twenty searches, an
+inspection that loads several pages — must be split so that each action (or each short chain
+that shares one page load) is its own `test.step(..., { timeout: UI_READY })`; the stage itself
+is then bounded by the flow's `test.setTimeout` ceiling, which counts every such step in its
+arithmetic. One 60 s budget over twenty actions fails on the shared CI runner at exactly 60.0 s,
+at whichever action happens to be running, and reads as three different bugs on three runs.
+
 ### Locators
 
 Role, label and text first — the frontend is MUI, its components are accessible, and this is the
