@@ -4,6 +4,7 @@ from datetime import timedelta
 
 import pytest
 
+from tracer.services.clickhouse.query_builders import latest_filter_predicates
 from tracer.services.clickhouse.query_builders.trace_list import TraceListQueryBuilder
 from tracer.services.clickhouse.v2.query_builders.trace_list import (
     _CLICKHOUSE_MAX_QUERY_SIZE_BYTES,
@@ -362,3 +363,71 @@ def test_oversized_mixed_typed_text_keeps_the_statement_parseable():
     rendered = _rendered_seed_statement(subject)
     assert "indexHint(hasAny(arrayMap" not in rendered
     assert len(rendered.encode()) < _CLICKHOUSE_MAX_QUERY_SIZE_BYTES
+
+
+def _index_hint_spans(sql: str) -> list[str]:
+    """Every ``indexHint(...)`` subexpression, parentheses balanced.
+
+    Safe for the synthetic values in this module, which carry no parenthesis.
+    """
+
+    spans = []
+    start = sql.find("indexHint(")
+    while start >= 0:
+        cursor, depth = start + len("indexHint("), 1
+        while cursor < len(sql) and depth:
+            depth += {"(": 1, ")": -1}.get(sql[cursor], 0)
+            cursor += 1
+        spans.append(sql[start:cursor])
+        start = sql.find("indexHint(", cursor)
+    return spans
+
+
+def _outside_index_hints(sql: str) -> str:
+    for span in _index_hint_spans(sql):
+        sql = sql.replace(span, "")
+    return sql
+
+
+@pytest.mark.parametrize("operation", ["equals", "in"])
+def test_index_companions_exist_only_inside_index_hints(operation, monkeypatch):
+    """``indexHint`` is true for every row, so declining one cannot drop a row.
+
+    That is what makes the size limit safe rather than a semantic change, and
+    it holds only while the companions live nowhere but inside a hint.
+    """
+
+    value = (
+        [ORDINARY_LONG_TEXT, ORDINARY_LONG_TEXT + " tail"]
+        if operation == "in"
+        else ORDINARY_LONG_TEXT
+    )
+    with_sql, _ = builder(operation=operation, value=value).build_filter_seed_page(
+        **_WINDOW
+    )
+    monkeypatch.setattr(
+        latest_filter_predicates, "_MAX_INDEX_COMPANION_VALUE_UTF8_BYTES", 0
+    )
+    without_sql, _ = builder(operation=operation, value=value).build_filter_seed_page(
+        **_WINDOW
+    )
+
+    hints = _index_hint_spans(with_sql)
+    assert hints, "the companion-bearing statement must carry index hints"
+    for companion in (
+        "arrayMap(x -> lowerUTF8(x), mapValues(attrs_string))",
+        "arrayMap(x -> lower(x), mapValues(attrs_string))",
+    ):
+        assert with_sql.count(companion) == sum(
+            hint.count(companion) for hint in hints
+        )
+        assert companion not in _outside_index_hints(without_sql)
+
+    # Outside every hint the two statements are the same predicate, bound to
+    # the same parameters, so they select the same rows.
+    assert _outside_index_hints(with_sql).count("latest_filter_param_0") == (
+        _outside_index_hints(without_sql).count("latest_filter_param_0")
+    )
+    assert "latest_filter_legacy_index_" not in _outside_index_hints(with_sql)
+    assert "latest_filter_legacy_index_" not in without_sql
+    assert "latest_filter_index_" not in without_sql
