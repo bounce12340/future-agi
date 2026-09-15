@@ -16524,6 +16524,11 @@ def test_a_walk_that_owes_a_classifier_keeps_the_wall_to_pay_for_it() -> None:
     executor = _IdentityHydrationFakeExecutor(
         builder,
         clock=clock,
+        # 795 ms x 4 = 3,180 ms, which lands just inside the acquisition
+        # wall this test is about: the 6,000 ms deadline less the builder's
+        # 300 ms hydration reserve less one FILTER_SELECTOR_QUERY_TIMEOUT_MS
+        # (2,500) held back for the classifier. The fifth seed is refused
+        # with 20 ms of that wall left.
         durations_ms={"seed": 795, "match_identity": 400},
     )
 
@@ -16559,3 +16564,89 @@ def test_a_walk_that_owes_a_classifier_keeps_the_wall_to_pay_for_it() -> None:
     ]
     assert page.continuation_slice_end is not None
     assert page.continuation_slice_end < END
+
+
+def test_an_interrupted_flush_leaves_no_position_past_the_chunk_it_lost() -> None:
+    """A buffer that merely LOOKS empty may not be committed past.
+
+    ``flush`` pops its chunk out of the buffer BEFORE it classifies it, and
+    marks it seen, so a classifier that fails server-side leaves those
+    candidates in neither place: not published, and no longer pending. The
+    buffer that remains is only the older leftovers, and resolving THOSE does
+    not license a position - the lost chunk sits above it.
+
+    So the progress flush declines a hop whose flush was interrupted and falls
+    through to the rollback, which restores the last position at which the
+    buffer really was empty. Asserted the same way as the exactness rule
+    above: against the acquired candidates rather than against the rows this
+    population happens to publish.
+    """
+
+    request_start = END - timedelta(minutes=90)
+    rows = [
+        {
+            "id": f"trace-{index:02d}",
+            "root_span_id": f"root-{index:02d}",
+            "start_time": END - timedelta(minutes=index + 1),
+            "trace_name": f"presented-{index:02d}",
+        }
+        # TWO in the opening five-minute slice and FOUR in the ten-minute
+        # slice below it: the buffer crosses a slice advance, and only then
+        # reaches the four-candidate classifier batch.
+        for index in (0, 1, 5, 6, 7, 8)
+    ]
+    builder = _CursorPageFillIdentityHydrationFakeBuilder(
+        rows,
+        start=request_start,
+        end=END,
+        match_rows=rows,
+        recommended_batch_size=4,
+        recommended_seed_batch_size=200,
+    )
+
+    class FirstClassifierFailsExecutor(_IdentityHydrationFakeExecutor):
+        def __init__(self, fake_builder):
+            super().__init__(fake_builder)
+            self.classifier_calls = 0
+
+        def execute_ch_query(self, query, params, *, timeout_ms, settings):
+            if query == "match_identity":
+                self.classifier_calls += 1
+                if self.classifier_calls == 1:
+                    self.calls.append((query, params))
+                    raise ReadDeadlineExceeded("Code: 241. Memory limit exceeded")
+            return super().execute_ch_query(
+                query, params, timeout_ms=timeout_ms, settings=settings
+            )
+
+    executor = FirstClassifierFailsExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(request_start, END)],
+        key_field="id",
+        page_number=0,
+        # Seven needed, six acquired: no sufficiency flush fires, so the only
+        # flush is the buffer's own at its four-candidate batch size.
+        page_size=6,
+        deadline_ms=5_000,
+        max_seed_attempts=4,
+        max_candidates=200,
+        max_query_count=50,
+        classify_batch_size=4,
+        include_incomplete_rows=True,
+        bounded_continuation=True,
+        carry_continuation_slice_width=True,
+    )
+
+    assert page.complete is False
+    if page.continuation_before_start_time is not None:
+        bound = page.continuation_before_start_time
+    else:
+        bound = page.continuation_slice_end
+    published = {row["id"] for row in page.rows}
+    assert all(
+        (row["id"] in published) or bound is None or (row["start_time"] < bound)
+        for row in rows
+    )

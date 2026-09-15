@@ -1556,6 +1556,11 @@ def read_bounded_filter_page(
     # progress flush can still tell an exception apart from an ordinary
     # unfinished exit.
     walk_hit_a_budget = False
+    # Set when a classifier chunk was popped out of the buffer and then failed.
+    # Those candidates are in neither place afterwards, so the buffer that
+    # remains is not a smaller buffer - it is an INCOMPLETE one, and no
+    # position may be committed on the strength of emptying it.
+    classifier_flush_interrupted = False
     safe_slice_end = slice_end
     safe_active_slice_start = active_slice_start
     safe_before_start_time = before_start_time
@@ -2782,19 +2787,30 @@ def read_bounded_filter_page(
             )
 
         def flush(batch_size: int) -> bool:
-            nonlocal identity_refill_limit
+            nonlocal identity_refill_limit, classifier_flush_interrupted
             batch_identities = list(pending_identity_candidates)[:batch_size]
             batch_entries = [
                 pending_identity_candidates.pop(identity)
                 for identity in batch_identities
             ]
             matches_before_flush = len(matched_by_id)
-            prefix_proven = classify_seed_rows(
-                [entry[0] for entry in batch_entries],
-                active_start=min(entry[1] for entry in batch_entries),
-                active_end=max(entry[2] for entry in batch_entries),
-                stop_on_ordered_prefix=stop_on_ordered_prefix,
-            )
+            try:
+                prefix_proven = classify_seed_rows(
+                    [entry[0] for entry in batch_entries],
+                    active_start=min(entry[1] for entry in batch_entries),
+                    active_end=max(entry[2] for entry in batch_entries),
+                    stop_on_ordered_prefix=stop_on_ordered_prefix,
+                )
+            except _BudgetExceeded:
+                # The chunk was POPPED before it was classified and is already
+                # marked seen, so what stays behind is only the older
+                # leftovers. Resolving those does not make the buffer empty -
+                # it makes it LOOK empty, above a chunk nobody classified and
+                # no page published. Record that, so the progress flush after
+                # the walk declines this hop and the rollback restores the
+                # last position at which the buffer really was empty.
+                classifier_flush_interrupted = True
+                raise
             if ordered_identity_refill and not pending_identity_candidates:
                 gained = len(matched_by_id) - matches_before_flush
                 remaining = prefix_needed - len(matched_by_id)
@@ -3923,7 +3939,12 @@ def read_bounded_filter_page(
         degraded_error_code = exc.error_code
         walk_hit_a_budget = True
 
-    if bounded_continuation and not page_complete and pending_identity_candidates:
+    if (
+        bounded_continuation
+        and not page_complete
+        and pending_identity_candidates
+        and not classifier_flush_interrupted
+    ):
         # THE PROGRESS FLUSH, and the reason an unfinished hop is never a
         # STOPPED one. A walk that ends without a page ends holding whatever
         # its last boundary declined to classify, and that buffer is what
@@ -3937,10 +3958,11 @@ def read_bounded_filter_page(
         # Progress is the SCAN position, not the last published row: the
         # explicit checkpoint below commits where the walk actually reached,
         # so a flush that classifies its whole buffer and matches nothing
-        # still moves the next hop forward. Only a clean flush earns it - an
-        # interrupted one leaves entries it popped but never classified, and
-        # ``checkpoint_continuation`` must not be handed a buffer that merely
-        # LOOKS empty.
+        # still moves the next hop forward. Only a hop whose every flush RAN
+        # to completion earns that - ``classifier_flush_interrupted`` above
+        # is the one case where the buffer left behind is incomplete rather
+        # than merely smaller, and emptying it would commit past a chunk
+        # nobody classified. Such a hop declines and takes the rollback.
         #
         # Nothing here outranks the reserve: this statement is charged to the
         # ordinary acquisition budget and the ordinary classification wall, so
