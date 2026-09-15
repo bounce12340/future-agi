@@ -51,13 +51,21 @@ class SessionListQueryBuilderV2(V2RewriteMixin, SessionListQueryBuilder):
             ("id", "id"),
         )
 
-    def _physical_time_bounds_sql(self) -> tuple[str, str]:
-        lower, _upper = super()._physical_time_bounds_sql()
+    def _physical_time_bounds_sql(
+        self,
+        *,
+        start_param: str = "start_date_us",
+        end_param: str = "end_date_us",
+    ) -> tuple[str, str]:
+        lower, _upper = super()._physical_time_bounds_sql(
+            start_param=start_param, end_param=end_param
+        )
         # end is exclusive; use its preceding microsecond to avoid reading an
         # extra hour when the request already ends on an hour boundary.
         return (
             f"toStartOfHour({lower})",
-            "toStartOfHour(fromUnixTimestamp64Micro(%(end_date_us)s - 1, 'UTC')) + INTERVAL 1 HOUR",
+            f"toStartOfHour(fromUnixTimestamp64Micro(%({end_param})s - 1, 'UTC'))"
+            " + INTERVAL 1 HOUR",
         )
 
     def build_candidate_slice_density_probe_query(

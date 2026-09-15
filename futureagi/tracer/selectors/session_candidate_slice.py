@@ -22,6 +22,21 @@ NEWEST one truly started twenty-two days earlier. Checking the rows that came
 back cannot detect this, because the row that is wrong is the row you are
 looking at, and the row it displaced is one you never saw.
 
+WHAT THE SLICE MAY BOUND. Discovery turns on two pieces of evidence and only
+one of them is a root: a live root fixes where a session RANKS, and a
+membership span - an end-user id, a scalar attribute, the raw witness - proves
+it matches the FILTER at all, and any span in the session may carry that. The
+floor is therefore raised under the root scan alone
+(``candidate_root_scan_start_us``); membership evidence is gathered over the
+whole request window. That asymmetry is not tidiness, it is what rule (2)
+below rests on. A reviewer found the earlier version of this module raising the
+floor under both: on the ``end_user_id`` and scalar-attribute shapes a session
+whose root sat INSIDE the slice went undiscovered because its membership span
+sat outside it, rule (2) then vouched for a page that had silently lost that
+row, and the row below it was published in its place. Root evidence is safe to
+bound by exactly the inference that fails for membership evidence: a root the
+slice cannot see is a root below T.
+
 THE RULE THIS MODULE IMPLEMENTS. Discovery in the slice, then re-resolution of
 those candidates against their full state over the whole request window, then a
 gate:
@@ -29,8 +44,10 @@ gate:
     a candidate whose re-resolved start EQUALS its slice start has no root
     below T, so its slice key is already its true key;
 
-    every session the slice did NOT discover has no root inside it, so its true
-    start is below T, hence below every such candidate;
+    every session the slice did NOT discover has no LIVE ROOT inside it -
+    membership is decided over the whole window, so nothing else can keep a
+    session out of the slice - and its true start is therefore below T, hence
+    below every such candidate;
 
     every discovered session outside the fetched prefix has a slice key below
     the prefix's lowest, and a true key no higher than its own slice key, hence
@@ -434,9 +451,7 @@ class _SliceReader:
         current_hours = max(
             _MIN_SLICE_HOURS, int((self._scan_end - floor) / timedelta(hours=1))
         )
-        widened = self._approved_floor(
-            lo_hours=current_hours, hi_hours=proposed_hours
-        )
+        widened = self._approved_floor(lo_hours=current_hours, hi_hours=proposed_hours)
         if widened is not None and widened >= floor:
             # The budget approves nothing OLDER than the slice just read, so
             # another round would issue the same statement and learn the same

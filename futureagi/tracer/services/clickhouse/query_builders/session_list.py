@@ -109,17 +109,30 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             alias for _expression, alias in self._physical_identity_fields()
         )
 
-    def _physical_time_bounds_sql(self) -> tuple[str, str]:
+    def _physical_time_bounds_sql(
+        self,
+        *,
+        start_param: str = "start_date_us",
+        end_param: str = "end_date_us",
+    ) -> tuple[str, str]:
         return (
-            "fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')",
-            "fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC')",
+            f"fromUnixTimestamp64Micro(%({start_param})s, 'UTC')",
+            f"fromUnixTimestamp64Micro(%({end_param})s, 'UTC')",
         )
 
-    def _physical_time_scope_sql(self, *, enabled: bool = True) -> str:
+    def _physical_time_scope_sql(
+        self,
+        *,
+        enabled: bool = True,
+        start_param: str = "start_date_us",
+        end_param: str = "end_date_us",
+    ) -> str:
         """Prune only complete replacement identities, never mutable leaf state."""
         if not enabled:
             return ""
-        lower, upper = self._physical_time_bounds_sql()
+        lower, upper = self._physical_time_bounds_sql(
+            start_param=start_param, end_param=end_param
+        )
         return (
             f"\n              AND toDate(start_time) BETWEEN toDate({lower}) AND toDate({upper})"
             f"\n              AND start_time >= {lower}"
@@ -132,11 +145,13 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         *,
         enabled: bool = True,
         param_prefix: str = "session_latest_time",
+        start_param: str = "start_date_us",
+        end_param: str = "end_date_us",
     ) -> str:
         """Apply the frozen native window/exclusions after version collapse."""
         clause = (
-            "\n              AND latest_start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')"
-            "\n              AND latest_start_time < fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC')"
+            f"\n              AND latest_start_time >= fromUnixTimestamp64Micro(%({start_param})s, 'UTC')"
+            f"\n              AND latest_start_time < fromUnixTimestamp64Micro(%({end_param})s, 'UTC')"
             if enabled
             else ""
         )
@@ -295,14 +310,14 @@ class SessionListQueryBuilder(BaseQueryBuilder):
     def _is_non_native_filter(item: dict[str, Any]) -> bool:
         config = item.get("filter_config") or item.get("filterConfig") or {}
         return str(config.get("col_type") or config.get("colType") or "").upper() in {
-            "SPAN_ATTRIBUTE", "EVAL_METRIC", "ANNOTATION",
+            "SPAN_ATTRIBUTE",
+            "EVAL_METRIC",
+            "ANNOTATION",
         }
 
     def _native_session_filters(self) -> list[dict[str, Any]]:
         """Keep explicit non-native sources out of name-based session routing."""
-        return [
-            item for item in self.filters if not self._is_non_native_filter(item)
-        ]
+        return [item for item in self.filters if not self._is_non_native_filter(item)]
 
     @classmethod
     def bounded_datetime_exclusion_sql(
@@ -1228,16 +1243,19 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             return None
         configs = [
             item.get("filter_config") or item.get("filterConfig") or {}
-            for item in self.filters if self._is_raw_attribute_filter(item)
+            for item in self.filters
+            if self._is_raw_attribute_filter(item)
         ]
         if not configs or any(
             (config.get("filter_type") or config.get("filterType"))
-            not in {"text", "string", "number", "boolean"} for config in configs
+            not in {"text", "string", "number", "boolean"}
+            for config in configs
         ):
             return None
         plans, residual = self._bounded_span_filter_parts()
         if (
-            residual or len(plans) != len(configs)
+            residual
+            or len(plans) != len(configs)
             or self._bounded_root_witness_plan(plans) is None
         ):
             return None
@@ -1654,6 +1672,33 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             enabled=scope_to_request_window,
             param_prefix="session_candidate_time_exclusion",
         )
+        # A bounded candidate slice raises the floor of the ROOT scan only, and
+        # these are the bindings it moves.  Everything below that proves a
+        # session MATCHES the filter - the end-user span, the scalar-attribute
+        # spans, the raw witness - keeps the request window above, because a
+        # session is discovered by a root AND by membership evidence that any
+        # span may carry.  Narrow the second and a session whose root sits
+        # inside the slice is never discovered at all, and the exactness gate
+        # in ``selectors.session_candidate_slice`` vouches for a page that has
+        # silently lost it.  Root evidence is safe to narrow by the same token:
+        # a root the slice cannot see is a root below the floor, which puts the
+        # session's true start below every row the slice can publish.  Session
+        # aggregates (cost, tokens, traces, duration) are computed from roots
+        # too, so they move with the root scan and stay consistent with it.
+        params.setdefault("candidate_root_scan_start_us", params["start_date_us"])
+        params.setdefault("candidate_root_scan_end_us", params["end_date_us"])
+        root_span_time_scope = self._physical_time_scope_sql(
+            enabled=scope_to_request_window,
+            start_param="candidate_root_scan_start_us",
+            end_param="candidate_root_scan_end_us",
+        )
+        root_latest_time_scope = self._latest_time_scope_sql(
+            params,
+            enabled=scope_to_request_window,
+            param_prefix="session_candidate_time_exclusion",
+            start_param="candidate_root_scan_start_us",
+            end_param="candidate_root_scan_end_us",
+        )
 
         positive_session_ids = self._candidate_positive_filter_values(
             self._SESSION_ID_FILTER_COLS
@@ -1669,10 +1714,16 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             # Cost tie-break only; retain every plan for latest group membership.
             # Prefer the compiler's proven numeric value-index companion, not
             # a same-span conjunction or a new discovery scan.
-            witness_plans = sorted(root_filter_plans, key=lambda plan: not (
-                plan.raw_graph_value_witness_predicate
-                and "mapValues(span_attr_num)" in plan.raw_graph_value_witness_predicate
-            ))
+            witness_plans = sorted(
+                root_filter_plans,
+                key=lambda plan: (
+                    not (
+                        plan.raw_graph_value_witness_predicate
+                        and "mapValues(span_attr_num)"
+                        in plan.raw_graph_value_witness_predicate
+                    )
+                ),
+            )
             witness = self._bounded_root_witness_plan(witness_plans)
             if witness is not None:
                 # Complete any-span candidates, materialized once. Values only
@@ -1708,7 +1759,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         candidate_root_raw_session_ids AS (
             SELECT DISTINCT trace_session_id AS raw_session_id
             FROM {self.TABLE}
-            PREWHERE {self.project_filter_sql()}{span_time_scope}
+            PREWHERE {self.project_filter_sql()}{root_span_time_scope}
             WHERE (parent_span_id IS NULL OR parent_span_id = '')
               AND isNotNull(trace_session_id)
               AND trace_session_id != toUUID('{NIL_UUID}')
@@ -1818,15 +1869,16 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             # Reuse the all-span replay for root order only on the separately
             # qualified finite String page-first route. Other routes are unchanged.
             combined_scalar_roots = (
-                bool(candidate_session_ids) and self.project_ids is None
-                and not candidate_full_state and not include_trace_id
-                and not additional_root_ctes and not root_membership_predicates
+                bool(candidate_session_ids)
+                and self.project_ids is None
+                and not candidate_full_state
+                and not include_trace_id
+                and not additional_root_ctes
+                and not root_membership_predicates
                 and getattr(self, "prefers_bounded_filter_page", lambda: False)()
             )
             if combined_scalar_roots:
-                scalar_aggregate_select += (
-                    ", argMax(tuple(parent_span_id), _peerdb_version).1 AS latest_parent_span_id"
-                )
+                scalar_aggregate_select += ", argMax(tuple(parent_span_id), _peerdb_version).1 AS latest_parent_span_id"
                 scalar_alias_select += (
                     ", latest_start_time, (isNull(latest_parent_span_id) "
                     "OR latest_parent_span_id = '') AS is_root"
@@ -2215,7 +2267,9 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             # collision guard proves this aggregate has exactly one project
             # before the view consumes it.
             # Qualify input membership too: CH25 aliases are visible in WHERE.
-            org_project_evidence_select = ", any(resolved_root_sessions.project_id) AS project_id"
+            org_project_evidence_select = (
+                ", any(resolved_root_sessions.project_id) AS project_id"
+            )
         return f"""
         {ts_map_ctes}
         {candidate_session_cte}
@@ -2224,7 +2278,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         candidate_root_identities AS (
             SELECT DISTINCT {self._physical_identity_select_sql()}
             FROM {self.TABLE}
-            PREWHERE {self.project_filter_sql()}{span_time_scope}
+            PREWHERE {self.project_filter_sql()}{root_span_time_scope}
             WHERE (parent_span_id IS NULL OR parent_span_id = '')
               {root_session_seed}
               {user_root_seed}
@@ -2240,7 +2294,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
                 argMax(_peerdb_is_deleted, _peerdb_version) AS latest_is_deleted
                 {latest_metric_select}
             FROM {self.TABLE}
-            PREWHERE {self.project_filter_sql()}{span_time_scope}
+            PREWHERE {self.project_filter_sql()}{root_span_time_scope}
               AND ({self._physical_group_by_sql()}) IN (
                   SELECT {self._physical_identity_names_sql()}
                   FROM candidate_root_identities
@@ -2256,7 +2310,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             FROM latest_roots
             LEFT JOIN ts_survivor_map AS ts_remap
                 ON latest_trace_session_id = ts_remap.any_id
-            WHERE latest_is_deleted = 0{latest_time_scope}
+            WHERE latest_is_deleted = 0{root_latest_time_scope}
               AND (latest_parent_span_id IS NULL OR latest_parent_span_id = '')
               AND isNotNull(latest_trace_session_id)
               AND latest_trace_session_id != toUUID('{NIL_UUID}')
@@ -2578,9 +2632,22 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         exact current total as ``seen_rows + remaining_count`` without an
         offset scan or a second count statement.
 
-        ``scan_start_time`` raises the floor of the PHYSICAL scan to a newer
-        moment inside the request window. The SQL text is unchanged - only the
-        window bindings move - so this is the same statement, reading less.
+        ``scan_start_time`` raises the floor of the ROOT scan to a newer moment
+        inside the request window. The SQL text is unchanged - only the window
+        bindings move - so this is the same statement, reading fewer roots.
+
+        IT RAISES THE FLOOR OF THE ROOT SCAN AND OF NOTHING ELSE. A session is
+        discovered by two pieces of evidence, and only one of them is a root.
+        The other - the span that proves the session matches the filter, an
+        end-user id, a scalar attribute, the raw witness - can sit on ANY span
+        in the session, so the scans that gather it keep the request window
+        (``start_date_us``/``end_date_us``). Narrow those too and a session
+        whose root is inside the slice is never discovered at all, its true
+        start is never compared against the page, and a row that belongs on the
+        page is silently replaced by one that ranks below it. Root evidence is
+        safe to narrow by exactly the inference that fails there: a root the
+        slice cannot see is a root below the floor, so that session's true
+        start is below every row the slice can publish.
 
         A raised floor makes the statement's ``session_start`` a **candidate**
         order rather than the canonical one: a session whose first root lies
@@ -2592,14 +2659,17 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         supported caller of this argument.
 
         A raised floor also moves the cursor keyset, which is why a sliced
-        continuation narrows the scan's UPPER bound to the cursor instant as
-        well. Without it the keyset would compare the cursor against inflated
-        starts and could hide a session that belongs on this page; with it,
-        every session whose true start is above the cursor has no root at or
-        below the cursor at all and is excluded by the scan itself. The
-        narrowing is exact for the unsliced statement too, but it is applied
-        only alongside a raised floor so the whole-window statement keeps its
-        current text byte for byte.
+        continuation narrows the ROOT scan's UPPER bound to the cursor instant
+        as well. Without it the keyset would compare the cursor against
+        inflated starts and could hide a session that belongs on this page;
+        with it, every session whose true start is above the cursor has no root
+        at or below the cursor at all and is excluded by the scan itself. That
+        ceiling is a root argument too, so it moves the root bindings only:
+        membership evidence above the cursor instant can be the only proof a
+        session matches, and truncating it loses the same page row the floor
+        does. The narrowing is exact for the unsliced statement too, but it is
+        applied only alongside a raised floor so the whole-window statement
+        keeps its current bindings.
         """
 
         if not self.supports_candidate_cursor_page():
@@ -2615,19 +2685,21 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             "limit": self.page_size + 1,
         }
         if scan_start_time is not None:
-            # Bind the floor into this statement's own params. ``self.params``
-            # still carries the request window, which is what the full-state
-            # re-resolution of these candidates has to read.
+            # Bind the floor into this statement's own params, and into the
+            # ROOT scan's bindings only. The request window stays on
+            # ``start_date_us``/``end_date_us``, which is what the membership
+            # scans inside this statement - and the full-state re-resolution of
+            # its candidates - have to read.
             if not self.start_date <= scan_start_time < self.end_date:
                 raise ValueError("candidate scan floor must stay inside the window")
-            params["start_date"] = scan_start_time
-            params["start_date_us"] = _unix_microseconds(scan_start_time)
+            params["candidate_root_scan_start_us"] = _unix_microseconds(scan_start_time)
             if before_start_time is not None:
                 # Half-open upper bound, so the cursor instant itself is read:
                 # a session tied on the cursor start is separated by the id
                 # tie-break in the keyset clause below, not by the scan.
-                params["end_date"] = before_start_time
-                params["end_date_us"] = _unix_microseconds(before_start_time) + 1
+                params["candidate_root_scan_end_us"] = (
+                    _unix_microseconds(before_start_time) + 1
+                )
         keyset_clause = ""
         if before_start_time is not None:
             params["cursor_before_start_us"] = _unix_microseconds(before_start_time)
