@@ -6,6 +6,10 @@ the statement reads every span of the project. ``equals``/``in`` are therefore
 compiled against the bare column and ``toUUID`` literals. Every other op keeps
 the cast: a bloom filter cannot serve a negation, and substring matching needs
 the text form.
+
+The negations still bind a valid UUID literal in the same canonical spelling,
+so the positive and negative forms of one value stay complementary: no row can
+satisfy both ``equals`` and ``not_equals`` on it.
 """
 
 from __future__ import annotations
@@ -99,7 +103,8 @@ def test_negations_keep_the_text_cast(
     """A bloom filter cannot serve a negation, so unwrapping buys no pruning.
 
     It would also have to invert the non-UUID fold and re-argue NULL handling
-    on a ``Nullable(UUID)`` column, so the negations are left alone.
+    on a ``Nullable(UUID)`` column, so the cast and the NULL semantics stay.
+    Only the spelling of a valid literal is normalised, asserted below.
     """
 
     sql, _ = _condition("end_user_id", filter_op, filter_value)
@@ -126,3 +131,57 @@ def test_sibling_uuid_columns_are_unchanged(column: str, filter_op: str) -> None
 
     assert f"toString({column})" in sql
     assert "toUUID(" not in sql
+
+
+def test_negations_bind_a_valid_uuid_literal_in_canonical_form() -> None:
+    """The cast renders lower case, so an upper-case literal must too."""
+
+    equals_sql, equals_params = _condition("end_user_id", "equals", USER_A.upper())
+    not_equals_sql, not_equals_params = _condition(
+        "end_user_id", "not_equals", USER_A.upper()
+    )
+    not_in_sql, not_in_params = _condition("end_user_id", "not_in", [USER_A.upper()])
+
+    assert equals_params == {"col_1": USER_A}
+    assert not_equals_sql == "toString(end_user_id) != %(col_1)s"
+    assert not_equals_params == {"col_1": USER_A}
+    assert not_in_sql == "toString(end_user_id) NOT IN %(col_1)s"
+    assert not_in_params == {"col_1": (USER_A,)}
+    assert "toUUID(" in equals_sql
+
+
+def test_no_row_can_satisfy_both_equals_and_not_equals() -> None:
+    """The two forms of one value are complementary, whatever its case.
+
+    Before this, ``equals`` was canonicalised while ``not_equals`` compared the
+    original text, so an upper-case literal matched a row under both.
+    """
+
+    for literal in (USER_A, USER_A.upper()):
+        _, equals_params = _condition("end_user_id", "equals", literal)
+        _, not_equals_params = _condition("end_user_id", "not_equals", literal)
+
+        assert equals_params["col_1"] == not_equals_params["col_1"] == USER_A
+
+
+@pytest.mark.parametrize(
+    ("filter_op", "filter_value", "expected_param"),
+    [
+        ("not_equals", NOT_A_UUID, NOT_A_UUID),
+        ("not_in", [NOT_A_UUID], (NOT_A_UUID,)),
+        ("not_equals", f"{{{USER_A}}}", f"{{{USER_A}}}"),
+        ("not_in", [USER_A.upper(), NOT_A_UUID], (USER_A, NOT_A_UUID)),
+    ],
+)
+def test_negations_leave_a_literal_that_is_not_a_uuid_alone(
+    filter_op: str, filter_value: object, expected_param: object
+) -> None:
+    """It matches every non-NULL row under ``!=`` today and still does.
+
+    Folding it away would be a behaviour change the positive ops could make
+    only because a non-UUID can never equal a UUID.
+    """
+
+    _, params = _condition("end_user_id", filter_op, filter_value)
+
+    assert params == {"col_1": expected_param}

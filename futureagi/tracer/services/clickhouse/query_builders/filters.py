@@ -2274,6 +2274,23 @@ class ClickHouseFilterBuilder:
             return None
         return canonical if canonical == text else None
 
+    @classmethod
+    def _canonical_uuid_negation_value(cls, filter_value: Any) -> Any:
+        """Lower-case the valid UUID literals a negation compares as text.
+
+        ``not_equals``/``not_in`` keep ``toString(end_user_id)``, which renders
+        a UUID in lower case, so an upper-case literal compared against it is
+        unequal to the row ``_end_user_uuid_equality`` now matches. Binding the
+        canonical spelling keeps the positive and negative forms complementary.
+        A value that is not a canonical UUID is returned untouched, so its
+        existing behaviour under a negation is unchanged.
+        """
+
+        if isinstance(filter_value, list):
+            return [cls._canonical_uuid_negation_value(item) for item in filter_value]
+        canonical = cls._canonical_uuid_literal(filter_value)
+        return filter_value if canonical is None else canonical
+
     def _end_user_uuid_equality(
         self,
         filter_op: str,
@@ -2291,10 +2308,19 @@ class ClickHouseFilterBuilder:
         A literal that is not a UUID can never equal a UUID, so under these two
         positive ops it contributes no rows: ``equals`` folds to ``0 = 1`` and
         an invalid member of an ``in`` set is dropped (all of them invalid
-        folds the whole condition to ``0 = 1``). The negations are deliberately
-        left on the cast — a bloom filter cannot serve ``NOT IN`` so they gain
-        no pruning, while the same fold would have to invert and their NULL
-        handling would have to be re-argued.
+        folds the whole condition to ``0 = 1``).
+
+        ``not_equals``/``not_in`` keep the cast and their NULL handling exactly
+        as they were: a bloom filter cannot serve ``NOT IN`` so unwrapping buys
+        them no pruning, and the non-UUID fold would have to invert. They do
+        canonicalise a *valid* UUID literal the same way this method does, via
+        ``_canonical_uuid_negation_value``. Otherwise the two forms would stop
+        being complementary — an upper-case literal is bound lower case here
+        and, against a lower-case ``toString``, was unequal to the very row
+        this method matches, so one row satisfied both ``equals`` and
+        ``not_equals`` on the same value. An *invalid* literal is left as
+        written for the negations, where it goes on matching every non-NULL
+        row as it does today.
         """
 
         if not isinstance(filter_value, list):
@@ -2332,6 +2358,10 @@ class ClickHouseFilterBuilder:
         case_insensitive = column in self._CASE_INSENSITIVE_COLUMNS
         if column == "end_user_id" and filter_op in ("equals", "in"):
             return self._end_user_uuid_equality(filter_op, filter_value, param)
+        if column == "end_user_id" and filter_op in ("not_equals", "not_in"):
+            # Same literal, same spelling as the positive ops above; the cast
+            # and the NULL handling below are deliberately left alone.
+            filter_value = self._canonical_uuid_negation_value(filter_value)
         comparison_column = (
             f"toString({column})"
             if column in self._NULLABLE_UUID_COLUMNS
