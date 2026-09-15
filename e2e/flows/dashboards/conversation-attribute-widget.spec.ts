@@ -6,6 +6,7 @@ import { sendTrace } from '../../lib/otlp';
 import { E2E } from '../../lib/env';
 import { POLL } from '../../lib/state-probe';
 import { flowAnnotation } from '../../lib/flow-meta';
+import { readJsonWithin } from '../../lib/response-body';
 
 // OBS008 / ProjectSerializer: public simulator-labelled project, ordinary OTLP;
 // dashboard.py has no voice_calls metric adapter. These fixed keys stay custom.
@@ -242,7 +243,7 @@ test('DASH-E2E-009: a saved conversation widget excludes child-model call-metric
         try {
           await attach('native-http-head', { ...receipt });
           if (!/\bapplication\/(?:[\w.-]+\+)?json\b/i.test(receipt.contentType!)) { receipt.error = 'non_json_body_omitted'; return; }
-          receipt.body = await response.json();
+          receipt.body = await readJsonWithin(response, UI_READY);
         } catch { receipt.error = 'response_json_unreadable'; }
         finally { receipt.endedAt = Date.now(); receipt.settled = true; }
       })();

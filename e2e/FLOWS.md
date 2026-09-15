@@ -100,7 +100,7 @@
 ### ANNOT-E2E-004 — corrected session annotations match only current authorized sessions
 
 **Goal:** Submit and correct all six native session annotations, then find only sessions with current, authorized scores  
-**Spec:** `flows/annotations/session-score-lifecycle.spec.ts:41`  
+**Spec:** `flows/annotations/session-score-lifecycle.spec.ts:42`  
 **Tags:** —
 
 **User steps:**
@@ -188,7 +188,7 @@
 ### DASH-E2E-002 — a saved trace-metric widget preserves its project, cohort and model results
 
 **Goal:** A developer saves a trace-metric widget for one project and cohort and sees the same exact model results after reopening it  
-**Spec:** `flows/dashboards/catalog-source-parity.spec.ts:47`  
+**Spec:** `flows/dashboards/catalog-source-parity.spec.ts:48`  
 **Tags:** —
 
 **User steps:**
@@ -208,7 +208,7 @@
 ### DASH-E2E-003 — a metric-specific Model filter changes only that metric after save and reopen
 
 **Goal:** A metric-specific Model filter changes only that metric after save and reopen.  
-**Spec:** `flows/dashboards/trace-metric-local-filter.spec.ts:53`  
+**Spec:** `flows/dashboards/trace-metric-local-filter.spec.ts:54`  
 **Tags:** —
 
 **User steps:**
@@ -228,7 +228,7 @@
 ### DASH-E2E-004 — a saved numeric attribute widget preserves numeric filtering and groups
 
 **Goal:** A saved numeric attribute widget preserves numeric filtering and groups.  
-**Spec:** `flows/dashboards/numeric-attribute-widget.spec.ts:53`  
+**Spec:** `flows/dashboards/numeric-attribute-widget.spec.ts:54`  
 **Tags:** —
 
 **User steps:**
@@ -248,7 +248,7 @@
 ### DASH-E2E-005 — a saved widget keeps boolean scope distinct from same-spelled text
 
 **Goal:** A saved widget keeps boolean scope distinct from same-spelled text.  
-**Spec:** `flows/dashboards/boolean-attribute-widget.spec.ts:55`  
+**Spec:** `flows/dashboards/boolean-attribute-widget.spec.ts:56`  
 **Tags:** —
 
 **User steps:**
@@ -268,7 +268,7 @@
 ### DASH-E2E-006 — a saved widget retains native array membership through popup edits
 
 **Goal:** A saved widget retains array membership without treating arrays as scalar metrics.  
-**Spec:** `flows/dashboards/array-membership-widget.spec.ts:50`  
+**Spec:** `flows/dashboards/array-membership-widget.spec.ts:51`  
 **Tags:** —
 
 **User steps:**
@@ -289,7 +289,7 @@
 ### DASH-E2E-007 — a saved Session widget counts only the selected project session traces
 
 **Goal:** A saved Session widget counts only the selected project's session traces.  
-**Spec:** `flows/dashboards/trace-backed-session-widget.spec.ts:53`  
+**Spec:** `flows/dashboards/trace-backed-session-widget.spec.ts:54`  
 **Tags:** —
 
 **User steps:**
@@ -313,7 +313,7 @@
 ### DASH-E2E-008 — a saved User widget keeps project and identifier-type scope
 
 **Goal:** A saved User widget keeps project and identifier-type scope.  
-**Spec:** `flows/dashboards/trace-backed-user-widget.spec.ts:60`  
+**Spec:** `flows/dashboards/trace-backed-user-widget.spec.ts:61`  
 **Tags:** —
 
 **User steps:**
@@ -337,7 +337,7 @@
 ### DASH-E2E-009 — a saved conversation widget excludes child-model call-metric decoys
 
 **Goal:** A saved conversation widget excludes child-model call-metric decoys.  
-**Spec:** `flows/dashboards/conversation-attribute-widget.spec.ts:53`  
+**Spec:** `flows/dashboards/conversation-attribute-widget.spec.ts:54`  
 **Tags:** —
 
 **User steps:**
@@ -360,7 +360,7 @@
 ### DASH-E2E-010 — a saved trace annotation widget retains numeric scores
 
 **Goal:** A saved trace annotation widget retains numeric scores.  
-**Spec:** `flows/dashboards/trace-numeric-annotation-widget.spec.ts:58`  
+**Spec:** `flows/dashboards/trace-numeric-annotation-widget.spec.ts:59`  
 **Tags:** —
 
 **User steps:**
@@ -383,7 +383,7 @@
 ### DASH-E2E-011 — a saved trace annotation widget retains star ratings
 
 **Goal:** A saved trace annotation widget retains star ratings.  
-**Spec:** `flows/dashboards/trace-star-annotation-widget.spec.ts:59`  
+**Spec:** `flows/dashboards/trace-star-annotation-widget.spec.ts:60`  
 **Tags:** —
 
 **User steps:**
@@ -406,7 +406,7 @@
 ### DASH-E2E-012 — a saved trace annotation widget retains exact text membership
 
 **Goal:** A saved trace annotation widget retains exact text membership.  
-**Spec:** `flows/dashboards/trace-text-annotation-widget.spec.ts:62`  
+**Spec:** `flows/dashboards/trace-text-annotation-widget.spec.ts:63`  
 **Tags:** —
 
 **User steps:**

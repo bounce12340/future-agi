@@ -6,6 +6,7 @@ import { sendTrace } from '../../lib/otlp';
 import { E2E } from '../../lib/env';
 import { POLL } from '../../lib/state-probe';
 import { flowAnnotation } from '../../lib/flow-meta';
+import { readJsonWithin } from '../../lib/response-body';
 
 // useDashboards.js / tracer/views/dashboard.py: native read aliases, wrapped
 // create/update/dashboard GET, and RAW inherited nested-widget GET.
@@ -303,7 +304,7 @@ test('DASH-E2E-008: a saved User widget keeps project and identifier-type scope'
       else if (path === VALUES) values.push(receipt as Receipt<ValueBody>);
       else saves.push(receipt);
       const capture = (async () => {
-        try { receipt.body = await response.json(); }
+        try { receipt.body = await readJsonWithin(response, UI_READY); }
         catch (error) { receipt.parseError = error instanceof Error ? error.name : 'UnknownError'; }
         finally { receipt.endedAt = Date.now(); receipt.settled = true; }
       })();

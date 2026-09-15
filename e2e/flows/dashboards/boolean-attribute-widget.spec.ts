@@ -6,6 +6,7 @@ import { sendTrace, type OtlpAttributes } from '../../lib/otlp';
 import { E2E } from '../../lib/env';
 import { POLL } from '../../lib/state-probe';
 import { flowAnnotation } from '../../lib/flow-meta';
+import { readJsonWithin } from '../../lib/response-body';
 
 // frontend/src/hooks/useDashboards.js + futureagi/tracer/views/dashboard.py:
 // native create/detail/widgets, catalog, values and preview endpoints (no response rewriting).
@@ -214,7 +215,7 @@ test('DASH-E2E-005: a saved widget keeps boolean scope distinct from same-spelle
       const path = new URL(response.url()).pathname;
       if (![QUERY, METRICS, VALUES].includes(path) || response.request().method() !== 'POST') return;
       const capture = (async () => {
-        const body = await response.json();
+        const body = await readJsonWithin(response, UI_READY);
         const sent = response.request().postDataJSON();
         if (path === QUERY) queries.push({ config: sent, body, status: response.status(),
           startedAt: response.request().timing().startTime, endedAt: Date.now() });

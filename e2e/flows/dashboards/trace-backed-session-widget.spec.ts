@@ -6,6 +6,7 @@ import { sendTrace } from '../../lib/otlp';
 import { E2E } from '../../lib/env';
 import { POLL } from '../../lib/state-probe';
 import { flowAnnotation } from '../../lib/flow-meta';
+import { readJsonWithin } from '../../lib/response-body';
 
 // useDashboards.js / tracer/urls.py: native catalog, values, query, wrapped
 // dashboard/create/update and RAW inherited nested-widget GET endpoints.
@@ -255,7 +256,7 @@ test('DASH-E2E-007: a saved Session widget counts only the selected project sess
       const path = new URL(response.url()).pathname;
       if (![QUERY, METRICS, VALUES].includes(path) || response.request().method() !== 'POST') return;
       const capture = (async () => {
-        const receipt = { input: response.request().postDataJSON(), body: await response.json(), status: response.status(),
+        const receipt = { input: response.request().postDataJSON(), body: await readJsonWithin(response, UI_READY), status: response.status(),
           startedAt: response.request().timing().startTime, endedAt: Date.now(), scope: scopeOf(response) };
         if (path === QUERY) queries.push(receipt); else if (path === METRICS) catalogs.push(receipt); else values.push(receipt);
       })().catch(error => { responseErrors.push({ path, status: response.status(), startedAt: response.request().timing().startTime,

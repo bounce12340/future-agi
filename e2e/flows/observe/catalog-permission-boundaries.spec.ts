@@ -353,9 +353,11 @@ test('OBS-E2E-009: catalog permissions follow explicit scope and membership remo
         await page.getByPlaceholder('Search properties...').fill(f.search);
         await expect.poll(() => page.locator('[data-filter-property-option]').evaluateAll(nodes =>
           nodes.map(n => n.getAttribute('data-filter-property-option')).sort()), { timeout: UI_READY }).toEqual([...f.uiIds].sort());
-        await page.locator(`[data-filter-property-option="${f.uiIds[0]}"]`).click();
+        // Register the values waiter before the property click: a panel that fetches on
+        // selection answers before a waiter registered after the click can see it.
         const valueRead = page.waitForResponse(r => new URL(r.url()).pathname === VALUES &&
           JSON.stringify(r.request().postDataJSON()).includes(f.uiIds[0]), { timeout: UI_READY });
+        await page.locator(`[data-filter-property-option="${f.uiIds[0]}"]`).click();
         await page.locator(`[data-filter-value-trigger="${f.uiIds[0]}"]`).click();
         const response = await valueRead;
         await headers(response, s.reader);
@@ -385,8 +387,11 @@ test('OBS-E2E-009: catalog permissions follow explicit scope and membership remo
       await test.step(`${s.label}: dataset value picker`, async () => {
         await page.getByRole('button', { name: 'Filter', exact: true }).click();
         await page.getByRole('button', { name: 'Property', exact: true }).first().click();
-        await page.locator(`[data-filter-property-option="${s.columnId}"]`).click();
+        // The dataset filter fetches its column values when the property is chosen, not when
+        // the Value control opens (CI trace: values response 62 ms after the option click,
+        // before a waiter registered after it could see it). Register before the click.
         const values = page.waitForResponse(r => new URL(r.url()).pathname === VALUES, { timeout: UI_READY });
+        await page.locator(`[data-filter-property-option="${s.columnId}"]`).click();
         await page.getByPlaceholder('Value', { exact: true }).click();
         const response = await values;
         await headers(response, s.reader);

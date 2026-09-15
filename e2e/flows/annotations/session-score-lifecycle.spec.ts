@@ -4,6 +4,7 @@ import { sendTrace } from '../../lib/otlp';
 import { E2E } from '../../lib/env';
 import { POLL } from '../../lib/state-probe';
 import { flowAnnotation } from '../../lib/flow-meta';
+import { readJsonWithin } from '../../lib/response-body';
 
 // InlineAnnotator + api/scores/scores.js; model_hub/serializers/scores.py.
 const SCORES = '/model-hub/scores/';
@@ -188,7 +189,7 @@ test('ANNOT-E2E-004: corrected session annotations match only current authorized
     const read = (async () => {
       try {
         graphResponses.push({ status: response.status(), request: response.request().postDataJSON(),
-          body: await response.json() });
+          body: await readJsonWithin(response, UI_READY) });
       } catch (error) {
         graphResponses.push({ status: response.status(), error: String(error) });
       }

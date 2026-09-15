@@ -6,6 +6,7 @@ import { sendTrace, type OtlpAttributes } from '../../lib/otlp';
 import { E2E } from '../../lib/env';
 import { POLL } from '../../lib/state-probe';
 import { flowAnnotation } from '../../lib/flow-meta';
+import { readJsonWithin } from '../../lib/response-body';
 
 // useDashboards.js / tracer/views/dashboard.py: native catalog, values, query,
 // wrapped dashboard/create/update and RAW inherited nested-widget GET endpoints.
@@ -251,7 +252,7 @@ test('DASH-E2E-006: a saved widget retains native array membership through popup
       const path = new URL(response.url()).pathname;
       if (![QUERY, METRICS, VALUES].includes(path) || response.request().method() !== 'POST') return;
       const capture = (async () => {
-        const body = await response.json();
+        const body = await readJsonWithin(response, UI_READY);
         const receipt = { input: response.request().postDataJSON(), body, status: response.status(),
           startedAt: response.request().timing().startTime, endedAt: Date.now(), scope: scopeOf(response) };
         if (path === QUERY) queries.push(receipt);
