@@ -37,6 +37,23 @@ row, and the row below it was published in its place. Root evidence is safe to
 bound by exactly the inference that fails for membership evidence: a root the
 slice cannot see is a root below T.
 
+WHAT THE SLICE MAY BOUND AT THE CEILING IS NARROWER STILL. A continuation also
+caps the root scan at the cursor instant, and a second reviewer found the
+sibling defect there. Some page predicates are a function of the root SET
+rather than of root existence - ``traces_count``, ``duration``, ``total_cost``,
+``total_tokens``, the ``first_message``/``last_message`` argMin/argMax, and the
+org-scope project-count collision guard. Truncating the set ABOVE the cursor
+changes such a predicate's VALUE while leaving the session's rank alone: roots
+at cursor-10h, cursor+2h and cursor+3h are three traces to ``traces_count > 2``
+and one to the capped relation, so the session fails the HAVING, never enters
+the statement, and its true start sits above T and below the cursor - exactly
+where rule (2) says nothing can hide. The FLOOR is immune to this by the same
+inference as before: a set the floor truncates belongs to a session with a root
+below T. So the builder withholds the ceiling whenever such a predicate is
+present (``page_admission_reads_the_root_set``), and the ceiling is a cost
+lever, not a premise - a session it hides has no root in [T, cursor] at all,
+hence a root below T, hence rule (2).
+
 THE RULE THIS MODULE IMPLEMENTS. Discovery in the slice, then re-resolution of
 those candidates against their full state over the whole request window, then a
 gate:
@@ -45,9 +62,10 @@ gate:
     below T, so its slice key is already its true key;
 
     every session the slice did NOT discover has no LIVE ROOT inside it -
-    membership is decided over the whole window, so nothing else can keep a
-    session out of the slice - and its true start is therefore below T, hence
-    below every such candidate;
+    membership is decided over the whole window, and so is every predicate
+    computed from the root SET, so nothing else can keep a session out of the
+    slice - and its true start is therefore below T, hence below every such
+    candidate;
 
     every discovered session outside the fetched prefix has a slice key below
     the prefix's lowest, and a true key no higher than its own slice key, hence
@@ -101,6 +119,13 @@ from tracer.services.clickhouse.read_budget import ReadDeadline
 # statement, but the widening loop re-issues it once per attempt, so a page
 # that widens pays that membership scan again. Unmeasured; a shorter attempt
 # budget for those shapes is the obvious follow-up.
+#
+# The same reservation applies to a continuation whose page predicate reads the
+# root SET: the probe below costs [floor, cursor] while the statement then
+# reads [floor, request end], so the approved width is optimistic for those
+# shapes by however much of the window sits above the cursor. Still bounded
+# above by the unsliced statement, so it is a cost gap and not a correctness
+# one, and it is unmeasured.
 _CANDIDATE_SLICE_TARGET_INDEX_ROWS = 1_000_000
 # The narrowest width the search considers, and the unit the primary key's
 # ``toStartOfHour(start_time)`` component prunes on.

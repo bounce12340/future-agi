@@ -736,3 +736,262 @@ def test_a_session_proved_a_member_below_the_floor_is_not_displaced():
 
     assert [row["session_id"] for row in page.rows] == [_sid(0), _sid(1)]
     assert page.has_more is True
+
+
+# --------------------------------------------------------------------------
+# Set-valued page predicates
+#
+# The sibling of the defect above, on the other bound. Gate rule (2) reads a
+# session's absence from the slice as proof that its roots lie below the floor.
+# That holds while admission turns on root EXISTENCE. Some page predicates are
+# a function of the root SET instead - an aggregate HAVING, a message argMin or
+# argMax, a duration over min and max, the org-scope project count - and the
+# continuation's CEILING truncates that set above the cursor without moving the
+# session's rank. The predicate's VALUE changes, the session never enters the
+# statement, and its true start sits ABOVE the floor and BELOW the cursor,
+# exactly where rule (2) claims nothing can hide.
+#
+# The floor is immune by the inference rule (2) already uses: a set the floor
+# truncates belongs to a session with a root below the floor.
+# --------------------------------------------------------------------------
+
+# Newest-first, and inside the sparse stretch, so the width search approves a
+# slice whose floor reaches well below it. The page test asserts that rather
+# than assume it.
+ROOT_SET_CURSOR = END - timedelta(hours=100)
+MIN_TRACES = 2
+
+_SET_VALUED_COLUMNS = {
+    "traces_count": ("number", "greater_than", MIN_TRACES),
+    "duration": ("number", "greater_than", 5),
+    "total_cost": ("number", "greater_than", 1),
+    "total_tokens": ("number", "greater_than", 1),
+    "last_message": ("text", "contains", "hello"),
+    "first_message": ("text", "contains", "hello"),
+}
+
+
+def _root_set_filters(column, start=START, end=END):
+    filter_type, filter_op, filter_value = _SET_VALUED_COLUMNS[column]
+    return [
+        # A raw attribute filter is what makes this shape candidate-cursor safe
+        # at all; on its own it emits no session HAVING, so the aggregate below
+        # is the only set-valued predicate in the statement.
+        *_membership_filters("attribute", start=start, end=end),
+        {
+            "column_id": column,
+            "filter_config": {
+                "col_type": "SYSTEM_METRIC",
+                "filter_type": filter_type,
+                "filter_op": filter_op,
+                "filter_value": filter_value,
+            },
+        },
+    ]
+
+
+def _root_set_builder(column="traces_count", page_size=2):
+    return SessionListQueryBuilderV2(
+        project_id=PROJECT,
+        filters=_root_set_filters(column),
+        page_number=0,
+        page_size=page_size,
+        bounded_internal_scan=True,
+    )
+
+
+def _sessions_having(sql: str) -> str | None:
+    """The HAVING of the ``sessions`` relation, not of a membership CTE."""
+    tail = sql[re.search(r"\n\s*sessions AS \(", sql).end() :]
+    found = re.search(r"HAVING [^\n]*", tail)
+    return found.group(0).strip() if found else None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("column", sorted(_SET_VALUED_COLUMNS))
+def test_a_set_valued_predicate_keeps_the_root_ceiling_at_the_request_end(column):
+    """The ceiling may not truncate a set the page predicate is computed from.
+
+    Narrowing the root scan to the cursor drops the roots above it, which
+    changes what ``uniqExact``/``sum``/``dateDiff``/``argMax`` return for a
+    session whose rank is unaffected - so the session fails the HAVING and
+    never enters the statement at all. The floor still moves: this withholds
+    the ceiling, it does not switch slicing off.
+    """
+
+    builder = _root_set_builder(column)
+    floor = END - timedelta(hours=SPARSE_HOURS * 2)
+    sql, params = builder.build_candidate_cursor_page_query(
+        before_start_time=ROOT_SET_CURSOR,
+        before_session_id=_sid(0),
+        scan_start_time=floor,
+    )
+
+    assert _sessions_having(sql) is not None, "this shape must carry the HAVING"
+    for name in _ROOT_CTES:
+        assert _ceiling_of(_cte(sql, name), params) == END, name
+        assert _floor_of(_cte(sql, name), params) == floor, name
+    assert params["candidate_root_scan_end_us"] == params["end_date_us"]
+    assert builder.page_admission_reads_the_root_set() is True
+
+
+@pytest.mark.unit
+def test_an_org_scope_page_keeps_the_root_ceiling_at_the_request_end():
+    """``uniqExact(project_id)`` is the same shape with its test in Python.
+
+    The view refuses a page whose candidate reports more than one project,
+    because a reused session UUID must never merge two projects' data. That
+    count is an aggregate over the root set and the published row carries the
+    SLICE's value, so a ceiling that hides the second project's roots turns a
+    refusal into a published page.
+    """
+
+    builder = SessionListQueryBuilderV2(
+        project_ids=[PROJECT, str(UUID(int=2))],
+        filters=_filters(),
+        page_number=0,
+        page_size=2,
+        bounded_internal_scan=True,
+    )
+    floor = END - timedelta(hours=SPARSE_HOURS * 2)
+    sql, params = builder.build_candidate_cursor_page_query(
+        before_start_time=ROOT_SET_CURSOR,
+        before_session_id=_sid(0),
+        scan_start_time=floor,
+    )
+
+    assert "candidate_session_project_counts" in sql
+    for name in _ROOT_CTES:
+        assert _ceiling_of(_cte(sql, name), params) == END, name
+    assert params["candidate_root_scan_end_us"] == params["end_date_us"]
+    assert builder.page_admission_reads_the_root_set() is True
+
+
+@pytest.mark.unit
+def test_a_page_that_only_ranks_by_roots_still_narrows_the_ceiling():
+    """The withholding is conditional, and these shapes are the condition.
+
+    Nothing in them reduces the root set to a value, so a root the ceiling
+    hides changes no answer: the date-only page and the attribute page keep
+    the narrowed ceiling and the cost it buys.
+    """
+
+    for builder in (_builder(), _membership_builder("attribute")):
+        _sql, params = builder.build_candidate_cursor_page_query(
+            before_start_time=ROOT_SET_CURSOR,
+            before_session_id=_sid(0),
+            scan_start_time=END - timedelta(hours=SPARSE_HOURS * 2),
+        )
+        assert params["candidate_root_scan_end_us"] == (
+            params["cursor_before_start_us"] + 1
+        )
+        assert builder.page_admission_reads_the_root_set() is False
+
+
+class _RootSetServer(_Server):
+    """A CH double whose admission is computed from the roots it can SEE.
+
+    Each session is a set of live root instants. This double reads the ROOT
+    scan's own window out of the rendered statement - never a window the test
+    assumes - keeps the roots inside it, and admits a session only when more
+    than ``MIN_TRACES`` survive, which is the ``traces_count`` HAVING the
+    statement carries. ``session_start`` is the minimum of the survivors and
+    the keyset is applied to that, in that order, exactly as the statement
+    does. Every session here satisfies the attribute filter: round two put
+    membership evidence on the request window, and this case is about the set.
+
+    ``build_filter_match_query`` re-applies the same HAVING over the whole
+    request window, which ``_Server._match`` models by carrying only the
+    sessions whose FULL root set admits them.
+    """
+
+    def __init__(self, *, roots, **kwargs):
+        self.roots = roots
+        self.root_window: tuple[datetime, datetime] | None = None
+        admitted = {
+            sid: min(instants)
+            for sid, instants in roots.items()
+            if len(instants) > MIN_TRACES
+        }
+        super().__init__(
+            rows=[
+                {"session_id": sid, "session_start": start}
+                for sid, start in sorted(
+                    admitted.items(), key=lambda item: item[1], reverse=True
+                )
+            ],
+            full_state=admitted,
+            **kwargs,
+        )
+        self._sql = ""
+
+    def execute_ch_query(self, query, params, *, timeout_ms, settings):
+        if "AS remaining_count" in query:
+            self._sql = query
+        return super().execute_ch_query(
+            query, params, timeout_ms=timeout_ms, settings=settings
+        )
+
+    def _slice(self, params):
+        window = _cte(self._sql, "candidate_root_identities")
+        floor, ceiling = _floor_of(window, params), _ceiling_of(window, params)
+        self.root_window = (floor, ceiling)
+        cursor = _moment(params["cursor_before_start_us"])
+        found = []
+        for sid, instants in self.roots.items():
+            visible = [at for at in instants if floor <= at < ceiling]
+            # The HAVING, over the root set this scan can see.
+            if len(visible) <= MIN_TRACES:
+                continue
+            start = min(visible)
+            # The keyset, on the start this scan computes.
+            if start >= cursor:
+                continue
+            found.append({"session_id": sid, "session_start": start})
+        found.sort(key=lambda row: row["session_start"], reverse=True)
+        return SimpleNamespace(
+            data=[{**row, "remaining_count": len(found)} for row in found],
+            columns=["session_id", "session_start", "remaining_count"],
+        )
+
+
+@pytest.mark.unit
+def test_a_session_whose_traces_straddle_the_cursor_is_not_displaced():
+    """The page row a ceiling-bounded aggregate silently loses.
+
+    ``_sid(0)`` has three live roots - one ten hours below the cursor and two
+    above it - so it has three traces, passes ``traces_count > 2``, starts
+    above the floor and below the cursor, and belongs at the TOP of this page.
+    A root scan capped at the cursor sees one of those roots, counts one trace,
+    fails the HAVING and never discovers it. Every candidate such a scan does
+    discover survives the gate with an unchanged start, so the page publishes
+    the two rows BELOW the one it lost.
+    """
+
+    below_cursor = ROOT_SET_CURSOR - timedelta(hours=10)
+    roots = {
+        _sid(0): [
+            below_cursor,
+            ROOT_SET_CURSOR + timedelta(hours=2),
+            ROOT_SET_CURSOR + timedelta(hours=3),
+        ],
+        **{
+            _sid(index): [END - timedelta(hours=base + offset) for offset in range(3)]
+            for index, base in enumerate((120, 140, 160), start=1)
+        },
+    }
+    server = _RootSetServer(roots=roots)
+    page = _read(
+        _root_set_builder(page_size=2),
+        server,
+        before_start_time=ROOT_SET_CURSOR,
+        before_session_id=_sid(9),
+    )
+
+    floor, ceiling = server.root_window
+    # Guard the guard: the floor must reach the below-cursor root, or this
+    # would be pinning the floor rather than the ceiling.
+    assert floor <= below_cursor, "the width search must reach the lost root"
+    assert [row["session_id"] for row in page.rows] == [_sid(0), _sid(1)]
+    assert page.has_more is True
+    assert ceiling == END

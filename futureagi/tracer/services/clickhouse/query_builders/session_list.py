@@ -1683,8 +1683,14 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         # silently lost it.  Root evidence is safe to narrow by the same token:
         # a root the slice cannot see is a root below the floor, which puts the
         # session's true start below every row the slice can publish.  Session
-        # aggregates (cost, tokens, traces, duration) are computed from roots
-        # too, so they move with the root scan and stay consistent with it.
+        # aggregates (cost, tokens, traces, duration, the messages, the
+        # org-scope project count) are computed from roots too, and the FLOOR
+        # stays consistent with them for the same reason: a set it truncates
+        # belongs to a session whose true start is below it.  The CEILING does
+        # not - it drops roots ABOVE the cursor from a session that still
+        # belongs on the page - so the statement withholds it whenever one of
+        # those aggregates decides admission.  See
+        # ``page_admission_reads_the_root_set``.
         params.setdefault("candidate_root_scan_start_us", params["start_date_us"])
         params.setdefault("candidate_root_scan_end_us", params["end_date_us"])
         root_span_time_scope = self._physical_time_scope_sql(
@@ -2617,6 +2623,34 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         """
         return query, params
 
+    def page_admission_reads_the_root_set(self) -> bool:
+        """Whether a page predicate is a function of the root SET, not of roots.
+
+        Most of this statement turns on root EXISTENCE: a session is a
+        candidate because it has a live root, and it ranks by the earliest one.
+        Some predicates are not like that.  ``duration`` is a ``dateDiff`` over
+        the min and max of a session's whole live-root set, ``total_cost`` and
+        ``total_tokens`` are sums over it, ``traces_count`` a ``uniqExact``,
+        and ``first_message``/``last_message`` an ``argMin``/``argMax`` -
+        ``_build_having_clauses`` turns any of them into a ``HAVING`` over
+        ``resolved_root_sessions``.  The org-scope identity-collision guard is
+        the same shape with its comparison in Python: ``uniqExact(project_id)``
+        over that relation, which the view refuses a page for once it exceeds
+        one.
+
+        Each of these changes VALUE when the relation loses roots, rather than
+        only losing a session that could not have been published anyway, which
+        is why the root scan's upper bound cannot be narrowed under them.  See
+        ``build_candidate_cursor_page_query``.  ``_build_having_clauses`` is
+        asked rather than re-deriving its column set here: a second copy of
+        that set is how the next sibling of this defect gets written.  The
+        throwaway ``params`` keeps the question free of side effects.
+        """
+
+        return bool(self._build_having_clauses(params={})) or (
+            self.project_ids is not None
+        )
+
     def build_candidate_cursor_page_query(
         self,
         *,
@@ -2658,16 +2692,39 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         contract lives in ``selectors.session_candidate_slice`` and is the only
         supported caller of this argument.
 
-        A raised floor also moves the cursor keyset, which is why a sliced
-        continuation narrows the ROOT scan's UPPER bound to the cursor instant
-        as well. Without it the keyset would compare the cursor against
-        inflated starts and could hide a session that belongs on this page;
-        with it, every session whose true start is above the cursor has no root
-        at or below the cursor at all and is excluded by the scan itself. That
-        ceiling is a root argument too, so it moves the root bindings only:
-        membership evidence above the cursor instant can be the only proof a
-        session matches, and truncating it loses the same page row the floor
-        does. The narrowing is exact for the unsliced statement too, but it is
+        A sliced continuation ALSO narrows the ROOT scan's UPPER bound to the
+        cursor instant, and that ceiling is a cost lever rather than a
+        correctness requirement. A session the ceiling hides has no root in
+        [floor, cursor] at all, so with the floor raised its earliest root is
+        below the floor, and the gate's rule (2) already places it beneath
+        every row the slice can publish. The ceiling is a root argument too, so
+        like the floor it moves the root bindings only: membership evidence
+        above the cursor instant can be the only proof a session matches.
+
+        THE CEILING IS EXACT ONLY WHILE ADMISSION TURNS ON ROOT EXISTENCE. A
+        reviewer found the sibling of the membership defect above: some page
+        predicates are a function of the root SET rather than of root
+        existence - the ``traces_count``/``duration``/``total_cost``/
+        ``total_tokens``/message ``HAVING`` over ``resolved_root_sessions``,
+        and the org-scope ``uniqExact(project_id)`` collision guard. Truncating
+        the set ABOVE the cursor changes such a predicate's VALUE without
+        changing the session's rank: roots at cursor-10h, cursor+2h and
+        cursor+3h are three traces to ``traces_count > 2`` and one to the
+        ceiling-bounded relation, so the session fails the ``HAVING``, never
+        enters ``sessions``, and is absent from both the rows and the count -
+        while its true start sits ABOVE the floor and BELOW the cursor, exactly
+        where rule (2) claims nothing can hide. The floor cannot do this: a set
+        the floor truncates belongs to a session with a root below the floor,
+        hence a true start below every publishable row.
+
+        So the ceiling is bound to the cursor instant only when
+        ``page_admission_reads_the_root_set()`` is false, and otherwise stays
+        at the request end. Computing those aggregates over a wider relation
+        while the keyset kept the bounded one was the alternative, and it
+        cannot read fewer rows: the aggregate relation and the keyset relation
+        are the same physical scan, so widening one widens the scan and the
+        second relation only duplicates the ``argMax`` replay over rows already
+        read. The narrowing is exact for the unsliced statement too, but it is
         applied only alongside a raised floor so the whole-window statement
         keeps its current bindings.
         """
@@ -2693,10 +2750,16 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             if not self.start_date <= scan_start_time < self.end_date:
                 raise ValueError("candidate scan floor must stay inside the window")
             params["candidate_root_scan_start_us"] = _unix_microseconds(scan_start_time)
-            if before_start_time is not None:
+            if (
+                before_start_time is not None
+                and not self.page_admission_reads_the_root_set()
+            ):
                 # Half-open upper bound, so the cursor instant itself is read:
                 # a session tied on the cursor start is separated by the id
                 # tie-break in the keyset clause below, not by the scan.
+                # Withheld when a page predicate reads the root SET, because
+                # truncating the set above the cursor changes that predicate's
+                # value while leaving the session's rank where it was.
                 params["candidate_root_scan_end_us"] = (
                     _unix_microseconds(before_start_time) + 1
                 )
