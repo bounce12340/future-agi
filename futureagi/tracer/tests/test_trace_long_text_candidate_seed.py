@@ -469,6 +469,13 @@ def test_bounded_anchor_stays_a_necessary_condition(value):
 
     A row holding the whole value holds every substring of it, so a shorter
     anchor can only widen the granule set, never hide a matching row.
+
+    Stated as substring-in-order on purpose, not as a subset of the runs. A
+    value with no run boundary in it is a single run, and the budget then keeps
+    a prefix of that one run rather than a subset of several. A prefix is still
+    a substring in value order, so the necessity property holds either way and
+    this is the invariant that covers both shapes. Please do not narrow it back
+    to a subset check.
     """
 
     bounded = _caseless_ascii_ngram_anchor(value)
