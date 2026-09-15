@@ -16293,40 +16293,57 @@ def test_a_checkpoint_is_never_committed_past_an_unclassified_candidate() -> Non
     )
 
     assert page.complete is False
-    assert [attempt.kind for attempt in page.attempts].count("classify") == 0
-    acquired = [
-        row["start_time"]
-        for row in rows
-        if row["start_time"] >= END - timedelta(minutes=15)
-    ]
+    # Deferred ACROSS the walk and spent once at the exit. No classifier
+    # between the two seeds - that is the amortization - and exactly one after
+    # them, because a hop that ends with a buffer must resolve it to have any
+    # position at all to offer.
+    assert [
+        attempt.kind
+        for attempt in page.attempts
+        if attempt.kind in {"seed", "classify"}
+    ] == ["seed", "seed", "classify"]
+    acquired = [row for row in rows if row["start_time"] >= END - timedelta(minutes=15)]
     assert len(acquired) == 4
     if page.continuation_before_start_time is not None:
         bound = page.continuation_before_start_time
-    elif page.continuation_slice_end is not None:
-        bound = page.continuation_slice_end
     else:
-        # No position offered at all: the next hop restarts the page, which
-        # re-reads every candidate. Exact, and the honest answer for a hop that
-        # classified nothing.
-        bound = None
-    assert bound is None or all(start_time < bound for start_time in acquired)
+        bound = page.continuation_slice_end
+    # A position must be OFFERED. Declining every one of them is how this hop
+    # used to end the public list while four matches were still unread.
+    assert bound is not None
+    published = {row["id"] for row in page.rows}
+    # Every acquired candidate is accounted for exactly one of the two ways a
+    # candidate may be: published by this hop, or left strictly below the
+    # bound the next hop resumes at so that it is re-read. A candidate that is
+    # neither is one no page will ever show.
+    assert all(
+        (row["id"] in published) or (row["start_time"] < bound) for row in acquired
+    )
 
 
-def test_a_stopped_cursor_page_still_publishes_every_match_exactly_once() -> None:
-    """End to end over the same population: no row is skipped or duplicated.
+def _walk_the_public_trace_list_cursor_chain(
+    *,
+    rows: list[dict[str, Any]],
+    request_start: datetime,
+    page_size: int,
+    max_seed_attempts: int,
+    max_query_count: int = 50,
+    deadline_ms: int = 5_000,
+    hops: int = 16,
+) -> list[str]:
+    """Follow the cursor chain the trace list transport actually follows.
 
-    The first hop stops mid-walk with its buffer unclassified; the chain then
-    runs to exhaustion. Whatever positions the hops commit, the union of the
-    published rows must be the whole match set, once each, newest first.
+    Each hop re-issues the read with the row cursor AND the signed scan
+    checkpoint the previous hop committed, exactly as the list view does, and
+    the loop stops when the view would stop offering a next page. A hop that
+    publishes no row and commits no position is therefore not slow, it is the
+    END of the public list - so this asserts progress hop by hop rather than
+    only on the final union, and fails AT the stalled hop.
     """
 
-    request_start = END - timedelta(minutes=90)
-    rows = _slice_spread_cursor_rows()
     published: list[str] = []
-    continuation: dict[str, Any] = {}
-    attempts_allowed = 2
-
-    for _ in range(12):
+    carry: dict[str, Any] = {}
+    for _ in range(hops):
         builder = _CursorPageFillIdentityHydrationFakeBuilder(
             rows,
             start=request_start,
@@ -16335,35 +16352,210 @@ def test_a_stopped_cursor_page_still_publishes_every_match_exactly_once() -> Non
             recommended_batch_size=200,
             recommended_seed_batch_size=200,
         )
+        previous = dict(carry)
         page = read_bounded_filter_page(
             builder=builder,
             analytics=_IdentityHydrationFakeExecutor(builder),
             filters=[_time_filter(request_start, END)],
             key_field="id",
             page_number=0,
-            page_size=2,
-            deadline_ms=5_000,
-            max_seed_attempts=attempts_allowed,
+            page_size=page_size,
+            deadline_ms=deadline_ms,
+            max_seed_attempts=max_seed_attempts,
+            max_candidates=200,
+            max_query_count=max_query_count,
+            classify_batch_size=200,
+            include_incomplete_rows=True,
+            bounded_continuation=True,
+            carry_continuation_slice_width=True,
+            **carry,
+        )
+        published.extend(row["id"] for row in page.rows)
+        if page.complete and not page.has_more:
+            return published
+        # The list view's own gate: without one of these there is no next
+        # cursor to hand the client, and the list has ended.
+        assert page.has_more or page.continuation_slice_end is not None, (
+            "hop offered no next page while matches remained"
+        )
+        if page.rows:
+            carry = {
+                "cursor_start_time": page.rows[-1]["start_time"],
+                "cursor_order_token": page.rows[-1]["id"],
+            }
+        else:
+            carry = {
+                key: value
+                for key, value in carry.items()
+                if key in {"cursor_start_time", "cursor_order_token"}
+            }
+        if not page.has_more:
+            carry.update(
+                continuation_slice_start=page.continuation_slice_start,
+                continuation_slice_end=page.continuation_slice_end,
+                continuation_before_start_time=page.continuation_before_start_time,
+                continuation_before_id=page.continuation_before_id,
+            )
+        assert page.rows or carry != previous, (
+            "hop published nothing and moved nothing: the identical retry "
+            "returns the identical empty page"
+        )
+    raise AssertionError("cursor chain did not terminate")
+
+
+def test_a_stopped_cursor_page_still_publishes_every_match_exactly_once() -> None:
+    """End to end over the same population: no row is skipped or duplicated.
+
+    The first hop stops mid-walk with its buffer unclassified; the chain then
+    runs to exhaustion under ONE fixed attempt budget - the budget is the
+    hop's, not a knob the caller relaxes when a hop comes back empty. Whatever
+    positions the hops commit, the union of the published rows must be the
+    whole match set, once each, newest first.
+    """
+
+    request_start = END - timedelta(minutes=90)
+    rows = _slice_spread_cursor_rows()
+
+    published = _walk_the_public_trace_list_cursor_chain(
+        rows=rows,
+        request_start=request_start,
+        page_size=2,
+        max_seed_attempts=2,
+    )
+
+    assert published == [row["id"] for row in rows]
+    assert len(published) == len(set(published))
+
+
+def test_a_hop_that_classifies_nothing_still_commits_where_it_scanned() -> None:
+    """THE FORWARD-PROGRESS RULE, on the shape that used to stop the list.
+
+    A sparse cursor hop whose buffer never reaches the public prefix declines
+    every checkpoint the walk offers, because each one lies past a candidate
+    nobody classified. Decline them all and the hop returns zero rows and four
+    null continuation fields - a page the transport cannot tell from the end
+    of the data, and one the identical retry reproduces exactly.
+
+    So the hop must spend, at the exit, the classifier its deferral promised,
+    and commit WHERE THE SCAN REACHED rather than where its last published row
+    was: this hop publishes nothing at all, and must still move.
+    """
+
+    request_start = END - timedelta(minutes=90)
+    rows = _slice_spread_cursor_rows()
+    # Every root the two slices acquire is rejected by latest state, so this
+    # hop can publish nothing whatever it classifies.
+    builder = _CursorPageFillIdentityHydrationFakeBuilder(
+        rows,
+        start=request_start,
+        end=END,
+        match_rows=[],
+        recommended_batch_size=200,
+        recommended_seed_batch_size=200,
+    )
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=_IdentityHydrationFakeExecutor(builder),
+        filters=[_time_filter(request_start, END)],
+        key_field="id",
+        page_number=0,
+        # Four acquired candidates against a six-row prefix: the sufficiency
+        # rule declines every flush, so the walk reaches its exit still owing
+        # the classifier its deferral promised.
+        page_size=5,
+        deadline_ms=5_000,
+        max_seed_attempts=2,
+        max_candidates=200,
+        max_query_count=50,
+        classify_batch_size=200,
+        include_incomplete_rows=True,
+        bounded_continuation=True,
+        carry_continuation_slice_width=True,
+    )
+
+    assert page.rows == []
+    assert page.complete is False
+    # Zero rows published, one classifier spent at the exit, and a position
+    # committed strictly older than the boundary this hop started from.
+    assert [attempt.kind for attempt in page.attempts].count("classify") == 1
+    assert page.continuation_slice_end is not None
+    assert page.continuation_slice_end < END
+
+
+def test_a_walk_that_owes_a_classifier_keeps_the_wall_to_pay_for_it() -> None:
+    """The WALL half of the same rule, which is a different code path.
+
+    The attempt budget ends the seed loop and the progress flush runs on the
+    way out. The wall does not: it raises out of ``execute`` from wherever the
+    walk happens to be, and a walk that acquired until there was nothing left
+    would reach that flush with no wall to run it - which is the same stopped
+    list by a different route.
+
+    So while a hop still owes its buffer a classifier and has committed no
+    position, its ACQUIRING statements run one statement envelope short. The
+    room is not predicted, it is held back, and the flush on the way out is
+    what spends it. Here the walk is refused its fifth seed with 2,520 ms
+    still standing before the classification deadline, and it buys the
+    checkpoint with them.
+    """
+
+    request_start = END - timedelta(days=30)
+    rows = [
+        {
+            "id": f"trace-{minute:02d}",
+            "root_span_id": f"root-{minute:02d}",
+            "start_time": END - timedelta(minutes=minute),
+            "trace_name": f"presented-{minute:02d}",
+        }
+        # Two in the opening five-minute slice, two in the ten-minute slice
+        # after it, and a month of empty history below them.
+        for minute in (1, 2, 6, 7)
+    ]
+    builder = _CursorPageFillIdentityHydrationFakeBuilder(
+        rows,
+        start=request_start,
+        end=END,
+        match_rows=[],
+        recommended_batch_size=200,
+        recommended_seed_batch_size=200,
+    )
+    clock = _ManualMonotonic()
+    executor = _IdentityHydrationFakeExecutor(
+        builder,
+        clock=clock,
+        durations_ms={"seed": 795, "match_identity": 400},
+    )
+
+    with mock.patch("tracer.selectors.trace_filter_reads.monotonic", new=clock):
+        page = read_bounded_filter_page(
+            builder=builder,
+            analytics=executor,
+            filters=[_time_filter(request_start, END)],
+            key_field="id",
+            page_number=0,
+            page_size=5,
+            deadline_ms=6_000,
+            max_seed_attempts=24,
             max_candidates=200,
             max_query_count=50,
             classify_batch_size=200,
             include_incomplete_rows=True,
             bounded_continuation=True,
-            **continuation,
+            carry_continuation_slice_width=True,
         )
-        published.extend(row["id"] for row in page.rows)
-        if page.complete and not page.has_more:
-            break
-        if page.rows:
-            last = page.rows[-1]
-            continuation = {
-                "cursor_start_time": last["start_time"],
-                "cursor_order_token": last["id"],
-            }
-        else:
-            # A hop that published nothing must not be repeated unchanged, or
-            # the chain cannot terminate; give the next one more room.
-            attempts_allowed += 2
 
-    assert published == [row["id"] for row in rows]
-    assert len(published) == len(set(published))
+    assert page.complete is False
+    assert page.error_code == "deadline_exceeded"
+    assert page.rows == []
+    # Four seeds accepted, the fifth refused against the held-back envelope,
+    # and the classifier that resolves the buffer paid for out of it.
+    assert [attempt.kind for attempt in page.attempts] == [
+        "seed",
+        "seed",
+        "seed",
+        "seed",
+        "classify",
+    ]
+    assert page.continuation_slice_end is not None
+    assert page.continuation_slice_end < END
