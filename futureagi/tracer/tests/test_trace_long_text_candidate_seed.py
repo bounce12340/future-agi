@@ -7,13 +7,15 @@ import pytest
 from tracer.services.clickhouse.query_builders.trace_list import TraceListQueryBuilder
 from tracer.services.clickhouse.v2.query_builders.trace_list import (
     _CLICKHOUSE_MAX_QUERY_SIZE_BYTES,
+    TraceListQueryBuilderV2,
     _caseless_ascii_ngram_anchor,
 )
 from tracer.tests.test_bounded_trace_filter_reads import (
     _attribute_filter,
     _render_driver_sql,
 )
-from tracer.tests.test_trace_indexed_coordinate_reads import END, builder
+from tracer.tests.test_bounded_trace_filter_reads import _time_filter
+from tracer.tests.test_trace_indexed_coordinate_reads import END, PROJECT, builder
 from tracer.tests.test_trace_root_physical_replay import assert_coherent_classifier
 
 pytestmark = pytest.mark.unit
@@ -334,4 +336,29 @@ def test_ordinary_long_text_still_seeds_and_still_hints(operation):
     assert subject.supports_filter_candidate_seed_page()
     rendered = _rendered_seed_statement(subject)
     assert "arrayMap(x -> lowerUTF8(x), mapValues(attrs_string))" in rendered
+    assert len(rendered.encode()) < _CLICKHOUSE_MAX_QUERY_SIZE_BYTES
+
+
+def test_oversized_mixed_typed_text_keeps_the_statement_parseable():
+    """The picker-provenance IN path inlines the same way and takes the same limit."""
+
+    subject = TraceListQueryBuilderV2(
+        project_id=PROJECT,
+        filters=[
+            _time_filter(END - timedelta(days=365), END),
+            {
+                "column_id": "attribute_0",
+                "filter_config": {
+                    "col_type": "SPAN_ATTRIBUTE",
+                    "filter_type": "text",
+                    "filter_op": "in",
+                    "filter_value": [OVERSIZED_TEXT, OVERSIZED_TEXT + " tail"],
+                    "attribute_value_types": ["string", "string"],
+                },
+            },
+        ],
+        page_size=25,
+    )
+    rendered = _rendered_seed_statement(subject)
+    assert "indexHint(hasAny(arrayMap" not in rendered
     assert len(rendered.encode()) < _CLICKHOUSE_MAX_QUERY_SIZE_BYTES
