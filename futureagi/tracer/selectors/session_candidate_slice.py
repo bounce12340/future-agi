@@ -1,0 +1,493 @@
+"""Exact Session-list cursor pages from a bounded slice of the request window.
+
+WHY THIS EXISTS. The candidate cursor statement replays latest physical state
+across the WHOLE requested window: it builds the window's root identity set,
+then probes every row in the window against it and aggregates the survivors.
+Measured on production against one tenant's thirty-day window, that statement
+did not return - it was still reading at 35 s, having covered 200.3M rows /
+20.9 GB - while the product's request wall is 30 s, so the page is a 503 rather
+than a slow page. The scan is not the cost: a bare count over the same window
+is 2.85 s. The latest-state replay is, and the only lever that moves it is the
+number of rows it considers. The identical statement with its scanned window
+narrowed to the newest nine days of the same request returned a full page in
+605 ms.
+
+WHY A SLICE IS NOT EXACT ON ITS OWN. ``session_start`` is the earliest live
+root a session has inside the scanned window. Raise that window's floor to T
+and a session whose true first root lies below T keeps only the roots at or
+above it, so its start is INFLATED - and an inflated start can rank anywhere,
+including above rows that genuinely belong on the page. Production shows this
+is not a corner case: of the 26 candidates the nine-day slice returned, the
+NEWEST one truly started twenty-two days earlier. Checking the rows that came
+back cannot detect this, because the row that is wrong is the row you are
+looking at, and the row it displaced is one you never saw.
+
+THE RULE THIS MODULE IMPLEMENTS. Discovery in the slice, then re-resolution of
+those candidates against their full state over the whole request window, then a
+gate:
+
+    a candidate whose re-resolved start EQUALS its slice start has no root
+    below T, so its slice key is already its true key;
+
+    every session the slice did NOT discover has no root inside it, so its true
+    start is below T, hence below every such candidate;
+
+    every discovered session outside the fetched prefix has a slice key below
+    the prefix's lowest, and a true key no higher than its own slice key, hence
+    also below every member of the page;
+
+    so once ``page_size`` candidates survive with an unchanged start, the first
+    ``page_size`` of them IN THE SLICE'S OWN ORDER are exactly the page.
+
+Fewer than ``page_size`` survivors proves nothing about what lies below the
+floor, so the floor is lowered and the whole thing runs again; at the request
+start the statement is the unsliced one and is exact by construction. This page
+therefore degrades to today's statement in the worst case and is never worse
+than it.
+
+The gate compares starts rather than re-sorting in Python on purpose: the
+published order's tie-break is ClickHouse's own ``session_id`` collation, and a
+survivor's slice key already IS its true key, so the server's ordering is
+carried through untouched.
+
+WIDTH. A slice's cost tracks the rows it contains, and on a real tenant that
+varies by two orders of magnitude between adjacent days, so the floor cannot be
+a duration. Every candidate width is costed first against an index-only
+``EXPLAIN ESTIMATE`` - one row, 54 bytes measured - and the widest width inside
+the row budget is the one issued.
+"""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any, Protocol
+
+from tracer.selectors.filter_seed_width import EMPTY_DENSITY_ESTIMATE
+from tracer.services.clickhouse.query_builders.filter_seed_witness import floor_hour
+from tracer.services.clickhouse.read_budget import ReadDeadline
+
+# The rows one candidate slice may knowingly select, stated on the DENSITY
+# PROBE's scale rather than the statement's. Production, one tenant, one
+# request: the probe estimated 649,044 rows for the width whose statement then
+# read 2,245,046 and returned a full page in 605 ms - the statement inlines its
+# CTEs and touches the window about four times. One million index rows is
+# therefore roughly three and a half million statement rows, a slice the
+# measured replay rate finishes inside a second.
+_CANDIDATE_SLICE_TARGET_INDEX_ROWS = 1_000_000
+# The narrowest width the search considers, and the unit the primary key's
+# ``toStartOfHour(start_time)`` component prunes on.
+_MIN_SLICE_HOURS = 1
+# Probes per width decision. The search is geometric on whole hours, and the
+# crossing it hunts can be a few hours wide: measured on one tenant, the page's
+# whole answer sat inside a forty-minute burst, and a width three hours short of
+# it returned one session. Bracketing a YEAR-wide request down to that costs
+# about six halvings of the log range, so the cap is set where the search
+# actually converges rather than where it merely gets close. Each probe reads
+# the primary index - one row, 54 bytes measured - so the cost of the cap is
+# round trips, not server work.
+_MAX_DENSITY_PROBES = 7
+# Slice statements before this lane stops narrowing and issues the unsliced
+# statement, which is exactly what ships today.
+_MAX_SLICE_ATTEMPTS = 4
+_DENSITY_PROBE_MAX_RESULT_ROWS = 256
+# ``build_filter_match_query`` refuses a batch wider than this, and a page this
+# lane cannot verify is a page it must not narrow.
+_MAX_VERIFIABLE_CANDIDATES = 200
+
+
+class _QueryExecutor(Protocol):
+    def execute_ch_query(
+        self,
+        query: str,
+        params: dict[str, Any],
+        *,
+        timeout_ms: int,
+        settings: dict[str, Any],
+    ) -> Any: ...
+
+
+@dataclass(frozen=True)
+class SessionCandidateSlicePage:
+    """One exact cursor page, plus what it cost to prove it.
+
+    ``rows`` are the published candidates in the server's own order.
+    ``has_more`` follows today's rule: the discovery statement returned more
+    candidates than the page holds. ``remaining_count`` is that statement's own
+    ``count() OVER()`` - exact when ``slice_start`` is ``None``, and a LOWER
+    BOUND otherwise, the same contract the bounded filter route publishes.
+    """
+
+    rows: list[dict[str, Any]]
+    has_more: bool
+    remaining_count: int
+    slice_start: datetime | None
+    statement_count: int
+
+
+@dataclass(frozen=True)
+class _Survivors:
+    rows: list[dict[str, Any]]
+    deepest_displaced: datetime | None
+    statement_count: int
+
+
+def read_candidate_slice_page(
+    *,
+    builder: Any,
+    analytics: _QueryExecutor,
+    deadline: ReadDeadline,
+    read_settings: Callable[[int], dict[str, Any]],
+    query_timeout_ms: int,
+    before_start_time: datetime | None = None,
+    before_session_id: str | None = None,
+) -> SessionCandidateSlicePage:
+    """Return one exact candidate cursor page, narrowing the scan when it can.
+
+    Every statement issued here is the builder's own: discovery is
+    ``build_candidate_cursor_page_query`` with a raised floor and otherwise
+    identical text, the verifier is ``build_filter_match_query``, and the width
+    search reads only the primary index. Nothing here decides membership; the
+    gate in this module's docstring does.
+    """
+
+    page_size = int(builder.page_size)
+    request_start, request_end = builder.parse_time_range(builder.filters)
+    # The cursor's keyset instant and the parsed request bounds do not have to
+    # agree about tzinfo, and every width decision below is arithmetic on both.
+    scan_end = _aligned(before_start_time, request_start) or request_end
+    reader = _SliceReader(
+        builder=builder,
+        analytics=analytics,
+        deadline=deadline,
+        read_settings=read_settings,
+        query_timeout_ms=query_timeout_ms,
+        page_size=page_size,
+        before_start_time=before_start_time,
+        before_session_id=before_session_id,
+        request_start=request_start,
+        scan_end=scan_end,
+    )
+    floor = (
+        reader.initial_floor() if _slicing_is_available(builder, page_size) else None
+    )
+
+    attempt = 0
+    while True:
+        attempt += 1
+        rows, count = reader.slice_page(floor)
+        if floor is None:
+            # The unsliced statement. ``session_start`` is already the whole
+            # window's minimum, so the server's order is the published order.
+            return SessionCandidateSlicePage(
+                rows=rows[:page_size],
+                has_more=len(rows) > page_size,
+                remaining_count=count,
+                slice_start=None,
+                statement_count=reader.statements,
+            )
+        # A slice holding no more candidates than a page cannot settle the page
+        # whatever they resolve to - what is below the floor is unseen - so it
+        # widens without paying for a full-window verifier that cannot help.
+        survivors = (
+            reader.resolve(rows)
+            if len(rows) > page_size
+            else _Survivors(rows=[], deepest_displaced=None, statement_count=0)
+        )
+        if len(survivors.rows) >= page_size:
+            return SessionCandidateSlicePage(
+                rows=survivors.rows[:page_size],
+                has_more=len(rows) > page_size,
+                remaining_count=count,
+                slice_start=floor,
+                statement_count=reader.statements,
+            )
+        # Fewer survivors than a page. Sessions below the floor are unseen and
+        # unordered against each other, so nothing here can be published yet.
+        floor = (
+            None
+            if attempt >= _MAX_SLICE_ATTEMPTS
+            else reader.widened_floor(floor, survivors.deepest_displaced)
+        )
+
+
+class _SliceReader:
+    """The statements one candidate page may issue, and their bookkeeping."""
+
+    def __init__(
+        self,
+        *,
+        builder: Any,
+        analytics: _QueryExecutor,
+        deadline: ReadDeadline,
+        read_settings: Callable[[int], dict[str, Any]],
+        query_timeout_ms: int,
+        page_size: int,
+        before_start_time: datetime | None,
+        before_session_id: str | None,
+        request_start: datetime,
+        scan_end: datetime,
+    ) -> None:
+        self._builder = builder
+        self._analytics = analytics
+        self._deadline = deadline
+        self._read_settings = read_settings
+        self._query_timeout_ms = query_timeout_ms
+        self._page_size = page_size
+        self._before_start_time = before_start_time
+        self._before_session_id = before_session_id
+        self._request_start = request_start
+        self._scan_end = scan_end
+        self.statements = 0
+        # One width's estimate never changes inside one page read, and the
+        # widening search revisits the interval the first search bracketed.
+        self._probed: dict[int, int | None] = {}
+        # The narrowest width this read has seen exceed the budget. Every later
+        # search is bounded by it, so a short slice re-searches a bracket that
+        # is already tight instead of starting again from a fresh doubling.
+        self._refused_hours: int | None = None
+
+    # -- statements ------------------------------------------------------
+
+    def _execute(self, query: str, params: dict[str, Any], max_result_rows: int) -> Any:
+        self.statements += 1
+        return self._analytics.execute_ch_query(
+            query,
+            params,
+            timeout_ms=self._deadline.remaining_ms(self._query_timeout_ms),
+            settings=self._read_settings(max_result_rows),
+        )
+
+    def slice_page(self, floor: datetime | None) -> tuple[list[dict[str, Any]], int]:
+        query, params = self._builder.build_candidate_cursor_page_query(
+            before_start_time=self._before_start_time,
+            before_session_id=self._before_session_id,
+            scan_start_time=floor,
+        )
+        result = self._execute(query, params, self._page_size + 1)
+        rows = list(result.data or [])
+        count = int(rows[0].get("remaining_count", 0) or 0) if rows else 0
+        return rows, count
+
+    def probe_hours(self, hours: int) -> int | None:
+        """Estimated rows in the newest ``hours``; ``None`` when unreadable."""
+        if hours in self._probed:
+            return self._probed[hours]
+        counted = self._probe_rows(self._floor_for_hours(hours))
+        self._probed[hours] = counted
+        if counted is not None and counted > _CANDIDATE_SLICE_TARGET_INDEX_ROWS:
+            self._refused_hours = min(self._refused_hours or hours, hours)
+        return counted
+
+    def _probe_rows(self, floor: datetime) -> int | None:
+        query, params = self._builder.build_candidate_slice_density_probe_query(
+            slice_start=floor, slice_end=self._scan_end
+        )
+        result = self._execute(query, params, _DENSITY_PROBE_MAX_RESULT_ROWS)
+        estimate = self._builder.candidate_slice_density_estimate(
+            result.data or (), getattr(result, "columns", None)
+        )
+        if estimate is EMPTY_DENSITY_ESTIMATE:
+            # An empty estimate reads as a genuine zero only because the
+            # full-window probe ran first and proved this statement's result
+            # shape readable for this request; a narrower key condition of the
+            # identical statement naming no part is then real emptiness.
+            return 0
+        return estimate if isinstance(estimate, int) else None
+
+    def resolve(self, rows: list[dict[str, Any]]) -> _Survivors:
+        """Re-resolve the slice's candidates against the whole request window.
+
+        Returns the candidates whose start is unchanged, in the slice's own
+        order, and the earliest true start among those that moved - the moment
+        a wider slice has to reach before those candidates can be trusted.
+        """
+
+        identities = [
+            str(row.get("session_id") or "") for row in rows if row.get("session_id")
+        ]
+        if not identities:
+            return _Survivors(rows=[], deepest_displaced=None, statement_count=0)
+        before = self.statements
+        batch = _classify_batch_size(self._builder, len(identities))
+        resolved: dict[str, Any] = {}
+        for offset in range(0, len(identities), batch):
+            chunk = identities[offset : offset + batch]
+            query, params = self._builder.build_filter_match_query(chunk)
+            if not query:
+                continue
+            result = self._execute(query, params, len(chunk))
+            for row in result.data or []:
+                key = str(row.get("session_id") or "")
+                if key:
+                    resolved[key] = row.get("start_time")
+        unchanged: list[dict[str, Any]] = []
+        deepest: datetime | None = None
+        for row in rows:
+            true_start = resolved.get(str(row.get("session_id") or ""))
+            if true_start is not None and true_start == row.get("session_start"):
+                unchanged.append(row)
+                continue
+            # A candidate that moved, or that full state no longer places in
+            # the window at all, is not publishable from this slice. Only a
+            # moved one tells the widener where it has to reach.
+            if true_start is not None and (deepest is None or true_start < deepest):
+                deepest = true_start
+        return _Survivors(
+            rows=unchanged,
+            deepest_displaced=deepest,
+            statement_count=self.statements - before,
+        )
+
+    # -- width -----------------------------------------------------------
+
+    def _window_hours(self) -> int:
+        span = self._scan_end - self._request_start
+        return max(_MIN_SLICE_HOURS, int(span / timedelta(hours=1)))
+
+    def _floor_for_hours(self, hours: int) -> datetime:
+        return max(
+            self._request_start,
+            floor_hour(self._scan_end - timedelta(hours=hours)),
+        )
+
+    def initial_floor(self) -> datetime | None:
+        """The widest newest-anchored slice this request's rows fit inside.
+
+        ``None`` means do not narrow at all - the whole window already fits the
+        budget, or the probe could not answer and this lane refuses to guess.
+        """
+
+        window_hours = self._window_hours()
+        if window_hours <= _MIN_SLICE_HOURS:
+            return None
+        return self._approved_floor(lo_hours=0, hi_hours=window_hours)
+
+    def _approved_floor(self, *, lo_hours: int, hi_hours: int) -> datetime | None:
+        """Bracket the row budget geometrically between two widths.
+
+        ``lo_hours`` is a width already known cheap (zero at the start of a
+        read); ``hi_hours`` is the proposal. ``None`` means either the whole
+        proposal fits - so there is nothing to narrow - or the probe could not
+        answer, which this lane reads as "do not narrow blind".
+        """
+
+        if self._refused_hours is not None:
+            # Nothing at or above this width fits, and the estimate is monotone
+            # in the width, so there is nothing to learn above it.
+            hi_hours = min(hi_hours, self._refused_hours)
+            if hi_hours <= lo_hours:
+                return self._floor_for_hours(lo_hours) if lo_hours else None
+        probed = self.probe_hours(hi_hours)
+        if probed is None:
+            return None
+        if probed <= _CANDIDATE_SLICE_TARGET_INDEX_ROWS:
+            return (
+                None
+                if hi_hours >= self._window_hours()
+                else self._floor_for_hours(hi_hours)
+            )
+        for _ in range(_MAX_DENSITY_PROBES - 1):
+            mid = int(math.isqrt(max(1, lo_hours) * hi_hours))
+            if mid <= lo_hours or mid >= hi_hours:
+                break
+            probed = self.probe_hours(mid)
+            if probed is None:
+                break
+            if probed <= _CANDIDATE_SLICE_TARGET_INDEX_ROWS:
+                lo_hours = mid
+            else:
+                hi_hours = mid
+        if lo_hours <= 0:
+            # Nothing narrower than the proposal fits the budget. Issue the
+            # proposal: it is still a subset of what the unsliced statement
+            # reads, so it cannot be the worse of the two, and the request's
+            # own wall deadline remains the ceiling.
+            lo_hours = hi_hours
+        return (
+            None
+            if lo_hours >= self._window_hours()
+            else self._floor_for_hours(lo_hours)
+        )
+
+    def widened_floor(
+        self, floor: datetime, deepest: datetime | None
+    ) -> datetime | None:
+        """Lower the floor for another round; ``None`` to read the window whole.
+
+        Doubling alone bounds the number of rounds. A displaced candidate says
+        something stronger - exactly how far back the slice must reach before
+        THAT candidate resolves inside it - so the proposal takes whichever of
+        the two is older, and the row budget then costs it before it is issued.
+        """
+
+        doubled = self._scan_end - 2 * (self._scan_end - floor)
+        deepest = _aligned(deepest, self._scan_end)
+        proposed = min(doubled, floor_hour(deepest)) if deepest else doubled
+        if proposed <= self._request_start:
+            return None
+        proposed_hours = max(
+            _MIN_SLICE_HOURS, int((self._scan_end - proposed) / timedelta(hours=1))
+        )
+        current_hours = max(
+            _MIN_SLICE_HOURS, int((self._scan_end - floor) / timedelta(hours=1))
+        )
+        widened = self._approved_floor(
+            lo_hours=current_hours, hi_hours=proposed_hours
+        )
+        if widened is not None and widened >= floor:
+            # The budget approves nothing OLDER than the slice just read, so
+            # another round would issue the same statement and learn the same
+            # thing. Stop narrowing and read the window whole - today's
+            # behaviour - instead of spending the attempt budget on repeats.
+            return None
+        return widened
+
+
+def _aligned(moment: datetime | None, reference: datetime) -> datetime | None:
+    """Put ``moment`` on the same naive/aware footing as ``reference``.
+
+    Request bounds are parsed from the filter payload while resolved starts
+    come back from the driver, and the two do not have to agree about tzinfo.
+    Comparing them without this raises rather than widening.
+    """
+
+    if moment is None:
+        return None
+    if (moment.tzinfo is None) == (reference.tzinfo is None):
+        return moment
+    if reference.tzinfo is None:
+        offset = moment.utcoffset() or timedelta(0)
+        return (moment - offset).replace(tzinfo=None)
+    return moment.replace(tzinfo=reference.tzinfo)
+
+
+def _classify_batch_size(builder: Any, candidates: int) -> int:
+    recommended = getattr(builder, "recommended_filter_classify_batch_size", None)
+    size = recommended() if callable(recommended) else None
+    return max(1, int(size)) if size else max(1, candidates)
+
+
+def _slicing_is_available(builder: Any, page_size: int) -> bool:
+    """Whether this request can be both narrowed and verified.
+
+    Both halves are required. Without the full-state verifier a narrowed scan
+    would publish inflated starts, so a builder that cannot run one reads the
+    window whole, exactly as it does today.
+    """
+
+    probe = getattr(builder, "build_candidate_slice_density_probe_query", None)
+    estimate = getattr(builder, "candidate_slice_density_estimate", None)
+    supports_scan = getattr(builder, "supports_bounded_filter_scan", None)
+    return bool(
+        callable(probe)
+        and callable(estimate)
+        and callable(supports_scan)
+        and supports_scan()
+        and page_size + 1 <= _MAX_VERIFIABLE_CANDIDATES
+    )
+
+
+__all__ = ["SessionCandidateSlicePage", "read_candidate_slice_page"]

@@ -442,6 +442,12 @@ def test_public_default_session_dispatch_uses_real_exact_builder_and_signed_cano
     def execute(sql, params, **kwargs):
         calls.append((sql, params))
         assert "spans_per_session" not in sql and "_seed_order" not in sql
+        if sql.lstrip().startswith("EXPLAIN ESTIMATE"):
+            # The candidate slice width probe reads the primary index only, so
+            # it carries no physical replacement key and no data read at all.
+            # Answering with no ``columns`` is the reducer's "unknown" case,
+            # which keeps this page on the unnarrowed statement asserted below.
+            return SimpleNamespace(data=[])
         assert (
             "GROUP BY project_id, observation_type, service_name, toStartOfHour(start_time), trace_id, id"
             in sql

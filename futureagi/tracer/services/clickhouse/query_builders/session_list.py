@@ -2568,6 +2568,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         *,
         before_start_time: datetime | None = None,
         before_session_id: str | None = None,
+        scan_start_time: datetime | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Select an exact finite-identity cursor page in stable root order.
 
@@ -2576,6 +2577,29 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         evaluated after the keyset predicate, so the view can reconstruct an
         exact current total as ``seen_rows + remaining_count`` without an
         offset scan or a second count statement.
+
+        ``scan_start_time`` raises the floor of the PHYSICAL scan to a newer
+        moment inside the request window. The SQL text is unchanged - only the
+        window bindings move - so this is the same statement, reading less.
+
+        A raised floor makes the statement's ``session_start`` a **candidate**
+        order rather than the canonical one: a session whose first root lies
+        below the floor keeps only the roots inside the slice, so its start is
+        inflated and it can rank anywhere. The slice is therefore a discovery
+        pass whose rows MUST be re-resolved over the whole request window
+        (``build_filter_match_query``) before publication; that two-phase
+        contract lives in ``selectors.session_candidate_slice`` and is the only
+        supported caller of this argument.
+
+        A raised floor also moves the cursor keyset, which is why a sliced
+        continuation narrows the scan's UPPER bound to the cursor instant as
+        well. Without it the keyset would compare the cursor against inflated
+        starts and could hide a session that belongs on this page; with it,
+        every session whose true start is above the cursor has no root at or
+        below the cursor at all and is excluded by the scan itself. The
+        narrowing is exact for the unsliced statement too, but it is applied
+        only alongside a raised floor so the whole-window statement keeps its
+        current text byte for byte.
         """
 
         if not self.supports_candidate_cursor_page():
@@ -2590,6 +2614,20 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             "end_date": self.end_date,
             "limit": self.page_size + 1,
         }
+        if scan_start_time is not None:
+            # Bind the floor into this statement's own params. ``self.params``
+            # still carries the request window, which is what the full-state
+            # re-resolution of these candidates has to read.
+            if not self.start_date <= scan_start_time < self.end_date:
+                raise ValueError("candidate scan floor must stay inside the window")
+            params["start_date"] = scan_start_time
+            params["start_date_us"] = _unix_microseconds(scan_start_time)
+            if before_start_time is not None:
+                # Half-open upper bound, so the cursor instant itself is read:
+                # a session tied on the cursor start is separated by the id
+                # tie-break in the keyset clause below, not by the scan.
+                params["end_date"] = before_start_time
+                params["end_date_us"] = _unix_microseconds(before_start_time) + 1
         keyset_clause = ""
         if before_start_time is not None:
             params["cursor_before_start_us"] = _unix_microseconds(before_start_time)
