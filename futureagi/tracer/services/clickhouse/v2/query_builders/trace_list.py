@@ -118,10 +118,19 @@ _CLICKHOUSE_MAX_QUERY_SIZE_BYTES = 262_144
 _LONG_TEXT_SEED_INLINE_BUDGET_BYTES = 232 * 1024
 
 
+# clickhouse-driver renders a string literal by expanding each of these to two
+# characters, so every occurrence costs a byte more than the value carries.
+# Counting only the backslash and the quote understates a value full of tabs or
+# newlines by a third, which is exactly the escaped-text shape this budget has
+# to hold. Pinned against the driver's own table by the unit tests.
+_ESCAPED_LITERAL_CHARS = "\\'\b\f\r\n\t\0\a\v"
+
+
 def _rendered_literal_bytes(value: str) -> int:
     """What one string literal costs once clickhouse-driver has escaped it."""
 
-    return len(value.encode()) + value.count("\\") + value.count("'") + 2
+    expanded = sum(value.count(char) for char in _ESCAPED_LITERAL_CHARS)
+    return len(value.encode()) + expanded + 2
 
 
 class UserEnrichmentLimitExceeded(ReadDeadlineExceeded):

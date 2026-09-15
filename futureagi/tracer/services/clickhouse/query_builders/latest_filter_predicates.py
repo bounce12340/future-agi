@@ -39,7 +39,12 @@ _MAX_INDEX_COMPANION_VALUE_UTF8_BYTES = 16 * 1024
 
 
 def _values_fit_index_companion_budget(normalized_values: tuple[object, ...]) -> bool:
-    """Whether these values are small enough to inline a second and third time."""
+    """Whether these values are small enough to inline a second and third time.
+
+    Raw bytes are the right measure here. Escaping can inflate a literal by a
+    third, but this budget sits an order of magnitude below the parser limit,
+    so it decides selectivity rather than whether a statement can be parsed.
+    """
 
     return (
         sum(

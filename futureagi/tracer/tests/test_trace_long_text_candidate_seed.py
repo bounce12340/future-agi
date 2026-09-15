@@ -2,16 +2,20 @@
 
 import re
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
+from clickhouse_driver.util.escape import escape_chars_map, escape_params
 
 from tracer.services.clickhouse.query_builders import latest_filter_predicates
 from tracer.services.clickhouse.query_builders.trace_list import TraceListQueryBuilder
 from tracer.services.clickhouse.v2.query_builders.trace_list import (
     _CLICKHOUSE_MAX_QUERY_SIZE_BYTES,
+    _ESCAPED_LITERAL_CHARS,
     _MAX_NGRAM_ANCHOR_BYTES,
     TraceListQueryBuilderV2,
     _caseless_ascii_ngram_anchor,
+    _rendered_literal_bytes,
     _runs_within_anchor_budget,
 )
 from tracer.tests.test_bounded_trace_filter_reads import (
@@ -519,3 +523,35 @@ def test_seed_stands_down_when_even_one_value_will_not_fit():
     rendered = _rendered_seed_statement(subject)
     assert "matching_scalar_trace_identities" not in rendered
     assert len(rendered.encode()) < _CLICKHOUSE_MAX_QUERY_SIZE_BYTES
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "a common message 000123 another response. " * 40,
+        "escaped \\ and quoted ' text. " * 40,
+        "line\nline\n" * 200,
+        "tab\tcarriage\rbell\anull\0" * 150,
+    ],
+    ids=["plain", "backslash-and-quote", "newlines", "control-characters"],
+)
+def test_inline_budget_counts_what_the_driver_actually_renders(value):
+    """The budget guards a parser limit, so it must not understate the literal.
+
+    An escaped-text value is mostly characters the driver doubles. Counting
+    only the backslash and the quote understates a tab-heavy value by about a
+    third, which would let an oversized statement through the budget and fail
+    at the parser instead.
+    """
+
+    context = SimpleNamespace(
+        server_info=SimpleNamespace(get_timezone=lambda: "UTC")
+    )
+    rendered = escape_params({"v": value}, context)["v"]
+    assert _rendered_literal_bytes(value) == len(rendered.encode())
+
+
+def test_escaped_literal_chars_match_the_driver():
+    """If clickhouse-driver's escape table moves, this budget must move with it."""
+
+    assert set(_ESCAPED_LITERAL_CHARS) == set(escape_chars_map)
