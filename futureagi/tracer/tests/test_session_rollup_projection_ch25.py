@@ -3,6 +3,11 @@
 The statement this PR deletes is carried here verbatim as
 ``LEGACY_ROLLUP_STATEMENT``, so a real server answers the only question that
 matters: does the narrow statement return the same numbers?
+
+This module issues DDL and DML as an admin user, so it opts in explicitly
+before it opens a socket: see ``_live_native_port``. Nothing here resolves a
+default port, because a developer host's well-known ClickHouse ports are held
+by port-forwards to shared clusters.
 """
 
 from __future__ import annotations
@@ -24,11 +29,15 @@ from tracer.services.clickhouse.query_builders.session_time_series import (
 pytestmark = pytest.mark.integration
 
 CH_HOST = os.environ.get("CH25_HOST", "127.0.0.1")
-CH_NATIVE_PORT = int(
-    os.environ.get("CH25_NATIVE_PORT") or os.environ.get("CH25_TCP_PORT") or "19000"
-)
 CH_USER = os.environ.get("CH25_USER") or os.environ.get("CH_USERNAME") or "default"
 CH_PASSWORD = os.environ.get("CH25_PASSWORD") or os.environ.get("CH_PASSWORD") or ""
+
+LIVE_CH_TESTS_ENV_VAR = "FI_LIVE_CH_TESTS"
+
+# Native ports a developer host keeps pointed at shared ClickHouse clusters.
+# This suite creates and drops objects, so it refuses them outright rather
+# than trusting whoever exported the variable to have meant the test stack.
+REFUSED_NATIVE_PORTS = frozenset({19000, 19001, 19002, 19010, *range(18230, 18233)})
 
 PROJECT_ID = "11111111-1111-4111-8111-111111111111"
 OTHER_PROJECT_ID = "99999999-9999-4999-8999-999999999999"
@@ -99,10 +108,47 @@ WINDOW_START = datetime(2026, 3, 1, tzinfo=UTC)
 WINDOW_END = datetime(2026, 3, 4, tzinfo=UTC)
 
 
-def _ch_client(*, database: str) -> Client:
+def _live_native_port() -> int:
+    """Return the opted-into native port, or skip before any socket is opened.
+
+    There is deliberately no default and no fallback chain onto a sibling
+    variable. An unpinned run must not resolve to whatever happens to be
+    listening on a well-known port: on a developer host those are held by
+    port-forwards to shared clusters, and this suite runs ``CREATE``/``INSERT``
+    as an admin user. The caller names the disposable stack, or gets a skip.
+    """
+
+    if os.environ.get(LIVE_CH_TESTS_ENV_VAR) != "1":
+        pytest.skip(f"live ClickHouse tests are opt-in: set {LIVE_CH_TESTS_ENV_VAR}=1")
+
+    raw_port = os.environ.get("CH25_NATIVE_PORT", "").strip()
+    if not raw_port:
+        pytest.skip(
+            "CH25_NATIVE_PORT is not set; this suite will not guess a "
+            "ClickHouse port for a test that writes"
+        )
+    try:
+        port = int(raw_port)
+    except ValueError:
+        pytest.skip(f"CH25_NATIVE_PORT={raw_port!r} is not a port number")
+
+    if port in REFUSED_NATIVE_PORTS:
+        pytest.skip(
+            f"refusing to write to ClickHouse on port {port}: that port is "
+            "reserved for port-forwards to shared clusters on this host"
+        )
+    return port
+
+
+@pytest.fixture(scope="module")
+def ch_port() -> int:
+    return _live_native_port()
+
+
+def _ch_client(*, port: int, database: str) -> Client:
     return Client(
         host=CH_HOST,
-        port=CH_NATIVE_PORT,
+        port=port,
         user=CH_USER,
         password=CH_PASSWORD,
         database=database,
@@ -131,18 +177,16 @@ def _rollup_table_ddl() -> str:
 
 
 @pytest.fixture(scope="module")
-def ch_database():
+def ch_database(ch_port: int):
     database = f"test_session_rollup_{uuid.uuid4().hex}"
     _require_safe_ch25_test_target(host=CH_HOST, database=database)
-    admin = _ch_client(database="default")
+    admin = _ch_client(port=ch_port, database="default")
     created = False
     try:
         try:
             admin.execute("SELECT 1")
         except Exception as exc:
-            pytest.skip(
-                f"CH25 is not reachable on {CH_HOST}:{CH_NATIVE_PORT} ({exc!r})"
-            )
+            pytest.skip(f"CH25 is not reachable on {CH_HOST}:{ch_port} ({exc!r})")
         admin.execute(f"CREATE DATABASE {database}")
         created = True
         yield database
@@ -157,8 +201,8 @@ def ch_database():
 
 
 @pytest.fixture(scope="module")
-def ch_client(ch_database):
-    client = _ch_client(database=ch_database)
+def ch_client(ch_port: int, ch_database: str):
+    client = _ch_client(port=ch_port, database=ch_database)
     try:
         client.execute("SELECT 1")
         client.execute(_rollup_table_ddl())
