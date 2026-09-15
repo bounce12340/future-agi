@@ -461,7 +461,9 @@ def _occurs_in_order(fragments: list[str], text: str) -> bool:
 MANY_RUN_TEXT = "an indexed message 000123 with a distinct reply. " * 2400
 
 
-@pytest.mark.parametrize("value", [OVERSIZED_TEXT, MANY_RUN_TEXT])
+@pytest.mark.parametrize(
+    "value", [OVERSIZED_TEXT, MANY_RUN_TEXT], ids=["one-run", "many-runs"]
+)
 def test_bounded_anchor_stays_a_necessary_condition(value):
     """Every kept fragment is a substring of the value, in the value's order.
 
