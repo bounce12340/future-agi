@@ -16129,3 +16129,241 @@ def test_attempt_ledger_exposes_separate_timing_query_rows_and_bytes() -> None:
         sum(attempt.result_payload_bytes for attempt in page.attempts)
         == page.result_payload_bytes
     )
+
+
+def _slice_spread_cursor_rows() -> list[dict[str, Any]]:
+    """Two matches in each of the first three widening cursor slices.
+
+    The slice schedule a cursor page walks back from its newest boundary is
+    five minutes, then ten, then twenty, so a pair of rows inside each of those
+    three intervals puts a small - sufficient only in aggregate - candidate
+    batch in every one of them. That is the production shape this exercises: a
+    negation filter on a sparse project matches a handful of roots per slice
+    and needs several slices to fill one page.
+    """
+
+    return [
+        {
+            "id": f"trace-{minute:02d}",
+            "root_span_id": f"root-{minute:02d}",
+            "start_time": END - timedelta(minutes=minute),
+            "trace_name": f"presented-{minute:02d}",
+        }
+        for minute in (1, 2, 6, 7, 16, 17)
+    ]
+
+
+def test_page_filling_cursor_classifies_its_slices_in_one_statement() -> None:
+    """A page that fills across slices pays ONE classifier, not one per slice.
+
+    Each of the three slices holds fewer candidates than the page needs, so
+    none of them can close the page on its own and none is worth a statement.
+    The walk used to spend one anyway at every slice advance, to buy itself a
+    committable checkpoint; it now defers to the buffer and classifies the
+    accumulated batch once, as soon as that batch could complete the prefix.
+    """
+
+    request_start = END - timedelta(minutes=90)
+    rows = _slice_spread_cursor_rows()
+    builder = _CursorPageFillIdentityHydrationFakeBuilder(
+        rows,
+        start=request_start,
+        end=END,
+        match_rows=rows,
+        recommended_batch_size=200,
+        recommended_seed_batch_size=200,
+    )
+    executor = _IdentityHydrationFakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(request_start, END)],
+        key_field="id",
+        page_number=0,
+        page_size=5,
+        deadline_ms=5_000,
+        max_seed_attempts=24,
+        max_candidates=200,
+        max_query_count=50,
+        classify_batch_size=200,
+        include_incomplete_rows=True,
+        bounded_continuation=True,
+    )
+
+    kinds = [attempt.kind for attempt in page.attempts]
+    assert kinds.count("classify") == 1
+    assert kinds.count("seed") == 3
+    # The same page the per-slice flush produced: every match, in order, once.
+    assert [row["id"] for row in page.rows] == [row["id"] for row in rows[:5]]
+    assert page.complete is True
+
+
+def test_per_slice_publisher_keeps_its_classifier_at_every_slice() -> None:
+    """The reader that DECIDES at each slice boundary is untouched.
+
+    ``fill_bounded_cursor_page_across_slices`` is what separates the two: a
+    reader without it publishes whatever one slice classified, so for it the
+    flush is the decision rather than a checkpoint it could have declined.
+    Same population, same schedule: it classifies its very first slice on the
+    spot and publishes that slice's two matches as a partial page, instead of
+    buffering them and walking on to fill the five it was asked for.
+    """
+
+    request_start = END - timedelta(minutes=90)
+    rows = _slice_spread_cursor_rows()
+    builder = _IdentityHydrationFakeBuilder(
+        rows,
+        start=request_start,
+        end=END,
+        match_rows=rows,
+        recommended_batch_size=200,
+        recommended_seed_batch_size=200,
+    )
+    executor = _IdentityHydrationFakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(request_start, END)],
+        key_field="id",
+        page_number=0,
+        page_size=5,
+        deadline_ms=5_000,
+        max_seed_attempts=24,
+        max_candidates=200,
+        max_query_count=50,
+        classify_batch_size=200,
+        include_incomplete_rows=True,
+        bounded_continuation=True,
+    )
+
+    assert [attempt.kind for attempt in page.attempts] == [
+        "seed",
+        "classify",
+        "hydrate",
+    ]
+    assert [row["id"] for row in page.rows] == [row["id"] for row in rows[:2]]
+    assert page.complete is False
+
+
+def test_a_checkpoint_is_never_committed_past_an_unclassified_candidate() -> None:
+    """THE EXACTNESS RULE, stated about the resume boundary.
+
+    Stop the walk while candidates are still buffered and read the position the
+    page offers its next hop. Whatever that position is, every buffered
+    candidate must lie strictly below the bound the next hop resumes at - the
+    signed keyset when there is one, the open slice's own end when there is not
+    - because a candidate at or above that bound is one the next hop would
+    never re-read and no page ever published.
+
+    Asserted against the acquired candidates rather than against the rows this
+    population happens to publish, so a displaced row the test never
+    constructed could not slip through it either.
+    """
+
+    request_start = END - timedelta(minutes=90)
+    rows = _slice_spread_cursor_rows()
+    builder = _CursorPageFillIdentityHydrationFakeBuilder(
+        rows,
+        start=request_start,
+        end=END,
+        match_rows=rows,
+        recommended_batch_size=200,
+        recommended_seed_batch_size=200,
+    )
+    executor = _IdentityHydrationFakeExecutor(builder)
+
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(request_start, END)],
+        key_field="id",
+        page_number=0,
+        page_size=5,
+        deadline_ms=5_000,
+        # Two slices acquire four candidates and classify none of them: fewer
+        # than the six this page needs, so the sufficiency rule declines.
+        max_seed_attempts=2,
+        max_candidates=200,
+        max_query_count=50,
+        classify_batch_size=200,
+        include_incomplete_rows=True,
+        bounded_continuation=True,
+    )
+
+    assert page.complete is False
+    assert [attempt.kind for attempt in page.attempts].count("classify") == 0
+    acquired = [
+        row["start_time"]
+        for row in rows
+        if row["start_time"] >= END - timedelta(minutes=15)
+    ]
+    assert len(acquired) == 4
+    if page.continuation_before_start_time is not None:
+        bound = page.continuation_before_start_time
+    elif page.continuation_slice_end is not None:
+        bound = page.continuation_slice_end
+    else:
+        # No position offered at all: the next hop restarts the page, which
+        # re-reads every candidate. Exact, and the honest answer for a hop that
+        # classified nothing.
+        bound = None
+    assert bound is None or all(start_time < bound for start_time in acquired)
+
+
+def test_a_stopped_cursor_page_still_publishes_every_match_exactly_once() -> None:
+    """End to end over the same population: no row is skipped or duplicated.
+
+    The first hop stops mid-walk with its buffer unclassified; the chain then
+    runs to exhaustion. Whatever positions the hops commit, the union of the
+    published rows must be the whole match set, once each, newest first.
+    """
+
+    request_start = END - timedelta(minutes=90)
+    rows = _slice_spread_cursor_rows()
+    published: list[str] = []
+    continuation: dict[str, Any] = {}
+    attempts_allowed = 2
+
+    for _ in range(12):
+        builder = _CursorPageFillIdentityHydrationFakeBuilder(
+            rows,
+            start=request_start,
+            end=END,
+            match_rows=rows,
+            recommended_batch_size=200,
+            recommended_seed_batch_size=200,
+        )
+        page = read_bounded_filter_page(
+            builder=builder,
+            analytics=_IdentityHydrationFakeExecutor(builder),
+            filters=[_time_filter(request_start, END)],
+            key_field="id",
+            page_number=0,
+            page_size=2,
+            deadline_ms=5_000,
+            max_seed_attempts=attempts_allowed,
+            max_candidates=200,
+            max_query_count=50,
+            classify_batch_size=200,
+            include_incomplete_rows=True,
+            bounded_continuation=True,
+            **continuation,
+        )
+        published.extend(row["id"] for row in page.rows)
+        if page.complete and not page.has_more:
+            break
+        if page.rows:
+            last = page.rows[-1]
+            continuation = {
+                "cursor_start_time": last["start_time"],
+                "cursor_order_token": last["id"],
+            }
+        else:
+            # A hop that published nothing must not be repeated unchanged, or
+            # the chain cannot terminate; give the next one more room.
+            attempts_allowed += 2
+
+    assert published == [row["id"] for row in rows]
+    assert len(published) == len(set(published))
