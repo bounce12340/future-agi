@@ -6,6 +6,7 @@ import pytest
 
 from tracer.services.clickhouse.query_builders.trace_list import TraceListQueryBuilder
 from tracer.services.clickhouse.v2.query_builders.trace_list import (
+    _CLICKHOUSE_MAX_QUERY_SIZE_BYTES,
     _caseless_ascii_ngram_anchor,
 )
 from tracer.tests.test_bounded_trace_filter_reads import (
@@ -278,3 +279,59 @@ def test_page_keyset_does_not_limit_the_necessary_child_witness():
     assert "filter_before" not in cte
     assert "filter_before_start_us" in roots
     assert params["filter_before_id"] == "previous"
+
+
+
+# No letter here is an i or a k, so every value below anchors whole: the worst
+# case for a statement that inlines the anchor beside the exact literal.
+_ANCHORABLE_UNIT = "a common message 000123 another response. "
+OVERSIZED_TEXT = _ANCHORABLE_UNIT * 2600
+ORDINARY_LONG_TEXT = _ANCHORABLE_UNIT * 60
+_WINDOW = dict(slice_start=END - timedelta(days=365), slice_end=END, limit=50)
+
+
+def _rendered_seed_statement(subject) -> str:
+    """The statement the route this builder chose actually hands the parser."""
+
+    if subject.supports_filter_candidate_seed_page():
+        sql, params = subject.build_filter_candidate_seed_page(**_WINDOW)
+    else:
+        sql, params = subject.build_filter_seed_page(**_WINDOW)
+    return _render_driver_sql(sql, params)
+
+
+@pytest.mark.parametrize("operation", ["equals", "in"])
+def test_oversized_text_keeps_the_statement_inside_the_parser_limit(operation):
+    """ClickHouse refuses an oversized statement before it runs, so never send one."""
+
+    value = (
+        [OVERSIZED_TEXT, OVERSIZED_TEXT + " tail"]
+        if operation == "in"
+        else OVERSIZED_TEXT
+    )
+    subject = builder(operation=operation, value=value)
+    # The value is anchorable and long, so only its size may decline the seed.
+    assert _caseless_ascii_ngram_anchor(OVERSIZED_TEXT) is not None
+    assert subject._public_long_text_candidate_seed_plan() is None
+    assert not subject.supports_filter_candidate_seed_page()
+    rendered = _rendered_seed_statement(subject)
+    assert "indexHint(has(arrayMap" not in rendered
+    assert "indexHint(hasAny(arrayMap" not in rendered
+    assert len(rendered.encode()) < _CLICKHOUSE_MAX_QUERY_SIZE_BYTES
+
+
+@pytest.mark.parametrize("operation", ["equals", "in"])
+def test_ordinary_long_text_still_seeds_and_still_hints(operation):
+    """The size limits drop oversized values only; ordinary long text is untouched."""
+
+    value = (
+        [ORDINARY_LONG_TEXT, ORDINARY_LONG_TEXT + " tail"]
+        if operation == "in"
+        else ORDINARY_LONG_TEXT
+    )
+    subject = builder(operation=operation, value=value)
+    assert subject._public_long_text_candidate_seed_plan() is not None
+    assert subject.supports_filter_candidate_seed_page()
+    rendered = _rendered_seed_statement(subject)
+    assert "arrayMap(x -> lowerUTF8(x), mapValues(attrs_string))" in rendered
+    assert len(rendered.encode()) < _CLICKHOUSE_MAX_QUERY_SIZE_BYTES

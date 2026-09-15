@@ -74,6 +74,25 @@ def _caseless_ascii_ngram_anchor(value: str) -> str | None:
     )
 
 
+# ClickHouse parses at most ``max_query_size`` bytes of a statement (262144 by
+# default) and rejects the whole thing with SYNTAX_ERROR before it starts, so a
+# statement that carries its filter text inline has a hard size ceiling.
+_CLICKHOUSE_MAX_QUERY_SIZE_BYTES = 262_144
+
+# The candidate seed renders every value's exact witness and its index anchor
+# into the candidate CTE and again into the statement that reads from it, so a
+# long filter value reaches the parser multiplied. Hold those literals inside a
+# budget that leaves the rest of the statement room under the ceiling above.
+_LONG_TEXT_SEED_STATEMENT_COPIES = 2
+_LONG_TEXT_SEED_INLINE_BUDGET_BYTES = 192 * 1024
+
+
+def _rendered_literal_bytes(value: str) -> int:
+    """What one string literal costs once clickhouse-driver has escaped it."""
+
+    return len(value.encode()) + value.count("\\") + value.count("'") + 2
+
+
 class UserEnrichmentLimitExceeded(ReadDeadlineExceeded):
     """A page's remap fan-in exceeded the optional enrichment read bound."""
 
@@ -642,6 +661,17 @@ class _TraceListQueryBuilderV2Core(_TraceRootReplayV2, TraceListQueryBuilder):
             ):
                 anchors = [_caseless_ascii_ngram_anchor(value) for value in values]
                 if any(anchor is None for anchor in anchors):
+                    continue
+                # A value too large to inline this many times keeps the
+                # ordinary exact route, which carries it once. Acquisition is
+                # the only thing that changes: the exact route is the same
+                # necessary-and-sufficient membership test the seed defers to.
+                inlined = _LONG_TEXT_SEED_STATEMENT_COPIES * sum(
+                    _rendered_literal_bytes(literal)
+                    for literal in [*anchors, *values]
+                    if literal is not None
+                )
+                if inlined > _LONG_TEXT_SEED_INLINE_BUDGET_BYTES:
                     continue
                 params = dict(plan.params)
                 hints = []
