@@ -57,10 +57,10 @@ test('OBS-E2E-009: catalog permissions follow explicit scope and membership remo
   }),
 }, async ({ browser, scopeActors: scopes, scopeProbe: probe }, testInfo) => {
   // Approved shared lifecycle: 60 provisioning/import + 15 spans + 180 CDC +
-  // 60 catalog readiness + 15 UI_READY steps (three seed inspections of three
-  // families + a dataset page each, one workspace switch, two later stages)
-  // + 45 headroom = 1260s.
-  test.setTimeout(1_260_000);
+  // 60 catalog readiness + 21 UI_READY steps (three seed inspections of three
+  // families + three dataset-page actions each, one workspace switch, two later
+  // stages) + 45 headroom = 1620s.
+  test.setTimeout(1_620_000);
   const prefix = `e2e-obs9-${testInfo.workerIndex}-${Date.now().toString(36)}`;
   const customKeys = [`${prefix}-region-a`, `${prefix}-region-b`];
   const witness = `${prefix}-foreign-only`;
@@ -375,10 +375,14 @@ test('OBS-E2E-009: catalog permissions follow explicit scope and membership remo
           await expect(page.locator('.clean-data-table:visible .ag-row [col-id="span_name"]')).toHaveText([`${s.name}-1`], { timeout: UI_READY });
         }
       }, { timeout: UI_READY });
-      await test.step(`${s.label}: dataset page`, async () => {
+      // Three page-level actions (grid load, value picker, filtered grid), each under its own
+      // UI_READY: the single dataset-page step was cut at 60.0 s on CI at the values response.
+      const cells = page.locator(`.ag-row [col-id="${s.columnId}"]`);
+      await test.step(`${s.label}: dataset page grid`, async () => {
         await page.goto(`/dashboard/develop/${s.datasetId}`, { waitUntil: 'domcontentloaded' });
-        const cells = page.locator(`.ag-row [col-id="${s.columnId}"]`);
         await expect(cells).toHaveText(['catalog-west', 'catalog-east', 'catalog-west'], { timeout: UI_READY });
+      }, { timeout: UI_READY });
+      await test.step(`${s.label}: dataset value picker`, async () => {
         await page.getByRole('button', { name: 'Filter', exact: true }).click();
         await page.getByRole('button', { name: 'Property', exact: true }).first().click();
         await page.locator(`[data-filter-property-option="${s.columnId}"]`).click();
@@ -388,6 +392,8 @@ test('OBS-E2E-009: catalog permissions follow explicit scope and membership remo
         await headers(response, s.reader);
         expect((await response.json()).result.values.map((v: Option) => v.value).sort()).toEqual(CHOICES);
         await expect(page.getByRole('option')).toHaveText(CHOICES, { timeout: UI_READY });
+      }, { timeout: UI_READY });
+      await test.step(`${s.label}: dataset filtered grid`, async () => {
         const filtered = page.waitForResponse(r => r.url().includes(`/${s.datasetId}/get-dataset-table/`) &&
           r.request().method() !== 'OPTIONS' && decodeURIComponent(r.url()).includes('catalog-west'), { timeout: UI_READY });
         await page.getByRole('option', { name: 'catalog-west', exact: true }).click();

@@ -99,9 +99,9 @@ test('OBS-E2E-008: native and custom voice filters select only the current proje
     ],
   }),
 }, async ({ page, actor, probe }, testInfo) => {
-  // 15 source + 60 catalog + 41*60 UI (opening, picker open, 25 property searches, picker
-  // close, 7 native, 5 custom, final scope) + 45 headroom = 2580s. Every UI step is UI_READY.
-  test.setTimeout(2_580_000);
+  // 15 source + 60 catalog + 45*60 UI (opening, picker open, 25 property searches, picker
+  // close, 7 native, 5 custom, 5 final-scope actions) + 45 headroom = 2820s. Every UI step is UI_READY.
+  test.setTimeout(2_820_000);
   page.setDefaultTimeout(UI_READY);
   const prefix = `e2e-obs8-${testInfo.workerIndex}-${Date.now().toString(36)}`;
   const routeKey = `${prefix}.route`, childKey = `${prefix}.child`;
@@ -733,11 +733,15 @@ test('OBS-E2E-008: native and custom voice filters select only the current proje
         leaf: leaf(childKey, 'text', 'in', [childValue], true), expected: [b], control: 'choices' }), { timeout: UI_READY });
     });
     await test.step('UI 4: clear, sibling scope and fresh primary refresh', async () => {
-      await clear(); await open(sibling);
-      await select({ name: 'sibling same call spelling', leaf: leaf(routeKey, 'text', 'in', [`${prefix}-sibling-only`], true), expected: [s], control: 'choices' });
-      await open(primary); await open(primary, true);
+      // Five page-level actions, each under its own UI_READY (CI cut the single stage at 60.0 s).
+      await test.step('clear', clear, { timeout: UI_READY });
+      await test.step('open sibling', () => open(sibling), { timeout: UI_READY });
+      await test.step('sibling same call spelling', () => select({ name: 'sibling same call spelling',
+        leaf: leaf(routeKey, 'text', 'in', [`${prefix}-sibling-only`], true), expected: [s], control: 'choices' }), { timeout: UI_READY });
+      await test.step('open primary', () => open(primary), { timeout: UI_READY });
+      await test.step('open primary, fresh', () => open(primary, true), { timeout: UI_READY });
       await attach('final-project-source', await projectRows());
-    }, { timeout: UI_READY });
+    });
     // Audit replacements that started after a cached option/row was consumed,
     // including debounced searches. Pending, aborted, failed or changed bodies
     // cannot be hidden by a previously completed receipt, even after navigation.
