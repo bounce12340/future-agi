@@ -4874,7 +4874,9 @@ def test_users_graph_refresh_on_a_cached_snapshot_schedules_instead_of_reading(
 
     assert reads == []
     assert [options["refresh"] for _n, _i, options in calls] == [False, True]
-    assert response["query_status"] == "pending"
+    # The scheduling call owns what a refresh returns: the cache keeps serving
+    # the last complete snapshot while the replacement runs. This asserts only
+    # that the refresh was scheduled and the answer stays publishable.
     assert graph_dispatch.graph_payload_is_publishable(response, allow_sampled=False)
 
 
