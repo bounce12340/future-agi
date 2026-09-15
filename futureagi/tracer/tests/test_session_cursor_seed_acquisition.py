@@ -84,7 +84,7 @@ def _world(matching: int = 25, rejected: int = 95) -> tuple[_CountingWorld, list
     sessions: dict[str, tuple[Any, Any]] = {}
     expected: list[str] = []
     for index in range(total):
-        session_id = "00000000-0000-4000-8000-%012d" % index
+        session_id = f"00000000-0000-4000-8000-{index:012d}"
         root = END - timedelta(minutes=index + 1)
         hit = index >= rejected
         sessions[session_id] = (root, root if hit else None)
