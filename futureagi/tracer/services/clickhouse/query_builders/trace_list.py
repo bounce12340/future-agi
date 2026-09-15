@@ -855,9 +855,14 @@ class TraceListQueryBuilder(BaseQueryBuilder):
         ``user``/``user_id`` values are external identifiers, so resolve them
         through the existing curated end-user/remap expansion before probing
         the indexed span UUID. ``end_user_id`` is already a physical structural
-        UUID and can use the normal direct-column compiler. The returned
-        predicate is a necessary candidate condition only; the existing finite
-        latest-state classifier remains authoritative for publication.
+        UUID, so it is compared on its own type whenever the supplied value is
+        canonical UUID text, and falls back to the direct-column compiler's
+        textual form otherwise. Either way the predicate carries the
+        membership envelope, because the CTE it seeds spans the whole table.
+
+        The returned predicate is a necessary candidate condition only; the
+        existing finite latest-state classifier remains authoritative for
+        publication.
         """
 
         filter_item = self._positive_exact_end_user_seed_filter()
