@@ -154,7 +154,7 @@ test('DASH-E2E-002: a saved trace-metric widget preserves its project, cohort an
     const path = new URL(response.url()).pathname;
     if (![QUERY, METRICS, VALUES].includes(path) || response.request().method() !== 'POST') return;
     const capture = (async () => {
-      const body = await readJsonWithin(response, UI_READY);
+      const body = await readJsonWithin(response);
       if (path === QUERY) queries.push({ config: response.request().postDataJSON(), body, status: response.status(),
         startedAt: response.request().timing().startTime, endedAt: Date.now() });
       else discoveries.push({ path, request: response.request().postDataJSON(), body, status: response.status() });

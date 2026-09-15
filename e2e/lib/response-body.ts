@@ -1,7 +1,15 @@
 import type { Response } from '@playwright/test';
 
 /**
- * Read a response's JSON body within `ms`, or reject with `body-timeout`.
+ * A body whose response has already arrived is read in milliseconds; this is a
+ * ceiling for the read that never completes, and it must sit well inside the
+ * UI_READY (60 s) step that awaits the harness's pending reads, so a lost body is
+ * recorded as an error instead of becoming that step's timeout.
+ */
+export const BODY_READ_MS = 10_000;
+
+/**
+ * Read a response's JSON body within `ms` (default BODY_READ_MS), or reject with `body-timeout`.
  *
  * A flow's capture harness reads the body of every catalog/query response the
  * page receives and awaits those reads before it judges the receipts. A body
@@ -12,7 +20,7 @@ import type { Response } from '@playwright/test';
  */
 // Defaults to `any`, exactly like Response.json(), so it is a drop-in replacement.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export async function readJsonWithin<T = any>(response: Response, ms: number): Promise<T> {
+export async function readJsonWithin<T = any>(response: Response, ms: number = BODY_READ_MS): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   const deadline = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new Error(

@@ -509,7 +509,7 @@ HTML report (7-day retention); on failure it dumps `bin/e2e ps` and the last 200
 `E2E Tests Pass` gate fails closed unless every dependency succeeded or was legitimately skipped.
 
 **Wall time in CI has not been measured yet** — the job has never run on a real PR. Record it on the
-first run and put the number here; the hard timeout is 60 minutes and the boot budgets above are the
+first run and put the number here; the hard timeout is 90 minutes and the boot budgets above are the
 laptop-measured ones.
 
 ---

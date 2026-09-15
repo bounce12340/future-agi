@@ -263,7 +263,7 @@ test('DASH-E2E-012: a saved trace annotation widget retains exact text membershi
         try {
           await attach('native-http-head', { ...receipt });
           if (!/\bapplication\/(?:[\w.-]+\+)?json\b/i.test(receipt.contentType!)) { receipt.error = 'non_json_body_omitted'; return; }
-          receipt.body = await readJsonWithin(response, UI_READY);
+          receipt.body = await readJsonWithin(response);
           // scores.py can return HTTP200 with per-score errors. Classify them
           // before settling so a later success cannot hide this failed Save.
           const body = receipt.body as { status?: boolean; result?: { errors?: unknown } } | null;

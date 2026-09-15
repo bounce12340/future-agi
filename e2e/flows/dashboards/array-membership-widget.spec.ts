@@ -252,7 +252,7 @@ test('DASH-E2E-006: a saved widget retains native array membership through popup
       const path = new URL(response.url()).pathname;
       if (![QUERY, METRICS, VALUES].includes(path) || response.request().method() !== 'POST') return;
       const capture = (async () => {
-        const body = await readJsonWithin(response, UI_READY);
+        const body = await readJsonWithin(response);
         const receipt = { input: response.request().postDataJSON(), body, status: response.status(),
           startedAt: response.request().timing().startTime, endedAt: Date.now(), scope: scopeOf(response) };
         if (path === QUERY) queries.push(receipt);

@@ -243,7 +243,7 @@ test('DASH-E2E-009: a saved conversation widget excludes child-model call-metric
         try {
           await attach('native-http-head', { ...receipt });
           if (!/\bapplication\/(?:[\w.-]+\+)?json\b/i.test(receipt.contentType!)) { receipt.error = 'non_json_body_omitted'; return; }
-          receipt.body = await readJsonWithin(response, UI_READY);
+          receipt.body = await readJsonWithin(response);
         } catch { receipt.error = 'response_json_unreadable'; }
         finally { receipt.endedAt = Date.now(); receipt.settled = true; }
       })();

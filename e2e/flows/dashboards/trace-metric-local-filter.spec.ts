@@ -189,7 +189,7 @@ test('DASH-E2E-003: a metric-specific Model filter changes only that metric afte
     const path = new URL(response.url()).pathname;
     if (![QUERY, METRICS, VALUES].includes(path) || response.request().method() !== 'POST') return;
     const capture = (async () => {
-      const body = await readJsonWithin(response, UI_READY);
+      const body = await readJsonWithin(response);
       const sent = response.request().postDataJSON();
       if (path === QUERY) queries.push({ config: sent, body, status: response.status(),
         startedAt: response.request().timing().startTime, endedAt: Date.now() });

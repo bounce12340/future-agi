@@ -304,7 +304,7 @@ test('DASH-E2E-008: a saved User widget keeps project and identifier-type scope'
       else if (path === VALUES) values.push(receipt as Receipt<ValueBody>);
       else saves.push(receipt);
       const capture = (async () => {
-        try { receipt.body = await readJsonWithin(response, UI_READY); }
+        try { receipt.body = await readJsonWithin(response); }
         catch (error) { receipt.parseError = error instanceof Error ? error.name : 'UnknownError'; }
         finally { receipt.endedAt = Date.now(); receipt.settled = true; }
       })();

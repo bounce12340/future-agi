@@ -189,7 +189,7 @@ test('ANNOT-E2E-004: corrected session annotations match only current authorized
     const read = (async () => {
       try {
         graphResponses.push({ status: response.status(), request: response.request().postDataJSON(),
-          body: await readJsonWithin(response, UI_READY) });
+          body: await readJsonWithin(response) });
       } catch (error) {
         graphResponses.push({ status: response.status(), error: String(error) });
       }
