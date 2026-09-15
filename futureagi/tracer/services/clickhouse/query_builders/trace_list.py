@@ -837,7 +837,16 @@ class TraceListQueryBuilder(BaseQueryBuilder):
                 operation,
                 value,
             )
-        return predicate or "", dict(filter_builder._params)
+        if not predicate:
+            return "", {}
+        # This predicate seeds a trace-membership CTE over the whole span
+        # table, so it needs the same event-time envelope every membership
+        # subquery ``translate`` compiles already carries. Without it the CTE
+        # is the one read in the statement that does not shrink with the
+        # request window: it rescans the project's entire span history for a
+        # one-day page exactly as it does for a year.
+        predicate += filter_builder._span_membership_date_filter()
+        return predicate, dict(filter_builder._params)
 
     def supports_filter_candidate_seed_page(self) -> bool:
         """Use necessary scalar or relational membership before ordered roots."""
