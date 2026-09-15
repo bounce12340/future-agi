@@ -43,6 +43,38 @@ class BoundedUserResolution:
 MAX_USER_PHYSICAL_IDENTITIES_PER_PAGE = 4_096
 
 
+# The anchor is as long as the value it describes, and the seed writes it into
+# two statements, so an unbounded anchor is what pushes a long value past the
+# parser limit. Keep only as much of it as the statement can afford. Every row
+# holding the whole value holds every substring of it, so a subset of the runs,
+# kept in order, is still a necessary condition: a shorter anchor can only
+# widen the granule set, never hide a matching row. The runs are ASCII by
+# construction above, so a character is a byte here.
+_MAX_NGRAM_ANCHOR_BYTES = 4 * 1024
+
+
+def _runs_within_anchor_budget(runs: list[str]) -> list[str]:
+    """The most selective runs that fit the anchor's byte budget, in order.
+
+    ``ngrambf_v1`` indexes four-grams, so a longer run carries more distinct
+    four-grams for the bytes it costs; prefer the longest. A single run past
+    the whole budget keeps a prefix, which is still a substring of the value.
+    """
+
+    if sum(len(run) + 1 for run in runs) <= _MAX_NGRAM_ANCHOR_BYTES:
+        return runs
+    kept: set[int] = set()
+    spent = 0
+    for index, run in sorted(enumerate(runs), key=lambda pair: (-len(pair[1]), pair[0])):
+        if spent + len(run) + 1 > _MAX_NGRAM_ANCHOR_BYTES:
+            continue
+        kept.add(index)
+        spent += len(run) + 1
+    if not kept:
+        return [max(runs, key=len)[: _MAX_NGRAM_ANCHOR_BYTES]]
+    return [run for index, run in enumerate(runs) if index in kept]
+
+
 def _caseless_ascii_ngram_anchor(value: str) -> str | None:
     """A necessary literal substring compatible with the existing ASCII index.
 
@@ -68,7 +100,7 @@ def _caseless_ascii_ngram_anchor(value: str) -> str | None:
         "%"
         + "%".join(
             run.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-            for run in runs
+            for run in _runs_within_anchor_budget(runs)
         )
         + "%"
     )
@@ -79,12 +111,11 @@ def _caseless_ascii_ngram_anchor(value: str) -> str | None:
 # statement that carries its filter text inline has a hard size ceiling.
 _CLICKHOUSE_MAX_QUERY_SIZE_BYTES = 262_144
 
-# The candidate seed renders every value's exact witness and its index anchor
-# into the candidate CTE and again into the statement that reads from it, so a
-# long filter value reaches the parser multiplied. Hold those literals inside a
-# budget that leaves the rest of the statement room under the ceiling above.
-_LONG_TEXT_SEED_STATEMENT_COPIES = 2
-_LONG_TEXT_SEED_INLINE_BUDGET_BYTES = 192 * 1024
+# The candidate seed writes each value's exact witness and its index anchor
+# into the statement once apiece. Hold their sum inside a budget that leaves
+# the rest of the statement room under the ceiling above; a value past it keeps
+# the ordinary exact route, which carries the witness and no anchor.
+_LONG_TEXT_SEED_INLINE_BUDGET_BYTES = 232 * 1024
 
 
 def _rendered_literal_bytes(value: str) -> int:
@@ -666,7 +697,7 @@ class _TraceListQueryBuilderV2Core(_TraceRootReplayV2, TraceListQueryBuilder):
                 # ordinary exact route, which carries it once. Acquisition is
                 # the only thing that changes: the exact route is the same
                 # necessary-and-sufficient membership test the seed defers to.
-                inlined = _LONG_TEXT_SEED_STATEMENT_COPIES * sum(
+                inlined = sum(
                     _rendered_literal_bytes(literal)
                     for literal in [*anchors, *values]
                     if literal is not None

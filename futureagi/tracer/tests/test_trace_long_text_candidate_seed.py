@@ -1,5 +1,6 @@
 """Long text may change acquisition, never exact membership or child scope."""
 
+import re
 from datetime import timedelta
 
 import pytest
@@ -8,8 +9,10 @@ from tracer.services.clickhouse.query_builders import latest_filter_predicates
 from tracer.services.clickhouse.query_builders.trace_list import TraceListQueryBuilder
 from tracer.services.clickhouse.v2.query_builders.trace_list import (
     _CLICKHOUSE_MAX_QUERY_SIZE_BYTES,
+    _MAX_NGRAM_ANCHOR_BYTES,
     TraceListQueryBuilderV2,
     _caseless_ascii_ngram_anchor,
+    _runs_within_anchor_budget,
 )
 from tracer.tests.test_bounded_trace_filter_reads import (
     _attribute_filter,
@@ -289,6 +292,8 @@ def test_page_keyset_does_not_limit_the_necessary_child_witness():
 # case for a statement that inlines the anchor beside the exact literal.
 _ANCHORABLE_UNIT = "a common message 000123 another response. "
 OVERSIZED_TEXT = _ANCHORABLE_UNIT * 2600
+# Past the seed's inline budget even on its own, so the seed must stand down.
+UNSEEDABLE_TEXT = _ANCHORABLE_UNIT * 5620
 ORDINARY_LONG_TEXT = _ANCHORABLE_UNIT * 60
 _WINDOW = dict(slice_start=END - timedelta(days=365), slice_end=END, limit=50)
 
@@ -305,7 +310,12 @@ def _rendered_seed_statement(subject) -> str:
 
 @pytest.mark.parametrize("operation", ["equals", "in"])
 def test_oversized_text_keeps_the_statement_inside_the_parser_limit(operation):
-    """ClickHouse refuses an oversized statement before it runs, so never send one."""
+    """ClickHouse refuses an oversized statement before it runs, so never send one.
+
+    One oversized value still fits the seed once its anchor is bounded; two do
+    not, and fall back to the ordinary exact route. Either way the statement
+    the builder chooses must reach the parser intact.
+    """
 
     value = (
         [OVERSIZED_TEXT, OVERSIZED_TEXT + " tail"]
@@ -313,10 +323,9 @@ def test_oversized_text_keeps_the_statement_inside_the_parser_limit(operation):
         else OVERSIZED_TEXT
     )
     subject = builder(operation=operation, value=value)
-    # The value is anchorable and long, so only its size may decline the seed.
     assert _caseless_ascii_ngram_anchor(OVERSIZED_TEXT) is not None
-    assert subject._public_long_text_candidate_seed_plan() is None
-    assert not subject.supports_filter_candidate_seed_page()
+    # The bounded anchor is small enough that the seed lane survives here.
+    assert subject.supports_filter_candidate_seed_page()
     rendered = _rendered_seed_statement(subject)
     assert "indexHint(has(arrayMap" not in rendered
     assert "indexHint(hasAny(arrayMap" not in rendered
@@ -431,3 +440,73 @@ def test_index_companions_exist_only_inside_index_hints(operation, monkeypatch):
     assert "latest_filter_legacy_index_" not in _outside_index_hints(with_sql)
     assert "latest_filter_legacy_index_" not in without_sql
     assert "latest_filter_index_" not in without_sql
+
+
+def _anchor_runs(anchor: str) -> list[str]:
+    return [run for run in anchor.split("%") if run]
+
+
+def _occurs_in_order(fragments: list[str], text: str) -> bool:
+    cursor = 0
+    for fragment in fragments:
+        found = text.find(fragment, cursor)
+        if found < 0:
+            return False
+        cursor = found + len(fragment)
+    return True
+
+
+# Units carrying an i split into many runs, so the anchor must choose among
+# them rather than truncate one.
+MANY_RUN_TEXT = "an indexed message 000123 with a distinct reply. " * 2400
+
+
+@pytest.mark.parametrize("value", [OVERSIZED_TEXT, MANY_RUN_TEXT])
+def test_bounded_anchor_stays_a_necessary_condition(value):
+    """Every kept fragment is a substring of the value, in the value's order.
+
+    A row holding the whole value holds every substring of it, so a shorter
+    anchor can only widen the granule set, never hide a matching row.
+    """
+
+    bounded = _caseless_ascii_ngram_anchor(value)
+    assert bounded is not None
+    assert len(bounded.encode()) <= _MAX_NGRAM_ANCHOR_BYTES + 2
+    kept = [fragment for fragment in bounded.split("%") if fragment]
+    assert kept
+    assert _occurs_in_order(kept, value.lower())
+
+
+def test_bounded_anchor_prefers_the_longest_runs_and_keeps_value_order():
+    """Longer runs carry more four-grams per byte, so they are taken first.
+
+    Whatever survives is emitted in the value's own order, because the LIKE
+    pattern requires its fragments in that order to stay a necessary condition.
+    """
+
+    runs = ["a" * 40, "b" * 4000, "c" * 40, "d" * 4000]
+    kept = _runs_within_anchor_budget(runs)
+    # The first 4000-run fits and the second no longer does; the short runs
+    # then fill the remainder, and the result stays in the original order.
+    assert kept == ["a" * 40, "b" * 4000, "c" * 40]
+    assert sum(len(run) + 1 for run in kept) <= _MAX_NGRAM_ANCHOR_BYTES
+    # An anchor that already fits is returned untouched.
+    assert _runs_within_anchor_budget(["e" * 40, "f" * 40]) == ["e" * 40, "f" * 40]
+
+
+def test_short_anchor_is_unbounded_and_unchanged():
+    """The budget must not touch anchors that already fit."""
+
+    assert _caseless_ascii_ngram_anchor("words 123456 words") == "%words 123456 words%"
+
+
+def test_seed_stands_down_when_even_one_value_will_not_fit():
+    """Past the inline budget the ordinary exact route carries the value alone."""
+
+    subject = builder(operation="equals", value=UNSEEDABLE_TEXT)
+    assert _caseless_ascii_ngram_anchor(UNSEEDABLE_TEXT) is not None
+    assert subject._public_long_text_candidate_seed_plan() is None
+    assert not subject.supports_filter_candidate_seed_page()
+    rendered = _rendered_seed_statement(subject)
+    assert "matching_scalar_trace_identities" not in rendered
+    assert len(rendered.encode()) < _CLICKHOUSE_MAX_QUERY_SIZE_BYTES
