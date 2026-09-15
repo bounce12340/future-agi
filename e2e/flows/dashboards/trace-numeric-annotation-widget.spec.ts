@@ -77,7 +77,7 @@ test('DASH-E2E-010: a saved trace annotation widget retains numeric scores', {
     ],
   }),
 }, async ({ browser, scopeActors, scopeProbe: probe }, testInfo) => {
-  test.setTimeout(780_000); // A8: ASYNC60 + 2×SPAN15 + CDC180 + 8×UI60 + 30 headroom.
+  test.setTimeout(900_000); // A8: ASYNC60 + 2×SPAN15 + CDC180 + 10×UI60 (three seed submissions) + 30 headroom.
   const uiExpect = expect.configure({ timeout: UI_READY });
   const prefix = `e2e-dash10-${testInfo.workerIndex}-${Date.now().toString(36)}`;
   const actor = scopeActors.ownerA, foreignActor = scopeActors.ownerB;
@@ -455,7 +455,9 @@ test('DASH-E2E-010: a saved trace annotation widget retains numeric scores', {
     };
     try {
       await test.step('1 submit three native numeric trace Scores', async () => {
-        for (const seed of [seeds[0], seeds[2], seeds[3]]) {
+        // One seed is a page load plus an annotation drawer, ~25 s on the CI runner; three
+        // under one UI_READY were cut at 60.0 s (run 34917707974). One UI_READY step per seed.
+        for (const seed of [seeds[0], seeds[2], seeds[3]]) await test.step(`seed ${seed.key}`, async () => {
           const owner = actors[seed.project], surface = seed.project === 2 ? foreignPage : page, queue = queues[seed.project];
           const labelId = labelIds[seed.project === 2 ? 1 : 0], projectId = projectIds[seed.project];
           const expected = seeds.filter(row => row.project === seed.project), since = Date.now();
@@ -545,8 +547,8 @@ test('DASH-E2E-010: a saved trace annotation widget retains numeric scores', {
             label_type: 'numeric', label_settings: { min: 0, max: 100, step_size: 1, display_type: 'slider' }, label_allow_notes: false,
             value: { value: seed.value }, value_history: [], score_source: 'human', notes: '', annotator: owner.userId, queue_id: queue.id });
           submissions.push({ seed, receipt }); await attach('native-submissions', submissions);
-        }
-      }, { timeout: UI_READY });
+        }, { timeout: UI_READY });
+      });
 
       await test.step('combined PG definitions and latest PG-to-CH Score barrier', async () => {
         initialScores = await readPG(); expect(initialScores).toHaveLength(3);
