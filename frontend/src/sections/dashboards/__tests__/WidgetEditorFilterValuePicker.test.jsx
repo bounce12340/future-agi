@@ -8,6 +8,7 @@ import {
   waitFor,
   within,
 } from "src/utils/test-utils";
+import { getFilterValueReadState } from "src/utils/queryReadState";
 
 const useResolvedFilterOptionsMock = vi.fn();
 
@@ -676,6 +677,88 @@ describe("WidgetEditor property-catalog loading state", () => {
 });
 
 describe("WidgetEditor filter-value picker", () => {
+  it.each([
+    { values: [] },
+    { values: [{ value: "observed", label: "Observed", type: "string" }] },
+  ])(
+    "keeps current-catalog suggestions selectable without a notice: %j",
+    async ({ values }) => {
+      const intersection = installIntersectionObserver();
+      const page = {
+        values,
+        query_complete: true,
+        query_status: "complete",
+        query_exact: false,
+        query_provenance: "current_property_catalog",
+        has_more: values.length > 0,
+        next_cursor: values.length > 0 ? "observed-next" : null,
+      };
+      const fetchNextPage = vi.fn(() => Promise.resolve());
+      useResolvedFilterOptionsMock.mockReturnValue({
+        options: page.values,
+        isLoading: false,
+        isError: false,
+        fetchNextPage,
+        hasNextPage: page.has_more,
+        continuationKey: page.next_cursor,
+        isFetchingNextPage: false,
+        isFetchNextPageError: false,
+        queryReadState: getFilterValueReadState(page),
+        cursorChainStopped: false,
+        refetch: vi.fn(),
+      });
+      const anchorEl = document.createElement("button");
+      document.body.appendChild(anchorEl);
+      const onApply = vi.fn();
+      const { unmount } = render(
+        <FilterValuePickerPopup
+          anchorEl={anchorEl}
+          filter={{
+            id: "customer.plan",
+            type: "custom_attribute",
+            dataType: "string",
+            value: [],
+          }}
+          onClose={vi.fn()}
+          onApply={onApply}
+          source="traces"
+        />,
+      );
+      try {
+        expect(screen.queryByRole("status")).not.toBeInTheDocument();
+        expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+        expect(
+          screen.queryByText(
+            /history|coverage|suggestions only|temporarily unavailable/i,
+          ),
+        ).not.toBeInTheDocument();
+        expect(
+          screen.queryByRole("button", { name: "Retry" }),
+        ).not.toBeInTheDocument();
+        if (values.length) {
+          await act(async () => intersection.emit(true));
+          expect(fetchNextPage).toHaveBeenCalledOnce();
+          fireEvent.click(screen.getByText("Observed"));
+        } else {
+          expect(screen.getByText("No values found")).toBeInTheDocument();
+          fireEvent.change(screen.getByPlaceholderText("Search..."), {
+            target: { value: "literal-value" },
+          });
+          fireEvent.click(screen.getByText("literal-value"));
+          expect(fetchNextPage).not.toHaveBeenCalled();
+        }
+        fireEvent.click(screen.getByRole("button", { name: "Add" }));
+        expect(onApply).toHaveBeenCalledWith(
+          [values.length ? "observed" : "literal-value"],
+          ["string"],
+        );
+      } finally {
+        unmount();
+        anchorEl.remove();
+      }
+    },
+  );
+
   it("automatically continues retained values at the list end without a load-more button", async () => {
     const intersection = installIntersectionObserver();
     const nextPage = deferred();
@@ -1158,6 +1241,9 @@ describe("WidgetEditor filter-value picker", () => {
     );
 
     expect(screen.getByText("Retained")).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Suggestions are temporarily unavailable",
+    );
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     expect(retryFreshPage).toHaveBeenCalledOnce();
     document.body.removeChild(anchorEl);

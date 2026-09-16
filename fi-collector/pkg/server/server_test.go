@@ -61,9 +61,7 @@ func TestServerEnd2End(t *testing.T) {
 	})
 
 	s := New(Config{GRPCAddr: "127.0.0.1:0", BatchMaxRows: 1, BatchMaxAge: 50 * time.Millisecond}, w, nil, nil, nil)
-	// We need a known listen address to dial; replicate Run's bind step.
-	// Easier: use a non-zero port — pick one that's likely free.
-	addr := "127.0.0.1:24317"
+	addr := testTCPAddr(t)
 	s.cfg.GRPCAddr = addr
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -313,15 +311,16 @@ func TestServerEnd2End_WritesTraceRow(t *testing.T) {
 	})
 
 	// curatedwriter over the SAME chwriter (as production: server.New wires it).
-	s := New(Config{GRPCAddr: "127.0.0.1:24320", BatchMaxRows: 1, BatchMaxAge: 50 * time.Millisecond}, w, nil, nil, nil)
+	addr := testTCPAddr(t)
+	s := New(Config{GRPCAddr: addr, BatchMaxRows: 1, BatchMaxAge: 50 * time.Millisecond}, w, nil, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() { _ = s.Run(ctx) }()
-	if !waitPort("127.0.0.1:24320", 2*time.Second) {
+	if !waitPort(addr, 2*time.Second) {
 		t.Fatal("server didn't listen")
 	}
 
-	conn, err := grpc.NewClient("127.0.0.1:24320", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -388,8 +387,8 @@ func startServerWithHTTP(t *testing.T) (httpAddr, grpcAddr string, sawCH func() 
 		t.Fatalf("chwriter.New: %v", err)
 	}
 
-	httpAddr = "127.0.0.1:24318"
-	grpcAddr = "127.0.0.1:24319" // dynamic enough that grpc test above on :24317 doesn't clash
+	httpAddr = testTCPAddr(t)
+	grpcAddr = testTCPAddr(t)
 	s := New(Config{
 		GRPCAddr:     grpcAddr,
 		HTTPAddr:     httpAddr,
@@ -696,7 +695,7 @@ func TestPricerWiredThroughGRPCExport(t *testing.T) {
 	}
 
 	stub := &stubPricer{cost: 0.0099}
-	addr := "127.0.0.1:24321" // distinct from the other gRPC ports used in this file
+	addr := testTCPAddr(t)
 	s := New(Config{GRPCAddr: addr, BatchMaxRows: 1, BatchMaxAge: 50 * time.Millisecond}, w, nil, nil, nil, WithPricer(stub))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -758,6 +757,21 @@ func TestPricerWiredThroughGRPCExport(t *testing.T) {
 	if !strings.Contains(body, `"cost":0.0099`) {
 		t.Errorf("enqueued row cost != stub's 0.0099 (or key absent); CH body: %q", body)
 	}
+}
+
+// testTCPAddr keeps tests independent of developer machines, CI workers, and
+// unrelated local services that may already own a well-known port.
+func testTCPAddr(t *testing.T) string {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve test port: %v", err)
+	}
+	addr := lis.Addr().String()
+	if err := lis.Close(); err != nil {
+		t.Fatalf("release test port %s: %v", addr, err)
+	}
+	return addr
 }
 
 // waitPort polls until something accepts on addr or deadline. Simple enough
@@ -921,7 +935,7 @@ func TestGRPCAcceptsSpanLargerThanFourMiB(t *testing.T) {
 		DeadLetterFile: t.TempDir() + "/dl.jsonl",
 	})
 
-	addr := "127.0.0.1:24323"
+	addr := testTCPAddr(t)
 	s := New(Config{GRPCAddr: addr, BatchMaxRows: 1000, BatchMaxAge: 50 * time.Millisecond}, w, nil, nil, nil)
 	s.cfg.HTTPAddr = "" // gRPC-only; don't race other tests (or a dev stack) for :4318
 
@@ -987,7 +1001,7 @@ func TestGRPCOverCapRejectionIsLogged(t *testing.T) {
 		return logBuf.Write(p)
 	})
 
-	addr := "127.0.0.1:24322"
+	addr := testTCPAddr(t)
 	s := New(
 		Config{GRPCAddr: addr, BatchMaxRows: 1000, BatchMaxAge: 50 * time.Millisecond},
 		w, nil, nil, nil,

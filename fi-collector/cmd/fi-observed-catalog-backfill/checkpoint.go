@@ -25,6 +25,9 @@ type checkpoint struct {
 	Rows     uint64       `json:"source_rows"`
 	Complete bool         `json:"scan_complete"`
 	Legacy   legacyCursor `json:"legacy_after,omitempty"`
+	// Optional for old checkpoints. Counts only exclusions recorded by this
+	// checkpoint; an older binary can ignore and drop the field when rewriting.
+	PolicyExclusionSpans uint64 `json:"recorded_policy_exclusion_spans,omitempty"`
 }
 
 func lockCheckpoint(path string) (*os.File, error) {

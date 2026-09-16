@@ -64,7 +64,7 @@ func TestClickHouseMigratedStringOverflowBackfill(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	batch, err := buildPage(rows, scope, hour, hour.Add(time.Hour), observedcatalog.DefaultLimits())
+	batch, _, err := buildPage(rows, scope, hour, hour.Add(time.Hour), observedcatalog.DefaultLimits())
 	if err != nil || len(batch.Keys) != 2 || len(batch.Values) != 3 {
 		t.Fatalf("String overflow not normalized like live JSON: %v %v", batch, err)
 	}

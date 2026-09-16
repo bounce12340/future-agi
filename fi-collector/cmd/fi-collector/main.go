@@ -263,6 +263,12 @@ func applyEnvOverrides(log *slog.Logger, c *rootConfig) error {
 	if v := os.Getenv("FI_PG_READ"); v != "" {
 		c.Auth.PGRead = v
 	}
+	if endpoint := auth.EndpointFromEnv(os.Getenv, "FI_PG_WRITE"); endpoint != "" {
+		c.Auth.PGWrite = endpoint
+	}
+	if endpoint := auth.EndpointFromEnv(os.Getenv, "FI_PG_READ"); endpoint != "" {
+		c.Auth.PGRead = endpoint
+	}
 	if v := os.Getenv("FI_AUTH_REDIS_ADDR"); v != "" {
 		c.Auth.RedisAddr = v
 	}

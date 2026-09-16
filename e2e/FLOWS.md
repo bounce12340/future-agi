@@ -559,6 +559,27 @@
 - latest ClickHouse cells equal exact Postgres identities and independently expected typed values without changing imported inputs
 - native choice, numeric and intersection filters return exact row identities and the saved/reopened widget retains its scoped sum
 
+### EVAL-E2E-005 — browser task submit retains a custom attribute predicate and excludes other spans
+
+**Goal:** Create an evaluation task from the browser for exactly the selected custom attribute value  
+**Spec:** `flows/evals/task-filter-submit.spec.ts:33`  
+**Tags:** —
+
+**User steps:**
+
+1. seed two differently attributed spans in an isolated project
+2. select the project, custom property and value on the task create page
+3. verify the exact matching preview
+4. select and configure an echo judge
+5. click the final Create Task button
+6. verify task and result inclusion and exclusion
+
+**Backend state verified:**
+
+- managed mock routing attested before model calls
+- UI POST and stored task retain the custom predicate
+- completed task has exactly the matching span in PG and CH, with mock verdict and usage
+
 ## observe
 
 ### OBS-E2E-001 — SDK trace appears in Observe with coherent backend state
@@ -766,6 +787,24 @@
 - preview has zero writes; bounded apply, resume and overlap converge through the live catalog consumer
 - grouped catalog tuples and typed API suggestions equal an independent input-event oracle
 - consumed-offset barrier precedes zero matches; real UI requests and complete API cursor walks return exact seeded IDs
+
+### OBS-E2E-011 — Sessions custom property/value selection preserves project and result scope
+
+**Goal:** Select a discovered custom attribute value in Sessions and inspect only its matching session traces  
+**Spec:** `flows/observe/catalog-session-custom-filter.spec.ts:19`  
+**Tags:** —
+
+**User steps:**
+
+1. ingest west and east sessions plus a foreign sibling-project value
+2. choose the custom property and west suggestion through the browser
+3. inspect the exact matching session and open its trace history
+
+**Backend state verified:**
+
+- source sessions retain their exact project identities
+- the dropdown excludes the sibling value and the request preserves the typed custom predicate
+- list and detail return only the matching session and its two source traces
 
 ### OBS-E2E-020 — duplicate saved-view names are rejected
 

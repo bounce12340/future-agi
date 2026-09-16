@@ -743,10 +743,18 @@ services:
       FI_CH_DATABASE: ${FI_CH_DATABASE:-${CH25_DATABASE:-${CH_DATABASE:-default}}}
       # Auth: collector validates API keys against Django's Postgres. Without
       # these it falls back to the baked-in default (postgres://user:password@db:5432/tfc),
-      # whose host `db` doesn't exist here -> every trace 503s. Point at the
-      # same `postgres` service Django uses (PG_USER/PG_PASSWORD/PG_DB).
-      FI_PG_WRITE: postgres://${PG_USER:-futureagi}:${PG_PASSWORD:-futureagi}@postgres:5432/${PG_DB:-futureagi}?sslmode=disable
-      FI_PG_READ: postgres://${PG_USER:-futureagi}:${PG_PASSWORD:-futureagi}@postgres:5432/${PG_DB:-futureagi}?sslmode=disable
+      # whose host `db` doesn't exist here -> every trace 503s. Keep endpoint
+      # fields separate so arbitrary passwords need no URI escaping.
+      FI_PG_WRITE_HOST: postgres
+      FI_PG_WRITE_PORT: 5432
+      FI_PG_WRITE_DATABASE: ${PG_DB:-futureagi}
+      FI_PG_WRITE_USER: ${PG_USER:-futureagi}
+      FI_PG_WRITE_PASSWORD: ${PG_PASSWORD:-futureagi}
+      FI_PG_READ_HOST: postgres
+      FI_PG_READ_PORT: 5432
+      FI_PG_READ_DATABASE: ${PG_DB:-futureagi}
+      FI_PG_READ_USER: ${PG_USER:-futureagi}
+      FI_PG_READ_PASSWORD: ${PG_PASSWORD:-futureagi}
       FI_AUTH_REDIS_ADDR: redis:6379
       FI_GRPC_ADDR: ":4317"
       # OTLP/HTTP receiver — needed by browser SDKs + lightweight clients.

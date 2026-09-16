@@ -45238,21 +45238,15 @@ export const TracerDashboardFilterValuesResponse = zod.object({
         description: zod.string().min(1).optional(),
       }),
     ),
-    query_complete: zod.boolean().optional(),
+    query_complete: zod
+      .boolean()
+      .optional()
+      .describe(
+        "Whether this page read completed, not whether all source history is indexed.",
+      ),
     query_status: zod
       .enum(["complete", "sampled", "degraded", "partial"])
       .optional(),
-    coverage_reason: zod
-      .enum([
-        "empty_scope",
-        "covered",
-        "floor_unavailable",
-        "project_unindexed",
-        "source_predates_index",
-        "probe_unavailable",
-      ])
-      .optional(),
-    coverage_floor: zod.string().min(1).optional(),
     query_error_code: zod
       .enum(["sample_limit", "read_budget_exceeded", "query_failed"])
       .optional(),
@@ -45541,20 +45535,14 @@ export const TracerDashboardMetricsResponse = zod.object({
       .min(1)
       .regex(tracerDashboardMetricsResponseResultActivationFingerprintRegExp)
       .optional(),
-    query_complete: zod.boolean().optional(),
+    query_complete: zod
+      .boolean()
+      .optional()
+      .describe(
+        "Whether this page read completed, not whether all source history is indexed.",
+      ),
     query_exact: zod.boolean().optional(),
     query_status: zod.enum(["complete", "partial"]).optional(),
-    coverage_reason: zod
-      .enum([
-        "empty_scope",
-        "covered",
-        "floor_unavailable",
-        "project_unindexed",
-        "source_predates_index",
-        "probe_unavailable",
-      ])
-      .optional(),
-    coverage_floor: zod.string().min(1).optional(),
     query_provenance: zod
       .enum(["activated_property_catalog", "current_property_catalog"])
       .optional(),

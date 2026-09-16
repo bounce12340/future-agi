@@ -4,7 +4,8 @@ The caller owns target authorization, transport and whole-job deadlines, an
 exclusive bootstrap window, and a fresh, complete mirror inventory for this
 database. Never supply an empty inventory on inspection failure. Existing mirrors
 are NOT created, changed, or qualified here.
-Only the fixed CDC CREATEs and the two named additive upgrades can be executed.
+Only the selected fixed CDC CREATEs and named additive upgrades can be executed.
+The caller selects usage support from installed apps, not from missing DB metadata.
 
 The small declaration reader below reads our packaged CREATE grammar, not arbitrary
 migrations. Unknown syntax/physical shapes fail closed. SQL formatting/transport
@@ -129,6 +130,24 @@ CREATE TABLE IF NOT EXISTS schema_versions (
 
 class BootstrapError(ValueError):
     """Unknown/incomplete physical contract; no automatic repair or cleanup."""
+
+
+def landing_tables(*, include_usage_schema: bool = True) -> tuple[str, ...]:
+    """Select the packaged apps' contract, never infer optionality from DB errors."""
+    if type(include_usage_schema) is not bool:
+        raise BootstrapError("usage schema selection must be a boolean")
+    return tuple(
+        name for name in LANDING if include_usage_schema or name != "usage_apicalllog"
+    )
+
+
+def migration_names(*, include_usage_schema: bool = True) -> tuple[str, ...]:
+    tables = set(landing_tables(include_usage_schema=include_usage_schema))
+    return tuple(
+        name
+        for name, columns in upgrade.MIGRATIONS.items()
+        if {table for table, _ in columns} <= tables
+    )
 
 
 @dataclass(frozen=True)
@@ -277,13 +296,18 @@ def _table(ddl: str):
     return columns, indexes, _clauses(tail)
 
 
-def _definitions(database: str) -> tuple[dict[str, str], dict[str, str]]:
+def _definitions(
+    database: str, *, include_usage_schema: bool = True
+) -> tuple[dict[str, str], dict[str, str]]:
     for name in (database, schema._CH_DATABASE):
         if not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]{0,127}", name):
             raise BootstrapError("database must be an explicit safe identifier")
     if database.lower() in {"system", "information_schema"}:
         raise BootstrapError("system database is not an OSS CDC target")
-    create = {name: schema._to_single_node_engine(ddl) for name, ddl in LANDING.items()}
+    create = {
+        name: schema._to_single_node_engine(LANDING[name])
+        for name in landing_tables(include_usage_schema=include_usage_schema)
+    }
     create.update(
         {
             name: ddl.replace(f"{schema._CH_DATABASE}.", f"{database}.").replace(
@@ -424,14 +448,17 @@ def _check_table(
         raise BootstrapError(f"{name}: incompatible skipping indexes")
 
 
-def _source_definitions(source: SourceInventory) -> dict[str, str]:
+def _source_definitions(
+    source: SourceInventory, *, include_usage_schema: bool = True
+) -> dict[str, str]:
     """Inspection-only profile from independent PG metadata, never executed.
 
     PeerDB owns all source columns and the ID-keyed transport layout. Only the
     fixed derived eval columns are optional before their named migration. Keep
     the application's required column names without copying its old, lossy types.
     """
-    if not isinstance(source, SourceInventory) or set(source.tables) != set(LANDING):
+    required_tables = set(landing_tables(include_usage_schema=include_usage_schema))
+    if not isinstance(source, SourceInventory) or set(source.tables) != required_tables:
         raise BootstrapError("complete PostgreSQL source schema required")
     result = {}
     derived = upgrade.MIGRATIONS["cdc_002_usage_eval_fields.sql"]
@@ -579,9 +606,11 @@ def inspect_bootstrap(
     inspect_mirrors: Callable[[], MirrorInventory],
     inspect_source: Callable[[], SourceInventory] | None = None,
     require_complete=False,
+    include_usage_schema: bool = True,
 ) -> Inspection:
     """SELECT-only preflight; all existing objects checked before any CREATE."""
-    create, native = _definitions(database)
+    create, native = _definitions(database, include_usage_schema=include_usage_schema)
+    landing = set(landing_tables(include_usage_schema=include_usage_schema))
     if client.query(
         "SELECT currentDatabase()", settings={"readonly": 1}
     ).result_rows != [(database,)]:
@@ -635,7 +664,7 @@ def inspect_bootstrap(
         raise BootstrapError("complete mirror inventory for exact database required")
     seen = set()
     for mirror, destination in inventory.mappings:
-        if destination not in LANDING or not mirror.strip() or destination in seen:
+        if destination not in landing or not mirror.strip() or destination in seen:
             raise BootstrapError("unknown/duplicate mirror mapping")
         # The inventory verifies actual endpoints and public source mappings.
         # A mirror's display name is not identity; one mirror may own many tables.
@@ -650,10 +679,12 @@ def inspect_bootstrap(
             not isinstance(source, SourceInventory)
             or inventory.source is None
             or source.source != inventory.source
-            or seen != set(LANDING)
+            or seen != landing
         ):
             raise BootstrapError("all source-owned mappings and exact PG peer required")
-        source_definitions = _source_definitions(source)
+        source_definitions = _source_definitions(
+            source, include_usage_schema=include_usage_schema
+        )
         # No source migration may compensate for incomplete replication.
         upgrade.inspect_source_fields(client)
     else:
@@ -687,7 +718,9 @@ def inspect_bootstrap(
         )
     recorded = apply_schema.fetch_applied(client) if ledger else {}
     eligible = set()
-    for migration_name, added_columns in upgrade.MIGRATIONS.items():
+    selected_migrations = migration_names(include_usage_schema=include_usage_schema)
+    for migration_name in selected_migrations:
+        added_columns = upgrade.MIGRATIONS[migration_name]
         prior = recorded.get(migration_name)
         if prior is not None:
             if prior != upgrade.migration_file(migration_name).sha256:
@@ -698,7 +731,7 @@ def inspect_bootstrap(
             inspect_source is None or migration_name != upgrade.MIGRATION_NAME
         ):
             eligible.update(added_columns)
-    required_migrations = set(upgrade.MIGRATIONS)
+    required_migrations = set(selected_migrations)
     if inspect_source is not None:
         required_migrations.remove(upgrade.MIGRATION_NAME)
     all_recorded = required_migrations <= recorded.keys()
@@ -743,22 +776,26 @@ def bootstrap_cdc(
     inspect_mirrors: Callable[[], MirrorInventory],
     applied_by: str,
     inspect_source: Callable[[], SourceInventory] | None = None,
+    include_usage_schema: bool = True,
 ) -> BootstrapResult:
     """One serialized apply, no retries/cleanup. Any failure stops subsequent DDL.
 
     With inspect_source, PeerDB-created tables are prerequisites, never CREATE or
-    ALTER targets except for the four derived eval columns. No cdc001 is applied
-    or recorded. Without it the separately qualified canonical path is retained.
+    ALTER targets except for the four derived eval columns when usage is selected.
+    No cdc001 is applied or recorded. Without inspect_source the separately
+    qualified canonical path is retained.
     """
-    create, _ = _definitions(database)
+    create, _ = _definitions(database, include_usage_schema=include_usage_schema)
+    landing = landing_tables(include_usage_schema=include_usage_schema)
     before = inspect_bootstrap(
         client,
         database=database,
         inspect_mirrors=inspect_mirrors,
         inspect_source=inspect_source,
+        include_usage_schema=include_usage_schema,
     )
     created = []
-    for name in () if inspect_source is not None else LANDING:
+    for name in () if inspect_source is not None else landing:
         if name in before.missing:
             client.command(create[name])
             created.append(name)
@@ -768,14 +805,15 @@ def bootstrap_cdc(
         database=database,
         inspect_mirrors=inspect_mirrors,
         inspect_source=inspect_source,
+        include_usage_schema=include_usage_schema,
     )
-    if set(middle.missing) & LANDING.keys():
+    if set(middle.missing) & set(landing):
         raise BootstrapError("landing CREATE did not establish its postcondition")
     # Inspect both before any ADD, so an incompatible later upgrade cannot
     # leave a newly applied earlier one behind. Do not replay native migrations.
     states = [
         upgrade.inspect_upgrade(client, migration_name=name)
-        for name in upgrade.MIGRATIONS
+        for name in migration_names(include_usage_schema=include_usage_schema)
         if inspect_source is None or name != upgrade.MIGRATION_NAME
     ]
     if any(not state.recorded for state in states) and not middle.ledger_present:
@@ -797,6 +835,7 @@ def bootstrap_cdc(
                     database=database,
                     inspect_mirrors=inspect_mirrors,
                     inspect_source=inspect_source,
+                    include_usage_schema=include_usage_schema,
                 )
                 _require_view_prerequisites(name, ready.missing)
                 _infer_view_header(client, name, create[name])
@@ -810,6 +849,7 @@ def bootstrap_cdc(
                     database=database,
                     inspect_mirrors=inspect_mirrors,
                     inspect_source=inspect_source,
+                    include_usage_schema=include_usage_schema,
                 )
                 if name in after.missing:
                     raise BootstrapError(
@@ -821,5 +861,6 @@ def bootstrap_cdc(
         inspect_mirrors=inspect_mirrors,
         require_complete=True,
         inspect_source=inspect_source,
+        include_usage_schema=include_usage_schema,
     )
     return BootstrapResult(tuple(created), any(not state.recorded for state in states))

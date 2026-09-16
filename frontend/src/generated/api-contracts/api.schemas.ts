@@ -20977,18 +20977,6 @@ export const DashboardFilterValuesResultApiQueryStatus = {
   partial: "partial",
 } as const;
 
-export type DashboardFilterValuesResultApiCoverageReason =
-  (typeof DashboardFilterValuesResultApiCoverageReason)[keyof typeof DashboardFilterValuesResultApiCoverageReason];
-
-export const DashboardFilterValuesResultApiCoverageReason = {
-  empty_scope: "empty_scope",
-  covered: "covered",
-  floor_unavailable: "floor_unavailable",
-  project_unindexed: "project_unindexed",
-  source_predates_index: "source_predates_index",
-  probe_unavailable: "probe_unavailable",
-} as const;
-
 export type DashboardFilterValuesResultApiQueryErrorCode =
   (typeof DashboardFilterValuesResultApiQueryErrorCode)[keyof typeof DashboardFilterValuesResultApiQueryErrorCode];
 
@@ -21049,11 +21037,9 @@ export const DashboardFilterValuesResultApiQueryProvenance = {
 export interface DashboardFilterValuesResultApi {
   query_exact?: boolean;
   values: DashboardFilterValueOptionApi[];
+  /** Whether this page read completed, not whether all source history is indexed. */
   query_complete?: boolean;
   query_status?: DashboardFilterValuesResultApiQueryStatus;
-  coverage_reason?: DashboardFilterValuesResultApiCoverageReason;
-  /** @minLength 1 */
-  coverage_floor?: string;
   query_error_code?: DashboardFilterValuesResultApiQueryErrorCode;
   query_window_start?: string;
   query_window_end?: string;
@@ -21232,18 +21218,6 @@ export const DashboardMetricsCatalogResultApiQueryStatus = {
   partial: "partial",
 } as const;
 
-export type DashboardMetricsCatalogResultApiCoverageReason =
-  (typeof DashboardMetricsCatalogResultApiCoverageReason)[keyof typeof DashboardMetricsCatalogResultApiCoverageReason];
-
-export const DashboardMetricsCatalogResultApiCoverageReason = {
-  empty_scope: "empty_scope",
-  covered: "covered",
-  floor_unavailable: "floor_unavailable",
-  project_unindexed: "project_unindexed",
-  source_predates_index: "source_predates_index",
-  probe_unavailable: "probe_unavailable",
-} as const;
-
 export type DashboardMetricsCatalogResultApiQueryProvenance =
   (typeof DashboardMetricsCatalogResultApiQueryProvenance)[keyof typeof DashboardMetricsCatalogResultApiQueryProvenance];
 
@@ -21288,12 +21262,10 @@ export interface DashboardMetricsCatalogResultApi {
    * @pattern ^[0-9a-f]{64}$
    */
   activation_fingerprint?: string;
+  /** Whether this page read completed, not whether all source history is indexed. */
   query_complete?: boolean;
   query_exact?: boolean;
   query_status?: DashboardMetricsCatalogResultApiQueryStatus;
-  coverage_reason?: DashboardMetricsCatalogResultApiCoverageReason;
-  /** @minLength 1 */
-  coverage_floor?: string;
   query_provenance?: DashboardMetricsCatalogResultApiQueryProvenance;
 }
 

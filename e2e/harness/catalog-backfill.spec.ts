@@ -161,6 +161,31 @@ test.describe('H5 offline guards', { tag: '@h5-guard' }, () => {
     expect(selectionBinding({ ...s, project: s.workspace })).not.toBe(p.binding);
   });
 
+  test('uses the CLI v2 binding and only accepts a descending completion checkpoint', () => {
+    const s = selection(), p = checkpoint(s);
+    // main.go scanBinding versions newest-hour-first checkpoints as 2. Keep
+    // this independent of selectionBinding so changing both sides cannot hide
+    // a return to the incompatible ascending format.
+    const bindingFor = (version: number) => createHash('sha256').update(JSON.stringify([
+      version, 'spans', 'http://clickhouse:8123', 'default',
+      { organization_id: s.organization, workspace_id: s.workspace, project_id: s.project },
+      s.since.replace('.000Z', 'Z'), s.until.replace('.000Z', 'Z'),
+      ['property-catalog-kafka:9092'], 'futureagi.observed-attributes.v1', 0, 0, '',
+      { MaxKeysPerSpan: 128, MaxArrayMembersPerSpan: 256 },
+    ])).digest('hex');
+    expect(p.binding).toBe(bindingFor(2));
+    expect(() => validateProgress({ ...p, binding: bindingFor(1) }, s)).toThrow('binding mismatch');
+    const completed: Progress = { ...p, scan_complete: true,
+      hour: new Date(Date.parse(p.hour) - 3_600_000).toISOString(),
+      after: { Observation: '', Service: '', Trace: '', Span: '' } };
+    expect(() => validateProgress(completed, s, p)).not.toThrow();
+    expect(() => validateProgress({ ...completed,
+      hour: new Date(Date.parse(p.hour) + 3_600_000).toISOString() }, s, p)).toThrow('outside scan');
+    expect(() => validateProgress({ ...completed, scan_complete: false }, s)).toThrow('completion');
+    expect(() => validateProgress({ ...completed, after: p.after }, s)).toThrow('cursor');
+    expect(() => validateProgress(p, s, completed)).toThrow('regressed');
+  });
+
   test('only accepts the exact bounded-stop receipt, not timeout, missing pages or generic exit one', () => {
     const p = checkpoint(), page = { preview: false, source_rows: 2, keys: 2, values: 2,
       scan_complete: false, pages_read: 1, consumer_visibility_verified: false };

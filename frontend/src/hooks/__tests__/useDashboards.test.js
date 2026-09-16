@@ -61,6 +61,7 @@ import {
   FILTER_VALUE_REQUEST_TIMEOUT_MS,
   PROPERTY_CATALOG_REQUEST_TIMEOUT_MS,
 } from "../useDashboards";
+import { getFilterValueReadMessage } from "src/utils/queryReadState";
 
 describe("property catalog search contract", () => {
   it("preserves exact custom JSON keys in public identities", () => {
@@ -468,13 +469,9 @@ describe("usePropertyCatalog", () => {
     ).toHaveProperty("__propertyCatalogCursorStopped", "malformed_page");
   });
 
-  it("accepts a partially-covered current page instead of calling it malformed", () => {
-    // The observed catalog reports coverage of the source's retained history.
-    // A still-backfilling index answers query_complete:false / "partial" -- the
-    // rows present are real, there may be older ones it has not indexed yet.
-    // This used to be rejected as malformed, which stopped the cursor and left
-    // the property picker empty: strictly worse than the incomplete answer, and
-    // it broke real dashboard and observe flows.
+  it("accepts usable false/partial current pages from older APIs", () => {
+    // Keep compatibility with the historical wire shape. New successful index
+    // reads use true/complete without claiming completeness of source history.
     const partial = currentPage({
       query_complete: false,
       query_status: "partial",
@@ -482,8 +479,7 @@ describe("usePropertyCatalog", () => {
     });
     expect(validatePropertyCatalogPage(partial)).toBe(partial);
 
-    // Only the current catalog may claim partial coverage. The legacy activated
-    // path has no coverage concept, so the same pair must still be rejected.
+    // The activated catalog still requires its exact, complete contract.
     const legacyPartial = validatePropertyCatalogPage({
       ...currentPage(),
       query_provenance: "activated_property_catalog",
@@ -507,6 +503,80 @@ describe("usePropertyCatalog", () => {
         "malformed_page",
       );
     }
+  });
+
+  it.each([
+    { label: "empty", metrics: [] },
+    {
+      label: "partially populated",
+      metrics: [{ name: "observed", property_id: "custom_attribute:observed" }],
+    },
+  ])(
+    "keeps an $label index page usable and follows its cursor",
+    async ({ metrics }) => {
+      mocks.get
+        .mockResolvedValueOnce({
+          data: {
+            result: currentPage({
+              metrics,
+              has_more: true,
+              next_cursor: "index-next",
+            }),
+          },
+        })
+        .mockResolvedValueOnce({
+          data: {
+            result: currentPage({
+              metrics: [
+                { name: "later", property_id: "custom_attribute:later" },
+              ],
+            }),
+          },
+        });
+      const client = new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      });
+      const { result } = renderHook(() => usePropertyCatalog(), {
+        wrapper: createQueryWrapper(client),
+      });
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      expect(result.current.metrics).toEqual(metrics);
+      expect(result.current.queryReadState).toBe("complete");
+      expect(result.current.cursorChainStopped).toBe(false);
+      expect(result.current.hasNextPage).toBe(true);
+      expect(mocks.get).toHaveBeenCalledTimes(1);
+
+      await act(async () => result.current.fetchNextPage());
+      await waitFor(() => expect(result.current.hasNextPage).toBe(false));
+      expect(result.current.metrics.map(({ name }) => name)).toEqual([
+        ...metrics.map(({ name }) => name),
+        "later",
+      ]);
+      expect(result.current.queryReadState).toBe("complete");
+      expect(result.current.total).toBeNull();
+      expect(result.current.totalIsExact).toBe(false);
+      expect(result.current.categoryCountsExact).toBe(false);
+      expect(mocks.get.mock.calls[1][1].params.cursor).toBe("index-next");
+    },
+  );
+
+  it("keeps an exhausted empty current index usable without exact counts", async () => {
+    mocks.get.mockResolvedValueOnce({
+      data: { result: currentPage({ metrics: [] }) },
+    });
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const { result } = renderHook(() => usePropertyCatalog(), {
+      wrapper: createQueryWrapper(client),
+    });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.metrics).toEqual([]);
+    expect(result.current.queryReadState).toBe("complete");
+    expect(result.current.cursorChainStopped).toBe(false);
+    expect(result.current.hasNextPage).toBe(false);
+    expect(result.current.total).toBeNull();
+    expect(result.current.totalIsExact).toBe(false);
   });
 
   it("paginates current definitions and accepts live metadata updates", async () => {
@@ -1028,6 +1098,7 @@ describe("usePropertyCatalog", () => {
 
     await waitFor(() => expect(result.current.isError).toBe(true));
     expect(result.current.legacyFallbackRequired).toBe(false);
+    expect(result.current.queryReadState).toBe("degraded");
   });
 });
 
@@ -1057,6 +1128,73 @@ describe("useDashboardFilterValues bounded-read state", () => {
       { wrapper: createQueryWrapper(queryClient) },
     );
   };
+
+  it.each([
+    { values: [] },
+    { values: [{ value: "observed", label: "Observed", type: "string" }] },
+  ])(
+    "paginates successful current-index values without a notice: %j",
+    async ({ values }) => {
+      const page = {
+        values,
+        query_complete: true,
+        query_status: "complete",
+        query_exact: false,
+        query_provenance: "current_property_catalog",
+        attribute_types_exact: false,
+        has_more: true,
+        next_cursor: "observed-next",
+        browse_status: "continuation",
+      };
+      mocks.get
+        .mockResolvedValueOnce({ data: { result: page } })
+        .mockResolvedValueOnce({
+          data: {
+            result: {
+              ...page,
+              values: [],
+              has_more: false,
+              next_cursor: null,
+              browse_status: "exhausted",
+            },
+          },
+        });
+      const { result } = renderValues({ search: "" });
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      expect(result.current.data).toEqual(values);
+      expect(result.current.queryReadState).toBe("complete");
+      expect(
+        getFilterValueReadMessage(result.current.queryReadState),
+      ).toBeNull();
+      expect(result.current.hasNextPage).toBe(true);
+      expect(mocks.get).toHaveBeenCalledTimes(1);
+
+      await act(async () => result.current.fetchNextPage());
+      await waitFor(() => expect(result.current.hasNextPage).toBe(false));
+      expect(result.current.data).toEqual(values);
+      expect(result.current.browseStatus).toBe("exhausted");
+      expect(result.current.queryReadState).toBe("complete");
+      expect(result.current.cursorChainStopped).toBe(false);
+      expect(
+        getFilterValueReadMessage(result.current.queryReadState),
+      ).toBeNull();
+      expect(mocks.get.mock.calls[1][1].params.cursor).toBe("observed-next");
+    },
+  );
+
+  it("surfaces a 503 from the observed value reader", async () => {
+    mocks.get.mockRejectedValueOnce({
+      statusCode: 503,
+      code: "service_unavailable",
+    });
+    const { result } = renderValues();
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.queryReadState).toBe("error");
+    expect(getFilterValueReadMessage(result.current.queryReadState)).toMatch(
+      /unavailable/i,
+    );
+    expect(mocks.get).toHaveBeenCalledTimes(1);
+  });
 
   it("uses one namespaced registry identity for every native value adapter", () => {
     expect(
@@ -1648,6 +1786,8 @@ describe("useDashboardFilterValues bounded-read state", () => {
             values: [{ value: "CONVERSATION", type: "string" }],
             query_complete: true,
             query_status: "complete",
+            query_exact: false,
+            query_provenance: "current_property_catalog",
             ...cursorMetadata,
           },
         },

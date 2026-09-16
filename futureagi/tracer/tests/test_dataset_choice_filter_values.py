@@ -520,6 +520,88 @@ def test_search_matches_decoded_label_not_escaped_storage(reader, label, page_si
     assert CHOICE_SEARCH_SUPERSET in sql
 
 
+@pytest.mark.parametrize("page_size,limit", [(None, 1000), (50, 5000)])
+@pytest.mark.parametrize(
+    "label,search",
+    [
+        ("target", " TARGET "),
+        ("Straße", "STRASSE"),
+        ("雪", " 雪 "),
+        ("path\\name", "path\\name"),
+        ("a\nb", "a\nb"),
+    ],
+)
+def test_expanded_choice_cap_counts_only_decoded_matches(
+    reader, page_size, limit, label, search
+):
+    # Every raw cell survives the prefilter, yet their distinct decoded labels
+    # exceed the real cap. Repeated matches count once, including in later cells.
+    unrelated = [f"other-{index}" for index in range(limit + 1)]
+    raw = [
+        json.dumps(unrelated[start : start + 255] + [label])
+        for start in range(0, len(unrelated), 255)
+    ]
+    response = reader.invoke(raw, search=search, page_size=page_size)
+    assert response["status"] == 200
+    assert response["values"] == [{"value": label, "label": label}]
+
+
+@pytest.mark.parametrize("page_size,limit", [(None, 1000), (50, 5000)])
+def test_expanded_choice_search_can_return_an_exact_empty_result(
+    reader, page_size, limit
+):
+    unrelated = [f"other-{index}" for index in range(limit + 1)]
+    raw = [
+        json.dumps({"choices": unrelated[start : start + 256], "score": 0.2})
+        for start in range(0, len(unrelated), 256)
+    ]
+    response = reader.invoke(raw, search="0.2", page_size=page_size)
+    assert response["status"] == 200
+    assert response["values"] == []
+
+
+@pytest.mark.parametrize("page_size,limit", [(None, 1000), (50, 5000)])
+@pytest.mark.parametrize("extra", [0, 1])
+def test_expanded_matching_choices_still_obey_the_distinct_cap(
+    reader, page_size, limit, extra
+):
+    labels = [f"match-{index}" for index in range(limit + extra)]
+    raw = [
+        json.dumps(labels[start : start + 255] + ["match-0"])
+        for start in range(0, len(labels), 255)
+    ]
+    response = reader.invoke(raw, search="match", page_size=page_size)
+    if extra:
+        assert response == {
+            "status": 422,
+            "code": "filter_value_inventory_too_broad",
+        }
+        reader.view._finite_native_filter_values_response.assert_not_called()
+    else:
+        assert response["status"] == 200
+        assert response["values"] == [
+            {"value": label, "label": label} for label in sorted(labels)
+        ]
+
+
+def test_choice_search_filters_both_interpretations_before_the_expanded_cap(reader):
+    reader.scope["_FINITE_NATIVE_FILTER_VALUE_MAX"] = 1
+    response = reader.invoke(
+        [{"val": '["west"]', "choice_modes": 3}], search='["'
+    )
+    assert response["status"] == 200
+    assert response["values"] == [{"value": '["west"]', "label": '["west"]'}]
+
+
+@pytest.mark.parametrize("stored", ['["match", 2]', '["other", 2]', r'["\ud800"]'])
+def test_choice_search_does_not_skip_invalid_cells_after_a_match(reader, stored):
+    assert reader.invoke(["match", stored], search="match") == {
+        "status": 503,
+        "code": "service_unavailable",
+    }
+    reader.view._finite_native_filter_values_response.assert_not_called()
+
+
 def test_a_narrow_search_bounds_the_read_instead_of_scanning_everything(reader):
     """The read an oversized inventory gets must depend on the search.
 

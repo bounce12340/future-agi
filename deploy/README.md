@@ -169,34 +169,17 @@ default (`PROPERTY_CATALOG_READ_MODE=off`). That gate is gone: both endpoints no
 read the observed indexes exclusively, and those indexes contain only what has been
 ingested since they were created.
 
-So on an existing installation, immediately after upgrade, every custom-attribute
-key and value picker is **empty for all history**. The API does say so rather than
-passing the gap off as an answer — `filter_values` returns
-`query_complete: false` with a `coverage_reason` and, where one can be derived, a
-`coverage_floor` naming the oldest indexed observation — but nothing recovers the
-past on its own. Live ingestion starts filling the index from the moment the new
-collector runs; everything older than that stays missing until you backfill.
+An existing installation with empty observed indexes initially has no historical
+custom-attribute suggestions. Live ingestion fills them from the moment the new
+collector runs; earlier observations require a backfill or validated legacy
+import. Suggestions stay usable as they arrive, with no user-facing coverage
+notice. This does not disable actual filtering over the source records.
 
-That verdict is derived from the source `spans` table as the current schema leaves it
-(`002_spans_v2.sql` and later: `created_at`, the three `attrs_*` maps, `attributes_extra`,
-`model`, `is_deleted`), using `created_at` (arrival time), not the spans' own
-timestamps: a span that arrived
-within the last hour is treated as still on its way to the index rather than as a
-gap, so a freshly created project or a late-arriving trace does not flip the picker
-to incomplete for the seconds the consumer needs. A span that arrived over an hour
-ago and is still not indexed is a real gap and is reported as one. Only spans that
-carry something the catalog indexes count — custom attributes or a model — so a
-project of bare spans is not a gap at any age.
-
-The check is designed to cost a covered project a handful of index granules, not its
-history: each project is probed below its own oldest indexed observation, which the
-table's key can prune. No migration is required. One optional step helps the other
-probe, the one that runs for a project with no index rows yet: schema `024` adds a
-minmax index on `spans.created_at` but, as that file says, only parts written
-afterwards are indexed until you run `ALTER TABLE spans MATERIALIZE INDEX
-auto_minmax_index_created_at` off-peak (add the cluster clause on a replicated
-cluster). Until then a project created in the last hour is scanned when a picker
-opens on it — bounded by its own size, and by definition under an hour old.
+`query_complete: true` means the requested index page was read successfully, not
+that all retained history has been indexed. The API keeps `query_exact: false`;
+an empty page or exhausted cursor is not backfill-completion evidence. Pickers
+do not probe source spans, infer coverage from the oldest observation, or require
+an arrival-time index. Actual catalog read failures still return errors.
 
 Run the span backfill for each project over your retention window before you rely
 on the new pickers.
@@ -242,18 +225,13 @@ resume — give each project its own checkpoint file, since a checkpoint is boun
 the exact project, range and Kafka destination that created it. Without `--apply`
 it previews and publishes nothing, which is the right way to check scope first.
 
-It replays the **newest hour first** and works backwards. That order is what lets
-the pickers tell you the truth while it runs: `filter_values` decides
-completeness by asking whether the source still holds spans older than anything
-the index knows about, so a scan that has not reached your `--since` yet keeps
-reporting `query_complete: false`. It flips to complete when the run genuinely
-finishes. Replaying oldest-first would publish the very oldest span in the first
-page and make the index claim it covered everything from then on.
-
-So expect the pickers to stay marked incomplete for the whole backfill, and do
-not treat that as a failure — it is the signal working. Resuming with the same
-`--checkpoint` is safe; a checkpoint written by an older oldest-first build is
-rejected rather than resumed in the wrong direction.
+It replays the **newest hour first** so recent suggestions arrive first. Track
+progress through the CLI receipts and checkpoint, not picker metadata. A
+completed scan proves publication for that bounded scan; verify consumer offsets
+and indexed data separately before claiming migration completion. In particular,
+publication receipts deliberately report `consumer_visibility_verified: false`.
+Resuming with the same `--checkpoint` is safe; a checkpoint written by an older
+oldest-first build is rejected rather than resumed in the wrong direction.
 
 A fresh install needs none of this: there is no history to recover.
 

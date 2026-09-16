@@ -68,12 +68,17 @@ def test_native_choice_search_precedes_inventory_limit_and_preserves_paging():
         assert invoke(req).status_code == 422
 
 
-def test_observed_value_envelope_does_not_claim_exact_range_or_current_types(settings):
+@pytest.mark.parametrize(
+    "empty,has_more", [(True, False), (False, False), (False, True)]
+)
+def test_observed_value_envelope_describes_the_index_page_only(
+    settings, empty, has_more
+):
     settings.PROPERTY_CATALOG_DATABASE = "test_index"
     page = SimpleNamespace(
-        values=(SimpleNamespace(value=True, attribute_type="array"),),
-        has_more=False,
-        next_cursor=None,
+        values=() if empty else (SimpleNamespace(value=True, attribute_type="array"),),
+        has_more=has_more,
+        next_cursor="next-page" if has_more else None,
         attribute_types=("array",),
         query_count=2,
     )
@@ -84,14 +89,21 @@ def test_observed_value_envelope_does_not_claim_exact_range_or_current_types(set
         ),
         patch("tracer.views.dashboard.PropertyCatalogValueReader") as factory,
         patch("tracer.views.dashboard.AttributeReadSelector") as native,
+        patch("tracer.services.clickhouse.client.ClickHouseClient") as extra_client,
     ):
         factory.return_value.read_page.return_value = page
         response = invoke(request())
     assert response.status_code == 200
     result = response.data["result"]
-    assert result["values"] == [{"value": True, "type": "array", "label": "true"}]
+    assert result["values"] == (
+        [] if empty else [{"value": True, "type": "array", "label": "true"}]
+    )
     assert result["query_provenance"] == "current_property_catalog"
     assert result["query_exact"] is False and result["attribute_types_exact"] is False
+    assert result["query_complete"] is True and result["query_status"] == "complete"
+    assert result["has_more"] is has_more
+    assert result["next_cursor"] == ("next-page" if has_more else None)
+    assert result["browse_status"] == ("continuation" if has_more else "exhausted")
     assert not (
         {
             "catalog_epoch",
@@ -99,10 +111,13 @@ def test_observed_value_envelope_does_not_claim_exact_range_or_current_types(set
             "activation_fingerprint",
             "query_window_start",
             "query_window_end",
+            "coverage_reason",
+            "coverage_floor",
         }
         & result.keys()
     )
     native.assert_not_called()
+    extra_client.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -168,18 +183,8 @@ def test_authorization_and_all_scope_binding_precede_observed_query(settings):
     assert scope["workspace_scope"] and scope["project_ids"] == [PROJECT_ID]
 
 
-def test_value_page_returns_coverage_derived_from_the_authorized_scope():
-    """The helper owns coverage because it owns the resolved scope.
-
-    Regression: coverage was first computed at the response site in
-    ``filter_values``, where ``scope`` is not bound -- it is a local of this
-    helper. Every unit test passed because they exercised
-    ``observed_scope_coverage`` directly, and the view wiring only broke against
-    a live request, with ``UnboundLocalError: cannot access local variable
-    'scope'`` surfacing as a 500 on every custom-attribute value lookup.
-
-    Asserting the helper returns the pair keeps the two bound together.
-    """
+def test_value_page_returns_only_the_authorized_reader_page():
+    """No second source-history lookup is needed to serve index suggestions."""
     req = request(project_ids=[])
     with (
         patch(
@@ -187,19 +192,12 @@ def test_value_page_returns_coverage_derived_from_the_authorized_scope():
             return_value=[PROJECT_ID],
         ),
         patch("tracer.views.dashboard.PropertyCatalogValueReader") as reader,
-        patch("tracer.views.dashboard.observed_scope_coverage") as coverage,
     ):
         result = _read_property_catalog_value_page(
             req, req.validated_query_data, deadline=ReadDeadline.start(1000)
         )
 
-    assert isinstance(result, tuple) and len(result) == 2
-    returned_coverage, page = result
-    assert returned_coverage is coverage.return_value
-    assert page is reader.return_value.read_page.return_value
-    # Coverage must be judged against the same authorized scope the page used,
-    # never a differently-built one.
-    assert (
-        coverage.call_args.kwargs["scope"]
-        is reader.return_value.read_page.call_args.kwargs["scope"]
-    )
+    assert result is reader.return_value.read_page.return_value
+    scope = reader.return_value.read_page.call_args.kwargs["scope"]
+    assert scope["project_ids"] == [PROJECT_ID]
+    assert scope["workspace_scope"] is True

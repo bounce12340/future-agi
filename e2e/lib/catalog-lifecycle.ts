@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { lstat, readFile, realpath } from 'node:fs/promises';
 import { resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -136,10 +136,11 @@ export function validateSelection(s: Selection) {
     'historical window is outside the bounded two-day fixture');
 }
 
-// main.go scanBinding: same documented inputs, independently serialized here.
+// main.go scanBinding: v2 identifies newest-hour-first progress. Never accept
+// v1 checkpoints, whose hour represented an ascending scan.
 export function selectionBinding(s: Selection) {
   const goTime = (t: string) => new Date(t).toISOString().replace('.000Z', 'Z');
-  return createHash('sha256').update(JSON.stringify([1, 'spans', 'http://clickhouse:8123',
+  return createHash('sha256').update(JSON.stringify([2, 'spans', 'http://clickhouse:8123',
     H5_PIN.sourceDb, { organization_id: s.organization, workspace_id: s.workspace, project_id: s.project },
     goTime(s.since), goTime(s.until), [H5_PIN.broker], H5_PIN.topic, 0, 0, '',
     { MaxKeysPerSpan: 128, MaxArrayMembersPerSpan: 256 }])).digest('hex');
@@ -148,16 +149,20 @@ export function selectionBinding(s: Selection) {
 export function validateProgress(p: Progress, s: Selection, previous?: Progress) {
   invariant(p.binding === selectionBinding(s), 'checkpoint scope/destination binding mismatch');
   const hour = Math.floor(Date.parse(s.since) / 3_600_000) * 3_600_000;
-  invariant([hour, hour + 3_600_000].includes(Date.parse(p.hour)), 'checkpoint hour outside scan');
+  invariant([hour, hour - 3_600_000].includes(Date.parse(p.hour)), 'checkpoint hour outside scan');
   invariant(Number.isInteger(p.published_pages) && p.published_pages >= 1 && p.published_pages <= 8
     && Number.isInteger(p.source_rows) && p.source_rows >= 0 && p.source_rows <= 14,
   'checkpoint exceeds H5 row/page ceiling');
   invariant(typeof p.scan_complete === 'boolean'
-    && p.scan_complete === (Date.parse(p.hour) === hour + 3_600_000), 'invalid completion checkpoint');
+    && p.scan_complete === (Date.parse(p.hour) === hour - 3_600_000), 'invalid completion checkpoint');
   invariant(p.after && ['Observation', 'Service', 'Trace', 'Span'].every(k =>
     typeof p.after[k as keyof Progress['after']] === 'string'), 'invalid physical cursor');
+  invariant(!p.scan_complete || Object.values(p.after).every(value => value === ''),
+    'completed checkpoint retains a physical cursor');
   if (previous) invariant(p.published_pages >= previous.published_pages
-    && p.source_rows >= previous.source_rows, 'checkpoint regressed');
+    && p.source_rows >= previous.source_rows
+    && Date.parse(p.hour) <= Date.parse(previous.hour)
+    && (!previous.scan_complete || p.scan_complete), 'checkpoint regressed');
 }
 
 export function validateCLIResult(result: CommandResult, preview: boolean, progress?: Progress,
@@ -524,11 +529,17 @@ export class CatalogLifecycle {
   }
 }
 
-// Automatic worker preflight precedes inherited actor provisioning. Offline
-// guard tests import Playwright's base test and cannot instantiate this runner.
-export const catalogLifecycleTest = fixtures.extend<{}, { lifecycle: CatalogLifecycle }>({
-  lifecycle: [async ({}, use, workerInfo) => {
-    const h5 = await CatalogLifecycle.inspect('e2e-h5-' + workerInfo.workerIndex + '-' + Date.now().toString(36));
-    try { await use(h5); } finally { await h5.retainAndStop(); }
+// Keep automatic worker preflight before inherited actor provisioning, but give
+// each test its own selection, receipts, project name and retained resources.
+// Sharing a worker runner mixes historical facts and checkpoint state when H5
+// and OBS010 run together. Offline guards cannot instantiate either fixture.
+export const catalogLifecycleTest = fixtures.extend<{ lifecycle: CatalogLifecycle }, { catalogPreflight: CatalogLifecycle }>({
+  catalogPreflight: [async ({}, use, workerInfo) => {
+    await use(await CatalogLifecycle.inspect('e2e-h5-' + workerInfo.workerIndex + '-' + randomUUID()));
   }, { scope: 'worker', auto: true }],
+  lifecycle: [async ({ catalogPreflight }, use, testInfo) => {
+    await catalogPreflight.recheck();
+    const h5 = await CatalogLifecycle.inspect('e2e-h5-' + testInfo.workerIndex + '-' + randomUUID());
+    try { await use(h5); } finally { await h5.retainAndStop(); }
+  }, { auto: true }],
 });

@@ -98,10 +98,10 @@ export const hasValidStatusPair = (candidate) => {
     );
   }
   if (status === "degraded") return complete === false;
-  // The observed catalog's own word for an index that does not yet cover the
-  // source's retained history (coverage_reason says why). A well-formed,
-  // incomplete page: it renders as degraded below, but by contract, not by
-  // falling through as malformed metadata.
+  // Compatibility with older catalog APIs: false/partial remains a valid
+  // incomplete read and retains its degraded presentation. Current suggestion
+  // APIs use true/complete for successful page reads, without asserting source
+  // completeness. Do not extend that success contract to exact aggregations.
   if (status === "partial") return complete === false;
   return false;
 };

@@ -57,3 +57,16 @@ func TestOversizedCheckpointDoesNotReplaceProgress(t *testing.T) {
 		t.Fatal("oversized checkpoint loaded")
 	}
 }
+
+func TestCheckpointExclusionCounterRejectsInvalidIntegers(t *testing.T) {
+	for _, value := range []string{"-1", "18446744073709551616", "1.5", `"1"`} {
+		path := filepath.Join(t.TempDir(), "progress.json")
+		data := `{"binding":"scope","hour":"2026-01-01T00:00:00Z","recorded_policy_exclusion_spans":` + value + `}`
+		if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := loadCheckpoint(path, "scope", time.Now()); err == nil {
+			t.Fatalf("invalid counter %s accepted", value)
+		}
+	}
+}

@@ -188,7 +188,8 @@ def harness(monkeypatch):
 
     def run(**kwargs):
         return cli.run(
-            cli.Config.from_env({}),
+            # Model the complete usage contract independently of local packaging.
+            replace(cli.Config.from_env({}), include_usage_schema=True),
             pg_connect=pg_connect,
             ch_connect=ch_connect,
             request=request,

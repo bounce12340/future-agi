@@ -59,6 +59,7 @@ def _inspect_peers(request, config):
     Pending mirrors close the writer. Their configuration is checked separately
     from readiness using the shared running-mirror configuration validator.
     """
+    landing = core.landing_tables(include_usage_schema=config.include_usage_schema)
     cache = {}
 
     def read(method, path, body=None):
@@ -182,14 +183,17 @@ def _inspect_peers(request, config):
         for mirror_name, table in inventory.inspect_mappings(
             one_writer, source=src, destination=dst
         ):
-            if table not in core.LANDING or table in mappings:
+            if table not in landing or table in mappings:
                 raise SetupError("unknown or duplicate destination mapping")
             mappings[table] = mirror_name
     return missing_peers, mappings, pending, seen
 
 
 def _inspect_landing(client, config, definitions):
-    params = {"database": config.destination.database, "names": tuple(core.LANDING)}
+    params = {
+        "database": config.destination.database,
+        "names": core.landing_tables(include_usage_schema=config.include_usage_schema),
+    }
     tables = {}
     for name, *row in native._rows(
         client,
@@ -262,7 +266,10 @@ def _creates(config, missing_peers, missing_tables):
     missing_peers, missing_tables = tuple(missing_peers), tuple(missing_tables)
     for names, allowed in (
         (missing_peers, {config.source.name, config.destination.name}),
-        (missing_tables, core.LANDING),
+        (
+            missing_tables,
+            core.landing_tables(include_usage_schema=config.include_usage_schema),
+        ),
     ):
         if any(
             not isinstance(name, str)
@@ -461,10 +468,11 @@ def _run(config, *, apply, wait_for_mirrors, timeout, pg_connect, ch_connect, re
             deadline.remaining()
             return pg.execute(statement, parameters).fetchall()
 
-        source = inspect_source(
-            pg_query, source=config.source, tables=tuple(core.LANDING)
+        landing = core.landing_tables(include_usage_schema=config.include_usage_schema)
+        source = inspect_source(pg_query, source=config.source, tables=landing)
+        definitions = core._source_definitions(
+            source, include_usage_schema=config.include_usage_schema
         )
-        definitions = core._source_definitions(source)
         pool = install._SingleAttemptPool()
         stack.callback(pool.clear)
         raw = (ch_connect or clickhouse_connect.get_client)(
@@ -512,7 +520,7 @@ def _run(config, *, apply, wait_for_mirrors, timeout, pg_connect, ch_connect, re
             # put a CREATE or an uncertain failure inside this loop.
             complete = (
                 not missing_peers
-                and set(mappings) == set(core.LANDING)
+                and set(mappings) == set(landing)
                 and not missing_native
             )
             if wait_for_mirrors and complete:
@@ -538,7 +546,7 @@ def _run(config, *, apply, wait_for_mirrors, timeout, pg_connect, ch_connect, re
             raise SetupError(
                 "running mirror has no landing table; no repair is permitted"
             )
-        missing_tables = [table for table in core.LANDING if table not in mappings]
+        missing_tables = [table for table in landing if table not in mappings]
         if missing_tables and _mirror_name(config, missing_tables) in mirror_names:
             raise SetupError("required new mirror name is already occupied")
         plan = _creates(config, missing_peers, missing_tables)

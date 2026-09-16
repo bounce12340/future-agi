@@ -28,9 +28,6 @@ from tracer.services.clickhouse.v2.property_catalog.codec import (
     MAX_IDENTITY_COMPONENT_BYTES,
     validate_text,
 )
-from tracer.services.clickhouse.v2.property_catalog.coverage import (
-    COVERAGE_REASONS,
-)
 from tracer.utils.property_registry import (
     normalize_custom_attribute_source,
     parse_property_registry_id,
@@ -808,14 +805,15 @@ class DashboardMetricsCatalogResultSerializer(serializers.Serializer):
     )
     catalog_revision = serializers.IntegerField(min_value=1, required=False)
     activation_fingerprint = serializers.RegexField(r"^[0-9a-f]{64}$", required=False)
-    query_complete = serializers.BooleanField(required=False)
+    query_complete = serializers.BooleanField(
+        required=False,
+        help_text="Whether this page read completed, not whether all source history is indexed.",
+    )
     query_exact = serializers.BooleanField(required=False)
-    # See DashboardFilterValuesResultSerializer: the same coverage contract.
+    # Retain partial for compatibility with older catalog responses.
     query_status = serializers.ChoiceField(
         choices=["complete", "partial"], required=False
     )
-    coverage_reason = serializers.ChoiceField(choices=COVERAGE_REASONS, required=False)
-    coverage_floor = serializers.CharField(required=False)
     query_provenance = serializers.ChoiceField(
         choices=["activated_property_catalog", "current_property_catalog"],
         required=False,
@@ -1178,16 +1176,16 @@ class DashboardFilterValueOptionSerializer(serializers.Serializer):
 class DashboardFilterValuesResultSerializer(serializers.Serializer):
     query_exact = serializers.BooleanField(required=False)
     values = DashboardFilterValueOptionSerializer(many=True)
-    query_complete = serializers.BooleanField(required=False)
-    # `partial` is the observed catalog's own word for an index that does not
-    # yet cover the source's retained history; `coverage_reason` says why and
-    # `coverage_floor` names the oldest indexed observation when one exists.
+    query_complete = serializers.BooleanField(
+        required=False,
+        help_text="Whether this page read completed, not whether all source history is indexed.",
+    )
+    # Retain partial for compatibility with older catalog responses. Native
+    # readers still report their actual sampling/degraded status.
     query_status = serializers.ChoiceField(
         choices=["complete", "sampled", "degraded", "partial"],
         required=False,
     )
-    coverage_reason = serializers.ChoiceField(choices=COVERAGE_REASONS, required=False)
-    coverage_floor = serializers.CharField(required=False)
     query_error_code = serializers.ChoiceField(
         choices=["sample_limit", "read_budget_exceeded", "query_failed"],
         required=False,

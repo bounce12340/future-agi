@@ -169,41 +169,62 @@ func scanBinding(cfg options, scope observedcatalog.Scope) string {
 	return hex.EncodeToString(digest[:])
 }
 
-func buildPage(rows []map[string]any, scope observedcatalog.Scope, since, until time.Time, limits observedcatalog.Limits) (observedcatalog.Batch, error) {
+// Oversized values are intentionally ineligible suggestions, as in the live
+// writer. Keep their keys and eligible siblings; every other gap stays fatal.
+func extractionPolicyExclusion(report observedcatalog.Report) (uint64, error) {
+	if report.Complete && len(report.GapReasons) == 0 {
+		return 0, nil
+	}
+	if !report.Complete && len(report.GapReasons) > 0 {
+		sizeOnly := true
+		for _, reason := range report.GapReasons {
+			sizeOnly = sizeOnly && reason == "value_too_large"
+		}
+		if sizeOnly {
+			return 1, nil // affected spans, not the number of omitted values
+		}
+	}
+	return 0, fmt.Errorf("source page has extraction gaps %v; no checkpoint advanced", report.GapReasons)
+}
+
+func buildPage(rows []map[string]any, scope observedcatalog.Scope, since, until time.Time, limits observedcatalog.Limits) (observedcatalog.Batch, uint64, error) {
 	var batches []observedcatalog.Batch
+	var excludedSpans uint64
 	for _, row := range rows {
 		if fmt.Sprint(row["is_deleted"]) == "1" {
 			continue
 		}
 		if fmt.Sprint(row["is_deleted"]) != "0" {
-			return observedcatalog.Batch{}, errors.New("invalid source tombstone")
+			return observedcatalog.Batch{}, 0, errors.New("invalid source tombstone")
 		}
 		seen, err := time.Parse(observedcatalog.TimeLayout, fmt.Sprint(row["start_time"]))
 		if err != nil {
-			return observedcatalog.Batch{}, errors.New("invalid source timestamp")
+			return observedcatalog.Batch{}, 0, errors.New("invalid source timestamp")
 		}
 		if seen.Before(since) || !seen.Before(until) {
 			continue
 		}
 		if row["project_id"] != scope.ProjectID {
-			return observedcatalog.Batch{}, errors.New("source project does not match authorized project")
+			return observedcatalog.Batch{}, 0, errors.New("source project does not match authorized project")
 		}
 		canonical, err := canonicalRow(row)
 		if err != nil {
-			return observedcatalog.Batch{}, err
+			return observedcatalog.Batch{}, 0, err
 		}
 		batch, report, err := observedcatalog.Extract(observedcatalog.ScopedSpan{
 			OrganizationID: scope.OrganizationID, WorkspaceID: scope.WorkspaceID, Row: canonical,
 		}, limits)
 		if err != nil {
-			return observedcatalog.Batch{}, err
+			return observedcatalog.Batch{}, 0, err
 		}
-		if !report.Complete {
-			return observedcatalog.Batch{}, fmt.Errorf("source page has extraction gaps %v; no checkpoint advanced", report.GapReasons)
+		excluded, err := extractionPolicyExclusion(report)
+		if err != nil {
+			return observedcatalog.Batch{}, 0, err
 		}
+		excludedSpans += excluded
 		batches = append(batches, batch)
 	}
-	return observedcatalog.Merge(batches...), nil
+	return observedcatalog.Merge(batches...), excludedSpans, nil
 }
 
 // JSONEachRow represents typed ClickHouse Maps as objects. Rehydrate their Go
@@ -255,13 +276,8 @@ func nonnullMap[T any](input map[string]*T) (map[string]T, error) {
 	return result, nil
 }
 
-// Spans are replayed newest hour first. The read path derives coverage from
-// min(first_seen) in the index, so the floor must only reach the oldest span
-// once the scan has actually finished: ascending order published the oldest
-// hour in page one, which made an index that is still hours or days from
-// complete report itself as covering all retained history for the whole run.
-// Descending, an unfinished scan always leaves source spans below the floor,
-// which is exactly the condition that read path already tests for.
+// Replay newest hours first so recent suggestions arrive before older history.
+// Scan progress is a checkpoint/receipt concern, not a picker-page verdict.
 func lastHour(until time.Time) time.Time {
 	bucket := until.Truncate(time.Hour)
 	// --until is exclusive, so a value exactly on the hour selects no rows in
@@ -308,9 +324,12 @@ func runSpans(ctx context.Context, cfg options, scopes scopeReader, publisher ob
 		if err != nil {
 			return err
 		}
-		batch, err := buildPage(rows, scope, cfg.since, cfg.until, cfg.limits)
+		batch, excludedSpans, err := buildPage(rows, scope, cfg.since, cfg.until, cfg.limits)
 		if err != nil {
 			return err
+		}
+		if excludedSpans > ^uint64(0)-progress.PolicyExclusionSpans {
+			return errors.New("checkpoint policy exclusion count would overflow; page not published")
 		}
 		current, err := scopes.Scope(ctx, cfg.project)
 		if err != nil || current != scope {
@@ -323,6 +342,7 @@ func runSpans(ctx context.Context, cfg options, scopes scopeReader, publisher ob
 		}
 		progress.Pages++
 		progress.Rows += uint64(len(rows))
+		progress.PolicyExclusionSpans += excludedSpans
 		if len(keys) < cfg.pageSize {
 			progress.Hour = progress.Hour.Add(-time.Hour)
 			progress.After = physicalKey{}
@@ -335,7 +355,11 @@ func runSpans(ctx context.Context, cfg options, scopes scopeReader, publisher ob
 				return err
 			}
 		}
-		if err := encoder.Encode(map[string]any{"preview": !cfg.apply, "source_rows": len(rows), "keys": len(batch.Keys), "values": len(batch.Values), "scan_complete": progress.Complete, "pages_read": progress.Pages, "consumer_visibility_verified": false}); err != nil {
+		receipt := map[string]any{"preview": !cfg.apply, "source_rows": len(rows), "keys": len(batch.Keys), "values": len(batch.Values), "scan_complete": progress.Complete, "pages_read": progress.Pages, "consumer_visibility_verified": false, "policy_exclusion_spans": excludedSpans}
+		if cfg.apply {
+			receipt["recorded_policy_exclusion_spans"] = progress.PolicyExclusionSpans
+		}
+		if err := encoder.Encode(receipt); err != nil {
 			return err
 		}
 		if !progress.Complete && cfg.delay > 0 {
@@ -376,6 +400,8 @@ FI_OBSERVED_BACKFILL_CH_PASSWORD. Apply uses FI_OBSERVED_CATALOG_KAFKA_BROKERS
 and optional KAFKA_TOPIC/KAFKA_GROUP with the same FI_OBSERVED_CATALOG_ prefix.
 Live and backfill share FI_OBSERVED_CATALOG_MAX_KEYS_PER_SPAN and
 FI_OBSERVED_CATALOG_MAX_ARRAY_MEMBERS_PER_SPAN.
+Oversized suggestion values are omitted with keys and eligible values retained.
+Operator progress counts affected spans; all other extraction gaps remain fatal.
 
 Progress proves Kafka acknowledgement, not consumer visibility or complete
 source history. Re-run overlapping source ranges to repair late-arriving spans.

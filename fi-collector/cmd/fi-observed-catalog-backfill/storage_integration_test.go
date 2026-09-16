@@ -106,9 +106,12 @@ func TestPersistedRowsUseTheLiveExtractor(t *testing.T) {
 		t.Fatal(err)
 	}
 	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	backfilled, err := buildPage([]map[string]any{row}, scope, start, start.Add(24*time.Hour), observedcatalog.DefaultLimits())
+	backfilled, excluded, err := buildPage([]map[string]any{row}, scope, start, start.Add(24*time.Hour), observedcatalog.DefaultLimits())
 	if err != nil {
 		t.Fatal(err)
+	}
+	if excluded != 0 {
+		t.Fatal("eligible fixture reported exclusions")
 	}
 	if len(direct.Keys) != len(backfilled.Keys) || len(direct.Values) != len(backfilled.Values) {
 		t.Fatal("different extraction cardinality")

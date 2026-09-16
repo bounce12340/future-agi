@@ -16,6 +16,14 @@ proof that a current trace matches it; filtering still uses the source records.
 Strings, numbers and booleans retain their types. Current eval/annotation choices
 and dataset/prompt/simulation definitions remain native, permission-checked reads.
 
+Pickers show the observations currently indexed, without a history-coverage
+notice. Live ingestion and bounded backfills can add suggestions while users
+browse. A successful response's `query_complete: true` describes that page read;
+`query_exact: false` means it is not an authoritative inventory of current or
+historical source values. An empty page or `browse_status: exhausted` only means
+there are no more indexed matches for that request. No picker request scans
+source spans to infer backfill progress. Actual read failures remain errors.
+
 Keys preserve their exact spelling (up to 4 KiB UTF-8). Selectable string values
 allow 16 KiB raw UTF-8, or 4 KiB for array members; objects keep discoverable keys
 without fabricated scalar values. Extraction defaults to 128 keys and 256 array
@@ -98,6 +106,14 @@ choices/annotations/tags and observed attribute arrays keep their own contracts.
 
 ## Configuration
 
+The collector's PostgreSQL auth endpoint may be supplied either as the legacy
+`FI_PG_WRITE`/`FI_PG_READ` URI or, for new deployments, as separate fields:
+`FI_PG_{WRITE,READ}_{HOST,PORT,DATABASE,USER,PASSWORD}`. The separate form is
+recommended because passwords are never interpolated into a URI by Compose and
+characters such as `%`, `@`, `?`, or whitespace remain unambiguous. If all five
+fields for an endpoint are present they take precedence over its legacy URI;
+incomplete field sets preserve the legacy behavior.
+
 See the repository-root `.env.example` for local defaults.
 
 | Setting | Default / purpose |
@@ -176,6 +192,14 @@ To apply the reviewed scope, repeat with `--apply --checkpoint /backfill/progres
 and mount an operator-owned writable directory at `/backfill`. The container
 runs as UID/GID 65532, so grant that identity access to the checkpoint directory.
 Keep the checkpoint across bounded invocations and resume the same scope.
+
+Like live ingestion, span backfill retains property keys and eligible values
+when individual values exceed suggestion-size limits. Progress reports
+`policy_exclusion_spans` (affected spans, not omitted-value count). Applied
+checkpoints also retain `recorded_policy_exclusion_spans`; older checkpoints
+resume without this optional field. An older binary can drop that counter when
+rewriting progress, so it is not an audited lifetime total. All other extraction
+gaps remain fatal. No source values are truncated, converted or changed.
 
 For historical catalog rows, select `--source legacy` with an explicit
 `--legacy-epoch`, `--legacy-revision`, and `--legacy-build`; omit time-range

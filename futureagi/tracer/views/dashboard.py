@@ -130,9 +130,6 @@ from tracer.services.clickhouse.v2.property_catalog.value_reader import (
     PropertyCatalogValueReader,
     PropertyCatalogValueUnavailable,
 )
-from tracer.services.clickhouse.v2.property_catalog.coverage import (
-    observed_scope_coverage,
-)
 from tracer.services.clickhouse.v2.query_builders.dashboard import (
     DashboardQueryBuilderV2,
 )
@@ -206,11 +203,7 @@ def _read_property_catalog_value_page(request, query_params, *, deadline):
     scope.update(
         agent_definition_id="", dataset_id="", workspace_scope=not raw_projects
     )
-    # Coverage is derived here rather than by the caller because this is where
-    # the authorized scope is resolved; recomputing it there would repeat the
-    # project-scope lookup.
-    coverage = observed_scope_coverage(scope=scope, deadline=deadline)
-    return coverage, PropertyCatalogValueReader(
+    return PropertyCatalogValueReader(
         catalog_database=settings.PROPERTY_CATALOG_DATABASE,
         deadline=deadline,
     ).read_page(
@@ -2509,10 +2502,9 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                     "Dashboard properties are temporarily unavailable. Please retry.",
                     code="service_unavailable",
                 )
-            # The index only knows spans ingested since it was created, so an
-            # upgraded install can hold nothing for existing history. Derive the
-            # claim instead of asserting it; see coverage.observed_scope_coverage.
-            coverage = observed_scope_coverage(scope=scope, deadline=read_deadline)
+            # Completion describes this index page, not coverage of source
+            # history. Suggestions remain usable while live/backfill writes
+            # arrive; exact filtering still reads the authoritative records.
             return self._gm.success_response(
                 {
                     "metrics": list(page.metrics),
@@ -2521,16 +2513,10 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                     "page_size": query_params["page_size"],
                     "has_more": page.has_more,
                     "next_cursor": page.next_cursor,
-                    "query_complete": coverage.complete,
+                    "query_complete": True,
                     "query_exact": False,
-                    "query_status": coverage.status,
+                    "query_status": "complete",
                     "query_provenance": "current_property_catalog",
-                    "coverage_reason": coverage.reason,
-                    **(
-                        {"coverage_floor": coverage.floor}
-                        if coverage.floor
-                        else {}
-                    ),
                 }
             )
 
@@ -3044,7 +3030,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                 )
 
         try:
-            coverage, catalog_page = _read_property_catalog_value_page(
+            catalog_page = _read_property_catalog_value_page(
                 request,
                 query_params,
                 deadline=filter_value_deadline,
@@ -3102,19 +3088,13 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                 }
                 for row in catalog_page.values
             ]
-            # `coverage` comes from _read_property_catalog_value_page, which is
-            # where the authorized scope is resolved.
+            # This is a successful page of observed suggestions, not a claim
+            # that every historical value or current source type was indexed.
             return self._gm.success_response(
                 {
                     "values": values,
-                    "query_complete": coverage.complete,
-                    "query_status": coverage.status,
-                    "coverage_reason": coverage.reason,
-                    **(
-                        {"coverage_floor": coverage.floor}
-                        if coverage.floor
-                        else {}
-                    ),
+                    "query_complete": True,
+                    "query_status": "complete",
                     "query_exact": False,
                     "query_count": catalog_page.query_count,
                     "has_more": catalog_page.has_more,
@@ -5628,10 +5608,16 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
 
         seen = set()
         values = []
+        choice_needle = choice_search.casefold()
         try:
             for row in raw:
                 deadline.remaining_ms(_FILTER_VALUES_INTERACTIVE_TIMEOUT_MS)
                 for v in _expand(row["val"], row.get("choice_modes")):
+                    # Choice options use the decoded string as both value and
+                    # label. Apply the picker match before counting distinct
+                    # labels; the raw read and per-cell decoder stay bounded.
+                    if evaluation_choices and choice_needle not in v.casefold():
+                        continue
                     if v not in seen:
                         seen.add(v)
                         values.append(v)
@@ -5649,8 +5635,6 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
             )
         values.sort(key=lambda s: s.lower())
         options = [{"value": v, "label": v} for v in values]
-        if evaluation_choices:
-            options = _filter_value_options_for_search(options, search)
         return self._finite_native_filter_values_response(
             request,
             query_params=query_params,

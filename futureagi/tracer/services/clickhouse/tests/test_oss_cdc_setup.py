@@ -27,7 +27,11 @@ TABLES = (
     "simulate_scenarios simulate_agent_definition simulate_agent_version simulate_run_test "
     "model_hub_promptversion model_hub_prompttemplate model_hub_promptlabel tracer_enduser"
 ).split()
-CONFIG = setup.Config.from_env({"PG_DB": "source_db", "CH_DATABASE": "offline_native"})
+# This fixture models all 20 tables regardless of the checkout's EE packages.
+CONFIG = replace(
+    setup.Config.from_env({"PG_DB": "source_db", "CH_DATABASE": "offline_native"}),
+    include_usage_schema=True,
+)
 MIRROR = "futureagi_cdc_c7f7453b73702158"
 
 

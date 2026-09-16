@@ -179,21 +179,19 @@ export const validatePropertyCatalogPage = (
   consumedCursors = new Set(),
 ) => {
   const current = page?.query_provenance === "current_property_catalog";
-  // The observed catalog reports whether it covers the source's retained
-  // history. An index that is still being backfilled answers
-  // `query_complete: false` / `query_status: "partial"`, which is a truthful,
-  // well-formed page -- the rows in it are real, there may simply be older ones
-  // it has not seen yet. Treating that as malformed stopped the cursor and left
-  // the picker empty, which is both wrong and worse than the incomplete answer.
-  // Only the current catalog may say this; the legacy activated path has no
-  // coverage concept and must still be exactly complete.
-  const partialCoverage =
-    current && page?.query_complete === false && page?.query_status === "partial";
+  // Current-catalog completion describes a successful page read of mutable
+  // suggestions, not source-history completeness or exact fact membership.
+  // Older APIs also returned false/partial for usable current-catalog pages;
+  // keep accepting that pair without relaxing the activated-catalog contract.
+  const legacyPartialPage =
+    current &&
+    page?.query_complete === false &&
+    page?.query_status === "partial";
   if (
     !page ||
-    (!partialCoverage && page.query_complete !== true) ||
+    (!legacyPartialPage && page.query_complete !== true) ||
     (current ? page.query_exact !== false : page.query_exact !== true) ||
-    (!partialCoverage && page.query_status !== "complete") ||
+    (!legacyPartialPage && page.query_status !== "complete") ||
     (!current &&
       (page.query_provenance !== "activated_property_catalog" ||
         !Number.isSafeInteger(page.catalog_epoch) ||
@@ -227,6 +225,8 @@ const isPropertyCatalogCursorStopped = (page) =>
 
 // A bounded value walk may report `limit_reached` together with an advancing
 // signed cursor. That is a resumable checkpoint; only `exhausted` is terminal.
+// For current-catalog suggestions, exhaustion ends this index walk; it does
+// not establish source absence or freeze the inventory across page reads.
 const FILTER_VALUE_TERMINAL_BROWSE_STATUSES = new Set(["exhausted"]);
 const FILTER_VALUE_FOLLOWED_CURSORS_KEY = "__filterValueFollowedCursors";
 const FILTER_VALUE_CURSOR_STOPPED_KEY = "__filterValueCursorStopped";

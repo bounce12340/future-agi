@@ -32,10 +32,15 @@ def _request(**validated_overrides):
         "exclude_custom_attributes": False,
     }
     validated.update(validated_overrides)
-    organization = SimpleNamespace(id="11111111-1111-1111-1111-111111111111")
+    organization = SimpleNamespace(
+        id="11111111-1111-1111-1111-111111111111",
+        pk="11111111-1111-1111-1111-111111111111",
+    )
     user = SimpleNamespace(id="user-1", organization=organization)
     return SimpleNamespace(
-        workspace=SimpleNamespace(id=WORKSPACE_ID, organization=organization),
+        workspace=SimpleNamespace(
+            id=WORKSPACE_ID, pk=WORKSPACE_ID, organization=organization
+        ),
         organization=organization,
         user=user,
         auth=SimpleNamespace(id="token-1"),
@@ -328,11 +333,14 @@ def test_filter_values_maps_reader_value_error_to_400(settings):
     reader.read_page.assert_called_once()
 
 
-def test_current_metrics_envelope_has_no_activation_requirement(settings):
+@pytest.mark.parametrize("has_more", [False, True])
+def test_current_metrics_envelope_describes_the_index_page_only(settings, has_more):
     settings.PROPERTY_CATALOG_DATABASE = "test_index"
     reader = Mock()
     reader.read_page.return_value = SimpleNamespace(
-        metrics=(), has_more=False, next_cursor=None
+        metrics=({"id": "custom_attribute:key"},) if has_more else (),
+        has_more=has_more,
+        next_cursor="next-page" if has_more else None,
     )
     with (
         patch(
@@ -344,6 +352,7 @@ def test_current_metrics_envelope_has_no_activation_requirement(settings):
             return_value="",
         ),
         patch("tracer.views.dashboard.PropertyCatalogReader", return_value=reader),
+        patch("tracer.services.clickhouse.client.ClickHouseClient") as extra_client,
     ):
         response = inspect.unwrap(DashboardViewSet.metrics)(
             DashboardViewSet(), _request()
@@ -352,12 +361,18 @@ def test_current_metrics_envelope_has_no_activation_requirement(settings):
     result = response.data["result"]
     assert result["query_provenance"] == "current_property_catalog"
     assert result["query_exact"] is False and result["total"] is None
+    assert result["query_complete"] is True and result["query_status"] == "complete"
+    assert result["has_more"] is has_more
+    assert result["next_cursor"] == ("next-page" if has_more else None)
+    extra_client.assert_not_called()
     assert not (
         {
             "catalog_epoch",
             "catalog_revision",
             "activation_fingerprint",
             "category_counts",
+            "coverage_reason",
+            "coverage_floor",
         }
         & result.keys()
     )

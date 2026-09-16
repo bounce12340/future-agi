@@ -146,14 +146,21 @@ if [[ ! -f .env.example ]]; then
 fi
 
 if [[ ! -f .env ]]; then
-  cp .env.example .env
+  (umask 077; cp .env.example .env)
   ok "Created .env from .env.example"
 else
   # Merge any new keys added to .env.example since the user's last install,
   # without overwriting existing values. awk pattern from Coolify install.sh.
   before=$(wc -l <.env | tr -d ' ')
-  awk -F= 'NR==FNR{seen[$1]=1; print; next} !($1 in seen) && /^[A-Z]/ {print}' \
-    .env .env.example > .env.tmp && mv .env.tmp .env
+  # Keep secrets private during merging and after atomic replacement. mktemp
+  # also avoids following a pre-existing .env.tmp symlink.
+  env_tmp=$(mktemp .env.tmp.XXXXXX)
+  if ! awk -F= 'NR==FNR{seen[$1]=1; print; next} !($1 in seen) && /^[A-Z]/ {print}' \
+    .env .env.example > "$env_tmp"; then
+    rm -f -- "$env_tmp"
+    die "Could not merge .env.example; existing .env preserved"
+  fi
+  mv -- "$env_tmp" .env
   after=$(wc -l <.env | tr -d ' ')
   if [[ "$after" -gt "$before" ]]; then
     ok ".env exists — added $((after - before)) new key(s) from .env.example"

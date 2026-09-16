@@ -1149,6 +1149,71 @@ def test_real_clickhouse_grouped_observed_index_and_scoped_keysets():
                 )
                 return SimpleNamespace(data=list(result.named_results()))
 
+        def api_page(action):
+            # Real views/readers/ClickHouse indexes, isolated from native PG
+            # definitions. No spans table exists in this synthetic database:
+            # picker success must depend only on the index page it reads.
+            from django.test import override_settings
+
+            from tracer.tests.test_unified_property_catalog_api import _request
+            from tracer.views.dashboard import DashboardViewSet
+
+            req = _request(
+                project_ids=[PROJECT],
+                search="",
+                page_size=1,
+                property_id="custom_attribute:key",
+                _property_kind="custom_attribute",
+                metric_name="key",
+                metric_type="custom_attribute",
+            )
+            req.workspace.id = req.workspace.pk = WS
+            req.organization.id = req.organization.pk = ORG
+            definitions = Mock()
+            definitions.read_page.return_value = ()
+            with (
+                override_settings(PROPERTY_CATALOG_DATABASE=database),
+                patch(
+                    "tracer.views.dashboard.resolve_property_catalog_project_scope",
+                    return_value=[PROJECT],
+                ),
+                patch(
+                    "tracer.views.dashboard.resolve_property_catalog_agent_scope",
+                    return_value="",
+                ),
+                patch(
+                    "tracer.views.dashboard.PropertyCatalogReader",
+                    side_effect=lambda **kw: PropertyCatalogReader(
+                        HTTPExecutor(), definition_source=definitions, **kw
+                    ),
+                ),
+                patch(
+                    "tracer.views.dashboard.PropertyCatalogValueReader",
+                    side_effect=lambda **kw: PropertyCatalogValueReader(
+                        HTTPExecutor(), **kw
+                    ),
+                ),
+                patch(
+                    "tracer.services.clickhouse.client.ClickHouseClient"
+                ) as extra_client,
+            ):
+                response = inspect.unwrap(getattr(DashboardViewSet, action))(
+                    DashboardViewSet(), req
+                )
+            assert response.status_code == 200, response.data
+            result = response.data["result"]
+            assert (
+                result["query_complete"] is True
+                and result["query_status"] == "complete"
+            )
+            assert result["query_exact"] is False
+            assert not {"coverage_reason", "coverage_floor"} & result.keys()
+            extra_client.assert_not_called()
+            return result
+
+        assert api_page("metrics")["metrics"] == []
+        assert api_page("filter_values")["values"] == []
+
         rows = [value_row("a"), value_row("b")]
         keys = [ORG, WS, PROJECT, "custom_attribute", "key", "string", "key"]
         client.insert(
@@ -1203,6 +1268,10 @@ def test_real_clickhouse_grouped_observed_index_and_scoped_keysets():
             values + values + [[str(uuid4()), *values[0][1:]]],
             column_names=value_columns,
         )
+        assert [item["name"] for item in api_page("metrics")["metrics"]] == ["key"]
+        value_page = api_page("filter_values")
+        assert value_page["values"] == [{"value": "a", "type": "string", "label": "a"}]
+        assert value_page["has_more"] and value_page["next_cursor"]
         reader = PropertyCatalogValueReader(HTTPExecutor(), catalog_database=database)
         first = reader.read_page(scope=SCOPE, query=VALUE_QUERY, page_size=1)
         assert len(first.values) == 1 and first.has_more

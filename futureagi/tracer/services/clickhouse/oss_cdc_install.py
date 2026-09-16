@@ -32,6 +32,7 @@ from urllib.parse import urlsplit
 
 import urllib3
 
+from tfc import ee_loader
 from tracer.services.clickhouse import oss_cdc_bootstrap as core
 from tracer.services.clickhouse import oss_cdc_upgrade as upgrade
 from tracer.services.clickhouse import oss_native_bootstrap as native
@@ -88,6 +89,10 @@ class Config:
     ch_password: str = field(repr=False)
     peerdb_url: str
     hosted: bool = False
+    # Match INSTALLED_APPS: usage is presence-gated even without an EE license.
+    include_usage_schema: bool = field(
+        default_factory=lambda: ee_loader.has_ee("ee.usage")
+    )
 
     def __post_init__(self):
         for target in (self.source, self.destination):
@@ -105,7 +110,11 @@ class Config:
                 raise InstallError(
                     "database must be a literal name, not a connection string"
                 )
-        core._definitions(self.destination.database)
+        if type(self.include_usage_schema) is not bool:
+            raise InstallError("usage schema selection must be a boolean")
+        core._definitions(
+            self.destination.database, include_usage_schema=self.include_usage_schema
+        )
         if type(self.http_port) is not int or not 0 < self.http_port < 65536:
             raise InstallError("invalid ClickHouse HTTP port")
         if type(self.hosted) is not bool:
@@ -384,14 +393,25 @@ def run(
             autogenerate_session_id=False,
         )
         stack.callback(raw.close)
-        derived = upgrade.migration_file("cdc_002_usage_eval_fields.sql")
-        declarations, _ = core._definitions(config.destination.database)
+        derived = (
+            upgrade.migration_file("cdc_002_usage_eval_fields.sql")
+            if config.include_usage_schema
+            else None
+        )
+        declarations, _ = core._definitions(
+            config.destination.database,
+            include_usage_schema=config.include_usage_schema,
+        )
         allowed = {
             core._tokens(statement)
             for statement in (
-                core._LEDGER_DDL,
+                *((core._LEDGER_DDL,) if derived else ()),
                 *(declarations[name] for name in core.DEPENDENT),
-                *apply_schema.split_statements(derived.path.read_text()),
+                *(
+                    apply_schema.split_statements(derived.path.read_text())
+                    if derived
+                    else ()
+                ),
             )
         }
         if phase == "native":
@@ -432,6 +452,7 @@ def run(
                     raise InstallError("apply was not requested")
                 if (
                     phase != "cdc"
+                    or derived is None
                     or table != "schema_versions"
                     or column_names != ["filename", "sha256", "applied_by", "notes"]
                     or len(rows) != 1
@@ -457,13 +478,18 @@ def run(
 
         arguments = {
             "database": config.destination.database,
+            "include_usage_schema": config.include_usage_schema,
             "inspect_mirrors": lambda: core.MirrorInventory.from_peerdb(
                 request,
                 source=config.source,
                 destination=config.destination,
             ),
             "inspect_source": lambda: inspect_source(
-                pg_query, source=config.source, tables=tuple(core.LANDING)
+                pg_query,
+                source=config.source,
+                tables=core.landing_tables(
+                    include_usage_schema=config.include_usage_schema
+                ),
             ),
         }
         client = Client()
