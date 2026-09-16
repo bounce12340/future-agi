@@ -131,9 +131,10 @@ _GRAPH_SEED_SCALAR_FILTER_TYPES = frozenset({"boolean", "number", "string", "tex
 # is the probe's doing either way; this keeps the real read's budget stated
 # instead of collapsing it.
 _GRAPH_BASE_READ_SETTINGS = {
-    # The retained hourly rollup is already row-reduced. Four workers keep the
-    # interactive scan parallel without leaving concurrency unbounded on the
-    # largest reference projects.
+    # The unfiltered route reads pre-aggregated hourly states, so it is
+    # already row-reduced. Four workers keep the interactive scan parallel
+    # without leaving concurrency unbounded on the largest reference
+    # projects; the filtered routes below share the same ceiling.
     "max_threads": settings.DASHBOARD_TRACE_READ_MAX_THREADS,
     "max_block_size": settings.OBSERVABILITY_LIST_MAX_BLOCK_SIZE,
     "max_memory_usage": settings.OBSERVABILITY_LIST_MAX_MEMORY_BYTES,

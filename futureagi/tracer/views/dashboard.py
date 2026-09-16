@@ -1687,8 +1687,9 @@ def _read_dashboard_rollup_fast_path(
     query_count = 0
     rows_returned = 0
     try:
-        # These materialized views are fed by the direct-write CH25 spans table;
-        # bind the query to the same physical generation explicitly.
+        # Span metrics come from `spans`'s own hourly aggregate states and
+        # trace counts from a materialized view over the same direct-write
+        # table; bind both to that physical generation explicitly.
         analytics = V2AnalyticsQueryService()
         if not bool(getattr(analytics, "supports_per_query_read_settings", True)):
             return _dashboard_refresh_or_degraded(
