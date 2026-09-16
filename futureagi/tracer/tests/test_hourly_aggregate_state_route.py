@@ -209,7 +209,7 @@ class _CapturingAnalytics:
             if part.startswith("metric_")
         ]
         row = {"time_bucket": params["start_date"]}
-        row.update({alias: 1 for alias in aliases})
+        row.update(dict.fromkeys(aliases, 1))
         return SimpleNamespace(data=[row], columns=["time_bucket", *aliases])
 
 
