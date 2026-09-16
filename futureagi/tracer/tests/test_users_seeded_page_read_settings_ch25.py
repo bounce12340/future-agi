@@ -146,6 +146,9 @@ def seeded_tables(ch_client):
         ORDER BY (old_id, new_id)
         """
     )
+    # Every version must stay a physical row: a background merge would collapse
+    # the moved user and the tombstone before the statement replays them.
+    ch_client.execute(f"SYSTEM STOP MERGES {spans}")
     t0 = WINDOW_START + timedelta(hours=6)
 
     def span(trace, sid, user, tag, version, *, hours=0, deleted=0, cost=1.0):
@@ -228,6 +231,10 @@ def seeded_tables(ch_client):
         {"t": spans},
     )[0][0]
     assert parts >= 2, "the fixture must span several parts"
+    physical_versions = ch_client.execute(
+        f"SELECT count() FROM {spans} WHERE id = 'b1'"
+    )[0][0]
+    assert physical_versions == 2, "both versions of the moved span must persist"
     return spans, end_users, remap
 
 
@@ -297,6 +304,9 @@ def test_hash_and_in_order_execution_publish_identical_pages(ch_client, seeded_t
     # The witness set is a superset the manager narrows later; the page itself
     # must still carry the users whose latest live spans it replayed.
     assert "charlie" in published and "delta" not in published
+    # B's only span moved to C in its latest version: only a replay of every
+    # version can drop B, and only from the latest one can C's page be right.
+    assert "bravo" not in published
     assert len(published) >= 2
     by_label = {row["user_id"]: row for row in shipped}
     # C's usage counts the un-witnessed span too: metrics are set-valued.
