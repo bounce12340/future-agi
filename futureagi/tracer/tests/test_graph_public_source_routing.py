@@ -163,11 +163,13 @@ def direct(filters, observe_type):
         observe_type=observe_type,
     )
     assert result["query_complete"] is True
-    # A filtered trace graph may first spend bounded EXPLAIN ESTIMATE probes
-    # choosing a candidate seed. The graph statement is always the last one,
-    # and a span graph never probes at all.
+    # Every filtered graph first costs its own scan from the part index, and a
+    # trace graph may then spend bounded EXPLAIN ESTIMATE probes choosing a
+    # candidate seed. The graph statement is always the last one. A span graph
+    # compiles no trace witness, so its one probe is the cost probe alone.
     if observe_type == "span":
-        assert len(analytics.calls) == 1
+        assert len(analytics.calls) == 2
+        assert "graph_cost_project_id" in analytics.calls[0][0]
     assert all("EXPLAIN ESTIMATE" in call[0] for call in analytics.calls[:-1])
     assert "EXPLAIN ESTIMATE" not in analytics.calls[-1][0]
     return analytics.calls[-1]
@@ -186,10 +188,15 @@ def test_public_dispatch_admitted_seed_prunes_with_a_plain_trace_set(key):
         observe_type="trace",
     )
     assert result["query_complete"] is True
+    # query_count reports the statements the READ issued: one seed probe and
+    # the graph statement. The cost probe in front of them is a routing
+    # decision, not a read, and is deliberately not counted as one.
     assert result["query_count"] == 2
-    assert len(analytics.calls) == 2
-    probe_query, _, _ = analytics.calls[0]
-    query, params, _ = analytics.calls[1]
+    assert len(analytics.calls) == 3
+    cost_query, _, _ = analytics.calls[0]
+    probe_query, _, _ = analytics.calls[1]
+    query, params, _ = analytics.calls[2]
+    assert "graph_cost_project_id" in cost_query
     assert "EXPLAIN ESTIMATE" in probe_query
     assert "trace_id IN (" in query
     assert "FROM spans AS graph_seed_spans" in query
@@ -263,7 +270,14 @@ def test_cluster_env_routing_shapes_keep_the_prior_release_schedule(
         observe_type="trace",
     )
 
-    probes = [call for call in analytics.calls if "EXPLAIN ESTIMATE" in call[0]]
+    estimates = [call for call in analytics.calls if "EXPLAIN ESTIMATE" in call[0]]
+    # One of them is the routing cost probe every filtered graph now runs
+    # before it picks a lane. It is not a seed probe: it carries no witness,
+    # takes the request's remaining wall rather than the seed grant, and its
+    # count is fixed at one for every shape here.
+    cost_probes = [call for call in estimates if "graph_cost_project_id" in call[0]]
+    probes = [call for call in estimates if "graph_cost_project_id" not in call[0]]
+    assert len(cost_probes) == 1
     assert len(probes) == expected_probes
     assert all(call[2]["timeout_ms"] == 1_500 for call in probes)
     query = analytics.calls[-1][0]

@@ -1042,10 +1042,15 @@ def test_filtered_raw_graph_statement_uses_one_interactive_deadline(
         django_settings.INTERACTIVE_ANALYTICS_DEFAULT_WALL_MS
     )
     assert len(observed_analytics) == 1
-    assert deadline.remaining_ms.call_count == 1
+    # One deadline object, and every consumer asks it rather than the clock:
+    # the routing cost probe asks twice (for its own grant, and again for what
+    # the wall has left AFTER it spent), then once more when its statement is
+    # clamped, and the read's statement once. What must not happen is a second
+    # ReadDeadline, which ``deadline_start`` above pins.
+    assert deadline.remaining_ms.call_count == 4
     assert [
         call.kwargs["timeout_ms"] for call in analytics.execute_ch_query.call_args_list
-    ] == [9_300]
+    ] == [9_300, 9_300]
     for call in analytics.execute_ch_query.call_args_list:
         read_settings = call.kwargs["settings"]
         assert "max_rows_to_read" not in read_settings

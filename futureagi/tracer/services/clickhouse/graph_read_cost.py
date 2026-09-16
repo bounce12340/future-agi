@@ -92,11 +92,18 @@ def _reduce_estimate(
       meaning unknown.
     """
 
-    names = {str(name) for name in (columns or ())}
+    try:
+        names = {str(name) for name in (columns or ())}
+        candidate_rows = list(rows or ())
+    except TypeError:
+        # A transport that answered something other than a result set at all.
+        # "Unknown" covers that too; raising here would turn a routing
+        # optimisation into a failed request.
+        return None
     if not _ESTIMATE_COLUMNS.issubset(names):
         return None
     estimate = 0
-    for row in rows or ():
+    for row in candidate_rows:
         if not isinstance(row, Mapping):
             return None
         if str(row.get("table") or "") != _ESTIMATE_TABLE:

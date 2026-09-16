@@ -1531,16 +1531,19 @@ def _affordable_raw_graph_seed(
     interval: str,
     observe_type: str,
     interactive_deadline_ms: int,
-) -> tuple[_GraphRawTraceCandidate | None, int] | _GraphReadUnaffordable:
+) -> tuple[_GraphRawTraceCandidate | None, int] | _GraphReadUnaffordable | None:
     """Decide, before the statement, whether this wall can run it at all.
 
     Three outcomes, in the order the evidence arrives:
 
-    * the unseeded scan fits the wall - return ``(None, probes)`` and let the
-      ordinary path run, seeding it for pruning exactly as it does today;
+    * the unseeded scan fits the wall - return ``None``, which is the read
+      path's own word for "no decision taken here". It then probes and seeds
+      for optional pruning exactly as it does today, because a read that fits
+      is still worth making faster and this function has not looked;
     * it does not fit, but a compiler-proven positive witness is selective
-      enough to be admitted - return that candidate, so the statement issues
-      with its trace-ID set and reads a fraction of the window;
+      enough to be admitted - return that candidate with the probes it cost,
+      so the statement issues with its trace-ID set, reads a fraction of the
+      window, and never pays for the same probes twice;
     * it does not fit and no candidate is admitted, including because the seed
       probe could not answer - return the unaffordable sentinel. Spending the
       wall to prove what the index already said, and publishing nothing, is
@@ -1553,7 +1556,7 @@ def _affordable_raw_graph_seed(
     start_date, end_date = BaseQueryBuilder.parse_time_range(filters, strict=True)
     scan_window = raw_graph_scan_window(start_date, end_date)
     if scan_window is None:
-        return None, 0
+        return None
     # Refuse a series the graph contract cannot carry before routing it: a
     # scheduled request would otherwise wait for a worker that raises the
     # identical refusal.
@@ -1574,7 +1577,7 @@ def _affordable_raw_graph_seed(
             estimated_rows,
             remaining_ms=analytics.remaining_read_ms(interactive_deadline_ms),
         ):
-            return None, 0
+            return None
         if observe_type != "trace":
             # A span graph compiles no trace-ID witness, so there is no second
             # lever to try: the window is the read.
