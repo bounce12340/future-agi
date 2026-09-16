@@ -7080,9 +7080,20 @@ def test_candidate_first_seed_keeps_exact_classifier_and_page_hydration() -> Non
         query_settings["max_bytes_to_read"] == settings.OBSERVABILITY_LIST_MAX_BYTES
         and query_settings["max_memory_usage"]
         == settings.OBSERVABILITY_LIST_MAX_MEMORY_BYTES
-        and query_settings["max_threads"] == 1
         and 0 < query_settings["max_result_rows"] <= 10_000
         for _, query_settings in executor.settings_by_query
+    )
+    # The candidate-first seed covers the whole year in one slice, so it is a
+    # wide seed and runs with the wide seed worker budget; the classifier and
+    # hydration statements keep the single worker.
+    assert all(
+        query_settings["max_threads"]
+        == (
+            settings.FILTER_SELECTOR_WIDE_SEED_MAX_THREADS
+            if query == "candidate_seed"
+            else 1
+        )
+        for query, query_settings in executor.settings_by_query
     )
 
 
