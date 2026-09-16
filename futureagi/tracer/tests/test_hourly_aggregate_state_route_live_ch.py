@@ -70,8 +70,10 @@ _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]"})
 _PLAN_READ_TARGET = re.compile(r"ReadFromMergeTree \(([^)]*)\)")
 
 # ClickHouse raises this when ``force_optimize_projection = 1`` and the plan
-# uses no projection at all.
-_PROJECTION_NOT_USED = "584"
+# uses no projection at all. Matched on the exact server text: a bare "584"
+# also occurs in byte counts and line numbers, and turning an unrelated driver
+# error into "no projection was used" would report the wrong cause.
+_PROJECTION_NOT_USED = "Code: 584."
 
 
 def _client():
