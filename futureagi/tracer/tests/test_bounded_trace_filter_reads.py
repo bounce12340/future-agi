@@ -6422,7 +6422,7 @@ def test_span_list_nonempty_page_content_shares_wall_budget() -> None:
     from tracer.views.observation_span import (
         SPAN_LIST_CANDIDATE_DEADLINE_MS,
         SPAN_LIST_ENRICHMENT_TIMEOUT_MS,
-        SPAN_LIST_READ_SETTINGS,
+        SPAN_LIST_SINGLE_WORKER_READ_SETTINGS,
         SPAN_LIST_WALL_DEADLINE_MS,
         ObservationSpanView,
     )
@@ -6536,7 +6536,7 @@ def test_span_list_nonempty_page_content_shares_wall_budget() -> None:
     assert SPAN_LIST_ENRICHMENT_TIMEOUT_MS <= SPAN_LIST_WALL_DEADLINE_MS
     assert len(analytics.calls) == 1
     assert 0 < analytics.calls[0][1] <= SPAN_LIST_ENRICHMENT_TIMEOUT_MS
-    assert analytics.calls[0][2] == SPAN_LIST_READ_SETTINGS
+    assert analytics.calls[0][2] == SPAN_LIST_SINGLE_WORKER_READ_SETTINGS
 
 
 @override_settings(
