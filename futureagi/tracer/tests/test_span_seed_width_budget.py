@@ -275,6 +275,51 @@ def test_a_native_column_list_declares_no_budget_either():
 
 
 @pytest.mark.unit
+def test_a_score_relation_lane_keeps_its_full_window_slice():
+    """A candidate-seed (Score relation) lane declares no row budget even when
+    it also carries an attribute leaf.
+
+    That lane does not issue the raw seed this budget models; it acquires
+    through a live Score relation and asks for the WHOLE request window as one
+    slice on purpose. An hour-floored budget would replace that one statement
+    with a slice per hour.
+    """
+
+    filters = [
+        time_filter(start=WINDOW[0], end=WINDOW[1]),
+        {
+            "column_id": "quality",
+            "filter_config": {
+                "col_type": "ANNOTATION",
+                "filter_type": "text",
+                "filter_op": "equals",
+                "filter_value": "good",
+            },
+        },
+        {
+            "column_id": "attr_0",
+            "filter_config": {
+                "col_type": "SPAN_ATTRIBUTE",
+                "filter_type": "text",
+                "filter_op": "equals",
+                "filter_value": "a",
+            },
+        },
+    ]
+    subject = SpanListQueryBuilderV2(
+        project_id=PROJECT, filters=filters, bounded_internal_scan=True
+    )
+    start, end = subject._bounded_request_window
+    assert subject.supports_filter_candidate_seed_page() is True
+    assert subject._filter_population_plans()
+    assert subject.filter_seed_width_policy() is None
+    assert subject.filter_population_discovery_width_policy() is None
+    assert subject.supports_filter_seed_density_probe() is False
+    assert subject.recommended_filter_initial_slice_width() == end - start
+    assert subject.recommended_filter_max_slice_width() == end - start
+
+
+@pytest.mark.unit
 def test_both_budgets_open_and_floor_at_one_hour():
     """The seed's key predicate is hour-aligned, so a slice below an hour
     reads exactly the granules the whole hour reads for a fraction of the
@@ -341,9 +386,11 @@ def test_the_row_budget_narrows_the_proof_ladder_it_does_not_replace_it():
     The ladder still decides how wide a proof may be proposed - a text lane at
     the daily rung, other witness lanes widening 7d -> 28d -> request - and
     the row budget refuses the rung whose interval the primary index costs
-    above the budget. A proof this lane cannot cost falls back to a DAY, which
-    is the width it already issues today with nothing measured at all, so the
-    fallback is never narrower than the behaviour it guards.
+    above the budget. A proof this lane cannot cost falls back to a DAY - the
+    narrowest rung this lane ships, rather than the policy's four-hour default.
+    That is a fallback, not a promise that nothing narrows: a non-text lane
+    whose proof cannot be costed does get a day where the ladder proposed 7 or
+    28, which costs statements and never history.
     """
 
     subject = _subject(leaves=2)

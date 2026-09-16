@@ -242,9 +242,22 @@ class SpanListQueryBuilderV2(V2RewriteMixin, SpanListQueryBuilder):
         that witness. A time-only list has no attribute predicate to be blind
         about; a native-column list's statements were never measured here.
         Both keep the wall-clock schedule they ship with today.
+
+        A CANDIDATE-SEED (Score relation) LANE IS EXCLUDED even when it also
+        carries an attribute leaf. That lane does not issue the raw seed this
+        budget models: it acquires through a live Score relation, and it asks
+        for the WHOLE request window as one slice on purpose - see
+        ``recommended_filter_query_timeout_ms``, "a full-window Score relation
+        should not fail at the tiny chronological-slice cutoff". Declaring an
+        hour-floored row budget there would replace that one statement with a
+        slice per hour, which is neither what was measured nor what that lane
+        wants.
         """
 
-        return bool(self._filter_population_plans())
+        return bool(
+            self._filter_population_plans()
+            and not self.supports_filter_candidate_seed_page()
+        )
 
     def filter_seed_width_policy(self):
         """Budget the span seed by the rows it reads, not by hours.
@@ -306,10 +319,17 @@ class SpanListQueryBuilderV2(V2RewriteMixin, SpanListQueryBuilder):
         ``recommended_filter_population_time_discovery_windows`` proposes: the
         wall-clock rungs remain the outer contract the statement validates
         itself against, and the row budget refuses the rung whose interval the
-        primary index costs above the budget. The unprobed cap is a DAY rather
-        than the policy default, because a day is the width this lane already
-        issues today with nothing measured at all, and a fallback must not be
-        narrower than the behaviour it guards.
+        primary index costs above the budget.
+
+        The unprobed cap is a DAY rather than the policy's four-hour default,
+        because a day is the narrowest rung this lane ships - the width a text
+        lane already issues with nothing measured at all. It is NOT a promise
+        that nothing narrows: a non-text lane whose proof cannot be costed (an
+        estimate this request cannot read, or a spent probe allowance) falls
+        back to a day where the ladder would have proposed 7 or 28. That costs
+        statements, never history - intervals are contiguous and half-open, the
+        remainder is the next proof's, and the next proof's own read rows widen
+        it again.
         """
 
         if not self._row_budgeted_span_lane():
