@@ -14,18 +14,32 @@ mechanical rules are pinned here rather than only at the call sites:
   with a second explicit one — a plainly-written ``count()`` looks for
   ``AggregateFunction(count)``, finds ``AggregateFunction(countState)``, and
   can never match;
-* no cast around the token columns;
+* no cast around the token columns, in any spelling — ``toInt64`` is the one
+  the retired view body used, but ``toUInt64`` and ``CAST`` un-route it just
+  as well;
 * the window predicate on ``toStartOfHour(start_time)``, the key expression;
 * no projection named anywhere, because the optimiser chooses and with a real
-  ``WHERE`` the cost model may legitimately prefer a different one.
+  ``WHERE`` the cost model may legitimately prefer a different one. That rule
+  is checked over every product file on these two read paths and over the
+  *code*, not the rendered SQL: the realistic way to pin one is
+  ``force_optimize_projection_name`` in a read-settings dict, which never
+  reaches a statement at all.
+
+Whether the optimiser then *accepts* the shape is a different question, and no
+amount of text matching can answer it — ``test_hourly_aggregate_state_route_
+live_ch`` plans it against a real ClickHouse and asserts which target it picked.
 """
 
+import ast
+import pathlib
+import re
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 
+import tracer
 from tracer.services.clickhouse import graph_dispatch
 from tracer.services.clickhouse.query_builders.hourly_aggregate_states import (
     hourly_aggregate_state_source,
@@ -37,6 +51,26 @@ from tracer.views import dashboard as dashboard_view
 from tracer.views.dashboard import _read_dashboard_rollup_fast_path
 
 PROJECT_ID = "3f1d4b7a-0c2e-4a58-9f6b-1d2c3e4f5a6b"
+
+_REPO_ROOT = pathlib.Path(tracer.__file__).resolve().parent.parent
+
+# Every product file on the two unfiltered read paths. The rule "no projection
+# named in product code" has to be checked over all of them, not only the
+# shared source: a projection can be pinned at a *call site*, and pinned as a
+# read *setting* rather than in SQL, where no rendered-statement assertion can
+# ever see it.
+_PRODUCT_SOURCES = (
+    "tracer/services/clickhouse/query_builders/hourly_aggregate_states.py",
+    "tracer/services/clickhouse/query_builders/time_series.py",
+    "tracer/services/clickhouse/graph_dispatch.py",
+    "tracer/views/dashboard.py",
+)
+
+# Cast wrappers of every spelling. The retired rollup's view body cast the
+# token columns with ``toInt64``; the stored states are over the raw columns,
+# and any cast makes the aggregate signature stop matching. Pinning only the
+# one spelling would leave ``toUInt64`` and ``CAST`` free to un-route it.
+_CAST_CALL = re.compile(r"\b(?:to(?:U?Int|Float|Decimal)\d*|CAST|_CAST)\s*\(")
 
 _GRAPH_COLUMNS = [
     "time_bucket",
@@ -114,25 +148,67 @@ def test_unfiltered_graph_windows_on_the_hour_key_expression():
 def test_unfiltered_graph_casts_nothing_and_pins_no_projection():
     query = _unfiltered_graph_sql()
     assert "toInt64(" not in query
+    assert _CAST_CALL.search(query) is None, (
+        "the unfiltered graph statement casts a column. The projections store"
+        " sumState over the raw columns, so any cast — toInt64, toUInt64,"
+        " toFloat64, CAST — changes the aggregate signature and the query"
+        f" stops matching them: {_CAST_CALL.search(query).group(0)!r} in\n{query}"
+    )
     assert "proj_" not in query
     assert "FINAL" not in query.upper()
     assert "SAMPLE" not in query.upper()
 
 
+def _code_without_docstrings_or_comments(path: pathlib.Path) -> str:
+    """Product source with comments and docstrings dropped, values kept.
+
+    Docstrings are exempt because the mechanism is worth explaining by name.
+    A projection named in a *value* is not the same thing, and a by-name pin
+    can only ever be a value — which is why this reads code rather than SQL.
+    """
+
+    tree = ast.parse(path.read_text())
+    for node in ast.walk(tree):
+        if not isinstance(
+            node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            continue
+        first = node.body[0] if node.body else None
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            node.body = node.body[1:] or [ast.Pass()]
+    return ast.unparse(tree)
+
+
 @pytest.mark.unit
-def test_no_source_file_names_a_projection():
-    """The optimiser picks; naming one would freeze a cost-model decision."""
+@pytest.mark.parametrize("relative", _PRODUCT_SOURCES)
+def test_no_source_file_names_a_projection(relative):
+    """The optimiser picks; naming one would freeze a cost-model decision.
 
-    import tracer.services.clickhouse.query_builders.hourly_aggregate_states as module
+    Checked over every product file on these read paths, and over the code
+    rather than the rendered SQL, because the realistic way to pin a
+    projection is ``force_optimize_projection_name`` in the read-settings dict
+    handed to the client — which never appears in a statement, so no
+    rendered-SQL assertion anywhere can see it.
+    """
 
-    with open(module.__file__) as handle:
-        source = handle.read()
-    code = "\n".join(
-        line for line in source.splitlines() if not line.lstrip().startswith("#")
+    code = _code_without_docstrings_or_comments(_REPO_ROOT / relative)
+    assert "proj_metrics_hourly" not in code
+    assert "proj_" not in code, (
+        f"{relative} names a projection outside its docstring. Which"
+        " projection answers this query is the cost model's choice and may"
+        " legitimately change with the data; pinning one turns a preference"
+        " into a hard dependency. The by-name detector also raises on 'not"
+        " chosen', which is indistinguishable from 'not a candidate' — it is"
+        " a test instrument at best, never a product setting."
     )
-    body = code.split('"""', 2)[-1]
-    assert "proj_metrics_hourly" not in body
-    assert "force_optimize_projection_name" not in body
+    assert "force_optimize_projection_name" not in code, (
+        f"{relative} pins a projection by name. See above: 'not chosen' and"
+        " 'not a candidate' are the same exception."
+    )
 
 
 @pytest.mark.unit
@@ -262,8 +338,20 @@ def test_dashboard_widget_routes_and_reports_exactness(
     assert "FROM spans\n" in query
     assert "countState() AS n" in query
     assert "toStartOfHour(start_time) >= %(start_date)s" in query
+    assert "toStartOfHour(start_time) < %(end_date)s" in query
     assert "proj_" not in query
     assert "FINAL" not in query.upper()
+    assert "SAMPLE" not in query.upper()
+    # The widget selects only the metrics asked for, so its -Merge list varies;
+    # the inner states do not. They are the half that has to keep matching.
+    for state, _merge in _STATE_PAIRS:
+        assert state in query, f"{state} missing from the widget statement"
+    assert "toInt64(" not in query
+    assert _CAST_CALL.search(query) is None, (
+        "the dashboard widget statement casts a column, which changes the"
+        " aggregate signature and stops it matching the stored states:"
+        f" {_CAST_CALL.search(query).group(0)!r} in\n{query}"
+    )
 
 
 @pytest.mark.unit
