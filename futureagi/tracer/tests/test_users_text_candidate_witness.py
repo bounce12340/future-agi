@@ -361,3 +361,60 @@ def test_single_witness_binding_only_widens_a_set_the_manager_already_rejects():
     # The widened row carries no witnessed value in latest state, which is why
     # the manager rejects it rather than publishing it.
     assert not [row for row in rows if row[4] == swapped and needle in row[-1]]
+
+
+@pytest.mark.parametrize(
+    "filter_type,value", [("text", "123456"), ("number", 7)], ids=["text", "numeric"]
+)
+def test_widened_candidate_without_a_recorded_value_is_never_published(
+    filter_type, value
+):
+    """The second half of the rule, on the side that decides publication.
+
+    The numeric witness is the case that has no text accelerator: its
+    `attribute_exact_text_filters` is empty, so the per-batch prune returns the
+    candidates untouched and `_row_matches_filters` is the only reader left.
+    Enrichment records absence for every requested user, so a candidate the
+    widened acquisition admitted but that carries no value for the filtered key
+    fails the exact check instead of reaching the page.
+    """
+    from tracer.services.users_list_manager import UsersListManager
+
+    leaf_item = {
+        "column_id": "tag",
+        "filter_config": {
+            "col_type": "SPAN_ATTRIBUTE",
+            "filter_type": filter_type,
+            "filter_op": "equals",
+            "filter_value": value,
+        },
+    }
+    manager = UsersListManager(
+        organization_id=PROJECT,
+        allowed_project_ids=[PROJECT],
+        project_id=PROJECT,
+        filters=[
+            {
+                "column_id": "created_at",
+                "filter_config": {
+                    "filter_type": "datetime",
+                    "filter_op": "between",
+                    "filter_value": [
+                        START.isoformat(),
+                        (START + timedelta(days=7)).isoformat(),
+                    ],
+                },
+            },
+            leaf_item,
+        ],
+        requested_columns=["user_id"],
+        attribute_keys=["tag"],
+    )
+    assert manager.filters_need_enrichment
+    assert bool(manager.attribute_exact_text_filters) is (filter_type == "text")
+    widened = str(UUID(int=150))
+    manager._attribute_values_by_user[widened] = {}
+    manager._attribute_value_types_by_user[widened] = {}
+    assert not manager._row_matches_filters(
+        {"end_user_id": widened, "user_id": "widened"}
+    )
