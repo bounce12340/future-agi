@@ -46,7 +46,7 @@ _ESTIMATE_TABLE = "spans"
 _SCAN_WINDOW_MARGIN = timedelta(days=1)
 # Measured on production against the highest-volume reference tenant, running
 # this surface's own unseeded 30-day filtered trace statement at
-# DASHBOARD_TRACE_READ_MAX_THREADS workers: 5,572,506 physical spans and
+# DASHBOARD_TRACE_READ_MAX_THREADS workers: 5.57M physical spans and
 # 12.04 GiB in 5,756 ms of server time, i.e. 968 rows/ms at 2.25 GB/s and
 # 2,323 bytes per row. Faster rates exist for the same surface on the same
 # tenant (74.2M rows in 28.5 s, 2,605 rows/ms, on rows roughly half as wide),
@@ -136,7 +136,7 @@ def estimate_raw_graph_scan_rows(
       included, which is what the graph statement has to walk past;
     * no attribute predicate and no ``indexHint``. Measured on production, the
       attribute witness this surface's seed probe carries prunes 0.08% of the
-      estimated rows (87,413,176 to 87,346,495) and 109 of 14,532 granules,
+      estimated rows (87.41M to 87.35M) and 109 of 14,532 granules,
       and costs 831 ms of single-worker skip-index analysis at 30 days and
       2,777 ms at twelve months - over that probe's own 1,500 ms budget. The
       pruning is not worth the money at any window;

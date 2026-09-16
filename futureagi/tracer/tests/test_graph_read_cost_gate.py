@@ -50,7 +50,7 @@ def _window(days: int = 30) -> dict:
     }
 
 
-def _attribute_filter(key: str = "langfuse.environment", value: str = "production"):
+def _attribute_filter(key: str = "deployment.environment", value: str = "production"):
     return {
         "column_id": key,
         "filter_config": {
@@ -162,9 +162,9 @@ def _fetch(analytics, *, observe_type="trace", organization_id=ORG_ID, filters=N
 def test_unaffordable_trace_graph_is_scheduled_without_issuing_the_statement(
     scheduled,
 ):
-    """87M estimated rows on a 30 s wall: schedule, do not spend the wall."""
+    """87.4M estimated rows on a 30 s wall: schedule, do not spend it."""
 
-    analytics = Analytics(estimated_rows=87_413_176, seed_estimate=87_346_495)
+    analytics = Analytics(estimated_rows=87_400_000, seed_estimate=87_300_000)
     response = _fetch(analytics)
 
     assert analytics.statements == [], "the graph statement must not be issued"
@@ -179,7 +179,7 @@ def test_unaffordable_trace_graph_is_scheduled_without_issuing_the_statement(
 def test_unaffordable_span_graph_is_scheduled_although_it_never_seeds(scheduled):
     """A span graph compiles no trace witness, so the window IS the read."""
 
-    analytics = Analytics(estimated_rows=87_413_176)
+    analytics = Analytics(estimated_rows=87_400_000)
     response = _fetch(analytics, observe_type="span")
 
     assert analytics.statements == []
@@ -197,7 +197,7 @@ def test_seed_probe_failure_on_an_unaffordable_read_schedules_not_scans(schedule
     second wall and returned nothing.
     """
 
-    analytics = Analytics(estimated_rows=87_413_176, seed_raises=True)
+    analytics = Analytics(estimated_rows=87_400_000, seed_raises=True)
     response = _fetch(analytics)
 
     assert analytics.statements == [], (
@@ -211,7 +211,7 @@ def test_seed_probe_failure_on_an_unaffordable_read_schedules_not_scans(schedule
 def test_unaffordable_read_without_a_background_lane_fails_fast(scheduled):
     """No organization to schedule under: refuse now, not in thirty seconds."""
 
-    analytics = Analytics(estimated_rows=87_413_176, seed_raises=True)
+    analytics = Analytics(estimated_rows=87_400_000, seed_raises=True)
     response = _fetch(analytics, organization_id=None)
 
     assert analytics.statements == []
@@ -228,7 +228,7 @@ def test_unaffordable_read_without_a_background_lane_fails_fast(scheduled):
 def test_affordable_read_still_runs_inline(scheduled):
     """The mid-volume tenant completes today and must keep completing."""
 
-    analytics = Analytics(estimated_rows=10_586_729)
+    analytics = Analytics(estimated_rows=10_500_000)
     response = _fetch(analytics)
 
     assert len(analytics.statements) == 1
@@ -251,7 +251,7 @@ def test_an_unknown_estimate_does_not_divert_the_read(scheduled):
 def test_an_admitted_seed_rescues_an_unaffordable_window(scheduled):
     """A selective witness is the one thing that can bound this read inline."""
 
-    analytics = Analytics(estimated_rows=87_413_176, seed_estimate=1_600_000)
+    analytics = Analytics(estimated_rows=87_400_000, seed_estimate=1_600_000)
     response = _fetch(analytics)
 
     assert len(analytics.statements) == 1
@@ -276,7 +276,7 @@ def test_gate_never_narrows_the_statement_window(scheduled):
     _fetch(ungated)
     _query, ungated_params, _kwargs = ungated.statements[0]
 
-    seeded = Analytics(estimated_rows=87_413_176, seed_estimate=1_600_000)
+    seeded = Analytics(estimated_rows=87_400_000, seed_estimate=1_600_000)
     _fetch(seeded)
     _query, seeded_params, _kwargs = seeded.statements[0]
 
@@ -296,7 +296,7 @@ def test_gate_never_narrows_the_statement_window(scheduled):
 def test_cost_probe_is_metadata_only(scheduled):
     """It must read no parts: no predicate, no indexHint, no IN subquery."""
 
-    analytics = Analytics(estimated_rows=10_586_729)
+    analytics = Analytics(estimated_rows=10_500_000)
     _fetch(analytics)
     query, params, kwargs = analytics.cost_probes[0]
 
@@ -319,7 +319,7 @@ def test_cost_probe_is_metadata_only(scheduled):
 def test_cost_probe_covers_the_widest_window_the_statement_can_scan(scheduled):
     """The raw statement widens its scan by a day at each end; so must this."""
 
-    analytics = Analytics(estimated_rows=10_586_729)
+    analytics = Analytics(estimated_rows=10_500_000)
     _fetch(analytics)
     _query, cost_params, _kwargs = analytics.cost_probes[0]
     _query, statement_params, _kwargs = analytics.statements[0]
@@ -344,7 +344,7 @@ def test_seed_probe_is_not_pinned_to_one_worker(scheduled):
     """
     from django.conf import settings
 
-    analytics = Analytics(estimated_rows=87_413_176, seed_estimate=1_600_000)
+    analytics = Analytics(estimated_rows=87_400_000, seed_estimate=1_600_000)
     _fetch(analytics)
     _query, _params, kwargs = analytics.seed_probes[0]
 
