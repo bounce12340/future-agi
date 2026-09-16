@@ -293,11 +293,13 @@ class SpanListQueryBuilderV2(V2RewriteMixin, SpanListQueryBuilder):
         The proof and the seed read the same interval of the same table and are
         both linear in the rows inside it, but they read DIFFERENT columns: the
         proof reads ``start_time`` and the thin Map ``.keys`` stream its witness
-        names, never a Map VALUE, so it walks far more rows per second than the
-        seed. One number cannot serve both, so each declares its own;
-        everything else - the width lattice, the floor, the unprobed cap, the
-        proportional fit and its one refinement - is the same policy object
-        doing the same arithmetic.
+        names, never a Map VALUE, so it walks about five times the seed's rows
+        per second (measured read-only against production at one worker: 43.9
+        bytes and ~1.5M rows per second, against the seed's 3.73 KB and ~0.3M).
+        One number cannot serve both, so each declares its own; everything
+        else - the width lattice, the floor, the unprobed cap, the proportional
+        fit and its one refinement - is the same policy object doing the same
+        arithmetic.
 
         THE PROOF'S WIDTHS ARE STILL BOUNDED BY ITS LADDER. This budget only
         ever NARROWS what
@@ -337,23 +339,22 @@ class SpanListQueryBuilderV2(V2RewriteMixin, SpanListQueryBuilder):
         answers from the primary index and the skip indexes alone, and for
         every part they cannot exclude it reports the parts, granules
         (``marks``) and ``rows`` a real statement WOULD read. Measured
-        read-only against production, it returns 54 bytes read: the 30-day
-        AND-2 shape on the high-volume tenant is answered in about 0.4 s and
-        the 12-month shape in under 0.8 s. That is true of every conjunct it
-        carries, whether or not the conjunct would be a row-level read in an
-        executed statement - which is why this statement may carry the
-        population witness VERBATIM rather than needing an index-only spelling
-        of its own.
+        read-only against production carrying this lane's witness, it returns
+        54 bytes read and answers a 30-day interval in about 0.7 s. That holds
+        for every conjunct it carries, whether or not the conjunct would be a
+        row-level read in an EXECUTED statement - which is why this statement
+        may carry the population witness VERBATIM rather than needing a second,
+        index-only spelling of the same predicate.
 
         IT CARRIES THE CONJUNCTION. The plain time-range form would answer for
-        a population this lane never reads: on the measured 30-day AND-2 shape
-        the plain estimate is 187 parts / 97.1M rows / 11,925 marks and the
-        conjunction-carrying estimate is 66 parts / 55.3M rows / 9,224 marks -
-        and the two diverge much further over a year, where the same filter's
-        key is absent from most of the retained history (12 months: 314.6M
-        plain against 96.4M with the conjunction). Costing against the plain
-        count would shrink every interval by the ratio of the two and turn a
-        page into a crawl.
+        a population this lane never reads. Measured read-only against
+        production over the same 30-day interval, the plain estimate is 219
+        parts / 92.0M rows and the witness-carrying estimate is 172 parts /
+        88.9M rows for a key held by most parts; the two diverge much further
+        for a key absent from most of the retained history, which is the shape
+        that made the old proof expensive. Costing against the plain count
+        would shrink every interval by the ratio of the two and turn a page
+        into a crawl.
 
         The conjunct carried for each plan is its ``raw_index_witness_predicate``
         - key presence plus the deployed value/ngram ``indexHint`` companions -

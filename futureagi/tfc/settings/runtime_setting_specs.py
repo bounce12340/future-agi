@@ -476,20 +476,29 @@ INTERACTIVE_READ_SETTING_SPECS = {
             # The SPAN list's own two row budgets. The span lane has two
             # statements whose cost tracks the rows inside an interval rather
             # than the interval's width, and they read DIFFERENT columns, so
-            # one number cannot serve both: measured read-only against
-            # production on the high-volume tenant at one worker, the seed
-            # walks its typed Map at ~0.3M rows/s (3.73 KB/row: 755,996 rows =
-            # 2.82 GB) and the population-discovery proof walks ``start_time``
-            # alone at ~34M rows/s (a 30-day interval whose index estimate is
-            # 55.3M rows answered in about 1.6 s). Both are consumed as
-            # ``EXPLAIN ESTIMATE`` rows, which are an upper bound twice over -
-            # whole granules, and every physical version inside them - so both
-            # errors point at a NARROWER issued interval.
+            # one number cannot serve both.
             #
-            # 500,000 seed rows is about 1.7 s of that Map walk; 40,000,000
-            # discovery rows is about 1.2 s of the timestamp walk. Narrowing
-            # either never skips history: intervals are contiguous and
-            # half-open and the remainder is the next adjacent interval's work.
+            # THE SEED replays the typed Map of every physical row inside its
+            # slice - 3.73 KB of ``attrs_string`` per row measured (755,996
+            # rows = 2.82 GB), about 0.3M rows/s at one worker - so 500,000
+            # rows is roughly 1.7 s of that Map walk.
+            #
+            # THE POPULATION-DISCOVERY PROOF reads ``start_time`` plus the thin
+            # Map ``.keys`` stream its witness evaluates, and no Map VALUE at
+            # all. Measured read-only against production at one worker:
+            # 831,771 rows in 0.567 s (36.5 MB, 43.9 B/row), i.e. ~1.5M rows/s,
+            # so 2,000,000 rows is about 1.4 s - less at this proof's own
+            # two-worker budget above. The number is calibrated for the witness
+            # the proof actually CARRIES: a proof reading ``start_time`` alone
+            # walks more than an order of magnitude faster, and a budget chosen
+            # for that shape would not bound this statement.
+            #
+            # Both are consumed as ``EXPLAIN ESTIMATE`` rows, which are an
+            # upper bound twice over - whole granules, and every physical
+            # version inside them - so both errors point at a NARROWER issued
+            # interval. Narrowing either never skips history: intervals are
+            # contiguous and half-open and the remainder is the next adjacent
+            # interval's work.
             (
                 "FILTER_SELECTOR_SPAN_SEED_TARGET_READ_ROWS",
                 500_000,
@@ -498,8 +507,8 @@ INTERACTIVE_READ_SETTING_SPECS = {
             ),
             (
                 "FILTER_SELECTOR_SPAN_POPULATION_DISCOVERY_TARGET_READ_ROWS",
-                40_000_000,
-                1_000_000,
+                2_000_000,
+                100_000,
                 2_000_000_000,
             ),
             ("FILTER_SELECTOR_MAX_NUMBERED_PAGE_WORK_ROWS", 5_000, 1, 100_000),
