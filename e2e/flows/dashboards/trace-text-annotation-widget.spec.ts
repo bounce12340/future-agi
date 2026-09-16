@@ -1,12 +1,12 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
-import { request, type Request, type Response } from '@playwright/test';
+import { request } from '@playwright/test';
 import { test, expect, type ScopeActor } from '../../lib/scope-actors';
 import { sendTrace } from '../../lib/otlp';
 import { E2E } from '../../lib/env';
 import { POLL } from '../../lib/state-probe';
 import { flowAnnotation } from '../../lib/flow-meta';
-import { readJsonWithin } from '../../lib/response-body';
+import { captureAnnotationHttp, type Receipt } from '../../lib/annotation-http';
 
 // Pins: AnnotationSidebarContent/scores.js, annotation_queues.py, WidgetEditorView.
 // Endpoints: api/scores/scores.js, hooks/useDashboards.js and the scoped DRF views.
@@ -23,9 +23,6 @@ const EXPECTED_CATALOG_TEXT_TYPE = 'text'; // Check1 -> 'star', assertion only.
 const EXPECTED_REOPENED_TEXT_COUNT = 1; // Check3 -> 2, fresh reopened A-series only.
 type Wire = Record<string, unknown>;
 type Scope = { organizationId: string; workspaceId: string };
-type Receipt<T> = { path: string; method: string; input: Wire; scope: Scope; authorized: boolean;
-  status: number; body?: T; error?: string; requestId?: string; contentType?: string;
-  startedAt: number; endedAt: number; settled: boolean };
 type Config = { project_ids: string[]; time_range: { preset: string }; granularity: string;
   metrics: Wire[]; filters: Wire[]; breakdowns: Wire[] };
 type Result = { query_complete: boolean; query_exact: boolean; granularity: string; time_range: { start: string; end: string };
@@ -237,51 +234,15 @@ test('DASH-E2E-012: a saved trace annotation widget retains exact text membershi
   expect(await readPG()).toEqual([]);
   let initialScores: Score[] = [], initialCHScores: CHScore[] = [], initialItems: Wire[] = [];
   const submissions: { seed: typeof seeds[number]; receipt: Receipt<{ result: { scores: NativeScore[]; errors: unknown[] } }> }[] = [];
-  const receipts: Receipt<unknown>[] = [], scopeReceipts: unknown[] = [], pending = new Set<Promise<void>>();
-  const requests = new Map<Request, Receipt<unknown>>();
+  const scopeReceipts: unknown[] = [];
   const context = await scopeActors.openContext(browser, actor), foreignContext = await scopeActors.openContext(browser, foreignActor);
   try {
     const page = await context.newPage(), foreignPage = await foreignContext.newPage();
     for (const surface of [page, foreignPage]) surface.setDefaultTimeout(UI_READY);
     const scopeOf = (owner: ScopeActor): Scope => ({ organizationId: owner.organizationId, workspaceId: owner.workspaceId });
-    const onRequest = (outgoing: Request) => {
-      const url = new URL(outgoing.url()), path = url.pathname, method = outgoing.method();
-      if (url.origin !== new URL(E2E.apiUrl).origin || !['GET', 'POST', 'PATCH', 'PUT'].includes(method) ||
-        !([LIST, BULK, `${QUEUES}for-source/`, METRICS, VALUES, QUERY, DASHBOARDS].includes(path) ||
-          /^\/tracer\/trace\/[0-9a-f-]+\/$/.test(path) || /^\/tracer\/dashboard\/[0-9a-f-]+\/(?:widgets\/(?:[0-9a-f-]+\/)?)?$/.test(path))) return;
-      const headers = outgoing.headers();
-      const receipt: Receipt<unknown> = { path, method, input: {}, status: 0, startedAt: Date.now(), endedAt: 0, settled: false,
-        scope: { organizationId: headers['x-organization-id'], workspaceId: headers['x-workspace-id'] }, authorized: /^Bearer \S+$/.test(headers.authorization ?? '') };
-      try { receipt.input = method === 'GET' ? Object.fromEntries(url.searchParams) : outgoing.postDataJSON() as Wire; }
-      catch { receipt.error = 'request_json_unreadable'; }
-      requests.set(outgoing, receipt); receipts.push(receipt);
-    };
-    const onResponse = (response: Response) => {
-      const receipt = requests.get(response.request()); if (!receipt) return;
-      Object.assign(receipt, { status: response.status(), endedAt: Date.now(), requestId: response.headers()['x-request-id'], contentType: response.headers()['content-type'] ?? '' });
-      const capture = (async () => {
-        try {
-          await attach('native-http-head', { ...receipt });
-          if (!/\bapplication\/(?:[\w.-]+\+)?json\b/i.test(receipt.contentType!)) { receipt.error = 'non_json_body_omitted'; return; }
-          receipt.body = await readJsonWithin(response);
-          // scores.py can return HTTP200 with per-score errors. Classify them
-          // before settling so a later success cannot hide this failed Save.
-          const body = receipt.body as { status?: boolean; result?: { errors?: unknown } } | null;
-          if (body?.status === false) receipt.error ??= 'application_error';
-          if (receipt.path === BULK &&
-            (!Array.isArray(body?.result?.errors) || body.result.errors.length !== 0)) {
-            receipt.error ??= 'bulk_score_errors';
-          }
-        } catch { receipt.error = 'response_json_unreadable'; }
-        finally { receipt.endedAt = Date.now(); receipt.settled = true; }
-      })();
-      pending.add(capture); void capture.then(() => pending.delete(capture));
-    };
-    const onFailed = (outgoing: Request) => {
-      const receipt = requests.get(outgoing); if (receipt) Object.assign(receipt, { error: 'request_failed', settled: true, endedAt: Date.now() });
-    };
-    for (const surface of [page, foreignPage]) { surface.on('request', onRequest); surface.on('response', onResponse); surface.on('requestfailed', onFailed); }
-    // Approved D12 receipt contract: a matching failure outranks a later200; unrelated inputs/scopes do not.
+    const capture = captureAnnotationHttp([page, foreignPage], E2E.apiUrl, attach);
+    const { receipts, pending } = capture;
+    // A matching failure outranks a later success; unrelated inputs/scopes do not.
     const readNative = async <T>(path: string, input: Wire | ((wire: Wire) => boolean) | undefined, since: number,
       method = 'POST', owner = actor, complete?: (body: T) => boolean): Promise<Receipt<T>> => {
       let chosen: Receipt<unknown> | undefined;
@@ -768,7 +729,7 @@ test('DASH-E2E-012: a saved trace annotation widget retains exact text membershi
         expect(finalLabels).toEqual(initialLabels); expect(finalQueues).toEqual(initialQueues); expect(finalLinks).toEqual(initialLinks); expect(finalItems).toEqual(initialItems);
       }, { timeout: UI_READY });
     } finally {
-      for (const surface of [page, foreignPage]) { surface.off('request', onRequest); surface.off('response', onResponse); surface.off('requestfailed', onFailed); }
+      capture.stop();
       await Promise.all(pending); // Settle captured semantic errors before publishing final receipt states.
       await attach('native-request-states', receipts.map(({ body, ...head }) => head));
       await attach('native-reads-writes-scope', { receipts, scopeReceipts });

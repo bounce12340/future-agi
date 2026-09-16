@@ -26,7 +26,7 @@ from tracer.services.clickhouse import oss_cdc_bootstrap as core
 
 _ROOT = Path(__file__).with_name("v2") / "schema"
 _READ = {"readonly": 1, "max_threads": 1, "max_execution_time": 5}
-# (filename, exact statement count, selected index, exact declaration prefix).
+# (filename, exact statement count, selected index).
 # No glob, operator SQL/path, generic ALTER interpreter, or legacy file receipts.
 _TABLES = {
     "traces": ("015_traces_and_trace_dict.sql", 3, 0),

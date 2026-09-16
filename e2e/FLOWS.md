@@ -360,7 +360,7 @@
 ### DASH-E2E-010 — a saved trace annotation widget retains numeric scores
 
 **Goal:** A saved trace annotation widget retains numeric scores.  
-**Spec:** `flows/dashboards/trace-numeric-annotation-widget.spec.ts:59`  
+**Spec:** `flows/dashboards/trace-numeric-annotation-widget.spec.ts:56`  
 **Tags:** —
 
 **User steps:**
@@ -383,7 +383,7 @@
 ### DASH-E2E-011 — a saved trace annotation widget retains star ratings
 
 **Goal:** A saved trace annotation widget retains star ratings.  
-**Spec:** `flows/dashboards/trace-star-annotation-widget.spec.ts:60`  
+**Spec:** `flows/dashboards/trace-star-annotation-widget.spec.ts:57`  
 **Tags:** —
 
 **User steps:**
@@ -406,7 +406,7 @@
 ### DASH-E2E-012 — a saved trace annotation widget retains exact text membership
 
 **Goal:** A saved trace annotation widget retains exact text membership.  
-**Spec:** `flows/dashboards/trace-text-annotation-widget.spec.ts:63`  
+**Spec:** `flows/dashboards/trace-text-annotation-widget.spec.ts:60`  
 **Tags:** —
 
 **User steps:**

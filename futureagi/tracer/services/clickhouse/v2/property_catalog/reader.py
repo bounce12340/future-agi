@@ -28,7 +28,6 @@ from .source_adapters import (
     source_matches,
 )
 
-PROPERTY_CATALOG_MAX_PAGE_SIZE = RUNTIME_LIMITS.max_page_size
 PROPERTY_CATALOG_MAX_SEARCH_BYTES = RUNTIME_LIMITS.max_search_bytes
 PROPERTY_CATALOG_QUERY_WALL_MS = RUNTIME_LIMITS.query_wall_ms
 
