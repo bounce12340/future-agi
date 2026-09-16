@@ -311,9 +311,12 @@ def _select_raw_trace_seed_candidate(
     re-clamp in :class:`_DeadlineBoundGraphAnalytics` (every statement is
     asked for ``ReadDeadline.remaining_ms(...)``, and the deadline raises
     below 25 ms) and, on the unwrapped background lane, the graph statement's
-    arithmetic floor. Single-node walls too short for that floor to be worth
-    anything do not reach this function at all - see
-    ``_GRAPH_SEED_SINGLE_NODE_MIN_WALL_MS``.
+    arithmetic floor. On the read path, single-node walls too short for that
+    floor to be worth anything do not reach this function at all - see
+    ``_GRAPH_SEED_SINGLE_NODE_MIN_WALL_MS``. The interactive routing gate
+    calls this function directly and does not apply that floor: there the seed
+    is not optional pruning but the last lever before the statement is
+    scheduled rather than issued, so it is worth probing on any wall.
     """
 
     candidates = _raw_trace_seed_candidates(filters)
@@ -1514,13 +1517,17 @@ def _fetch_direct_raw_system_metric_graph(
     return enforce_exact_graph_data_contract(response)
 
 
+@dataclass(frozen=True)
 class _GraphReadUnaffordable:
-    """Sentinel: no lane inside the interactive wall can run this statement."""
+    """No lane inside the interactive wall can run this statement.
 
-    __slots__ = ()
+    ``estimated_rows`` is the index's own answer, carried forward because the
+    next question - whether the BACKGROUND wall can absorb it either - is the
+    same arithmetic against a different deadline, and asking it once from one
+    probe is cheaper and more honest than probing again.
+    """
 
-
-_GRAPH_READ_UNAFFORDABLE = _GraphReadUnaffordable()
+    estimated_rows: int | None
 
 
 def _affordable_raw_graph_seed(
@@ -1565,6 +1572,7 @@ def _affordable_raw_graph_seed(
         start_date=start_date,
         end_date=end_date,
     )
+    estimated_rows: int | None = None
     try:
         estimated_rows = estimate_raw_graph_scan_rows(
             analytics=analytics,
@@ -1581,7 +1589,7 @@ def _affordable_raw_graph_seed(
         if observe_type != "trace":
             # A span graph compiles no trace-ID witness, so there is no second
             # lever to try: the window is the read.
-            return _GRAPH_READ_UNAFFORDABLE
+            return _GraphReadUnaffordable(estimated_rows)
         seed_candidate, seed_probe_count = _select_raw_trace_seed_candidate(
             analytics=analytics,
             project_id=project_id,
@@ -1593,24 +1601,39 @@ def _affordable_raw_graph_seed(
     except ReadDeadlineExceeded:
         # The request wall is already gone. That is the plainest possible
         # proof that this statement cannot run on it.
-        return _GRAPH_READ_UNAFFORDABLE
+        return _GraphReadUnaffordable(estimated_rows)
     if seed_candidate is None:
-        return _GRAPH_READ_UNAFFORDABLE
+        return _GraphReadUnaffordable(estimated_rows)
     return seed_candidate, seed_probe_count
 
 
 def _schedule_unaffordable_graph_read(
     *,
     metric_id: str,
+    verdict: _GraphReadUnaffordable,
     identity: dict[str, Any],
     pending_payload: dict[str, Any],
     organization_id: str | None,
     workspace_id: str | None,
 ) -> dict[str, Any]:
-    """Hand a proven-unaffordable read to the background lane, or say so."""
+    """Hand a proven-unaffordable read to the background lane, or say so.
+
+    The background lane is a wider wall, not an unbounded one. A scan the
+    index says will outlast ``GRAPH_BACKGROUND_WALL_MS`` too is not scheduled
+    at all: a cold refresh that fails leaves no snapshot, and a failed state
+    does not stop the NEXT poll from asking for another refresh, so scheduling
+    one would buy the user a spinner with no terminal state and the cluster a
+    full-window scan per poll cycle. Refusing it here is the honest answer and
+    the cheap one, and it is the same arithmetic the interactive wall just
+    failed - only against the deadline the worker would actually have.
+    """
 
     unaffordable = BoundedGraphReadError("read_budget_exceeded", retryable=True)
-    if organization_id:
+    schedulable = raw_graph_scan_fits_wall(
+        verdict.estimated_rows,
+        remaining_ms=GRAPH_WALL_DEADLINE_MS,
+    )
+    if organization_id and schedulable:
         try:
             return _read_or_refresh_exact_graph(
                 namespace="observe-system-graph",
@@ -1624,10 +1647,11 @@ def _schedule_unaffordable_graph_read(
             # Cache/worker transport availability must not turn a routing
             # decision into a raw API exception.
             logger.info("graph_unaffordable_schedule_unavailable", exc_info=True)
-    # Without a background lane there is nowhere to hand this read, and the
-    # index has already proved the wall cannot absorb it. Returning the same
-    # degraded payload now rather than in thirty seconds costs the user
-    # nothing and costs the cluster one full-window scan less.
+    # Either there is no background lane to hand this read to, or no wall the
+    # product owns is wide enough for it. The index has already proved the
+    # read cannot complete, so returning the degraded payload now rather than
+    # in thirty seconds costs the user nothing and costs the cluster one
+    # full-window scan - or one per poll - less.
     return degraded_graph_response(
         metric_id,
         unaffordable,
@@ -1753,12 +1777,13 @@ def fetch_system_metric_graph_ch(
         observe_type=normalized_observe_type,
         interactive_deadline_ms=interactive_deadline_ms,
     )
-    if seed is _GRAPH_READ_UNAFFORDABLE:
+    if isinstance(seed, _GraphReadUnaffordable):
         # Nothing ran in the foreground, so the background worker - which owns
         # the same statement under GRAPH_BACKGROUND_WALL_MS instead of this
         # interactive wall - is its first and only execution.
         return _schedule_unaffordable_graph_read(
             metric_id=str(metric_id or ""),
+            verdict=seed,
             identity=identity,
             pending_payload=pending_payload,
             organization_id=organization_id,

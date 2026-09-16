@@ -208,6 +208,43 @@ def test_seed_probe_failure_on_an_unaffordable_read_schedules_not_scans(schedule
 
 
 @pytest.mark.unit
+def test_a_read_no_wall_can_absorb_is_refused_not_scheduled(scheduled):
+    """The background lane is a wider wall, not an unbounded one.
+
+    Twelve months on the high-volume tenant is 311.9M estimated rows. At the
+    measured rate the 180 s background wall affords 174.2M, so the worker
+    would expire too - and a failed cold refresh leaves no snapshot while the
+    next poll is free to ask for another one. Scheduling that is a spinner
+    with no terminal state and one full-window scan per poll cycle.
+    """
+    from django.conf import settings
+
+    hopeless = settings.GRAPH_BACKGROUND_WALL_MS * graph_read_cost._RAW_SCAN_ROWS_PER_MS
+    analytics = Analytics(estimated_rows=hopeless + 1, seed_raises=True)
+    response = _fetch(analytics)
+
+    assert analytics.statements == []
+    assert [call for call in scheduled if call[2]["refresh"] is True] == []
+    assert response["query_status"] == "degraded"
+    assert response["query_error_code"] == "read_budget_exceeded"
+    assert response["query_provenance"] == "read_cost_gate"
+
+
+@pytest.mark.unit
+def test_a_read_the_background_wall_can_absorb_is_still_scheduled(scheduled):
+    """Thirty days on the same tenant fits the worker, so it must reach it."""
+    from django.conf import settings
+
+    hopeless = settings.GRAPH_BACKGROUND_WALL_MS * graph_read_cost._RAW_SCAN_ROWS_PER_MS
+    analytics = Analytics(estimated_rows=hopeless, seed_raises=True)
+    response = _fetch(analytics)
+
+    assert analytics.statements == []
+    assert len([call for call in scheduled if call[2]["refresh"] is True]) == 1
+    assert response["query_status"] == "pending"
+
+
+@pytest.mark.unit
 def test_unaffordable_read_without_a_background_lane_fails_fast(scheduled):
     """No organization to schedule under: refuse now, not in thirty seconds."""
 
