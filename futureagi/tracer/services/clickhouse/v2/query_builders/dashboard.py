@@ -39,7 +39,8 @@ from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
 from tracer.services.clickhouse.v2.adapter import CH_INSERT_COLUMNS
 from tracer.services.clickhouse.v2.query_builders._rewrite import V2RewriteMixin
 from tracer.services.clickhouse.v2.query_builders.filters import (
-    rewrite_and_apply_v2_settings,
+    _append_v2_settings,
+    rewrite_v1_sql_to_v2,
 )
 
 # Tables whose columns must NOT be rewritten (they keep `_peerdb_is_deleted`).
@@ -82,6 +83,9 @@ _EXACT_REPLAY_IDENTITY_COLUMNS = (
     "trace_id",
     "id",
 )
+# The candidate CTE's name marks a statement that carries the exact replay;
+# ``build_metric_query`` reads it to choose that statement's aggregation.
+_EXACT_REPLAY_CANDIDATE_CTE = "dashboard_filter_candidate_identities"
 
 # Fat payload columns that no dashboard metric, filter or breakdown expression
 # can name: ``_qualify_span_expression`` does not know them and neither builder
@@ -378,7 +382,7 @@ class DashboardQueryBuilderV2(V2RewriteMixin, DashboardQueryBuilder):
         # unpacking it in the same SELECT aliases a winner element to a name
         # argMax itself reads, which the CH 25.3 analyzer rejects.
         return f"""(
-            WITH dashboard_filter_candidate_identities AS (
+            WITH {_EXACT_REPLAY_CANDIDATE_CTE} AS (
                 SELECT
                     dashboard_candidate_source.project_id AS project_id,
                     dashboard_candidate_source.observation_type
@@ -434,7 +438,7 @@ class DashboardQueryBuilderV2(V2RewriteMixin, DashboardQueryBuilder):
                     any(dashboard_candidate_state.dashboard_candidate_winner)
                         AS dashboard_candidate_winner
                 FROM spans AS dashboard_replay_source
-                INNER JOIN dashboard_filter_candidate_identities
+                INNER JOIN {_EXACT_REPLAY_CANDIDATE_CTE}
                         AS dashboard_candidate_state
                     ON dashboard_replay_source.project_id
                         = dashboard_candidate_state.project_id
@@ -1167,7 +1171,17 @@ class DashboardQueryBuilderV2(V2RewriteMixin, DashboardQueryBuilder):
     def build_metric_query(self, metric: dict) -> tuple[str, dict]:
         sql, params = super().build_metric_query(metric)
         sql = _protect_usage_cdc_columns(sql)
-        sql = rewrite_and_apply_v2_settings(sql)
+        # The exact replay groups both of its legs by the full spans sorting
+        # key, so ordered aggregation streams one merged stream per selected
+        # part - 700 to 1,400 parts a window on a mid-size tenant - and that
+        # machinery is about three quarters of the statement's peak, for a
+        # set operation whose result cannot depend on the execution strategy.
+        # That statement states hash execution; every other dashboard shape
+        # keeps the v2 default.
+        sql = _append_v2_settings(
+            rewrite_v1_sql_to_v2(sql),
+            aggregation_in_order=_EXACT_REPLAY_CANDIDATE_CTE not in sql,
+        )
         sql = _restore_usage_cdc_columns(sql)
         # Mixed-table query: rewrite already fixed spans refs, now restore
         # _peerdb_is_deleted for every legacy-table alias.
