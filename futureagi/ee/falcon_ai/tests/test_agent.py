@@ -13,6 +13,7 @@ import uuid
 from unittest.mock import AsyncMock
 
 import pytest
+from asgiref.sync import sync_to_async
 
 from ee.falcon_ai.agent import AgentLoop
 from ee.falcon_ai.modes import CORE_TOOLS
@@ -257,21 +258,15 @@ class TestAgentRun:
         assert AgentLoop.MAX_ITERATIONS == 200
 
 
-def _model_that_renders_widgets_when_offered(offered_tool_names):
+def _model_that_calls_when_offered(tool_name, arguments, offered_tool_names):
     async def stream(messages, tools=None):
         names = {t["function"]["name"] for t in tools or []}
         offered_tool_names.append(names)
-        if len(offered_tool_names) == 1 and "render_widget" in names:
-            widgets = [{"type": "metric_card", "title": "Runs", "config": {"value": 5}}]
+        if len(offered_tool_names) == 1 and tool_name in names:
             call = {
                 "index": 0,
                 "id": "call_1",
-                "function": {
-                    "name": "render_widget",
-                    "arguments": json.dumps(
-                        {"action": "replace_all", "widgets": widgets}
-                    ),
-                },
+                "function": {"name": tool_name, "arguments": json.dumps(arguments)},
             }
             yield {
                 "choices": [
@@ -294,24 +289,28 @@ def _events(send_callback, event_type):
     ]
 
 
-@pytest.mark.django_db
-class TestDashboardRequestOutsideImagine:
+RENDER_ALL = {
+    "action": "replace_all",
+    "widgets": [{"type": "metric_card", "title": "Runs", "config": {"value": 5}}],
+}
+DASHBOARD_ASK = "Can you build a dashboard for my auto-sc project?"
+
+
+@pytest.mark.django_db(transaction=True)
+class TestDashboardRequestFromFalcon:
     @pytest.mark.asyncio
-    async def test_general_chat_cannot_render_a_dashboard_nobody_can_see(
+    async def test_general_chat_is_not_offered_the_imagine_canvas(
         self, falcon_context, conversation
     ):
         agent = AgentLoop(falcon_context, conversation)
         offered = []
-        agent.llm_client.stream_completion = _model_that_renders_widgets_when_offered(
-            offered
+        agent.llm_client.stream_completion = _model_that_calls_when_offered(
+            "render_widget", RENDER_ALL, offered
         )
         send_callback = AsyncMock()
 
         result = await agent.run(
-            "Can you build a dashboard for my project?",
-            [],
-            send_callback,
-            context_page="general",
+            DASHBOARD_ASK, [], send_callback, context_page="general"
         )
 
         assert agent.mode == "general"
@@ -325,21 +324,55 @@ class TestDashboardRequestOutsideImagine:
     ):
         agent = AgentLoop(falcon_context, conversation)
         offered = []
-        agent.llm_client.stream_completion = _model_that_renders_widgets_when_offered(
-            offered
+        agent.llm_client.stream_completion = _model_that_calls_when_offered(
+            "render_widget", RENDER_ALL, offered
         )
         send_callback = AsyncMock()
 
         result = await agent.run(
-            "Can you build a dashboard for my project?",
-            [],
-            send_callback,
-            context_page="imagine",
+            DASHBOARD_ASK, [], send_callback, context_page="imagine"
         )
 
         assert agent.mode == "imagine"
-        assert "render_widget" in offered[0]
         [event] = _events(send_callback, "widget_render")
-        assert event["data"]["action"] == "replace_all"
         assert event["data"]["widgets"][0]["title"] == "Runs"
         assert [tc["tool_name"] for tc in result["tool_calls"]] == ["render_widget"]
+
+    @pytest.mark.asyncio
+    async def test_general_chat_dashboard_is_saved_and_listed_on_dashboards(
+        self, falcon_context, conversation, auth_client
+    ):
+        agent = AgentLoop(falcon_context, conversation)
+        offered = []
+        agent.llm_client.stream_completion = _model_that_calls_when_offered(
+            "create_dashboard", {"name": "SC Generation"}, offered
+        )
+
+        result = await agent.run(DASHBOARD_ASK, [], AsyncMock(), context_page="general")
+
+        [call] = result["tool_calls"]
+        assert (call["tool_name"], call["status"]) == ("create_dashboard", "completed")
+        listed = await sync_to_async(auth_client.get)("/tracer/dashboard/")
+        [dashboard] = [
+            d for d in listed.json()["result"] if d["name"] == "SC Generation"
+        ]
+        assert result["completion_card"]["action_path"] == (
+            f"/dashboard/dashboards/{dashboard['id']}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_blank_dashboard_name_saves_nothing_and_claims_nothing(
+        self, falcon_context, conversation, auth_client
+    ):
+        agent = AgentLoop(falcon_context, conversation)
+        agent.llm_client.stream_completion = _model_that_calls_when_offered(
+            "create_dashboard", {"name": "   "}, []
+        )
+
+        result = await agent.run(DASHBOARD_ASK, [], AsyncMock(), context_page="general")
+
+        [call] = result["tool_calls"]
+        assert (call["tool_name"], call["status"]) == ("create_dashboard", "error")
+        assert result["completion_card"] is None
+        listed = await sync_to_async(auth_client.get)("/tracer/dashboard/")
+        assert listed.json()["result"] == []
