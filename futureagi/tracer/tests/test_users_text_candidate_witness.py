@@ -156,13 +156,34 @@ def population(needle):
     return rows
 
 
-def execute(rows, items, *, days=7, before=None, limit=65, redundant_membership=False):
+def execute(
+    rows,
+    items,
+    *,
+    days=7,
+    before=None,
+    limit=65,
+    redundant_membership=False,
+    redundant_dimension_having=False,
+    users=None,
+):
     engine = pytest.importorskip("chdb")
     sql, params = builder(items, days).build_dimension_candidate_query(
         limit=limit,
         before_first_seen=before[0] if before else None,
         before_end_user_id=before[1] if before else None,
     )
+    if redundant_dimension_having:
+        # Restore the removed second binding of the witness population as a
+        # differential control. It cost a whole extra witness scan and can only
+        # drop users whose latest state carries no witnessed span at all.
+        anchor = "\n            GROUP BY end_user_id\n"
+        assert sql.count(anchor) == 1
+        sql = sql.replace(
+            anchor,
+            anchor + "            HAVING end_user_id IN "
+            "(SELECT end_user_id FROM scalar_candidate_users)\n",
+        )
     if redundant_membership:
         # Restore the removed, redundant semijoin as a differential control.
         # Both versions retain the authoritative final dimension INNER JOIN.
@@ -190,7 +211,7 @@ def execute(rows, items, *, days=7, before=None, limit=65, redundant_membership=
             "rows": tuple(rows),
             "users": tuple(
                 (str(UUID(int=n)), FOREIGN if n == 110 else PROJECT)
-                for n in (10, 20, 30, 40, 50, 60, 70, 80, 100, 110, 120)
+                for n in (users or (10, 20, 30, 40, 50, 60, 70, 80, 100, 110, 120))
             ),
             "remaps": (
                 (str(UUID(int=10)), str(UUID(int=90))),
@@ -262,6 +283,7 @@ def test_native_candidates_preserve_corrected_users_full_metrics_and_pagination(
     item = leaf(expected, op)
     actual = execute(rows, [item], days=days)
     assert actual == execute(rows, [item], days=days, redundant_membership=True)
+    assert actual == execute(rows, [item], days=days, redundant_dimension_having=True)
     by_user = {row["end_user_id"]: row for row in actual}
     # Removed-field and reassigned-old-user witnesses remain conservative; final
     # membership is decided later. Never-matched users are safely pruned here.
@@ -283,3 +305,59 @@ def test_native_candidates_preserve_corrected_users_full_metrics_and_pagination(
             page[-1]["end_user_id"],
         )
     assert paged == actual
+
+
+def swap_row(user, identity, value, *, minute, version):
+    return (
+        PROJECT,
+        "svc",
+        "SPAN",
+        identity,
+        str(UUID(int=user)),
+        START.replace(minute=minute, tzinfo=None).isoformat(" "),
+        version,
+        0,
+        START.replace(minute=minute + 1, tzinfo=None).isoformat(" "),
+        1,
+        ["tag"],
+        [value],
+    )
+
+
+def test_single_witness_binding_only_widens_a_set_the_manager_already_rejects():
+    """Dropping the second binding never loses a candidate, and never a match.
+
+    THE RULE. A user belongs on the page only if the LATEST version of one of
+    its spans satisfies the filter. That version is itself a physical row
+    carrying both the witnessed value and the user, so its identity is in the
+    witness set and the user is in the witness population. A user the removed
+    HAVING would have dropped therefore has no witnessed span in latest state
+    and cannot match; the manager's own per-user attribute check rejects it.
+
+    A user in the witness population is never dropped in either direction, so
+    the change can only widen an already conservative candidate set.
+    """
+    needle = "123456"
+    rows = population(needle)
+    # `swapped` is admitted by the alias filter through its old user, and its
+    # LATEST version hands the span to a user with no witnessed span anywhere.
+    rows.append(swap_row(140, "swapped-witness", needle, minute=20, version=1))
+    rows.append(swap_row(140, "swapped", "unrelated", minute=25, version=1))
+    rows.append(swap_row(150, "swapped", "unrelated", minute=25, version=2))
+    users = (10, 20, 30, 40, 50, 60, 70, 80, 100, 110, 120, 140, 150)
+    item = leaf(needle, "equals")
+    widened = execute(rows, [item], users=users)
+    narrowed = execute(rows, [item], users=users, redundant_dimension_having=True)
+    swapped = str(UUID(int=150))
+    assert {row["end_user_id"] for row in narrowed} < {
+        row["end_user_id"] for row in widened
+    }
+    assert {row["end_user_id"] for row in widened} - {
+        row["end_user_id"] for row in narrowed
+    } == {swapped}
+    # Nothing a page publishes moved: shared users keep identical metrics and
+    # the surviving order is the same sequence with the extra row spliced in.
+    assert [row for row in widened if row["end_user_id"] != swapped] == narrowed
+    # The widened row carries no witnessed value in latest state, which is why
+    # the manager rejects it rather than publishing it.
+    assert not [row for row in rows if row[4] == swapped and needle in row[-1]]
