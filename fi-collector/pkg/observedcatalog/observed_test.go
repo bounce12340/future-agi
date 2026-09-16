@@ -329,6 +329,10 @@ func TestClickHouseKeysThenValuesAndAmbiguousFailure(t *testing.T) {
 	failValues := true
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
+		if strings.HasPrefix(q.Get("query"), "SELECT ") {
+			fmt.Fprintln(w, `{"engine":"ReplicatedAggregatingMergeTree","replicas":3}`)
+			return
+		}
 		queries = append(queries, q.Get("query"))
 		if q.Get("async_insert") != "0" || q.Get("wait_end_of_query") != "1" || q.Get("insert_quorum") != "auto" {
 			t.Error("unsafe acknowledgement settings")

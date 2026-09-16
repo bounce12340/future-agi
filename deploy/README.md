@@ -77,7 +77,7 @@ and review the exact failed job before explicitly resuming.
 
 ### Performing that initialization (first install)
 
-The prohibition above is on using the mutating root stack as a *workaround* — on
+The prohibition above is on using the mutating root stack as a _workaround_ — on
 letting `up` apply schema implicitly. It is not a prohibition on initializing at
 all. A first install has to run these jobs once, deliberately, one at a time,
 reviewing each before the next.
@@ -252,18 +252,34 @@ the separately provisioned `observed_catalog_reader`/`observed_catalog_writer`.
 Setup never generates or rotates catalog passwords; changing an env value does not
 change an installed ClickHouse user's password.
 
+The catalog consumer detects table topology automatically; no quorum env setting
+is needed. Plain `AggregatingMergeTree` tables need only their existing table
+grants. For `ReplicatedAggregatingMergeTree`, also grant the writer these metadata
+columns (use your actual writer name):
+
+```sql
+GRANT SELECT(database, table, total_replicas) ON system.replicas TO observed_catalog_writer;
+```
+
+Apply that grant on each replica when users are managed locally. It grants no
+access to source spans. The ClickHouse endpoint must route to the same replication
+group, with consistent catalog engines on every endpoint. Pause catalog writes
+while changing that topology. Single replicas use synchronous local inserts;
+multiple replicas retain automatic majority quorum. An unreadable or unsupported
+topology stops the consumer without committing the Kafka record.
+
 ## 2. Pin a release
 
 Each image is independently versioned. Include the collector release in `.env.production`:
 
-| Variable | Image |
-|---|---|
-| `FUTURE_AGI_VERSION` | `futureagi/future-agi` (backend + worker) |
-| `FRONTEND_VERSION` | `futureagi/frontend` |
-| `FI_COLLECTOR_VERSION` | `futureagi/fi-collector` (collector, consumer and packaged backfill) |
-| `AGENTCC_GATEWAY_VERSION` | `futureagi/agentcc-gateway` |
-| `SERVING_VERSION` | `futureagi/serving` |
-| `CODE_EXECUTOR_VERSION` | `futureagi/code-executor` |
+| Variable                    | Image                                                                |
+| --------------------------- | -------------------------------------------------------------------- |
+| `FUTURE_AGI_VERSION`        | `futureagi/future-agi` (backend + worker)                            |
+| `FRONTEND_VERSION`          | `futureagi/frontend`                                                 |
+| `FI_COLLECTOR_VERSION`      | `futureagi/fi-collector` (collector, consumer and packaged backfill) |
+| `AGENTCC_GATEWAY_VERSION`   | `futureagi/agentcc-gateway`                                          |
+| `SERVING_VERSION`           | `futureagi/serving`                                                  |
+| `CODE_EXECUTOR_VERSION`     | `futureagi/code-executor`                                            |
 | `SIMULATION_RUNNER_VERSION` | `futureagi/future-agi-simulation-runner` (separate SDK worker image) |
 
 Use reviewed release tags and record their verified registry digests, source SHAs
@@ -414,19 +430,19 @@ topics, volumes and obsolete workloads until their explicit retirement is approv
 
 ## Resource sizing
 
-| Service | RAM | CPU |
-|---|---|---|
-| backend | 1–2 GB | 1–2 cores |
-| worker | 1 GB | 1 core |
-| agentcc-gateway | 256 MB | 0.5 core |
-| serving | 512 MB | 0.5 core |
-| code-executor | 1 GB (cap) | 2 cores (cap) |
-| postgres | 1–2 GB | 1 core |
-| clickhouse | 2–4 GB | 2 cores |
-| redis | 256 MB | 0.5 core |
-| minio | 512 MB | 0.5 core |
-| temporal | 512 MB | 0.5 core |
-| **total** | **~10 GB** | **~10 cores** |
+| Service         | RAM        | CPU           |
+| --------------- | ---------- | ------------- |
+| backend         | 1–2 GB     | 1–2 cores     |
+| worker          | 1 GB       | 1 core        |
+| agentcc-gateway | 256 MB     | 0.5 core      |
+| serving         | 512 MB     | 0.5 core      |
+| code-executor   | 1 GB (cap) | 2 cores (cap) |
+| postgres        | 1–2 GB     | 1 core        |
+| clickhouse      | 2–4 GB     | 2 cores       |
+| redis           | 256 MB     | 0.5 core      |
+| minio           | 512 MB     | 0.5 core      |
+| temporal        | 512 MB     | 0.5 core      |
+| **total**       | **~10 GB** | **~10 cores** |
 
 ## Pre-flight checklist
 

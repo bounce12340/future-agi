@@ -50,9 +50,9 @@ func NewClickHouseSink(cfg ClickHouseConfig) (*ClickHouseSink, error) {
 }
 
 // Insert writes keys before values and acknowledges only complete synchronous
-// writes. Replicated engines require an automatic majority quorum; plain
-// engines retain their local-write semantics. This is not an all-replica read
-// barrier. A partial/ambiguous result is retryable with the same observations.
+// writes. Multi-replica engines require an automatic majority quorum; single
+// replicas and plain engines retain local-write semantics. This is not an
+// all-replica read barrier. Partial results can replay the same observations.
 func (s *ClickHouseSink) Insert(ctx context.Context, batch Batch) error {
 	chunks, err := Chunk(batch)
 	if err != nil {
@@ -74,6 +74,13 @@ func (s *ClickHouseSink) Insert(ctx context.Context, batch Batch) error {
 }
 
 func (s *ClickHouseSink) insert(ctx context.Context, table string, rows any) error {
+	// Metadata and INSERT share the existing per-table deadline.
+	ctx, cancel := context.WithTimeout(ctx, s.cfg.Timeout)
+	defer cancel()
+	quorum, err := s.insertQuorum(ctx, table)
+	if err != nil {
+		return err
+	}
 	var body bytes.Buffer
 	encoder := json.NewEncoder(&body)
 	encoder.SetEscapeHTML(false)
@@ -99,7 +106,7 @@ func (s *ClickHouseSink) insert(ctx context.Context, table string, rows any) err
 	q.Set("query", "INSERT INTO "+table+" FORMAT JSONEachRow")
 	q.Set("async_insert", "0")
 	q.Set("wait_end_of_query", "1")
-	q.Set("insert_quorum", "auto")
+	q.Set("insert_quorum", quorum)
 	// Leave response/transport headroom inside both the HTTP timeout and the
 	// caller's remaining batch deadline. Quorum timeout is milliseconds.
 	budget := s.cfg.Timeout
@@ -133,6 +140,79 @@ func (s *ClickHouseSink) insert(ctx context.Context, table string, rows any) err
 	// response whose status was already sent as 200, or log server payloads.
 	if response.StatusCode != http.StatusOK || len(strings.TrimSpace(string(result))) != 0 || response.Header.Get("X-ClickHouse-Exception-Code") != "" {
 		return fmt.Errorf("observedcatalog: %s insert not confirmed (HTTP %d)", table, response.StatusCode)
+	}
+	return nil
+}
+
+// ClickHouse 25.3's automatic quorum can time out waiting for another replica
+// to confirm a one-replica table. Resolve the actual table before each write;
+// never cache a single-replica downgrade across topology changes.
+func (s *ClickHouseSink) insertQuorum(ctx context.Context, table string) (string, error) {
+	var topology struct {
+		Engine   string  `json:"engine"`
+		Replicas *uint64 `json:"replicas"`
+	}
+	engineQuery := `SELECT engine FROM system.tables
+ WHERE database = {catalog:String} AND name = {table:String} LIMIT 2 FORMAT JSONEachRow`
+	if err := s.catalogMetadata(ctx, table, engineQuery, &topology); err != nil {
+		return "", err
+	}
+	if topology.Engine == "AggregatingMergeTree" {
+		return "auto", nil
+	}
+	if topology.Engine == "ReplicatedAggregatingMergeTree" {
+		topology.Replicas = nil
+		replicaQuery := `SELECT total_replicas AS replicas FROM system.replicas
+ WHERE database = {catalog:String} AND table = {table:String} LIMIT 2 FORMAT JSONEachRow`
+		// Plain OSS tables must not require access to replication metadata.
+		if err := s.catalogMetadata(ctx, table, replicaQuery, &topology); err != nil {
+			return "", err
+		}
+		if topology.Replicas != nil && *topology.Replicas > 0 {
+			if *topology.Replicas == 1 {
+				return "1", nil
+			}
+			return "auto", nil
+		}
+	}
+	return "", errors.New("observedcatalog: unsupported or missing ClickHouse catalog topology")
+}
+
+func (s *ClickHouseSink) catalogMetadata(ctx context.Context, table, query string, result any) error {
+	u := *s.origin
+	q := u.Query()
+	q.Set("database", s.cfg.Database)
+	q.Set("param_catalog", s.cfg.Database)
+	q.Set("param_table", table)
+	q.Set("query", query)
+	q.Set("readonly", "1")
+	q.Set("wait_end_of_query", "1")
+	q.Set("max_threads", "1")
+	q.Set("max_execution_time", "5")
+	q.Set("max_memory_usage", "67108864")
+	q.Set("max_result_rows", "2")
+	q.Set("max_result_bytes", "4096")
+	q.Set("result_overflow_mode", "throw")
+	q.Set("output_format_json_quote_64bit_integers", "0")
+	u.RawQuery = q.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), nil)
+	if err != nil {
+		return err
+	}
+	if s.cfg.Username != "" {
+		req.SetBasicAuth(s.cfg.Username, s.cfg.Password)
+	}
+	response, err := s.client.Do(req)
+	if err != nil {
+		return errors.New("observedcatalog: ClickHouse topology request failed")
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, 4097))
+	if err != nil || len(body) > 4096 || response.StatusCode != http.StatusOK || response.Header.Get("X-ClickHouse-Exception-Code") != "" {
+		return errors.New("observedcatalog: ClickHouse topology not confirmed (check system.tables/system.replicas SELECT grants)")
+	}
+	if err := json.Unmarshal(body, result); err != nil {
+		return errors.New("observedcatalog: invalid ClickHouse topology response")
 	}
 	return nil
 }

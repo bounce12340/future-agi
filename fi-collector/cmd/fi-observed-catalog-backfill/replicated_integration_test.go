@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -14,6 +17,98 @@ import (
 
 	"github.com/future-agi/future-agi/fi-collector/pkg/observedcatalog"
 )
+
+func TestReplicatedObservedSinkSingleReplicaWithRestrictedWriter(t *testing.T) {
+	origin := strings.Split(os.Getenv("OBS_TEST_REPLICA_URLS"), ",")[0]
+	testObservedRestrictedWriter(t, origin, true)
+}
+
+func TestClickHouseObservedSinkPlainWithRestrictedWriter(t *testing.T) {
+	testObservedRestrictedWriter(t, os.Getenv("OBS_TEST_CH_URL"), false)
+}
+
+func testObservedRestrictedWriter(t *testing.T, origin string, replicated bool) {
+	t.Helper()
+	if origin == "" {
+		t.Skip("set the isolated ClickHouse harness URL")
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Scheme != "http" || u.Hostname() != "127.0.0.1" || u.Port() == "" {
+		t.Fatal("replica must be an explicitly ported loopback endpoint")
+	}
+	database := fmt.Sprintf("observed_single_test_%d", time.Now().UnixNano())
+	localSQL(t, origin, "CREATE DATABASE "+database)
+	t.Cleanup(func() { localSQL(t, origin, "DROP DATABASE "+database) })
+	ddl, err := os.ReadFile(filepath.Join("..", "..", "..", "futureagi", "tracer", "services", "clickhouse", "v2", "observed_catalog", "schema.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range strings.Split(string(ddl), ";\n") {
+		if strings.TrimSpace(statement) != "" {
+			if replicated {
+				statement = strings.ReplaceAll(statement, "ENGINE = AggregatingMergeTree", "ENGINE = ReplicatedAggregatingMergeTree('/clickhouse/observed-test/"+database+"/{table}', '{replica}')")
+			}
+			localSQL(t, origin+"?database="+database, statement)
+		}
+	}
+	user := database + "_writer"
+	localSQL(t, origin, "CREATE USER "+user+" IDENTIFIED BY 'test'")
+	t.Cleanup(func() { localSQL(t, origin, "DROP USER "+user) })
+	for _, table := range []string{observedcatalog.KeyTable, observedcatalog.ValueTable} {
+		localSQL(t, origin, "GRANT SELECT, INSERT ON "+database+"."+table+" TO "+user)
+	}
+	if replicated {
+		localSQL(t, origin, "GRANT SELECT(database, table, total_replicas) ON system.replicas TO "+user)
+	}
+	sink, err := observedcatalog.NewClickHouseSink(observedcatalog.ClickHouseConfig{URL: origin, Database: database, Username: user, Password: "test", Timeout: 2 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, _, err := observedcatalog.Extract(exampleSpan(exampleScope()), observedcatalog.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replicated {
+		// Reproduce the paused pilot: automatic quorum stored keys but did not
+		// acknowledge them. The fixed sink must replay that exact partial batch.
+		var body bytes.Buffer
+		for _, key := range batch.Keys {
+			if err := json.NewEncoder(&body).Encode(key); err != nil {
+				t.Fatal(err)
+			}
+		}
+		q := url.Values{"database": {database}, "query": {"INSERT INTO " + observedcatalog.KeyTable + " FORMAT JSONEachRow"},
+			"insert_quorum": {"auto"}, "insert_quorum_timeout": {"500"}, "wait_end_of_query": {"1"}}
+		req, err := http.NewRequest(http.MethodPost, origin+"?"+q.Encode(), &body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.SetBasicAuth(user, "test")
+		response, err := (&http.Client{Timeout: 3 * time.Second}).Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := io.ReadAll(io.LimitReader(response.Body, 4096))
+		response.Body.Close()
+		if err != nil || response.StatusCode == http.StatusOK || !strings.Contains(string(result), "UNKNOWN_STATUS_OF_INSERT") {
+			t.Fatalf("automatic single-replica quorum failure not reproduced: %d %s %v", response.StatusCode, result, err)
+		}
+		if localSQL(t, origin, "SELECT count() FROM "+database+"."+observedcatalog.KeyTable) == "0\n" {
+			t.Fatal("fixture did not preserve the ambiguous key write")
+		}
+	}
+	for range 2 {
+		if err := sink.Insert(context.Background(), batch); err != nil {
+			t.Fatal("single replica insert/replay failed", err)
+		}
+	}
+	for _, table := range []string{observedcatalog.KeyTable, observedcatalog.ValueTable} {
+		count := localSQL(t, origin, "SELECT count() FROM (SELECT * FROM "+database+"."+table+" GROUP BY ALL)")
+		if strings.TrimSpace(count) != "8" {
+			t.Fatal("single replica replay changed logical rows", table, count)
+		}
+	}
+}
 
 func TestReplicatedObservedSinkUsesSameRowsAndMajorityWrites(t *testing.T) {
 	raw := os.Getenv("OBS_TEST_REPLICA_URLS")

@@ -110,6 +110,7 @@ jobs:
               "TestClickHouseMigratedStringOverflowBackfill",
               "TestClickHouseSourceKeysetAndPhysicalVersions",
               "TestClickHouseObservedIndexReplayBeforeMerges",
+              "TestClickHouseObservedSinkPlainWithRestrictedWriter",
               "TestKafkaMultipleConsumersAndWorkspaceScale",
               "TestKafkaSpoolRestartAndPartialConsumerWrite",
               "TestKafkaRejectsLegacyWireWithoutCommittingPastIt",
@@ -150,6 +151,35 @@ jobs:
             ${{ runner.temp }}/observed-services.log
           if-no-files-found: warn
           retention-days: 7
+
+  replicated:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      OBS_TEST_PROJECT: observed-replicated-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      OBS_TEST_REPLICA_URLS: http://127.0.0.1:18144,http://127.0.0.1:18145,http://127.0.0.1:18146
+      GOMAXPROCS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: fi-collector/go.mod
+          cache-dependency-path: fi-collector/go.sum
+      - name: Start isolated exact-version replicated ClickHouse
+        run: |
+          docker compose --env-file /dev/null \
+            -f fi-collector/test/observed-catalog/replicated.yml \
+            -p "$OBS_TEST_PROJECT" up -d --wait --wait-timeout 180
+      - name: Single-replica and majority-quorum regression tests
+        working-directory: fi-collector
+        run: go test -race -count=1 -timeout 3m -v -run '^TestReplicatedObservedSink' ./cmd/fi-observed-catalog-backfill
+      - name: Remove only this job's isolated replica fixtures
+        if: always()
+        run: |
+          : "${OBS_TEST_PROJECT:?exact test project is required}"
+          docker compose --env-file /dev/null \
+            -f fi-collector/test/observed-catalog/replicated.yml \
+            -p "$OBS_TEST_PROJECT" down --volumes --remove-orphans --timeout 10
 
   compose:
     runs-on: ubuntu-latest
