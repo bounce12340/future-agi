@@ -1519,12 +1519,17 @@ def _fetch_direct_raw_system_metric_graph(
 
 @dataclass(frozen=True)
 class _GraphReadUnaffordable:
-    """No lane inside the interactive wall can run this statement.
+    """This statement is not admitted to the interactive wall.
 
     ``estimated_rows`` is the index's own answer, carried forward because the
     next question - whether the BACKGROUND wall can absorb it either - is the
     same arithmetic against a different deadline, and asking it once from one
     probe is cheaper and more honest than probing again.
+
+    ``None`` means the read could not be costed at all. That is a reason to
+    schedule, never a reason to issue the statement inline and never on its own
+    a reason to refuse: an uncosted read goes to the bounded worker, which can
+    survive being wrong about it.
     """
 
     estimated_rows: int | None
@@ -1551,10 +1556,11 @@ def _affordable_raw_graph_seed(
       enough to be admitted - return that candidate with the probes it cost,
       so the statement issues with its trace-ID set, reads a fraction of the
       window, and never pays for the same probes twice;
-    * it does not fit and no candidate is admitted, including because the seed
-      probe could not answer - return the unaffordable sentinel. Spending the
-      wall to prove what the index already said, and publishing nothing, is
-      what this function exists to stop.
+    * it does not fit, or could not be costed at all, and no candidate is
+      admitted - return the unaffordable sentinel. Spending the wall to prove
+      what the index already said, and publishing nothing, is what this
+      function exists to stop; and a read nobody could cost is the one least
+      safe to issue on the wall that cannot survive being wrong about it.
 
     Both probes read part metadata and no parts. They are charged to the same
     request deadline the statement is, so one request stays on one budget.
@@ -1613,36 +1619,58 @@ def _schedule_unaffordable_graph_read(
     verdict: _GraphReadUnaffordable,
     identity: dict[str, Any],
     pending_payload: dict[str, Any],
+    refresh: bool,
     organization_id: str | None,
     workspace_id: str | None,
 ) -> dict[str, Any]:
-    """Hand a proven-unaffordable read to the background lane, or say so.
+    """Hand a read the interactive wall cannot run to the background lane.
 
-    The background lane is a wider wall, not an unbounded one. A scan the
-    index says will outlast ``GRAPH_BACKGROUND_WALL_MS`` too is not scheduled
-    at all: a cold refresh that fails leaves no snapshot, and a failed state
-    does not stop the NEXT poll from asking for another refresh, so scheduling
-    one would buy the user a spinner with no terminal state and the cluster a
-    full-window scan per poll cycle. Refusing it here is the honest answer and
-    the cheap one, and it is the same arithmetic the interactive wall just
-    failed - only against the deadline the worker would actually have.
+    The background lane is a wider wall, not an unbounded one, so the same
+    arithmetic is asked again against the deadline the worker would actually
+    have. Only a scan the index PROVES will outlast ``GRAPH_BACKGROUND_WALL_MS``
+    too is refused outright; a read that could not be costed is scheduled,
+    because the worker's wall is exactly the place an unknown read belongs and
+    the worker costs it again there against its own deadline.
+
+    Scheduling never re-enqueues behind a failed refresh: ``refresh`` is the
+    user's own flag, so a cold miss schedules once, a poll after a failed
+    refresh gets that sanitized failed envelope back from the cache without
+    starting a second full-window scan, and an explicit user refresh is what
+    retries. The worker's own cost gate then makes an unaffordable read
+    terminal in one attempt rather than in one attempt per poll.
     """
 
     unaffordable = BoundedGraphReadError("read_budget_exceeded", retryable=True)
-    schedulable = raw_graph_scan_fits_wall(
+    # Unknown is not "too big": it is "not costed here". Route it to the wider
+    # wall rather than refusing a read that may well fit.
+    schedulable = verdict.estimated_rows is None or raw_graph_scan_fits_wall(
         verdict.estimated_rows,
         remaining_ms=GRAPH_WALL_DEADLINE_MS,
     )
     if organization_id and schedulable:
         try:
-            return _read_or_refresh_exact_graph(
+            scheduled = _read_or_refresh_exact_graph(
                 namespace="observe-system-graph",
                 identity=dict(identity),
-                refresh=True,
+                refresh=refresh,
                 pending_payload=pending_payload,
                 organization_id=organization_id,
                 workspace_id=workspace_id,
             )
+            if not (
+                isinstance(scheduled, dict)
+                and scheduled.get("query_refresh_failed") is True
+                and scheduled.get("query_status") != "complete"
+            ):
+                return scheduled
+            # The worker has already tried this read and could not finish it,
+            # and the cache is right not to re-enqueue it on a poll. What it
+            # hands back is a PENDING envelope carrying that failure, and the
+            # browser polls a pending envelope - so returning it would be a
+            # spinner the cache can never complete. An explicit user refresh
+            # still retries; until then this read has a terminal answer and
+            # the user is owed it.
+            logger.info("graph_unaffordable_refresh_already_failed")
         except Exception:
             # Cache/worker transport availability must not turn a routing
             # decision into a raw API exception.
@@ -1656,6 +1684,99 @@ def _schedule_unaffordable_graph_read(
         metric_id,
         unaffordable,
         provenance="read_cost_gate",
+    )
+
+
+class _BackgroundWallGraphAnalytics:
+    """Charge the worker's probes to the worker's own wall.
+
+    The interactive wrapper cannot be reused here: it clamps every statement to
+    ``GRAPH_INTERACTIVE_QUERY_TIMEOUT_MS``, which is the wall the background lane
+    exists to escape. This one adds the single method the cost gate needs -
+    ``remaining_read_ms`` against ``GRAPH_BACKGROUND_WALL_MS`` - and delegates
+    everything else, statements included, untouched.
+    """
+
+    def __init__(self, delegate: Any, deadline: ReadDeadline) -> None:
+        self._delegate = delegate
+        self._deadline = deadline
+
+    def remaining_read_ms(self, cap_ms: int) -> int:
+        return self._deadline.remaining_ms(cap_ms)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
+
+
+def fetch_background_raw_system_metric_graph(
+    *,
+    analytics: Any,
+    project_id: str,
+    filters: list[dict[str, Any]],
+    interval: str,
+    metric_id: str,
+    observe_type: str,
+) -> dict[str, Any]:
+    """Run one filtered graph statement on the BACKGROUND wall, cost-gated.
+
+    The interactive gate removed the unbounded read from one door. This closes
+    the other: the worker entered the identical raw statement with no cost check
+    at all, and its own seed probe swallows a failure and issues the unseeded
+    full-window read - the production defect, wearing the worker's wall instead
+    of the browser's. Gating here rather than at any caller covers EVERY way the
+    worker is reached: the cold-miss schedule, the front-door explicit refresh
+    (which is not costed before it enqueues), and the post-failure schedule.
+
+    The background wall is wide, not infinite. A read the index PROVES it cannot
+    absorb raises instead of running, which the refresh activity turns into a
+    sanitized failed state - one attempt, terminal - rather than 180 s of scan
+    that publishes nothing and is asked for again on the next poll.
+
+    A read that could not be costed is a different case and runs here. "Absence
+    of proof means schedule" has to end somewhere, and this is where it ends:
+    the worker is the lane an uncosted read was scheduled to, its wall is
+    bounded, and a read that outlasts it costs one deduplicated attempt and a
+    terminal state - not a user's whole request, and not a scan per poll. What
+    the principle forbids is issuing an uncosted read on the wall that cannot
+    survive being wrong about it, and that wall is the interactive one.
+
+    The probes are charged to the same 180 s deadline the statement is, so the
+    statement's own budget is the remainder: a few hundred milliseconds of
+    metadata reads, stated rather than hidden.
+    """
+
+    bounded_analytics = _BackgroundWallGraphAnalytics(
+        analytics,
+        ReadDeadline.start(GRAPH_WALL_DEADLINE_MS),
+    )
+    seed = _affordable_raw_graph_seed(
+        analytics=bounded_analytics,
+        project_id=project_id,
+        filters=filters,
+        interval=interval,
+        observe_type=observe_type,
+        interactive_deadline_ms=GRAPH_WALL_DEADLINE_MS,
+    )
+    if isinstance(seed, _GraphReadUnaffordable):
+        if seed.estimated_rows is not None:
+            logger.info(
+                "graph_background_read_refused_by_cost_gate",
+                estimated_rows=int(seed.estimated_rows),
+            )
+            raise BoundedGraphReadError("read_budget_exceeded", retryable=True)
+        # Uncosted, and no admitted witness. Run it unseeded on this bounded
+        # wall without paying for the probes a second time.
+        logger.info("graph_background_read_uncosted_on_bounded_wall")
+        seed = (None, 0)
+    return _fetch_direct_raw_system_metric_graph(
+        analytics=bounded_analytics,
+        project_id=project_id,
+        filters=filters,
+        interval=interval,
+        metric_id=metric_id,
+        observe_type=observe_type,
+        timeout_ms=bounded_analytics.remaining_read_ms(GRAPH_WALL_DEADLINE_MS),
+        seed=seed,
     )
 
 
@@ -1786,6 +1907,7 @@ def fetch_system_metric_graph_ch(
             verdict=seed,
             identity=identity,
             pending_payload=pending_payload,
+            refresh=refresh,
             organization_id=organization_id,
             workspace_id=workspace_id,
         )

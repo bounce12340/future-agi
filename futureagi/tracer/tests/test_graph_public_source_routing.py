@@ -123,12 +123,36 @@ def public(filters, *, users=False):
 
 class RecordingAnalytics:
     supports_per_query_read_settings = True
+    # An affordable scan, so the routing gate hands these reads to the
+    # interactive lane and every assertion below is about the SQL that lane
+    # issues. A cost probe that answers nothing means "not costed", and an
+    # uncosted read is deliberately not issued inline any more - so a fake that
+    # cannot answer it would move every case here onto the background lane and
+    # stop testing the statements at all.
+    cost_estimate_rows = 1_000_000
 
     def __init__(self):
         self.calls = []
 
+    def cost_estimate(self):
+        return SimpleNamespace(
+            data=[
+                {
+                    "database": "default",
+                    "table": "spans",
+                    "parts": 4,
+                    "rows": self.cost_estimate_rows,
+                    "marks": 128,
+                }
+            ],
+            columns=["database", "table", "parts", "rows", "marks"],
+            query_time_ms=1,
+        )
+
     def execute_ch_query(self, query, params, **kwargs):
         self.calls.append((query, dict(params), kwargs))
+        if "graph_cost_project_id" in query:
+            return self.cost_estimate()
         return SimpleNamespace(data=[], columns=COLUMNS, query_time_ms=1)
 
 
@@ -143,6 +167,8 @@ class SeedAdmittingAnalytics(RecordingAnalytics):
 
     def execute_ch_query(self, query, params, **kwargs):
         self.calls.append((query, dict(params), kwargs))
+        if "graph_cost_project_id" in query:
+            return self.cost_estimate()
         if "EXPLAIN ESTIMATE" in query:
             return SimpleNamespace(
                 data=[{"rows": 1_600_000, "marks": 259}],

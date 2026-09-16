@@ -122,16 +122,43 @@ class Analytics:
         ]
 
 
+class _ScheduleLog(list):
+    """Recorded cache calls, plus the one piece of cache state a test sets."""
+
+    previous_refresh_failed = False
+
+    @property
+    def enqueued(self):
+        """Calls that would actually start a background refresh."""
+        return [call for call in self if call[2].get("schedule_on_miss") is not False]
+
+
 @pytest.fixture
 def scheduled(monkeypatch):
-    calls = []
+    """Model the snapshot cache closely enough to tell its answers apart.
+
+    ``schedule_on_miss=False`` is the interactive cold probe and enqueues
+    nothing. Every other call enqueues - EXCEPT behind a failed refresh, where
+    the real cache re-enqueues only for an explicit user refresh and otherwise
+    hands back its own sanitized failed envelope
+    (``read_or_schedule_exact_snapshot``: "Failed cold jobs wait for another
+    explicit refresh instead of being resubmitted by every polling request").
+    """
+
+    calls = _ScheduleLog()
 
     def _read_or_schedule(namespace, identity, **kwargs):
         calls.append((namespace, identity, kwargs))
-        if not kwargs.get("refresh"):
+        if kwargs.get("schedule_on_miss") is False:
             # A cold cache probe. Returning the pending envelope here would
             # short-circuit every case below before any read is routed.
             return None
+        if calls.previous_refresh_failed and not kwargs.get("refresh"):
+            return {
+                **dict(kwargs["pending_payload"]),
+                "query_refreshing": False,
+                "query_refresh_failed": True,
+            }
         return dict(kwargs["pending_payload"])
 
     monkeypatch.setattr(
@@ -169,7 +196,7 @@ def test_unaffordable_trace_graph_is_scheduled_without_issuing_the_statement(
 
     assert analytics.statements == [], "the graph statement must not be issued"
     assert len(analytics.cost_probes) == 1
-    refreshes = [call for call in scheduled if call[2]["refresh"] is True]
+    refreshes = scheduled.enqueued
     assert len(refreshes) == 1
     assert refreshes[0][0] == "observe-system-graph"
     assert response["query_status"] == "pending"
@@ -224,7 +251,7 @@ def test_a_read_no_wall_can_absorb_is_refused_not_scheduled(scheduled):
     response = _fetch(analytics)
 
     assert analytics.statements == []
-    assert [call for call in scheduled if call[2]["refresh"] is True] == []
+    assert scheduled.enqueued == []
     assert response["query_status"] == "degraded"
     assert response["query_error_code"] == "read_budget_exceeded"
     assert response["query_provenance"] == "read_cost_gate"
@@ -240,7 +267,7 @@ def test_a_read_the_background_wall_can_absorb_is_still_scheduled(scheduled):
     response = _fetch(analytics)
 
     assert analytics.statements == []
-    assert len([call for call in scheduled if call[2]["refresh"] is True]) == 1
+    assert len(scheduled.enqueued) == 1
     assert response["query_status"] == "pending"
 
 
@@ -252,10 +279,69 @@ def test_unaffordable_read_without_a_background_lane_fails_fast(scheduled):
     response = _fetch(analytics, organization_id=None)
 
     assert analytics.statements == []
-    assert [call for call in scheduled if call[2]["refresh"] is True] == []
+    assert scheduled.enqueued == []
     assert response["query_status"] == "degraded"
     assert response["query_error_code"] == "read_budget_exceeded"
     assert response["query_provenance"] == "read_cost_gate"
+
+
+@pytest.mark.unit
+def test_twelve_months_on_the_high_volume_tenant_delivers_a_chart(scheduled):
+    """The window this lane first declared unreachable must now SCHEDULE.
+
+    The index says 311,867,981 physical spans over twelve months on the
+    reference tenant, and the statement then reads 311,867,844 of them. Run on
+    production at this surface's own worker count, over five abutting scan
+    windows whose union is exactly what the whole statement reads, that costs
+    170,148 ms of server time - inside the 180 s background wall, outside the
+    30 s interactive one. So the browser gets a pending envelope and then a
+    chart, not the terminal error a 968 rows/ms calibration predicted.
+
+    The margin is single digits, and that is the honest state of it: a read
+    that misses now costs ONE bounded worker attempt and a terminal envelope,
+    which is what makes scheduling it the better answer than refusing it.
+    """
+    from django.conf import settings
+
+    twelve_months = 311_867_981
+    analytics = Analytics(estimated_rows=twelve_months, seed_raises=True)
+
+    response = _fetch(analytics)
+
+    assert analytics.statements == [], "30 s cannot run it; do not spend the wall"
+    assert len(scheduled.enqueued) == 1, "it must reach the worker, not be refused"
+    assert response["query_status"] == "pending"
+    # The prediction that decides it, stated as arithmetic rather than trusted.
+    assert graph_read_cost.raw_graph_scan_fits_wall(
+        twelve_months, remaining_ms=settings.GRAPH_BACKGROUND_WALL_MS
+    ), "the background wall must afford the measured twelve-month scan"
+    assert not graph_read_cost.raw_graph_scan_fits_wall(
+        twelve_months, remaining_ms=settings.INTERACTIVE_ANALYTICS_DEFAULT_WALL_MS
+    )
+
+
+@pytest.mark.unit
+def test_thirty_days_on_the_high_volume_tenant_never_runs_inline():
+    """The rate must stay slow enough to keep the original defect out.
+
+    A rate honest for twelve months is optimistic for thirty days, and if it
+    ever rose past 87,413,938 rows / 30,000 ms the 30-day read would be
+    predicted to fit the interactive wall and would run there - which is the
+    production defect this PR exists to remove, reintroduced through the
+    constant. Measured, that read takes 48,677 ms.
+    """
+    from django.conf import settings
+
+    thirty_days = 87_413_938
+    assert not graph_read_cost.raw_graph_scan_fits_wall(
+        thirty_days, remaining_ms=settings.INTERACTIVE_ANALYTICS_DEFAULT_WALL_MS
+    )
+    assert graph_read_cost.raw_graph_scan_fits_wall(
+        thirty_days, remaining_ms=settings.GRAPH_BACKGROUND_WALL_MS
+    )
+    # The measured duration, and the gate's prediction of it, agree to 2%.
+    predicted_ms = thirty_days / graph_read_cost._RAW_SCAN_ROWS_PER_MS
+    assert 44_000 <= predicted_ms <= 53_000
 
 
 # --- the read that can finish must still run inline ------------------------
@@ -270,17 +356,56 @@ def test_affordable_read_still_runs_inline(scheduled):
 
     assert len(analytics.statements) == 1
     assert response["query_complete"] is True
-    assert [call for call in scheduled if call[2]["refresh"] is True] == []
+    assert scheduled.enqueued == []
 
 
 @pytest.mark.unit
-def test_an_unknown_estimate_does_not_divert_the_read(scheduled):
-    """The gate fires on proof of a large scan, never on the absence of one."""
+def test_an_unknown_estimate_schedules_instead_of_scanning(scheduled):
+    """A read nobody could cost is the one least safe to issue inline.
+
+    This assertion is the inverse of the one this file shipped with. That one
+    pinned "an unknown estimate does not divert the read", i.e. a cost probe
+    that CANNOT ANSWER hands the full-window statement the whole interactive
+    wall - which is the production defect this PR exists to remove, moved from
+    the second probe in the chain to the first. Absence of proof means
+    SCHEDULE, not SCAN: the read goes to the background wall, and the browser
+    gets a pending envelope in the same half second instead of an error in
+    thirty.
+    """
+
+    analytics = Analytics(estimated_rows=None, seed_raises=True)
+    response = _fetch(analytics)
+
+    assert analytics.statements == [], (
+        "an uncosted read must not be issued on the interactive wall"
+    )
+    assert len(analytics.cost_probes) == 1
+    refreshes = scheduled.enqueued
+    assert len(refreshes) == 1
+    assert response["query_status"] == "pending"
+
+
+@pytest.mark.unit
+def test_an_unknown_estimate_on_a_span_graph_also_schedules(scheduled):
+    """A span graph has no seed lever, so the unknown estimate is the whole ruling."""
 
     analytics = Analytics(estimated_rows=None)
+    response = _fetch(analytics, observe_type="span")
+
+    assert analytics.statements == []
+    assert analytics.seed_probes == []
+    assert response["query_status"] == "pending"
+
+
+@pytest.mark.unit
+def test_an_unknown_estimate_still_lets_an_admitted_seed_run_inline(scheduled):
+    """Failing closed is not refusing: a proven-selective witness still bounds it."""
+
+    analytics = Analytics(estimated_rows=None, seed_estimate=1_600_000)
     response = _fetch(analytics)
 
     assert len(analytics.statements) == 1
+    assert "GROUP BY trace_id" in analytics.statements[0][0]
     assert response["query_complete"] is True
 
 
@@ -309,7 +434,7 @@ def test_gate_never_narrows_the_statement_window(scheduled):
     asked for, which is worse than a slow one.
     """
 
-    ungated = Analytics(estimated_rows=None)
+    ungated = Analytics(estimated_rows=10_500_000)
     _fetch(ungated)
     _query, ungated_params, _kwargs = ungated.statements[0]
 
@@ -390,6 +515,137 @@ def test_seed_probe_is_not_pinned_to_one_worker(scheduled):
     )
     assert kwargs["settings"]["max_threads"] > 1
     assert kwargs["settings"]["optimize_use_projections"] == 0
+
+
+# --- the background worker is one door along, and it is gated too ----------
+
+
+def _background(analytics, *, observe_type="trace", filters=None):
+    return graph_dispatch.fetch_background_raw_system_metric_graph(
+        analytics=analytics,
+        project_id=PROJECT_ID,
+        filters=filters if filters is not None else [_window(), _attribute_filter()],
+        interval="day",
+        metric_id="traffic",
+        observe_type=observe_type,
+    )
+
+
+@pytest.mark.unit
+def test_background_worker_refuses_a_read_its_own_wall_cannot_absorb():
+    """The unbounded read was still there, one door along.
+
+    The worker entered the identical raw statement with NO cost gate: its seed
+    probe raised, the exception was swallowed, and it issued the unseeded
+    full-window read on the 180 s wall. Gating at the statement - not at any
+    caller - covers every way the worker is reached, the front-door explicit
+    refresh included, because none of those doors costs anything.
+    """
+    from django.conf import settings
+
+    hopeless = settings.GRAPH_BACKGROUND_WALL_MS * graph_read_cost._RAW_SCAN_ROWS_PER_MS
+    analytics = Analytics(estimated_rows=hopeless + 1, seed_raises=True)
+
+    with pytest.raises(graph_dispatch.BoundedGraphReadError) as raised:
+        _background(analytics)
+
+    assert analytics.statements == [], (
+        "the worker must not issue a statement its own wall cannot finish"
+    )
+    assert raised.value.error_code == "read_budget_exceeded"
+
+
+@pytest.mark.unit
+def test_background_worker_runs_a_read_its_own_wall_can_absorb():
+    """The wider wall is the point of the lane: what fits it must still run."""
+    from django.conf import settings
+
+    # Half the wall: the probes themselves cost a millisecond or two, so the
+    # exact boundary belongs to the arithmetic guard, not to this one.
+    affordable = (
+        settings.GRAPH_BACKGROUND_WALL_MS * graph_read_cost._RAW_SCAN_ROWS_PER_MS
+    ) // 2
+    analytics = Analytics(estimated_rows=affordable, seed_raises=True)
+
+    response = _background(analytics)
+
+    assert len(analytics.statements) == 1
+    assert response["query_complete"] is True
+
+
+@pytest.mark.unit
+def test_background_worker_runs_an_uncosted_read_on_its_bounded_wall():
+    """Absence of proof means schedule - and that has to end somewhere.
+
+    The worker IS the lane an uncosted read is scheduled to. Refusing it there
+    would mean a graph whose cost probe merely could not answer never renders
+    at all, and the containment the principle asks for - a bounded wall, one
+    deduplicated attempt, a terminal state - is already what this lane gives.
+    """
+
+    analytics = Analytics(estimated_rows=None, seed_raises=True)
+
+    response = _background(analytics)
+
+    assert len(analytics.statements) == 1
+    assert len(analytics.cost_probes) == 1
+    assert response["query_complete"] is True
+
+
+@pytest.mark.unit
+def test_background_worker_costs_a_span_graph_too():
+    """Span graphs were never probed at all; the worker's gate does not skip them."""
+    from django.conf import settings
+
+    hopeless = settings.GRAPH_BACKGROUND_WALL_MS * graph_read_cost._RAW_SCAN_ROWS_PER_MS
+    analytics = Analytics(estimated_rows=hopeless + 1)
+
+    with pytest.raises(graph_dispatch.BoundedGraphReadError):
+        _background(analytics, observe_type="span")
+
+    assert analytics.statements == []
+    assert analytics.seed_probes == []
+
+
+@pytest.mark.unit
+def test_background_worker_is_the_namespace_handler_the_refresh_task_calls():
+    """The gate is worthless if the worker still reaches the ungated function."""
+
+    from inspect import getsource
+
+    from tracer.tasks import exact_aggregation
+
+    source = getsource(exact_aggregation._observe_payload)
+    assert "fetch_background_raw_system_metric_graph(" in source
+    assert "_fetch_direct_raw_system_metric_graph" not in source
+
+
+# --- a failed background read must be terminal, not a spinner per poll ------
+
+
+@pytest.mark.unit
+def test_a_poll_behind_a_failed_refresh_does_not_re_enqueue_the_scan(scheduled):
+    """The cache already refuses to resubmit; the gate must stop overriding it.
+
+    ``read_or_schedule_exact_snapshot`` re-enqueues a failed cold job only for
+    an explicit user refresh. Passing ``refresh=True`` unconditionally bypassed
+    exactly that rule, which is what would have made a scheduled read cost one
+    full-window scan per poll cycle - and was the stated reason for refusing
+    twelve months outright rather than scheduling it.
+    """
+
+    scheduled.previous_refresh_failed = True
+    analytics = Analytics(estimated_rows=87_400_000, seed_raises=True)
+
+    response = _fetch(analytics)
+
+    assert analytics.statements == []
+    assert [call for call in scheduled.enqueued if call[2]["refresh"] is True] == []
+    # A pending envelope the cache will never complete is a spinner with no
+    # terminal state. The user is owed the refusal instead.
+    assert response["query_status"] == "degraded"
+    assert response["query_error_code"] == "read_budget_exceeded"
+    assert response["query_provenance"] == "read_cost_gate"
 
 
 # --- the estimate reducer --------------------------------------------------

@@ -16,10 +16,18 @@ reaches a published point: it decides which lane runs the statement, and the
 statement is byte-identical either way, so the answer a user finally sees is
 the same value an ungated read would have produced.
 
-The estimate is an UPPER BOUND, twice over - whole granules, and every
+The estimate is an upper bound in principle - whole granules, and every
 physical ``ReplacingMergeTree`` version inside them - and the scan window it
-costs is the widest one the builder can emit. Both errors point the same way,
-at scheduling a read that might have fitted, never at running one that cannot.
+costs is the widest one the builder can emit, so its error points at
+scheduling a read that might have fitted rather than running one that cannot.
+In practice it is not loose: on the reference tenant the index says 311,867,981
+rows over twelve months and the statement then reads 311,867,844, a difference
+of 137.
+
+What the gate must never do is treat NOT KNOWING as knowing. A probe that
+cannot answer leaves the read uncosted, and an uncosted read is the one least
+safe to issue on a wall whose expiry costs a user their whole request. Absence
+of proof means schedule, not scan - see ``raw_graph_scan_fits_wall``.
 """
 
 from __future__ import annotations
@@ -45,20 +53,37 @@ _ESTIMATE_TABLE = "spans"
 # errs toward scheduling.
 _SCAN_WINDOW_MARGIN = timedelta(days=1)
 # Measured on production against the highest-volume reference tenant, running
-# this surface's own unseeded 30-day filtered trace statement at
-# DASHBOARD_TRACE_READ_MAX_THREADS workers: 5.57M physical spans and
-# 12.04 GiB in 5,756 ms of server time, i.e. 968 rows/ms at 2.25 GB/s and
-# 2,323 bytes per row. Faster rates exist for the same surface on the same
-# tenant (74.2M rows in 28.5 s, 2,605 rows/ms, on rows roughly half as wide),
-# and this is deliberately the slower end: predicting with the fastest rate
-# under-predicts the time a read needs, which is the very mistake that spends
-# the wall and publishes nothing.
+# this surface's own unseeded filtered trace statement at
+# DASHBOARD_TRACE_READ_MAX_THREADS workers. A rate has to be taken from a read
+# that FINISHED, and at the window it is used to predict; both are what the
+# previous calibration here lacked.
+#
+#   thirty days, run to completion: 87,413,844 physical spans in 48,677 ms of
+#   server time = 1,796 rows/ms;
+#   twelve months, the same statement over five abutting scan windows whose
+#   union is exactly the one the whole statement reads: 311,867,844 spans and
+#   756.4 GB in 170,148 ms = 1,833 rows/ms.
+#
+# The slower of the two is the constant. Both are whole-window numbers, and
+# they agree to two percent, which is the point: the statement's cost per row
+# is stable even though its cost per BYTE is not - the same tenant's rows are
+# roughly 1.0 kB in an older month and 3.4 kB in a recent one, and the read
+# sustains 4.0-4.6 GB/s throughout.
+#
+# The calibration this replaces was 968 rows/ms, taken from a 30-day read that
+# was CUT by the measuring profile's 12 GiB ceiling after 5,756 ms: at that
+# length the statement's fixed start-up dominates, so it measured a read
+# getting going rather than a read running. Predicting with it roughly doubled
+# every window's cost, which is how twelve months on this tenant came to be
+# declared unreachable on any wall - measured, it is 170 s against a 180 s
+# background wall. Erring slow is not free: it refuses charts that would have
+# rendered.
 #
 # This is a throughput calibration, not a window: the affordable row count is
 # always this rate multiplied by the milliseconds the request still has, so a
 # longer wall admits a proportionally larger scan and no window length is
 # written down anywhere.
-_RAW_SCAN_ROWS_PER_MS = 968
+_RAW_SCAN_ROWS_PER_MS = 1_796
 
 
 def raw_graph_scan_window(
@@ -147,10 +172,15 @@ def estimate_raw_graph_scan_rows(
       the optimizer will route a bare ``count()`` to, and ``rows`` would then
       describe that projection rather than the base table the graph statement
       reads. Measured on the same 30-day window, leaving projections on
-      reports 10,846 marks where the base table needs 14,532.
+      reports 10,846 marks where the base table needs 14,532, and
+      ``force_optimize_projection=1`` does not throw on this statement - so a
+      projection really is available to be chosen, and pinning it off is
+      load-bearing rather than defensive.
 
     It answers a COST question only: which lane runs the statement, never what
-    the statement returns.
+    the statement returns. Measured at
+    ``DASHBOARD_TRACE_READ_MAX_THREADS`` workers on the reference tenant it
+    costs 27 ms of server time at thirty days and 90 ms at twelve months.
     """
 
     probe_settings = {
@@ -178,9 +208,10 @@ def estimate_raw_graph_scan_rows(
             settings=probe_settings,
         )
     except Exception:
-        # The cost probe is an optimisation of WHICH lane runs the statement.
-        # Its absence restores exactly the routing this surface had before it
-        # existed, which the post-hoc degrade-and-schedule path still covers.
+        # ``None`` is "unknown", not "small". It is the caller's job to route an
+        # unknown read to a wall that can survive being wrong about it, and
+        # ``raw_graph_scan_fits_wall`` refuses to call it affordable, so a probe
+        # that cannot answer can never license the interactive full-window scan.
         logger.info("graph_raw_scan_estimate_unavailable", exc_info=True)
         return None
     return _reduce_estimate(
@@ -189,14 +220,24 @@ def estimate_raw_graph_scan_rows(
 
 
 def raw_graph_scan_fits_wall(estimated_rows: int | None, *, remaining_ms: int) -> bool:
-    """Whether a scan of *estimated_rows* can complete in *remaining_ms*.
+    """Whether a scan of *estimated_rows* is PROVEN to complete in *remaining_ms*.
 
-    An unknown estimate is not evidence of a large scan, so it fits: the gate
-    fires on proof, never on the absence of it.
+    An unknown estimate does not fit. A read nobody could cost is exactly the
+    read least safe to issue unbounded: the shape this gate exists to remove is
+    a probe that cannot answer, followed by the full-window statement spending
+    the whole interactive wall and publishing nothing. Treating "unknown" as
+    "affordable" reproduces that shape one probe earlier, and it does so
+    precisely when the system knows least about the read.
+
+    Absence of proof therefore means SCHEDULE, not SCAN. Callers that own a
+    wider wall must say so themselves rather than read a ``True`` here: see
+    ``_schedule_unaffordable_graph_read``, where an uncosted read is handed to
+    the bounded background worker instead of being refused outright.
     """
 
     if estimated_rows is None:
-        return True
+        logger.info("graph_raw_scan_estimate_unknown_not_affordable")
+        return False
     affordable_rows = max(0, int(remaining_ms)) * _RAW_SCAN_ROWS_PER_MS
     if estimated_rows <= affordable_rows:
         return True
