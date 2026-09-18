@@ -362,9 +362,14 @@ INTERACTIVE_READ_SETTING_SPECS = {
             ("USER_LIST_PAGE_WALL_MS", 5_000, 100, 60_000),
             ("USER_LIST_WALK_MAX_STATEMENTS", 24, 1, 256),
             ("USER_LIST_WALK_INITIAL_SLICE_SECONDS", 60 * 60, 1, 7 * 24 * 60 * 60),
+            # Application reads carry no server deadline, so one dense slice
+            # is bounded only by its width: a one-day slice of a common value
+            # on the largest tenant measured about two seconds at eight
+            # threads. Wider slices trade that against the statements an
+            # empty result needs to prove itself.
             (
                 "USER_LIST_WALK_MAX_SLICE_SECONDS",
-                7 * 24 * 60 * 60,
+                24 * 60 * 60,
                 60,
                 366 * 24 * 60 * 60,
             ),

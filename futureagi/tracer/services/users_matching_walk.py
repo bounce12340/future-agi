@@ -518,15 +518,16 @@ def walk_matching_activity_page(
             if not _publish(state, boundary):
                 state.stopped = True
             break
-        if (
-            read.query_ms is not None
-            and read.query_ms * 8 <= state.budget.remaining_ms()
-        ):
-            # An empty slice cost only its fixed overhead (the bloom pruned
-            # every granule): widen hard, the next slice is bounded anyway.
-            # A populated slice that came back untruncated widens by four.
-            growth = 16 if not candidates else 4
-            width = min(USER_LIST_WALK_MAX_SLICE, width * growth)
+        # An empty slice cost only its fixed overhead (the bloom pruned every
+        # granule), so its time says nothing about a wider one: widen hard as
+        # long as another statement like it fits the wall. A populated slice
+        # that came back untruncated widens by four only if four of it would
+        # fit, since its cost grows with its width.
+        remaining_ms = state.budget.remaining_ms()
+        if not candidates and read.query_ms * 2 <= remaining_ms:
+            width = min(USER_LIST_WALK_MAX_SLICE, width * 16)
+        elif candidates and read.query_ms * 4 <= remaining_ms:
+            width = min(USER_LIST_WALK_MAX_SLICE, width * 4)
 
     leftover = state.pending(boundary)
     has_more = bool(leftover) or not exhausted
