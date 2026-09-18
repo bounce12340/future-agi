@@ -539,3 +539,62 @@ def test_slice_width_grows_without_a_server_time_report():
     assert _names(read) == ["user-1"]
     slices = [call for call in engine.calls if "witnessed AS" in call]
     assert 2 <= len(slices) <= 4
+
+
+def test_wall_spent_during_materialisation_still_publishes_the_certified_user():
+    """Finish mode does not hand the wall to the materialising statements.
+
+    The replay of a certified user consumes the last of the wall; the metrics
+    read that follows it must still run (the page has already committed to the
+    user) instead of raising on the client clock and dropping the row.
+    """
+    world = World()
+    world.user(1, key=minutes_before_end(3), raw=(minutes_before_end(3),))
+    engine = Engine(world)
+    original = engine.execute_ch_query
+    metric_timeouts: list[int | None] = []
+
+    def slow_replay_then_metrics(query, params=None, timeout_ms=None, settings=None):
+        import time
+
+        if "session_rows AS" in query:
+            metric_timeouts.append(timeout_ms)
+            engine.calls.append(query)
+            return SimpleNamespace(
+                data=[{"end_user_id": uid, "num_sessions": 7} for uid in world.users],
+                query_time_ms=1.0,
+            )
+        if "candidate_users AS" in query:
+            time.sleep(0.08)
+        return original(query, params, timeout_ms, settings)
+
+    engine.execute_ch_query = slow_replay_then_metrics
+    manager = UsersListManager(
+        organization_id=ORG,
+        allowed_project_ids=[PROJECT],
+        project_id=PROJECT,
+        filters=_filters(),
+        requested_columns=["num_sessions"],
+        attribute_keys=[],
+    )
+    with (
+        patch.object(walk, "USER_LIST_PAGE_WALL_MS", 60),
+        patch(SERVICE, return_value=engine),
+        patch.object(manager, "_read_dimension_candidates", side_effect=_never_seed),
+    ):
+        read = manager.list_cursor_payload(page_size=25, cursor=None)
+
+    assert _names(read) == ["user-1"]
+    assert read.payload["table"][0]["num_sessions"] == 7
+    kinds = [
+        "slice"
+        if "witnessed AS" in call
+        else "enrich"
+        if "latest_candidate_attribute_values" in call
+        else "metrics"
+        if "session_rows AS" in call
+        else "replay"
+        for call in engine.calls
+    ]
+    assert kinds == ["slice", "enrich", "replay", "metrics"]
+    assert metric_timeouts == [None]

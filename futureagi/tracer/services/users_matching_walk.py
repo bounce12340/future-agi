@@ -356,7 +356,11 @@ def _materialise(state: _WalkState, entries: list[_Certified]) -> bool:
             frozen_filters=state.frozen_filters,
             window_start=state.window_start,
             window_end=state.window_end,
-            deadline=state.budget.statement_deadline(),
+            # Finish mode: the wall does not govern these statements. Passing
+            # the deadline would let the replay spend the last of it and the
+            # metrics read that follows raise on the client clock, dropping a
+            # user the page had already certified.
+            deadline=None,
             enrich_rows=True,
             candidate_rows=None,
             skip_attribute_read=True,
