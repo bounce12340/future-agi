@@ -278,6 +278,15 @@ def raw_graph_scan_fits_wall(estimated_rows: int | None, *, remaining_ms: int) -
 # attempt. Like the raw constant this is a throughput, not a window:
 # affordable rows are this rate multiplied by the milliseconds the request
 # still has.
+#
+# Two caveats on the calibration. The measured run was cut at 21% of its
+# window, so the tail - merging the external-aggregation parts the scan
+# spilled (12.7k of them at the 32 MiB EXACT_GRAPH_READ_EXTERNAL_SPILL_BYTES
+# threshold) - is unmeasured and 563 s is a floor, not the whole statement;
+# "thirty days fits the background wall" is this arithmetic, not a measured
+# thirty-day read. And the rate is a property of the statement AT its
+# settings: it is coupled to DASHBOARD_TRACE_READ_MAX_THREADS and to that
+# spill threshold, and must be re-measured if either moves.
 _USER_GRAPH_SCAN_ROWS_PER_MS = 553
 
 
