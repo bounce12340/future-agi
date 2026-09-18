@@ -723,8 +723,11 @@ class SpanListQueryBuilderV2(V2RewriteMixin, SpanListQueryBuilder):
         # Equality/IN already have a typed raw value witness. Other scalar
         # leaves retain compiler key-only/absent metadata, never a promoted
         # latest-state predicate. Prefix and time discovery share this policy.
+        # The seed carries the exact comparison once whatever happens here, so
+        # the compiler decides whether this SECOND copy of the value still fits
+        # under the parser limit, and hands back key presence when it does not.
         if ordinary_seed and plan.raw_key_witness_predicate:
-            return plan.raw_witness_predicate
+            return plan.population_witness_predicate
         return super()._filter_population_plan_predicate(
             plan, ordinary_seed=ordinary_seed
         )
