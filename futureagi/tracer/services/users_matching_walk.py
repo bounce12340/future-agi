@@ -36,6 +36,7 @@ at the enrichment step, before any replay.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -105,22 +106,37 @@ class _WalkBudget:
         self.statements = 0
         self.exhausted_by: str | None = None
 
-    def take(self, statements: int) -> bool:
-        if self.exhausted_by:
+    def take(self, statements: int, *, finish: bool = False) -> bool:
+        """Spend ``statements``; ``finish`` spends past the wall, never past the count.
+
+        The wall bounds the search (slices and certification). Materialising
+        users that are already certified and next in line is one finite replay
+        per page, and a page that has found its users should publish them
+        rather than return empty because the search used the whole wall.
+        """
+        if self.exhausted_by == "statements":
             return False
         if self.statements + statements > self.max_statements:
             self.exhausted_by = "statements"
             return False
-        try:
-            self.deadline.remaining_ms()
-        except ReadDeadlineExceeded:
-            self.exhausted_by = "wall"
-            return False
+        if not finish:
+            if self.exhausted_by == "wall":
+                return False
+            try:
+                self.deadline.remaining_ms()
+            except ReadDeadlineExceeded:
+                self.exhausted_by = "wall"
+                return False
         self.statements += statements
         return True
 
     def remaining_ms(self) -> float:
         return max(self.deadline.total_ms - self.deadline.elapsed_ms(), 0.0)
+
+    def statement_deadline(self) -> ReadDeadline | None:
+        """The wall as a per-statement deadline while it still has room."""
+
+        return self.deadline if self.remaining_ms() >= 25 else None
 
 
 @dataclass
@@ -219,6 +235,7 @@ def _read_slice(
             limit=USER_LIST_WALK_SLICE_USER_LIMIT,
             before=before,
         )
+        started = time.monotonic()
         try:
             result = ulm.V2AnalyticsQueryService().execute_ch_query(
                 query,
@@ -263,7 +280,14 @@ def _read_slice(
         return _Slice(
             candidates=candidates,
             truncated=len(candidates) >= USER_LIST_WALK_SLICE_USER_LIMIT,
-            query_ms=getattr(result, "query_time_ms", None),
+            # The statement's own server time when the transport reports it;
+            # otherwise the client-observed time, so growth never waits on an
+            # optional attribute (an executor without it would freeze the
+            # slice width at its initial value).
+            query_ms=(
+                float(getattr(result, "query_time_ms", None) or 0.0)
+                or (time.monotonic() - started) * 1000.0
+            ),
             slice_start=slice_start,
         )
 
@@ -315,7 +339,7 @@ def _materialise(state: _WalkState, entries: list[_Certified]) -> bool:
     """Whole-window replay plus final membership for publishable users only."""
 
     manager = state.manager
-    if not state.budget.take(_materialisation_statement_count(manager)):
+    if not state.budget.take(_materialisation_statement_count(manager), finish=True):
         return False
     ids = [entry.end_user_id for entry in entries]
     scan_ids = list(
@@ -332,7 +356,7 @@ def _materialise(state: _WalkState, entries: list[_Certified]) -> bool:
             frozen_filters=state.frozen_filters,
             window_start=state.window_start,
             window_end=state.window_end,
-            deadline=state.budget.deadline,
+            deadline=state.budget.statement_deadline(),
             enrich_rows=True,
             candidate_rows=None,
             skip_attribute_read=True,
@@ -498,7 +522,11 @@ def walk_matching_activity_page(
             read.query_ms is not None
             and read.query_ms * 8 <= state.budget.remaining_ms()
         ):
-            width = min(USER_LIST_WALK_MAX_SLICE, width * 4)
+            # An empty slice cost only its fixed overhead (the bloom pruned
+            # every granule): widen hard, the next slice is bounded anyway.
+            # A populated slice that came back untruncated widens by four.
+            growth = 16 if not candidates else 4
+            width = min(USER_LIST_WALK_MAX_SLICE, width * growth)
 
     leftover = state.pending(boundary)
     has_more = bool(leftover) or not exhausted

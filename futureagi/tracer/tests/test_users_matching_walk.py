@@ -479,3 +479,63 @@ def test_slice_statement_is_bounded_by_the_slice_and_carries_no_sorting_key_in_s
     ):
         assert setting in tail
     assert "optimize_aggregation_in_order = 1" not in tail
+
+
+def test_certified_users_are_materialised_past_the_wall_but_the_search_stops():
+    """The wall bounds the search; a user the page already certified is published.
+
+    The slice and the enrichment consume the wall; the replay of the certified
+    user still runs (one finite statement), and no further slice is read.
+    """
+    world = World()
+    world.user(1, key=minutes_before_end(3), raw=(minutes_before_end(3),))
+    world.user(2, key=minutes_before_end(600), raw=(minutes_before_end(600),))
+    engine = Engine(world)
+    original = engine.execute_ch_query
+
+    def slow_enrichment(query, params=None, timeout_ms=None, settings=None):
+        import time
+
+        if "latest_candidate_attribute_values" in query:
+            time.sleep(0.08)
+        return original(query, params, timeout_ms, settings)
+
+    engine.execute_ch_query = slow_enrichment
+    with patch.object(walk, "USER_LIST_PAGE_WALL_MS", 60):
+        read, engine = _page(world, page_size=25, engine=engine)
+
+    assert _names(read) == ["user-1"]
+    assert read.has_more is True
+    kinds = [
+        "slice"
+        if "witnessed AS" in call
+        else "enrich"
+        if "latest_candidate_attribute_values" in call
+        else "replay"
+        for call in engine.calls
+    ]
+    assert kinds == ["slice", "enrich", "replay"]
+
+
+def test_slice_width_grows_without_a_server_time_report():
+    """An executor that reports no statement time must not freeze the walk.
+
+    The user's newest match is ten hours back; from a one-hour initial slice
+    the walk must reach it in a handful of statements, growing on the
+    client-observed time when the transport reports none.
+    """
+    world = World()
+    world.user(1, key=minutes_before_end(600), raw=(minutes_before_end(600),))
+    engine = Engine(world)
+    original = engine.execute_ch_query
+
+    def without_server_time(query, params=None, timeout_ms=None, settings=None):
+        result = original(query, params, timeout_ms, settings)
+        return SimpleNamespace(data=result.data)
+
+    engine.execute_ch_query = without_server_time
+    read, engine = _page(world, page_size=25, engine=engine)
+
+    assert _names(read) == ["user-1"]
+    slices = [call for call in engine.calls if "witnessed AS" in call]
+    assert 2 <= len(slices) <= 4
