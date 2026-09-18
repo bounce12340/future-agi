@@ -632,7 +632,10 @@ def test_positive_text_attribute_filter_walks_matching_activity_not_the_seed():
 
     The seeded 65-row witness batch is the shape that dies on the largest
     tenants; the page walks witnessed spans newest-first instead and says so
-    in its provenance and ordering.
+    in its provenance and ordering. An empty default thirty-day window is
+    proven in two statements: the first empty slice, then one existence
+    probe over the rest of the window, which returns nothing here; the walk
+    never spends its statement budget one day at a time on an empty tail.
     """
     manager = _manager(
         filters=[
@@ -670,9 +673,16 @@ def test_positive_text_attribute_filter_walks_matching_activity_not_the_seed():
     assert result.payload["query_provenance"] == "matching_activity_walk"
     assert result.payload["ordering"] == "latest_matching_activity"
     assert result.payload["has_more"] is False
-    for call in analytics_cls.return_value.execute_ch_query.call_args_list:
-        assert "witnessed AS" in call.args[0]
-        assert "scalar_witness_identities" not in call.args[0]
+    statements = [
+        call.args[0]
+        for call in analytics_cls.return_value.execute_ch_query.call_args_list
+    ]
+    assert len(statements) == 2
+    assert "AS raw_end_user_id" in statements[0]
+    assert "SELECT 1 AS witnessed" in statements[1] and "LIMIT 1" in statements[1]
+    for statement in statements:
+        assert "scalar_witness_identities" not in statement
+        assert "end_user_id_remap" not in statement
     assert USER_LIST_ATTRIBUTE_WITNESS_BATCH_SIZE == 64
 
 

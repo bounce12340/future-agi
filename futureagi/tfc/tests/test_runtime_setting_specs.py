@@ -475,6 +475,18 @@ def test_bulk_selection_query_budget_formula_is_shared_with_the_resolver():
             "REDIS_CACHE_SOCKET_CONNECT_TIMEOUT_SECONDS",
             "REDIS_CACHE_SOCKET_TIMEOUT_SECONDS",
         ),
+        (
+            "USER_LIST_WALK_INITIAL_SLICE_SECONDS",
+            "USER_LIST_WALK_MAX_SLICE_SECONDS",
+        ),
+        (
+            "USER_LIST_WALK_MIN_SLICE_SECONDS",
+            "USER_LIST_WALK_INITIAL_SLICE_SECONDS",
+        ),
+        (
+            "USER_LIST_PAGE_WALL_MS",
+            "INTERACTIVE_ANALYTICS_DEFAULT_WALL_MS",
+        ),
     ),
 )
 def test_interactive_ordered_limits_reject_inverted_values(lower_name, upper_name):

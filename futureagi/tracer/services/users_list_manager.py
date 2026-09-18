@@ -39,6 +39,7 @@ from tracer.services.users_matching_walk import (
     USER_LIST_MATCHING_CURSOR_ORDER,
     walk_matching_activity_page,
 )
+from tracer.services.users_walk_witness import WalkedTypedFilter, typed_walk_filter
 
 logger = structlog.get_logger(__name__)
 
@@ -188,6 +189,7 @@ def _users_attr_enrichment_query(
     end_date: datetime | None = None,
     candidate_end_user_id_map: dict[str, str] | None = None,
     candidate_text_values_by_key: dict[str, tuple[str, ...]] | None = None,
+    walked_typed_filter: WalkedTypedFilter | None = None,
 ):
     """Project only requested keys for a finite Observe-Users page.
 
@@ -195,6 +197,11 @@ def _users_attr_enrichment_query(
     versions are collapsed before tombstones, reassignments, or attribute
     presence are evaluated. All distinct typed values on the surviving spans
     are retained for any-span filter membership, not just the last value.
+
+    ``walked_typed_filter`` is the number/boolean predicate a matching-activity
+    walk is decided on: it narrows the physical seed exactly as the exact-text
+    values do and projects that filter's order key; it is read in its own
+    statement, never alongside text values.
     """
     from tracer.services.clickhouse.v2.id_remap_sql import (
         bounded_survivor_map_subquery,
@@ -274,6 +281,11 @@ def _users_attr_enrichment_query(
             """
         )
     params.update(candidate_value_params)
+    if walked_typed_filter is not None:
+        if candidate_value_clauses:
+            raise ValueError("a walked typed filter is read in its own statement")
+        params.update(walked_typed_filter.witness_params)
+        candidate_value_clauses.append(walked_typed_filter.witness_sql)
     candidate_value_filter = (
         "AND ((" + ") OR (".join(candidate_value_clauses) + "))"
         if candidate_value_clauses
@@ -304,6 +316,9 @@ def _users_attr_enrichment_query(
                 IN %(matching_activity_values_{index})s
             """
         )
+    if walked_typed_filter is not None:
+        params.update(walked_typed_filter.order_params)
+        matching_activity_clauses.append(walked_typed_filter.order_clause)
     matching_activity_projection = (
         ",\n        maxIf(latest_start_time, (("
         + ") OR (".join(matching_activity_clauses)
@@ -493,9 +508,12 @@ class UsersListManager:
         # Keep raw attributes separate from native response fields. A custom
         # user_id or latency_ms must not read or overwrite the native value.
         self._attribute_values_by_user: dict[str, dict[str, object]] = {}
-        # Newest live span per user and exact-text key whose latest value
-        # matches the filter: the matching-activity walk's certified order key.
+        # Newest live span per user and walked key whose latest value matches
+        # the filter: the matching-activity walk's certified order key.
         self._matching_activity_by_user: dict[str, dict[str, datetime]] = {}
+        # The number/boolean predicate the current walk is decided on, set by
+        # ``matching_activity_walk_applies`` for the page it applies to.
+        self._walked_typed_filter: WalkedTypedFilter | None = None
         # Public cost rounding/JSON dates are presentation, never filter truth.
         self._native_filter_values_by_user: dict[str, dict[str, Any]] = {}
         self._unqualified_attribute_fallback_used = False
@@ -807,6 +825,7 @@ class UsersListManager:
             bucket_end: datetime | None,
             *,
             candidate_text_values_by_key: dict[str, tuple[str, ...]] | None = None,
+            walked_typed_filter: WalkedTypedFilter | None = None,
         ) -> None:
             attr_query, attr_params = _users_attr_enrichment_query(
                 project_id=self.project_id,
@@ -816,6 +835,7 @@ class UsersListManager:
                 end_date=bucket_end,
                 candidate_end_user_id_map=candidate_end_user_id_map,
                 candidate_text_values_by_key=candidate_text_values_by_key,
+                walked_typed_filter=walked_typed_filter,
             )
             attr_params["eu_ids"] = tuple(str(e) for e in end_user_ids)
             attr_params["eu_scan_ids"] = tuple(
@@ -855,28 +875,38 @@ class UsersListManager:
                     bucket_start,
                     midpoint,
                     candidate_text_values_by_key=candidate_text_values_by_key,
+                    walked_typed_filter=walked_typed_filter,
                 )
                 _read_key_bucket(
                     keys,
                     midpoint,
                     bucket_end,
                     candidate_text_values_by_key=candidate_text_values_by_key,
+                    walked_typed_filter=walked_typed_filter,
                 )
                 return
             _collect(list(attr_result.data or ()))
 
+        walked = self._walked_typed_filter
+        walked_key = walked.key if walked is not None else None
         accelerated_keys = tuple(
             key
             for key in self.attribute_keys
-            if key in self.attribute_exact_text_filters
+            if key in self.attribute_exact_text_filters or key == walked_key
         )
         ordinary_keys = tuple(
-            key
-            for key in self.attribute_keys
-            if key not in self.attribute_exact_text_filters
+            key for key in self.attribute_keys if key not in accelerated_keys
         )
         key_batches = [
-            ((key,), {key: self.attribute_exact_text_filters[key]})
+            (
+                (key,),
+                (
+                    {key: self.attribute_exact_text_filters[key]}
+                    if key in self.attribute_exact_text_filters
+                    else None
+                ),
+                walked if key == walked_key else None,
+            )
             for key in accelerated_keys
         ]
         key_batches.extend(
@@ -885,17 +915,19 @@ class UsersListManager:
                     key_start : key_start + _USER_LIST_ATTRIBUTE_KEY_BATCH_SIZE
                 ],
                 None,
+                None,
             )
             for key_start in range(
                 0, len(ordinary_keys), _USER_LIST_ATTRIBUTE_KEY_BATCH_SIZE
             )
         )
-        for keys, candidate_values in key_batches:
+        for keys, candidate_values, typed_filter in key_batches:
             _read_key_bucket(
                 keys,
                 start_date,
                 end_date,
                 candidate_text_values_by_key=candidate_values,
+                walked_typed_filter=typed_filter,
             )
 
         user_attrs: dict[str, dict[str, object]] = {}
@@ -1134,15 +1166,42 @@ class UsersListManager:
     def matching_activity_walk_applies(self, builder: UserListQueryBuilderV2) -> bool:
         """Whether this page walks newest matching activity instead of seeding.
 
-        True exactly when the seeded candidate page would carry a plain-text
-        witness whose key the manager also accelerates as an exact-text filter:
-        the walk reuses that witness to discover users and that filter's
-        enrichment to certify them. Every other filter shape keeps its path.
+        True exactly when the first scalar witness is the ONLY filter item on
+        its key and either (text) the manager accelerates that key as an
+        exact-text filter, or (number/boolean) the item is a shape whose
+        Python and SQL comparisons are provably the same
+        (``users_walk_witness``): the walk reuses that one witness to discover
+        users, to narrow their certification and to project the order key.
+        A key carrying more than one filter item keeps the seeded page: the
+        walk's order key and its witness must be one predicate, and the
+        exact-text values of a key are the union of all its items.
+        Every other filter shape keeps its path. Sets the typed predicate the
+        certification reads when the walk applies.
         """
-        if not self.attribute_exact_text_filters or self.sort_params:
+        self._walked_typed_filter = None
+        if self.sort_params:
             return False
         witness = builder.matching_activity_witness()
-        return witness is not None and witness[0] in self.attribute_exact_text_filters
+        if witness is None:
+            return False
+        key, kind = witness[0], witness[1]
+        items = [
+            item
+            for item in self.filters
+            if not UserListQueryBuilderV2._is_date_filter(item)
+            and not UserListQueryBuilderV2._is_relation_filter(item)
+            and str(item.get("column_id") or item.get("columnId")) == key
+            and not UserListQueryBuilderV2._is_output_filter(item)
+        ]
+        if len(items) != 1:
+            return False
+        if kind == "text":
+            return key in self.attribute_exact_text_filters
+        typed = typed_walk_filter(witness, items[0])
+        if typed is None:
+            return False
+        self._walked_typed_filter = typed
+        return True
 
     def _prune_attribute_candidate_batch(
         self,
@@ -1872,6 +1931,7 @@ class UsersListManager:
         self._attribute_values_by_user.clear()
         self._attribute_value_types_by_user.clear()
         self._matching_activity_by_user.clear()
+        self._walked_typed_filter = None
         self._native_filter_values_by_user.clear()
         self._relation_matching_user_ids.clear()
         base_builder = UserListQueryBuilderV2(

@@ -1,8 +1,9 @@
 """The span-attribute-filtered Users page walks newest matching activity.
 
 A scripted world stands in for ClickHouse: raw witness rows (a superset that
-includes stale versions), latest-state order keys, and whole-window totals are
-three separate answers, so each guard can see which statement decided what.
+includes stale versions, keyed by the RAW id a span carries), the survivor
+map, latest-state order keys, and whole-window totals are separate answers,
+so each guard can see which statement decided what.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import pytest
 
 from tracer.services import users_matching_walk as walk
 from tracer.services.clickhouse.list_cursor import ListCursor
+from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
 from tracer.services.clickhouse.v2.query_builders.user_list import (
     UserListQueryBuilderV2,
 )
@@ -61,6 +63,7 @@ class World:
         cost: float = 1.0,
         aliases: int = 0,
         curated: bool = True,
+        typed_values: list[tuple[str, str]] | None = None,
     ) -> str:
         uid = str(uuid.UUID(int=1000 + ordinal))
         alias_ids = tuple(
@@ -72,6 +75,7 @@ class World:
             "aliases": (uid, *alias_ids),
             "curated": curated,
             "name": f"user-{ordinal}",
+            "typed_values": typed_values or [("string", '"Gold"')],
         }
         for alias in (uid, *alias_ids):
             self.canonical[alias] = uid
@@ -81,56 +85,100 @@ class World:
         return uid
 
 
+def kind_of(query: str) -> str:
+    if "AS raw_end_user_id" in query:
+        return "slice"
+    if "AS witnessed" in query:
+        return "probe"
+    if "dimension_candidate_ids" in query:
+        return "remap"
+    if "latest_candidate_attribute_values" in query:
+        return "enrich"
+    if "session_rows AS" in query:
+        return "metrics"
+    if "candidate_users AS" in query:
+        return "replay"
+    raise AssertionError("unexpected statement: " + " ".join(query.split())[:120])
+
+
 class Engine:
-    """Answers the walk's three statement shapes from the world."""
+    """Answers the walk's statement shapes from the world."""
 
     def __init__(self, world: World) -> None:
         self.world = world
         self.calls: list[str] = []
         self.enriched: list[tuple[str, ...]] = []
+        self.enrichment_scan_ids: list[tuple[str, ...]] = []
         self.replayed: list[tuple[str, ...]] = []
+        self.remapped: list[tuple[str, ...]] = []
+        self.slice_ranges: list[tuple[datetime, datetime]] = []
+        self.probe_ranges: list[tuple[datetime, datetime]] = []
 
     def execute_ch_query(self, query, params=None, timeout_ms=None, settings=None):
         self.calls.append(query)
         params = params or {}
-        if "witnessed AS" in query:
+        kind = kind_of(query)
+        if kind == "slice":
             return self._slice(params)
-        if "latest_candidate_attribute_values" in query:
+        if kind == "probe":
+            return self._probe(params)
+        if kind == "remap":
+            return self._remap(params)
+        if kind == "enrich":
             return self._enrich(params)
-        if "candidate_users AS" in query:
-            return self._replay(params)
-        raise AssertionError("unexpected statement: " + " ".join(query.split())[:120])
+        return self._replay(params)
 
-    def _slice(self, params):
+    def _witnessed(self, params, ranges):
         low, high = _from_us(params["slice_start_us"]), _from_us(params["slice_end_us"])
+        ranges.append((low, high))
         groups: dict[str, datetime] = {}
         for moment, raw_id in self.world.raw:
             if low <= moment < high:
-                canonical = self.world.canonical[raw_id]
-                groups[canonical] = max(groups.get(canonical, moment), moment)
-        rows = sorted(groups.items(), key=lambda item: (item[1], item[0]), reverse=True)
+                groups[raw_id] = max(groups.get(raw_id, moment), moment)
+        return groups
+
+    def _slice(self, params):
+        rows = sorted(
+            self._witnessed(params, self.slice_ranges).items(),
+            key=lambda item: (item[1], item[0]),
+            reverse=True,
+        )
         if "slice_before_us" in params:
             before = (
                 _from_us(params["slice_before_us"]),
                 params["slice_before_end_user_id"],
             )
-            rows = [(uid, moment) for uid, moment in rows if (moment, uid) < before]
+            rows = [(rid, moment) for rid, moment in rows if (moment, rid) < before]
         rows = rows[: params["slice_user_limit"]]
         return SimpleNamespace(
             data=[
-                {
-                    "end_user_id": uid,
-                    "newest_witness": moment,
-                    "alias_end_user_ids": list(self.world.users[uid]["aliases"]),
-                }
-                for uid, moment in rows
+                {"raw_end_user_id": rid, "raw_newest": moment} for rid, moment in rows
             ],
             query_time_ms=1.0,
         )
 
+    def _probe(self, params):
+        found = bool(self._witnessed(params, self.probe_ranges))
+        return SimpleNamespace(
+            data=[{"witnessed": 1}] if found else [], query_time_ms=1.0
+        )
+
+    def _remap(self, params):
+        ids = tuple(params["dimension_candidate_ids"])
+        self.remapped.append(ids)
+        rows = []
+        for survivor in {self.world.canonical[rid] for rid in ids}:
+            aliases = self.world.users[survivor]["aliases"]
+            if len(aliases) > 1:
+                rows.extend(
+                    {"any_id": alias, "survivor_id": survivor} for alias in aliases
+                )
+        return SimpleNamespace(data=rows, query_time_ms=1.0)
+
     def _enrich(self, params):
         ids = tuple(params["eu_ids"])
         self.enriched.append(ids)
+        self.enrichment_scan_ids.append(tuple(params["eu_scan_ids"]))
         data = []
         for uid in ids:
             key = self.world.users[uid]["key"]
@@ -139,8 +187,8 @@ class Engine:
             data.append(
                 {
                     "end_user_id": uid,
-                    "attribute_key": "tag",
-                    "attribute_typed_values": [("string", '"Gold"')],
+                    "attribute_key": params["requested_attribute_keys"][0],
+                    "attribute_typed_values": self.world.users[uid]["typed_values"],
                     "latest_matching_start_time": key,
                 }
             )
@@ -175,34 +223,36 @@ class Engine:
         return SimpleNamespace(data=data, query_time_ms=1.0)
 
 
-def _filters():
+def _attribute_filter(**config):
+    return {
+        "column_id": config.pop("column_id", "tag"),
+        "filter_config": {"col_type": "SPAN_ATTRIBUTE", **config},
+    }
+
+
+def _filters(*, window_start=WINDOW_START, window_end=WINDOW_END, attribute=None):
     return [
         {
             "column_id": "created_at",
             "filter_config": {
                 "filter_type": "datetime",
                 "filter_op": "between",
-                "filter_value": [WINDOW_START.isoformat(), WINDOW_END.isoformat()],
+                "filter_value": [window_start.isoformat(), window_end.isoformat()],
             },
         },
-        {
-            "column_id": "tag",
-            "filter_config": {
-                "col_type": "SPAN_ATTRIBUTE",
-                "filter_type": "text",
-                "filter_op": "equals",
-                "filter_value": "gold",
-            },
-        },
+        attribute
+        or _attribute_filter(
+            filter_type="text", filter_op="equals", filter_value="gold"
+        ),
     ]
 
 
-def _manager() -> UsersListManager:
+def _manager(filters=None) -> UsersListManager:
     return UsersListManager(
         organization_id=ORG,
         allowed_project_ids=[PROJECT],
         project_id=PROJECT,
-        filters=_filters(),
+        filters=filters or _filters(),
         requested_columns=[],
         attribute_keys=[],
     )
@@ -212,8 +262,15 @@ def _never_seed(**kwargs):
     raise AssertionError("the whole-window candidate statement must never run")
 
 
-def _page(world: World, *, page_size: int, cursor=None, engine: Engine | None = None):
-    manager = _manager()
+def _page(
+    world: World,
+    *,
+    page_size: int,
+    cursor=None,
+    engine: Engine | None = None,
+    filters=None,
+):
+    manager = _manager(filters)
     engine = engine or Engine(world)
     with (
         patch(SERVICE, return_value=engine),
@@ -237,6 +294,10 @@ def _names(read) -> list[str]:
     return [row["user_id"] for row in read.payload["table"]]
 
 
+def _kinds(engine: Engine) -> list[str]:
+    return [kind_of(call) for call in engine.calls]
+
+
 def test_filtered_page_orders_by_newest_matching_activity_and_never_seeds():
     world = World()
     world.user(1, key=minutes_before_end(30), raw=(minutes_before_end(30),))
@@ -253,19 +314,49 @@ def test_filtered_page_orders_by_newest_matching_activity_and_never_seeds():
     assert read.payload["ordering"] == "latest_matching_activity"
     assert read.payload["query_exact"] is True
     assert all("scalar_witness_identities" not in call for call in engine.calls)
-    assert all(
-        "witnessed AS" in call
-        or "latest_candidate_attribute_values" in call
-        or "candidate_users AS" in call
-        for call in engine.calls
+    assert set(_kinds(engine)) <= {"slice", "remap", "enrich", "replay", "probe"}
+
+
+def test_populated_slice_resolves_aliases_through_the_bounded_survivor_statement():
+    """The slice reads spans alone; a populated slice is followed by one remap.
+
+    The slice statement touches no other table and returns raw ids; the
+    existing bounded survivor statement then runs over exactly those ids, and
+    the certification scans every alias of the resolved user. An empty slice
+    issues no remap at all.
+    """
+    world = World()
+    walked = world.user(
+        1, key=minutes_before_end(3), raw=(minutes_before_end(3),), aliases=2
     )
+    read, engine = _page(world, page_size=25)
+
+    assert _names(read) == ["user-1"]
+    kinds = _kinds(engine)
+    assert kinds[:2] == ["slice", "remap"]
+    slice_sql = engine.calls[0]
+    assert "end_user_id_remap" not in slice_sql and "JOIN" not in slice_sql
+    assert slice_sql.count("FROM spans") == 1
+    raw_ids = {raw_id for _moment, raw_id in world.raw}
+    assert set(engine.remapped[0]) == raw_ids
+    aliases = set(world.users[walked]["aliases"])
+    assert set(engine.enrichment_scan_ids[0]) == aliases
+    assert engine.enriched == [(walked,)]
+    # The remap is the seeded page's own bounded survivor statement.
+    assert "dimension_candidate_ids" in engine.calls[1]
+    assert "end_user_id_remap FINAL" in engine.calls[1]
+
+    empty = World()
+    read, engine = _page(empty, page_size=25)
+    assert _names(read) == [] and read.has_more is False
+    assert "remap" not in _kinds(engine)
 
 
 def test_floor_rule_carries_a_stale_witness_below_the_slice_floor():
     """A raw witness above the floor does not place a user whose key is below it.
 
     P's newest raw row is a stale version; its live matching span is older
-    than H's. A slice truncated at two users returns P and A, so P must wait
+    than H's. A slice truncated at two ids returns P and A, so P must wait
     until the walk has covered H's activity; publishing P on its raw position
     would put it ahead of H.
     """
@@ -284,7 +375,7 @@ def test_floor_rule_carries_a_stale_witness_below_the_slice_floor():
     assert _names(read) == ["user-1", "user-3", "user-2"]
     assert read.has_more is False
     # P and A came out of the first slice; the second slice continued past A.
-    assert "slice_before_us" in engine.calls[0] or len(engine.calls) >= 4
+    assert any("slice_before_us" in call for call in engine.calls)
 
 
 def test_totals_come_from_the_whole_window_replay_for_published_users_only():
@@ -345,18 +436,26 @@ def test_budget_exhaustion_returns_partial_page_and_cursor_without_fallback():
             ordinal, key=minutes_before_end(minutes), raw=(minutes_before_end(minutes),)
         )
 
-    # One statement: the slice runs, nothing can be certified.
+    # One statement: the slice runs, its survivor statement is refused, the
+    # slice is discarded whole and the cursor re-reads it.
     with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 1):
         read, engine = _page(world, page_size=25)
     assert read.payload["table"] == []
     assert read.has_more is True
-    assert len(engine.calls) == 1 and "witnessed AS" in engine.calls[0]
+    assert _kinds(engine) == ["slice"]
     assert read.checkpoint_order[0] == walk.USER_LIST_MATCHING_CURSOR_ORDER
     assert read.checkpoint_order[1] is None and read.checkpoint_order[2] is None
+    assert read.checkpoint_order[3] == WINDOW_END
 
-    # Two statements: certified but not materialised; the cursor carries the
-    # certified keys so the next page starts above them.
+    # Two statements: resolved but not certified; nothing is enriched.
     with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 2):
+        read, engine = _page(world, page_size=25)
+    assert read.payload["table"] == [] and read.has_more is True
+    assert _kinds(engine) == ["slice", "remap"] and engine.enriched == []
+
+    # Three statements: certified but not materialised; the cursor carries the
+    # certified keys so the next page starts above them.
+    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 3):
         read, engine = _page(world, page_size=25)
     assert read.payload["table"] == []
     assert read.has_more is True
@@ -369,12 +468,47 @@ def test_budget_exhaustion_returns_partial_page_and_cursor_without_fallback():
     assert resumed.has_more is False
 
 
+def test_slice_read_exhaustion_returns_partial_page_and_cursor_without_fallback():
+    """The budget can run out AT a slice read; that path issues no seed either.
+
+    The first slice is empty, so the walk wants a second one. With one
+    statement in the budget the second read is refused before it is sent;
+    with the wall spent inside the transport the read raises. Both end the
+    page with a cursor at the first slice's start and never issue the
+    whole-window statement.
+    """
+    world = World()
+    world.user(1, key=minutes_before_end(600), raw=(minutes_before_end(600),))
+
+    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 1):
+        read, engine = _page(world, page_size=25)
+    assert _kinds(engine) == ["slice"]
+    assert read.payload["table"] == [] and read.has_more is True
+    assert read.checkpoint_order[3] == engine.slice_ranges[0][0] + walk._TICK
+
+    engine = Engine(world)
+    original = engine.execute_ch_query
+
+    def wall_spent_in_transport(query, params=None, timeout_ms=None, settings=None):
+        if len(engine.calls) == 1 and kind_of(query) == "slice":
+            engine.calls.append(query)
+            raise ReadDeadlineExceeded("read deadline exceeded")
+        return original(query, params, timeout_ms, settings)
+
+    engine.execute_ch_query = wall_spent_in_transport
+    read, engine = _page(world, page_size=25, engine=engine)
+    assert _kinds(engine) == ["slice", "slice"]
+    assert read.payload["table"] == [] and read.has_more is True
+    assert read.checkpoint_order[3] == engine.slice_ranges[0][0] + walk._TICK
+
+
 def test_wall_exhaustion_stops_between_statements():
     world = World()
     world.user(1, key=minutes_before_end(3), raw=(minutes_before_end(3),))
 
     # The wall is checked between statements: the slice statement alone
-    # outlives it, so certification never starts and the page is partial.
+    # outlives it, so its survivor statement is refused and the page is
+    # partial.
     with patch.object(walk, "USER_LIST_PAGE_WALL_MS", 60):
         engine = Engine(world)
         original = engine.execute_ch_query
@@ -390,7 +524,7 @@ def test_wall_exhaustion_stops_between_statements():
 
     assert read.payload["table"] == []
     assert read.has_more is True
-    assert len(engine.calls) == 1
+    assert _kinds(engine) == ["slice"]
 
 
 def test_a_slice_that_fails_on_a_read_budget_is_retried_narrower_never_wider():
@@ -403,7 +537,7 @@ def test_a_slice_that_fails_on_a_read_budget_is_retried_narrower_never_wider():
     widths: list[int] = []
 
     def flaky(query, params=None, timeout_ms=None, settings=None):
-        if "witnessed AS" in query:
+        if kind_of(query) == "slice":
             widths.append(params["slice_end_us"] - params["slice_start_us"])
             if len(widths) == 1:
                 raise ServerException("memory", code=241)
@@ -414,6 +548,77 @@ def test_a_slice_that_fails_on_a_read_budget_is_retried_narrower_never_wider():
 
     assert _names(read) == ["user-1"]
     assert len(widths) >= 2 and widths[1] == widths[0] // 4
+
+
+def test_empty_default_window_is_proven_by_one_existence_probe_within_budget():
+    """An empty thirty-day window is two statements, not thirty-one.
+
+    After the first empty slice the tail needs more slices at the one-day
+    cap than the statement budget holds, so the walk asks once whether any
+    witnessed row lies below at all; none proves the window exhausted.
+    """
+    thirty_days = _filters(window_start=WINDOW_END - timedelta(days=30))
+    read, engine = _page(World(), page_size=25, filters=thirty_days)
+
+    assert _kinds(engine) == ["slice", "probe"]
+    assert read.payload["table"] == []
+    assert read.has_more is False and read.checkpoint_order is None
+    probe = engine.calls[1]
+    assert "LIMIT 1" in probe and "GROUP BY" not in probe
+    assert engine.probe_ranges == [
+        (WINDOW_END - timedelta(days=30), engine.slice_ranges[0][0])
+    ]
+    assert "AND 0 = 1" not in probe
+
+
+def test_a_probe_that_finds_a_row_leaves_the_walk_slicing_at_the_cap():
+    """A row proves existence, never a position: the slices go on at the cap.
+
+    The populated slice re-arms the probe, so the twenty empty days below it
+    are proven by one more statement instead of spending the rest of the
+    budget one day at a time.
+    """
+
+    thirty_days = _filters(window_start=WINDOW_END - timedelta(days=30))
+    world = World()
+    world.user(
+        1,
+        key=WINDOW_END - timedelta(days=10),
+        raw=(WINDOW_END - timedelta(days=10),),
+    )
+    read, engine = _page(world, page_size=25, filters=thirty_days)
+
+    kinds = _kinds(engine)
+    assert _names(read) == ["user-1"] and read.has_more is False
+    assert kinds[:2] == ["slice", "probe"] and kinds.count("probe") == 2
+    assert kinds[-1] == "probe"
+    cap = walk.USER_LIST_WALK_MAX_SLICE
+    assert max(high - low for low, high in engine.slice_ranges) <= cap
+    assert kinds.count("slice") >= 3
+    assert len(engine.calls) <= walk.USER_LIST_WALK_MAX_STATEMENTS
+
+
+def test_a_probe_the_budget_refuses_or_that_fails_licenses_nothing():
+    from clickhouse_driver.errors import ServerException
+
+    thirty_days = _filters(window_start=WINDOW_END - timedelta(days=30))
+    world = World()
+    engine = Engine(world)
+    original = engine.execute_ch_query
+
+    def failing_probe(query, params=None, timeout_ms=None, settings=None):
+        result = original(query, params, timeout_ms, settings)
+        if kind_of(query) == "probe":
+            raise ServerException("rows", code=158)
+        return result
+
+    engine.execute_ch_query = failing_probe
+    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 4):
+        read, engine = _page(world, page_size=25, filters=thirty_days, engine=engine)
+    # The failed probe changed nothing: the walk went on slicing at the cap
+    # and stopped on its statement budget with a cursor.
+    assert _kinds(engine) == ["slice", "probe", "slice", "slice"]
+    assert read.has_more is True and read.payload["table"] == []
 
 
 def test_seeded_and_unfiltered_candidate_statements_are_byte_identical_to_the_pins():
@@ -441,6 +646,22 @@ def test_seeded_and_unfiltered_candidate_statements_are_byte_identical_to_the_pi
         limit=65, window_start=WINDOW_START, window_end=WINDOW_END
     )
     assert "scalar_witness_identities AS" in seeded
+    # A boolean filter qualifies no seeded witness: that statement keeps its
+    # reviewed shape and the walk alone carries the boolean witness.
+    boolean, _ = UserListQueryBuilderV2(
+        organization_id=ORG,
+        project_ids=[PROJECT],
+        filters=_filters(
+            attribute=_attribute_filter(
+                filter_type="boolean", filter_op="equals", filter_value=True
+            )
+        ),
+        search="",
+        empty_scope=False,
+    ).build_dimension_candidate_query(
+        limit=26, window_start=WINDOW_START, window_end=WINDOW_END
+    )
+    assert "scalar_witness_identities AS" not in boolean
 
 
 def test_slice_statement_is_bounded_by_the_slice_and_carries_no_sorting_key_in_set():
@@ -464,12 +685,14 @@ def test_slice_statement_is_bounded_by_the_slice_and_carries_no_sorting_key_in_s
     assert "start_time < fromUnixTimestamp64Micro(%(slice_end_us)s, 'UTC')" in compact
     assert "toStartOfHour(start_time) >= toStartOfHour(" in compact
     assert "LIMIT %(slice_user_limit)s" in compact
-    assert "HAVING newest_witness <" in compact
+    assert "HAVING raw_newest <" in compact
+    assert "ORDER BY raw_newest DESC, raw_end_user_id DESC" in compact
     assert params["slice_user_limit"] == 200
     assert params["project_ids"] == (PROJECT,)
     assert "attrs_string" in compact and "indexHint" in compact
     assert ") IN ( SELECT" not in compact and "IN (SELECT" not in compact
     assert compact.count("FROM spans") == 1
+    assert "end_user_id_remap" not in compact and "JOIN" not in compact
     assert "max_execution_time" not in compact and "max_memory_usage" not in compact
     tail = compact.rsplit("SETTINGS", 1)[1]
     for setting in (
@@ -480,12 +703,222 @@ def test_slice_statement_is_bounded_by_the_slice_and_carries_no_sorting_key_in_s
         assert setting in tail
     assert "optimize_aggregation_in_order = 1" not in tail
 
+    probe, probe_params = builder.build_matching_activity_existence_query(
+        range_start=WINDOW_START, range_end=minutes_before_end(60)
+    )
+    compact = " ".join(probe.split())
+    assert compact.startswith("SELECT 1 AS witnessed FROM spans PREWHERE")
+    assert "LIMIT 1" in compact and "GROUP BY" not in compact
+    assert "end_user_id_remap" not in compact
+    assert probe_params["slice_end_us"] == params["slice_start_us"]
+    assert "slice_user_limit" not in probe_params
+
+
+@pytest.mark.parametrize(
+    "attribute, column, order_fragment",
+    [
+        (
+            _attribute_filter(
+                column_id="score",
+                filter_type="number",
+                filter_op="greater_than",
+                filter_value=5,
+            ),
+            "attrs_number[",
+            "toFloat64OrNull(latest_attribute_value_json) > ",
+        ),
+        (
+            _attribute_filter(
+                column_id="score",
+                filter_type="number",
+                filter_op="in",
+                filter_value=[5, 7.5],
+            ),
+            "attrs_number[",
+            "toFloat64OrNull(latest_attribute_value_json) IN ",
+        ),
+        (
+            _attribute_filter(
+                column_id="flag",
+                filter_type="boolean",
+                filter_op="equals",
+                filter_value=True,
+            ),
+            "attrs_bool[",
+            "JSONExtractBool(latest_attribute_value_json) = ",
+        ),
+        (
+            _attribute_filter(
+                column_id="flag",
+                filter_type="boolean",
+                filter_op="equals",
+                filter_value=False,
+            ),
+            "attrs_bool[",
+            "JSONExtractBool(latest_attribute_value_json) = ",
+        ),
+    ],
+    ids=["number-greater_than", "number-in", "boolean-true", "boolean-false"],
+)
+def test_number_and_boolean_filters_walk_through_the_typed_map_witness(
+    attribute, column, order_fragment
+):
+    """A typed filter walks exactly as a text one, on one typed-map predicate.
+
+    The slice statement carries the compiler's typed witness; the enrichment
+    narrows its physical seed by the same predicate and projects the order
+    key on the LATEST typed value; the page never seeds.
+    """
+    config = attribute["filter_config"]
+    typed = (
+        [("boolean", "true" if config["filter_value"] else "false")]
+        if config["filter_type"] == "boolean"
+        else [("number", "7.5")]
+    )
+    world = World()
+    world.user(
+        1, key=minutes_before_end(3), raw=(minutes_before_end(3),), typed_values=typed
+    )
+    read, engine = _page(world, page_size=25, filters=_filters(attribute=attribute))
+
+    assert _names(read) == ["user-1"] and read.has_more is False
+    assert read.payload["ordering"] == "latest_matching_activity"
+    kinds = _kinds(engine)
+    # The page is not full, so the walk goes on slicing the window after
+    # its first member; those later slices are empty and issue no remap.
+    assert kinds[:4] == ["slice", "remap", "enrich", "replay"]
+    assert set(kinds[4:]) <= {"slice"}
+    assert column in engine.calls[0] and "attrs_string" not in engine.calls[0]
+    enrichment = engine.calls[2]
+    assert column in enrichment and order_fragment in enrichment
+    assert "latest_matching_start_time" in enrichment
+    assert "matching_activity_typed_key" in enrichment
+    assert "candidate_attribute_values_0" not in enrichment
+
+
+def test_a_typed_row_the_sql_matches_but_python_rejects_is_never_published():
+    """Python membership stays the authority: an order key alone publishes nothing."""
+
+    attribute = _attribute_filter(
+        column_id="score",
+        filter_type="number",
+        filter_op="greater_than",
+        filter_value=5,
+    )
+    world = World()
+    # The enrichment reports an order key, but the latest value it carries is
+    # string-typed: not a number match in Python.
+    world.user(
+        1,
+        key=minutes_before_end(3),
+        raw=(minutes_before_end(3),),
+        typed_values=[("string", '"7"')],
+    )
+    read, engine = _page(world, page_size=25, filters=_filters(attribute=attribute))
+
+    assert _names(read) == [] and read.has_more is False
+    assert engine.replayed == []
+
+
+@pytest.mark.parametrize(
+    "filters",
+    [
+        # Two items on one key: the order key and the witness would be two
+        # different predicates.
+        [
+            *_filters(),
+            _attribute_filter(
+                filter_type="text", filter_op="equals", filter_value="silver"
+            ),
+        ],
+        # A number range: Python compares the raw pair, the compiler coerces.
+        _filters(
+            attribute=_attribute_filter(
+                filter_type="number", filter_op="between", filter_value=[1, 9]
+            )
+        ),
+        # A storage-type picker on a number.
+        _filters(
+            attribute=_attribute_filter(
+                filter_type="number",
+                filter_op="in",
+                filter_value=[5],
+                attribute_value_types=["number"],
+            )
+        ),
+        # A boolean given as text.
+        _filters(
+            attribute=_attribute_filter(
+                filter_type="boolean", filter_op="equals", filter_value="true"
+            )
+        ),
+        # A negative predicate.
+        _filters(
+            attribute=_attribute_filter(
+                filter_type="number", filter_op="not_equals", filter_value=5
+            )
+        ),
+        # An ordering whose missing-key default satisfies it: the compiler
+        # gives it no value witness.
+        _filters(
+            attribute=_attribute_filter(
+                filter_type="number", filter_op="less_than", filter_value=5
+            )
+        ),
+        # A non-ASCII text value.
+        _filters(
+            attribute=_attribute_filter(
+                filter_type="text", filter_op="equals", filter_value="gôld"
+            )
+        ),
+    ],
+    ids=[
+        "two-items-one-key",
+        "number-between",
+        "number-picker",
+        "boolean-as-text",
+        "number-not_equals",
+        "number-less_than-default-matches",
+        "non-ascii-text",
+    ],
+)
+def test_shapes_the_walk_cannot_serve_keep_the_seeded_page(filters):
+    manager = _manager(filters)
+    builder = UserListQueryBuilderV2(
+        organization_id=ORG,
+        project_ids=[PROJECT],
+        filters=filters,
+        empty_scope=False,
+    )
+    assert manager.matching_activity_walk_applies(builder) is False
+    assert manager._walked_typed_filter is None
+
+
+def test_a_sorted_request_keeps_the_seeded_page():
+    manager = UsersListManager(
+        organization_id=ORG,
+        allowed_project_ids=[PROJECT],
+        project_id=PROJECT,
+        filters=_filters(),
+        sort_params=[{"column_id": "total_cost", "order": "desc"}],
+        requested_columns=[],
+        attribute_keys=[],
+    )
+    builder = UserListQueryBuilderV2(
+        organization_id=ORG,
+        project_ids=[PROJECT],
+        filters=_filters(),
+        empty_scope=False,
+    )
+    assert manager.matching_activity_walk_applies(builder) is False
+
 
 def test_certified_users_are_materialised_past_the_wall_but_the_search_stops():
     """The wall bounds the search; a user the page already certified is published.
 
-    The slice and the enrichment consume the wall; the replay of the certified
-    user still runs (one finite statement), and no further slice is read.
+    The slice, its survivor statement and the enrichment consume the wall;
+    the replay of the certified user still runs (one finite statement), and
+    no further slice is read.
     """
     world = World()
     world.user(1, key=minutes_before_end(3), raw=(minutes_before_end(3),))
@@ -496,7 +929,7 @@ def test_certified_users_are_materialised_past_the_wall_but_the_search_stops():
     def slow_enrichment(query, params=None, timeout_ms=None, settings=None):
         import time
 
-        if "latest_candidate_attribute_values" in query:
+        if kind_of(query) == "enrich":
             time.sleep(0.08)
         return original(query, params, timeout_ms, settings)
 
@@ -506,15 +939,7 @@ def test_certified_users_are_materialised_past_the_wall_but_the_search_stops():
 
     assert _names(read) == ["user-1"]
     assert read.has_more is True
-    kinds = [
-        "slice"
-        if "witnessed AS" in call
-        else "enrich"
-        if "latest_candidate_attribute_values" in call
-        else "replay"
-        for call in engine.calls
-    ]
-    assert kinds == ["slice", "enrich", "replay"]
+    assert _kinds(engine) == ["slice", "remap", "enrich", "replay"]
 
 
 def test_slice_width_grows_without_a_server_time_report():
@@ -537,8 +962,7 @@ def test_slice_width_grows_without_a_server_time_report():
     read, engine = _page(world, page_size=25, engine=engine)
 
     assert _names(read) == ["user-1"]
-    slices = [call for call in engine.calls if "witnessed AS" in call]
-    assert 2 <= len(slices) <= 4
+    assert 2 <= _kinds(engine).count("slice") <= 4
 
 
 def test_wall_spent_during_materialisation_still_publishes_the_certified_user():
@@ -586,15 +1010,16 @@ def test_wall_spent_during_materialisation_still_publishes_the_certified_user():
 
     assert _names(read) == ["user-1"]
     assert read.payload["table"][0]["num_sessions"] == 7
-    kinds = [
-        "slice"
-        if "witnessed AS" in call
-        else "enrich"
-        if "latest_candidate_attribute_values" in call
-        else "metrics"
-        if "session_rows AS" in call
-        else "replay"
-        for call in engine.calls
-    ]
-    assert kinds == ["slice", "enrich", "replay", "metrics"]
+    assert _kinds(engine) == ["slice", "remap", "enrich", "replay", "metrics"]
     assert metric_timeouts == [None]
+
+
+def test_walk_limits_are_runtime_settings_not_module_constants():
+    from django.conf import settings
+
+    assert walk.USER_LIST_WALK_MIN_SLICE == timedelta(
+        seconds=settings.USER_LIST_WALK_MIN_SLICE_SECONDS
+    )
+    assert walk.USER_LIST_WALK_CERTIFY_BATCH_SIZE == (
+        settings.USER_LIST_WALK_CERTIFY_BATCH_SIZE
+    )

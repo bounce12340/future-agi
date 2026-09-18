@@ -3,11 +3,16 @@
 The seeded candidate statement decides an attribute-filtered page by
 aggregating the whole window; on the largest tenants it materialises two
 planning-time sets over the sorting key and dies before it starts. This walk
-replaces it for plain-text ``equals``/``in`` filters:
+replaces it for one scalar span-attribute filter - plain-text
+``equals``/``in``, boolean ``equals``/``in``, or a number comparison - when
+that filter is the only item on its key:
 
 * discover: one bounded statement per time slice, newest-first, through the
-  deployed key and value blooms, grouped by survivor-resolved user
-  (``build_matching_activity_slice_query``; a raw superset, never a result);
+  deployed key and value blooms, grouped by the RAW user id the span carries
+  (``build_matching_activity_slice_query``; a raw superset, never a result),
+  then, only for a populated slice, one bounded survivor statement over
+  exactly the ids returned (``build_dimension_survivor_query``) that resolves
+  each raw id to its user and attaches every alias of that user;
 * certify: the page's existing attribute enrichment, which also returns the
   user's newest LIVE span whose LATEST value matches - the order key;
 * materialise: the existing finite per-user replay, only for users that are
@@ -16,11 +21,21 @@ replaces it for plain-text ``equals``/``in`` filters:
   (``_row_matches_filters``, unchanged), and carries the set-valued totals.
 
 Coverage floor. A truncated slice proves nothing at or below the newest
-witness of its last user; a user is published only once its certified key lies
-strictly above every undecided user's possible key (the slice floor, or the
-newest witness of the next uncertified batch). Users whose key is at or below
-that line are carried to a later slice, where their own newest matching row
-rediscovers them.
+witness of its last raw id; a user is published only once its certified key
+lies strictly above every undecided user's possible key (the slice floor, or
+the newest witness of the next uncertified batch). Users whose key is at or
+below that line are carried to a later slice, where their own newest matching
+row rediscovers them. Moving the LIMIT from resolved users to raw ids keeps
+that rule: every raw id with a witnessed row above the floor is returned, so
+every user with such a row is represented and its newest witness is exact.
+
+Empty tail. After an untruncated empty slice, when the rest of the window
+needs more slices at the cap than the statement budget has left, one
+existence statement (``build_matching_activity_existence_query``, ``LIMIT 1``
+through the same blooms) asks whether any witnessed row lies below the slice
+at all; none proves the window exhausted by the same rule an empty slice
+uses, a row leaves the walk exactly where it was. It is issued at most once
+per page and once more after each populated slice, never twice in a row.
 
 Budget. The walk owns a wall (``USER_LIST_PAGE_WALL_MS``) and a statement
 budget (``USER_LIST_WALK_MAX_STATEMENTS``). On exhaustion it returns the users
@@ -50,6 +65,7 @@ from tracer.services.clickhouse.read_budget import (
     ReadDeadlineExceeded,
     is_read_budget_error,
 )
+from tracer.services.clickhouse.v2.id_remap_sql import NIL_UUID
 from tracer.services.clickhouse.v2.query_builders.user_list import (
     UserListQueryBuilderV2,
 )
@@ -71,9 +87,9 @@ USER_LIST_WALK_MAX_SLICE = timedelta(seconds=settings.USER_LIST_WALK_MAX_SLICE_S
 USER_LIST_WALK_SLICE_USER_LIMIT = settings.USER_LIST_WALK_SLICE_USER_LIMIT
 # A slice that fails on a read budget is retried at a quarter of its width
 # down to this floor; below it the failure propagates as a retryable error.
-USER_LIST_WALK_MIN_SLICE = timedelta(minutes=1)
+USER_LIST_WALK_MIN_SLICE = timedelta(seconds=settings.USER_LIST_WALK_MIN_SLICE_SECONDS)
 # Users certified per enrichment statement and replayed per materialisation.
-USER_LIST_WALK_CERTIFY_BATCH_SIZE = 25
+USER_LIST_WALK_CERTIFY_BATCH_SIZE = settings.USER_LIST_WALK_CERTIFY_BATCH_SIZE
 _TICK = timedelta(microseconds=1)
 
 
@@ -129,6 +145,9 @@ class _WalkBudget:
                 return False
         self.statements += statements
         return True
+
+    def remaining_statements(self) -> int:
+        return max(self.max_statements - self.statements, 0)
 
     def remaining_ms(self) -> float:
         return max(self.deadline.total_ms - self.deadline.elapsed_ms(), 0.0)
@@ -187,10 +206,12 @@ def _utc(value: Any) -> datetime | None:
 def _enrichment_statement_count(manager: Any) -> int:
     from tracer.services.users_list_manager import _USER_LIST_ATTRIBUTE_KEY_BATCH_SIZE
 
+    walked = getattr(manager, "_walked_typed_filter", None)
+    walked_key = walked.key if walked is not None else None
     accelerated = sum(
         1
         for key in manager.attribute_keys
-        if key in manager.attribute_exact_text_filters
+        if key in manager.attribute_exact_text_filters or key == walked_key
     )
     ordinary = len(manager.attribute_keys) - accelerated
     return accelerated + -(-ordinary // _USER_LIST_ATTRIBUTE_KEY_BATCH_SIZE)
@@ -209,8 +230,66 @@ def _materialisation_statement_count(manager: Any) -> int:
 class _Slice:
     candidates: list[_Candidate]
     truncated: bool
-    query_ms: float | None
+    # Client-observed time of the slice statement and, for a populated slice,
+    # its survivor statement: what a slice like it charges the wall.
+    query_ms: float
     slice_start: datetime
+    # The last RAW id returned, in ``(raw_newest DESC, raw_end_user_id DESC)``
+    # order: the keyset a truncated slice continues from, and its floor.
+    raw_last: tuple[datetime, str] | None
+
+
+def _statement_ms(result: Any, started: float) -> float:
+    # ``QueryResult.query_time_ms`` is the transport's client-observed time
+    # around the native call; an executor without it reports nothing, so the
+    # walk clocks the call itself. Either way the schedule runs on the client
+    # clock: the wall it is measured against runs on that clock, and the round
+    # trip is part of what a statement costs the page.
+    return float(getattr(result, "query_time_ms", None) or 0.0) or (
+        (time.monotonic() - started) * 1000.0
+    )
+
+
+def _resolve_raw_witnesses(
+    raw_rows: list[tuple[str, datetime]], remap_rows: list[dict[str, Any]]
+) -> list[_Candidate]:
+    """Group raw witnessed ids by survivor, exactly as ``resolved_id_expr`` does.
+
+    A raw id the survivor map does not know, or maps to the nil uuid, is its
+    own user. Every alias the map holds for a returned user travels with it,
+    so the certification scans all of that user's identities.
+    """
+    survivor_of: dict[str, str] = {}
+    aliases_of: dict[str, set[str]] = {}
+    for row in remap_rows:
+        any_id = str(row.get("any_id") or "")
+        survivor = str(row.get("survivor_id") or "")
+        if not any_id or not survivor or survivor == NIL_UUID:
+            continue
+        survivor_of[any_id] = survivor
+        aliases_of.setdefault(survivor, set()).add(any_id)
+    newest: dict[str, datetime] = {}
+    aliases: dict[str, set[str]] = {}
+    for raw_id, raw_newest in raw_rows:
+        canonical = survivor_of.get(raw_id, raw_id)
+        previous = newest.get(canonical)
+        if previous is None or raw_newest > previous:
+            newest[canonical] = raw_newest
+        aliases.setdefault(canonical, set()).add(raw_id)
+    candidates = [
+        _Candidate(
+            canonical,
+            moment,
+            tuple(
+                sorted(
+                    aliases[canonical] | aliases_of.get(canonical, set()) | {canonical}
+                )
+            ),
+        )
+        for canonical, moment in newest.items()
+    ]
+    candidates.sort(key=lambda c: (c.newest_witness, c.end_user_id), reverse=True)
+    return candidates
 
 
 def _read_slice(
@@ -222,7 +301,10 @@ def _read_slice(
 ) -> _Slice | None:
     """One slice statement, retried narrower on a read-budget failure.
 
-    Returns ``None`` when the walk's own budget stops it first.
+    A populated slice is followed by the bounded survivor statement over the
+    raw ids it returned. Returns ``None`` when the walk's own budget stops it
+    first; a slice whose survivor statement the budget refuses is discarded
+    whole, so the cursor stays at the slice's end and re-reads it.
     """
     from tracer.services import users_list_manager as ulm
 
@@ -261,35 +343,79 @@ def _read_slice(
             )
             slice_start = max(state.window_start, slice_end - narrower)
             continue
-        candidates = []
+        # Kept in the statement's own order: the survivor statement is bound
+        # to exactly the ids returned, as returned.
+        raw_rows: list[tuple[str, datetime]] = []
         for row in result.data or ():
-            end_user_id = str(row.get("end_user_id") or "")
-            newest = _utc(row.get("newest_witness"))
-            if not end_user_id or newest is None:
-                continue
-            aliases = tuple(
-                dict.fromkeys(
-                    [
-                        *(str(alias) for alias in row.get("alias_end_user_ids") or ()),
-                        end_user_id,
-                    ]
-                )
+            raw_id = str(row.get("raw_end_user_id") or "")
+            newest = _utc(row.get("raw_newest"))
+            if raw_id and newest is not None:
+                raw_rows.append((raw_id, newest))
+        ordered = sorted(raw_rows, key=lambda item: (item[1], item[0]), reverse=True)
+        query_ms = _statement_ms(result, started)
+        remap_rows: list[dict[str, Any]] = []
+        if raw_rows:
+            if not state.budget.take(1):
+                return None
+            remap_query, remap_params = state.builder.build_dimension_survivor_query(
+                [raw_id for raw_id, _newest in raw_rows]
             )
-            candidates.append(_Candidate(end_user_id, newest, aliases))
-        candidates.sort(key=lambda c: (c.newest_witness, c.end_user_id), reverse=True)
+            started = time.monotonic()
+            try:
+                remap = ulm.V2AnalyticsQueryService().execute_ch_query(
+                    remap_query,
+                    remap_params,
+                    timeout_ms=state.budget.deadline.remaining_ms(),
+                    settings=ulm._page_read_settings(
+                        max_result_rows=ulm._USER_LIST_ATTR_RESULT_ROWS
+                    ),
+                )
+            except ReadDeadlineExceeded:
+                state.budget.exhausted_by = "wall"
+                return None
+            remap_rows = list(remap.data or ())
+            query_ms += _statement_ms(remap, started)
         return _Slice(
-            candidates=candidates,
-            truncated=len(candidates) >= USER_LIST_WALK_SLICE_USER_LIMIT,
-            # The statement's own server time when the transport reports it;
-            # otherwise the client-observed time, so growth never waits on an
-            # optional attribute (an executor without it would freeze the
-            # slice width at its initial value).
-            query_ms=(
-                float(getattr(result, "query_time_ms", None) or 0.0)
-                or (time.monotonic() - started) * 1000.0
-            ),
+            candidates=_resolve_raw_witnesses(ordered, remap_rows),
+            truncated=len(ordered) >= USER_LIST_WALK_SLICE_USER_LIMIT,
+            query_ms=query_ms,
             slice_start=slice_start,
+            raw_last=ordered[-1][::-1] if ordered else None,
         )
+
+
+def _tail_is_empty(state: _WalkState, *, below: datetime) -> bool | None:
+    """Whether no witnessed row lies in ``[window_start, below)``.
+
+    ``None`` when the walk's budget stops the statement, or when it fails on
+    a read budget: a probe that fails licenses nothing, the walk goes on
+    slicing at the cap exactly as it would have without it.
+    """
+    from tracer.services import users_list_manager as ulm
+
+    if not state.budget.take(1):
+        return None
+    query, params = state.builder.build_matching_activity_existence_query(
+        range_start=state.window_start, range_end=below
+    )
+    try:
+        result = ulm.V2AnalyticsQueryService().execute_ch_query(
+            query,
+            params,
+            timeout_ms=state.budget.deadline.remaining_ms(),
+            settings=ulm._page_replay_read_settings(max_result_rows=1),
+        )
+    except ReadDeadlineExceeded:
+        state.budget.exhausted_by = "wall"
+        return None
+    except Exception as exc:
+        if not is_read_budget_error(exc):
+            raise
+        logger.warning(
+            "users_matching_walk_tail_probe_failed", error_type=type(exc).__name__
+        )
+        return None
+    return not list(result.data or ())
 
 
 def _certify(state: _WalkState, batch: list[_Candidate]) -> bool:
@@ -407,6 +533,13 @@ def _publish(state: _WalkState, boundary: datetime | None) -> bool:
     return True
 
 
+def _slices_needed(width: timedelta) -> int:
+    """Slices at the cap that ``width`` of window still needs."""
+
+    cap = USER_LIST_WALK_MAX_SLICE
+    return max(-(-width // cap), 0)
+
+
 def walk_matching_activity_page(
     manager: UsersListManager,
     *,
@@ -470,6 +603,7 @@ def walk_matching_activity_page(
     # Every undecided user's newest matching row lies strictly below this line.
     boundary: datetime | None = slice_end
     exhausted = manager.empty_scope or slice_end <= window_start
+    probed = False
     while not exhausted and not state.stopped and len(state.published) < page_size:
         read = _read_slice(
             state,
@@ -482,11 +616,11 @@ def walk_matching_activity_page(
             break
         candidates = read.candidates
         width = slice_end - read.slice_start
-        floor = (
-            min(c.newest_witness for c in candidates)
-            if read.truncated
-            else read.slice_start
-        )
+        floor = read.raw_last[0] if read.truncated else read.slice_start
+        if candidates:
+            # A populated slice re-arms the tail probe: the tail below it is a
+            # new question, and one probe per populated region is the bound.
+            probed = False
         batch_size = USER_LIST_WALK_CERTIFY_BATCH_SIZE
         for start in range(0, len(candidates), batch_size):
             batch = candidates[start : start + batch_size]
@@ -509,8 +643,7 @@ def walk_matching_activity_page(
                 state.stopped = True
                 break
         if read.truncated:
-            last = candidates[-1]
-            before = (last.newest_witness, last.end_user_id)
+            before = read.raw_last
             slice_end = floor + _TICK
             width = max(USER_LIST_WALK_MIN_SLICE, width / 4)
             continue
@@ -522,6 +655,27 @@ def walk_matching_activity_page(
             if not _publish(state, boundary):
                 state.stopped = True
             break
+        if (
+            not candidates
+            and not probed
+            and _slices_needed(slice_end - window_start)
+            > state.budget.remaining_statements()
+        ):
+            # The tail below this empty slice does not fit the statements
+            # left at the cap: ask once whether anything witnessed is down
+            # there at all. Nothing means the window is exhausted; a row, or
+            # a probe the budget refuses or that fails, changes nothing.
+            probed = True
+            empty = _tail_is_empty(state, below=slice_end)
+            if empty is None and state.budget.exhausted_by is not None:
+                state.stopped = True
+                break
+            if empty:
+                exhausted = True
+                boundary = None
+                if not _publish(state, boundary):
+                    state.stopped = True
+                break
         # An empty slice cost only its fixed overhead (the bloom pruned every
         # granule), so its time says nothing about a wider one: widen hard as
         # long as another statement like it fits the wall. A populated slice

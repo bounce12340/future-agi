@@ -374,6 +374,13 @@ INTERACTIVE_READ_SETTING_SPECS = {
                 366 * 24 * 60 * 60,
             ),
             ("USER_LIST_WALK_SLICE_USER_LIMIT", 200, 2, 10_001),
+            # A slice that fails on a read budget is retried at a quarter of
+            # its width down to this floor; below it the failure propagates.
+            ("USER_LIST_WALK_MIN_SLICE_SECONDS", 60, 1, 7 * 24 * 60 * 60),
+            # Users certified per enrichment statement and replayed per
+            # materialisation; the enrichment result is bounded by this times
+            # the requested keys.
+            ("USER_LIST_WALK_CERTIFY_BATCH_SIZE", 25, 1, 1_000),
             ("FILTER_VALUE_READ_MAX_THREADS", 2, 1, 16),
             ("FILTER_SELECTOR_QUERY_TIMEOUT_MS", 2_500, 25, 10_000),
             ("FILTER_SELECTOR_MAX_OPT_IN_QUERY_TIMEOUT_MS", 3_000, 25, 30_000),
@@ -971,6 +978,11 @@ def validate_interactive_read_settings(values: Mapping[str, Numeric]) -> None:
         values["USER_LIST_WALK_INITIAL_SLICE_SECONDS"],
         values["USER_LIST_WALK_MAX_SLICE_SECONDS"],
         "USER_LIST_WALK_INITIAL_SLICE_SECONDS cannot exceed USER_LIST_WALK_MAX_SLICE_SECONDS",
+    )
+    _require_at_most(
+        values["USER_LIST_WALK_MIN_SLICE_SECONDS"],
+        values["USER_LIST_WALK_INITIAL_SLICE_SECONDS"],
+        "USER_LIST_WALK_MIN_SLICE_SECONDS cannot exceed USER_LIST_WALK_INITIAL_SLICE_SECONDS",
     )
     _require_at_most(
         values["FILTER_SELECTOR_QUERY_TIMEOUT_MS"],

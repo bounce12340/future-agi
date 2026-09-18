@@ -351,7 +351,13 @@ def test_two_page_cursor_publishes_every_member_once_in_matching_order(
 
 
 def test_published_totals_are_whole_window_not_slice(ch_client, seeded_tables):
-    with patch.object(walk, "USER_LIST_WALK_SLICE_USER_LIMIT", 2):
+    # Two-id slices make this three-day window a dozen slices, each populated
+    # one followed by its survivor statement; give the page the statements
+    # that shape needs so it finishes instead of returning partial + cursor.
+    with (
+        patch.object(walk, "USER_LIST_WALK_SLICE_USER_LIMIT", 2),
+        patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 48),
+    ):
         read, executor = _read_page(ch_client, seeded_tables, page_size=25)
     rows = {row["user_id"]: row for row in read.payload["table"]}
     assert list(rows) == ["delta", "alpha", "hotel", "echo-old", "bravo"]

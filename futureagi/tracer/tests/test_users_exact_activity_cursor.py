@@ -302,6 +302,12 @@ def test_native_filters_walk_exact_order_and_prove_exhaustion(
 
 
 def test_sparse_raw_numeric_walk_releases_rejected_caches_and_keeps_types():
+    """The seeded page's batch walk over a sparse numeric match.
+
+    A number comparison now takes the matching-activity walk
+    (test_users_matching_walk.py); the seeded page still serves it for a
+    sorted request, and this is that page's cache and type discipline.
+    """
     m = manager([raw_filter()])
     rows = candidates(253)
     calls = []
@@ -331,6 +337,7 @@ def test_sparse_raw_numeric_walk_releases_rejected_caches_and_keeps_types():
             }
 
     with (
+        patch.object(m, "matching_activity_walk_applies", return_value=False),
         patch.object(m, "_read_dimension_candidates", side_effect=reader(rows)),
         patch.object(m, "_enrich_rows", side_effect=enrich),
     ):
