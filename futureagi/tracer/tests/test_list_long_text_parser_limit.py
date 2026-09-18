@@ -248,17 +248,68 @@ def test_span_classifier_carries_the_measured_values_once_and_parses():
     assert _copies(classifier, SECOND_VALUE) == 1
 
 
-def test_span_population_discovery_never_inlines_an_oversized_value():
-    """Discovery locates an interval; past the budget it carries the key only."""
-
-    value = FIRST_VALUE + SECOND_VALUE
-    builder = _span_builder("equals", value)
+def _span_discovery(builder) -> str:
     sql, params = builder.build_filter_population_time_discovery_query(
         slice_start=END - timedelta(days=1), slice_end=END
     )
-    rendered = _render_driver_sql(sql, params)
-    assert _copies(rendered, value) == 0
+    return _render_driver_sql(sql, params)
+
+
+_VALUE_COMPARISON = "lowerUTF8(toString(attrs_string['raw_log'])) IN ("
+
+
+@pytest.mark.parametrize("typed", [False, True], ids=["plain", "picker"])
+@pytest.mark.parametrize(
+    "values",
+    [[MID_VALUE, MID_VALUE + " tail"], [FIRST_VALUE, SECOND_VALUE]],
+    ids=["past-companions", "measured"],
+)
+def test_span_population_discovery_locates_by_value_once_companions_stand_down(
+    typed, values
+):
+    """Discovery carries no comparison of its own, so past the companion
+    budget it inlines the value once and finds the matching hour by it. Key
+    presence alone is no discovery for a key most spans carry: every hour is
+    a hit, and production walked six hours in twelve statements that way."""
+
+    rendered = _span_discovery(_span_builder("in", values, typed=typed))
+    assert _fits(rendered)
+    for value in values:
+        assert _copies(rendered, value) == 1
+    assert _VALUE_COMPARISON in rendered
+    assert "indexHint(hasAny(arrayMap" not in rendered
     assert "has(attrs_string.keys, 'raw_log')" in rendered
+
+
+def test_span_population_discovery_guard_sees_the_bare_key_witness(monkeypatch):
+    """Negative control: preferring a companion-less index witness is what the
+    measurement must catch."""
+
+    monkeypatch.setattr(
+        SpanListQueryBuilderV2,
+        "_population_discovery_witness",
+        lambda self, plan: (
+            plan.raw_index_witness_predicate or plan.raw_witness_predicate
+        ),
+    )
+    rendered = _span_discovery(
+        _span_builder("in", [FIRST_VALUE, SECOND_VALUE], typed=True)
+    )
+    assert _copies(rendered, FIRST_VALUE) == 0
+    assert _VALUE_COMPARISON not in rendered
+
+
+def test_span_population_discovery_keeps_its_companions_for_ordinary_values():
+    """Ordinary values still discover through the deployed blooms, reading no
+    Map value: the literal rides inside the companion only."""
+
+    # One 8 KiB value: inside the 16 KiB companion budget (two of them would
+    # not be, and would take the value-discovery route above instead).
+    rendered = _span_discovery(_span_builder("in", [ORDINARY_VALUE], typed=True))
+    assert _fits(rendered)
+    assert "indexHint(hasAny(arrayMap" in rendered
+    assert _copies(rendered, ORDINARY_VALUE) == 1
+    assert _VALUE_COMPARISON not in rendered
 
 
 def test_the_compiler_hands_back_key_presence_only_past_the_budget():
