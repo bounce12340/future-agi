@@ -487,6 +487,10 @@ def test_bulk_selection_query_budget_formula_is_shared_with_the_resolver():
             "USER_LIST_PAGE_WALL_MS",
             "INTERACTIVE_ANALYTICS_DEFAULT_WALL_MS",
         ),
+        (
+            "USER_LIST_WALK_PROBE_WALL_MS",
+            "USER_LIST_PAGE_WALL_MS",
+        ),
     ),
 )
 def test_interactive_ordered_limits_reject_inverted_values(lower_name, upper_name):

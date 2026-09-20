@@ -39,13 +39,20 @@ bytes or time, so it is COSTED FIRST: ``EXPLAIN ESTIMATE`` of the identical
 text (``build_matching_activity_existence_estimate_query``, index marks only,
 no column data) reports the rows the blooms leave in the tail, and the
 existence statement is issued only when that count fits
-``USER_LIST_WALK_PROBE_TARGET_READ_ROWS``. An estimate over the target, or
-one the walk cannot read, licenses nothing: the walk slices at the cap. The
-estimate never decides coverage - only the existence statement's own answer
-does: none proves the tail exhausted by the same rule an empty slice uses; a
-row proves existence, never a position, and leaves the walk slicing at the
-cap exactly where it was. The pair is asked at most once per page and once
-more after each populated slice, never twice in a row.
+``USER_LIST_WALK_PROBE_TARGET_READ_ROWS``. The estimate is not free: it is the
+existence statement's own index analysis, whose cost is the index granules
+it reads (parts times marks, times cache state), so it runs under the SAME
+read settings as the statement it costs - threads included - and the pair
+shares one budget, ``USER_LIST_WALK_PROBE_WALL_MS`` within the page wall:
+the existence statement, which repeats that analysis before it reads a row,
+is issued only when the estimate's observed time fits what the probe budget
+has left. An estimate over the target, over its time, or one the walk cannot
+read, licenses nothing: the walk slices at the cap. The estimate never
+decides coverage - only the existence statement's own answer does: none
+proves the tail exhausted by the same rule an empty slice uses; a row proves
+existence, never a position, and leaves the walk slicing at the cap exactly
+where it was. The pair is asked at most once per page and once more after
+each populated slice, never twice in a row.
 
 Budget. The walk owns a wall (``USER_LIST_PAGE_WALL_MS``) and a statement
 budget (``USER_LIST_WALK_MAX_STATEMENTS``). On exhaustion it returns the users
@@ -103,6 +110,10 @@ USER_LIST_WALK_CERTIFY_BATCH_SIZE = settings.USER_LIST_WALK_CERTIFY_BATCH_SIZE
 # The rows a tail existence statement may knowingly read (its EXPLAIN
 # ESTIMATE must fit here before it is issued).
 USER_LIST_WALK_PROBE_TARGET_READ_ROWS = settings.USER_LIST_WALK_PROBE_TARGET_READ_ROWS
+# The wall the estimate and the existence statement share, within the page
+# wall: the estimate's own time must fit what is left of it before the
+# existence statement, which repeats that index analysis, is issued.
+USER_LIST_WALK_PROBE_WALL_MS = settings.USER_LIST_WALK_PROBE_WALL_MS
 _TICK = timedelta(microseconds=1)
 
 
@@ -397,36 +408,58 @@ def _read_slice(
         )
 
 
+def _probe_wall_spent(state: _WalkState) -> None:
+    """A deadline raised inside a probe statement: the page's wall, or the probe's.
+
+    An executor that honours ``timeout_ms`` raises for the probe's own
+    deadline; that ends the probe, never the page. Only a page wall that is
+    really spent stops the walk.
+    """
+    try:
+        state.budget.deadline.remaining_ms()
+    except ReadDeadlineExceeded:
+        state.budget.exhausted_by = "wall"
+
+
 def _tail_is_empty(state: _WalkState, *, below: datetime) -> bool | None:
     """Whether no witnessed row lies in ``[window_start, below)``.
 
-    Two statements: the estimate, which costs the existence statement and
-    refuses it when the blooms leave more than
+    Two statements under ONE budget, ``USER_LIST_WALK_PROBE_WALL_MS`` or what
+    is left of the page wall, whichever is smaller: the estimate, which costs
+    the existence statement and refuses it when the blooms leave more than
     ``USER_LIST_WALK_PROBE_TARGET_READ_ROWS`` rows in the tail (or when the
     estimate cannot be read), then the existence statement itself, whose
-    answer alone decides. ``None`` when the walk's budget stops either, when
-    the estimate refuses, or when the existence statement fails on a read
-    budget: a probe that fails licenses nothing, the walk goes on slicing at
-    the cap exactly as it would have without it.
+    answer alone decides. Both run under the existence statement's read
+    settings (threads included): the estimate is that statement's own index
+    analysis, and its observed time is what the existence statement pays
+    again before it reads its first row, so the existence statement is
+    issued only when that time fits what the probe budget has left. ``None``
+    when the walk's budget stops either, when the estimate refuses on rows
+    or on time, or when either statement fails on a read budget: a probe
+    that cannot answer inside its budget licenses nothing, and the walk goes
+    on slicing at the cap exactly as it would have without it.
     """
     from tracer.services import users_list_manager as ulm
 
     if not state.budget.take(1):
         return None
+    # The probe's budget runs on the clock the walk schedules on: the
+    # statement's own client-observed time (``_statement_ms``), the clock the
+    # page wall is measured on too.
+    probe_wall_ms = max(
+        25, min(USER_LIST_WALK_PROBE_WALL_MS, int(state.budget.remaining_ms()))
+    )
+    settings = ulm._page_replay_read_settings(max_result_rows=1)
     query, params = state.builder.build_matching_activity_existence_estimate_query(
         range_start=state.window_start, range_end=below
     )
+    started = time.monotonic()
     try:
         estimate = ulm.V2AnalyticsQueryService().execute_ch_query(
-            query,
-            params,
-            timeout_ms=state.budget.deadline.remaining_ms(),
-            settings=ulm._page_read_settings(
-                max_result_rows=ulm._USER_LIST_ATTR_RESULT_ROWS
-            ),
+            query, params, timeout_ms=probe_wall_ms, settings=settings
         )
     except ReadDeadlineExceeded:
-        state.budget.exhausted_by = "wall"
+        _probe_wall_spent(state)
         return None
     except Exception as exc:
         if not is_read_budget_error(exc):
@@ -435,6 +468,7 @@ def _tail_is_empty(state: _WalkState, *, below: datetime) -> bool | None:
             "users_matching_walk_tail_estimate_failed", error_type=type(exc).__name__
         )
         return None
+    estimate_ms = _statement_ms(estimate, started)
     rows = state.builder.matching_activity_existence_estimate(
         list(estimate.data or ()), getattr(estimate, "columns", None)
     )
@@ -443,6 +477,18 @@ def _tail_is_empty(state: _WalkState, *, below: datetime) -> bool | None:
             "users_matching_walk_tail_probe_refused",
             estimated_rows=rows,
             target_rows=USER_LIST_WALK_PROBE_TARGET_READ_ROWS,
+            estimate_ms=round(estimate_ms, 1),
+        )
+        return None
+    # What the estimate left of the probe's budget; the existence statement
+    # repeats the estimate's index analysis before it reads a row, so it is
+    # issued only when a statement of the estimate's own time fits there.
+    probe_left_ms = probe_wall_ms - estimate_ms
+    if estimate_ms > probe_left_ms:
+        logger.info(
+            "users_matching_walk_tail_probe_over_budget",
+            estimate_ms=round(estimate_ms, 1),
+            probe_wall_ms=probe_wall_ms,
         )
         return None
     if not state.budget.take(1):
@@ -452,13 +498,10 @@ def _tail_is_empty(state: _WalkState, *, below: datetime) -> bool | None:
     )
     try:
         result = ulm.V2AnalyticsQueryService().execute_ch_query(
-            query,
-            params,
-            timeout_ms=state.budget.deadline.remaining_ms(),
-            settings=ulm._page_replay_read_settings(max_result_rows=1),
+            query, params, timeout_ms=max(25, int(probe_left_ms)), settings=settings
         )
     except ReadDeadlineExceeded:
-        state.budget.exhausted_by = "wall"
+        _probe_wall_spent(state)
         return None
     except Exception as exc:
         if not is_read_budget_error(exc):

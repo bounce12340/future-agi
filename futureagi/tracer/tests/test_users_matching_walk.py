@@ -71,6 +71,8 @@ class World:
         )
         self.users[uid] = {
             "key": key,
+            # The user's whole-window cost sits on its OLDEST raw row, so a
+            # replay narrowed to anything newer than that row loses it.
             "cost": cost,
             "aliases": (uid, *alias_ids),
             "curated": curated,
@@ -83,6 +85,21 @@ class World:
             # Spread raw rows over the user's aliases so alias resolution is live.
             self.raw.append((moment, self.users[uid]["aliases"][index % (aliases + 1)]))
         return uid
+
+    def replayed_totals(
+        self, uid: str, low: datetime, high: datetime
+    ) -> tuple[float, int]:
+        """``(total_cost, num_traces)`` of ``uid`` over ``[low, high)``."""
+
+        rows = sorted(
+            moment
+            for moment, raw_id in self.raw
+            if self.canonical[raw_id] == uid and low <= moment < high
+        )
+        every = [moment for moment, raw_id in self.raw if self.canonical[raw_id] == uid]
+        oldest = min(every) if every else None
+        carries_cost = oldest is not None and low <= oldest < high
+        return (self.users[uid]["cost"] if carries_cost else 0.0), len(rows)
 
 
 def kind_of(query: str) -> str:
@@ -116,15 +133,24 @@ class Engine:
         self.slice_ranges: list[tuple[datetime, datetime]] = []
         self.probe_ranges: list[tuple[datetime, datetime]] = []
         self.estimate_ranges: list[tuple[datetime, datetime]] = []
+        self.replay_ranges: list[tuple[datetime, datetime]] = []
         # The estimate table the scripted server returns for a tail: by
         # default the raw rows in range (a true index estimate); a test may
         # set an integer to over-report (bloom false positives with no real
         # row), an empty list for a plan the reducer cannot read, or a list
         # of rows for any other shape.
         self.estimate_override: int | list | None = None
+        # The client-observed time the scripted server reports for the
+        # estimate: what the walk charges the probe's wall.
+        self.estimate_ms: float = 1.0
+        # Per statement: the read settings and the timeout the walk sent.
+        self.settings: list[dict | None] = []
+        self.timeouts: list[float | None] = []
 
     def execute_ch_query(self, query, params=None, timeout_ms=None, settings=None):
         self.calls.append(query)
+        self.settings.append(settings)
+        self.timeouts.append(timeout_ms)
         params = params or {}
         kind = kind_of(query)
         if kind == "slice":
@@ -197,7 +223,7 @@ class Engine:
                 }
             ],
             columns=columns,
-            query_time_ms=1.0,
+            query_time_ms=self.estimate_ms,
         )
 
     def _remap(self, params):
@@ -234,19 +260,26 @@ class Engine:
     def _replay(self, params):
         ids = tuple(params["candidate_end_user_ids"])
         self.replayed.append(ids)
+        # The replay answers over the window the statement carries, so a
+        # replay narrowed to a slice returns that slice's totals, not the
+        # window's: the totals guard can see it.
+        low = _from_us(params["user_window_start_us"])
+        high = _from_us(params["user_window_end_us"])
+        self.replay_ranges.append((low, high))
         data = []
         for uid in ids:
             user = self.world.users[uid]
             if not user["curated"]:
                 continue
+            total_cost, num_traces = self.world.replayed_totals(uid, low, high)
             data.append(
                 {
                     "user_id": user["name"],
-                    "total_cost": user["cost"],
+                    "total_cost": total_cost,
                     "total_tokens": 10,
                     "input_tokens": 6,
                     "output_tokens": 4,
-                    "num_traces": 1,
+                    "num_traces": num_traces,
                     "num_sessions": 0,
                     "activated_at": WINDOW_START,
                     "last_active": user["key"],
@@ -416,9 +449,19 @@ def test_floor_rule_carries_a_stale_witness_below_the_slice_floor():
 
 
 def test_totals_come_from_the_whole_window_replay_for_published_users_only():
+    """The scripted replay answers over the window its statement carries.
+
+    The published user's cost sits on a raw row twelve hours below the
+    one-hour slice that discovered it: a replay narrowed to that slice (or
+    to anything newer than the window's start) returns zero, so this guard
+    sees a narrowed replay, not only a missing one.
+    """
     world = World()
     published = world.user(
-        1, key=minutes_before_end(5), raw=(minutes_before_end(5),), cost=6.0
+        1,
+        key=minutes_before_end(5),
+        raw=(minutes_before_end(5), minutes_before_end(720)),
+        cost=6.0,
     )
     carried = world.user(
         2, key=minutes_before_end(40), raw=(minutes_before_end(40),), cost=9.0
@@ -429,9 +472,13 @@ def test_totals_come_from_the_whole_window_replay_for_published_users_only():
 
     assert _names(read) == ["user-1"]
     assert read.payload["table"][0]["total_cost"] == 6.0
-    # One replay, for the published user alone: the carried member and the
-    # stale witness were never replayed, and nothing was summed from a slice.
+    assert read.payload["table"][0]["num_traces"] == 2
+    # One replay, for the published user alone, over the whole window: the
+    # carried member and the stale witness were never replayed, and nothing
+    # was summed from a slice.
     assert engine.replayed == [(published,)]
+    assert engine.replay_ranges == [(WINDOW_START, WINDOW_END)]
+    assert engine.slice_ranges[0][0] > minutes_before_end(720)
     assert carried not in {uid for ids in engine.replayed for uid in ids}
     assert read.has_more is True
     assert read.unseen_row_proven is False
@@ -508,21 +555,26 @@ def test_budget_exhaustion_returns_partial_page_and_cursor_without_fallback():
 def test_slice_read_exhaustion_returns_partial_page_and_cursor_without_fallback():
     """The budget can run out AT a slice read; that path issues no seed either.
 
-    The first slice is empty, so the walk wants a second one. With one
-    statement in the budget the second read is refused before it is sent;
-    with the wall spent inside the transport the read raises. Both end the
-    page with a cursor at the first slice's start and never issue the
-    whole-window statement.
+    The first slice is populated and spends four statements (slice, survivor,
+    certification, replay) publishing its user; the page is not full, so the
+    walk wants a second slice. With four statements in the budget that read
+    is refused before it is sent, inside ``_read_slice``: a tail probe is
+    never asked below a populated slice, so this is the only budget refusal
+    that reaches the slice read itself. With the wall spent inside the
+    transport the read raises instead. Both end the page with a cursor at
+    the first slice's start and never issue the whole-window statement.
     """
     world = World()
-    world.user(1, key=minutes_before_end(600), raw=(minutes_before_end(600),))
+    world.user(1, key=minutes_before_end(3), raw=(minutes_before_end(3),))
 
-    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 1):
+    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 4):
         read, engine = _page(world, page_size=25)
-    assert _kinds(engine) == ["slice"]
-    assert read.payload["table"] == [] and read.has_more is True
+    assert _kinds(engine) == ["slice", "remap", "enrich", "replay"]
+    assert _names(read) == ["user-1"] and read.has_more is True
     assert read.checkpoint_order[3] == engine.slice_ranges[0][0] + walk._TICK
 
+    world = World()
+    world.user(1, key=minutes_before_end(600), raw=(minutes_before_end(600),))
     engine = Engine(world)
     original = engine.execute_ch_query
 
@@ -738,6 +790,82 @@ def test_a_probe_the_budget_refuses_or_that_fails_licenses_nothing():
     with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 2):
         read, engine = _page(world, page_size=25, filters=thirty_days, engine=engine)
     assert _kinds(engine) == ["slice", "estimate"]
+    assert read.has_more is True and read.payload["table"] == []
+
+
+def test_the_estimate_runs_under_the_existence_statements_settings_in_the_probe_wall():
+    """The estimate is the existence statement's own index analysis.
+
+    It goes out under the SAME read settings as the statement it costs -
+    the parallel page-replay settings, eight threads, not the one-thread
+    page settings - and both carry the probe's own deadline, never more
+    than ``USER_LIST_WALK_PROBE_WALL_MS``, the existence statement getting
+    what the estimate left of it.
+    """
+    from tracer.services import users_list_manager as ulm
+
+    thirty_days = _filters(window_start=WINDOW_END - timedelta(days=30))
+    read, engine = _page(World(), page_size=25, filters=thirty_days)
+
+    assert _kinds(engine) == ["slice", "estimate", "probe"]
+    assert read.has_more is False
+    expected = ulm._page_replay_read_settings(max_result_rows=1)
+    assert expected["max_threads"] == 8
+    assert engine.settings[1] == expected and engine.settings[2] == expected
+    assert engine.settings[1] != ulm._page_read_settings(max_result_rows=1)
+    assert 0 < engine.timeouts[1] <= walk.USER_LIST_WALK_PROBE_WALL_MS
+    assert 0 < engine.timeouts[2] <= engine.timeouts[1]
+
+
+def test_an_estimate_over_its_time_budget_licenses_no_wide_statement():
+    """A probe that cannot answer inside its budget is 'cannot answer'.
+
+    The existence statement repeats the estimate's index analysis before it
+    reads a row, so when the estimate's own observed time does not fit what
+    is left of the probe wall the statement is not issued and the walk
+    slices at the cap - and the PAGE goes on: the probe's budget is not the
+    page's wall.
+    """
+    thirty_days = _filters(window_start=WINDOW_END - timedelta(days=30))
+    engine = Engine(World())
+    engine.estimate_ms = walk.USER_LIST_WALK_PROBE_WALL_MS / 2 + 1
+    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 4):
+        read, engine = _page(World(), page_size=25, filters=thirty_days, engine=engine)
+    assert _kinds(engine) == ["slice", "estimate", "slice", "slice"]
+    assert read.has_more is True and read.payload["table"] == []
+    cap = walk.USER_LIST_WALK_MAX_SLICE
+    assert max(high - low for low, high in engine.slice_ranges) <= cap
+
+    # Within the budget, the statement is issued.
+    engine = Engine(World())
+    engine.estimate_ms = walk.USER_LIST_WALK_PROBE_WALL_MS / 2 - 50
+    read, engine = _page(World(), page_size=25, filters=thirty_days, engine=engine)
+    assert _kinds(engine) == ["slice", "estimate", "probe"]
+    assert read.has_more is False
+
+
+def test_a_probe_deadline_raised_in_the_transport_ends_the_probe_not_the_page():
+    """An executor that honours ``timeout_ms`` raises for the probe's deadline.
+
+    That ends the probe (no existence statement, nothing licensed) and the
+    walk slices on at the cap; only a page wall that is really spent stops
+    the page.
+    """
+    thirty_days = _filters(window_start=WINDOW_END - timedelta(days=30))
+    world = World()
+    engine = Engine(world)
+    original = engine.execute_ch_query
+
+    def probe_deadline(query, params=None, timeout_ms=None, settings=None):
+        if kind_of(query) == "estimate":
+            engine.calls.append(query)
+            raise ReadDeadlineExceeded("probe deadline exceeded")
+        return original(query, params, timeout_ms, settings)
+
+    engine.execute_ch_query = probe_deadline
+    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 4):
+        read, engine = _page(world, page_size=25, filters=thirty_days, engine=engine)
+    assert _kinds(engine) == ["slice", "estimate", "slice", "slice"]
     assert read.has_more is True and read.payload["table"] == []
 
 
@@ -1169,3 +1297,4 @@ def test_walk_limits_are_runtime_settings_not_module_constants():
     assert walk.USER_LIST_WALK_PROBE_TARGET_READ_ROWS == (
         settings.USER_LIST_WALK_PROBE_TARGET_READ_ROWS
     )
+    assert walk.USER_LIST_WALK_PROBE_WALL_MS == settings.USER_LIST_WALK_PROBE_WALL_MS

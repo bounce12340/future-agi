@@ -393,6 +393,16 @@ INTERACTIVE_READ_SETTING_SPECS = {
             # 3.3 GB and 1.2 s at eight threads, a fifth of the page wall, and
             # a slice of a common value at the one-day cap reads 2.4M.
             ("USER_LIST_WALK_PROBE_TARGET_READ_ROWS", 1_000_000, 8_192, 50_000_000),
+            # The wall the estimate and the existence statement share, inside
+            # the page wall. The estimate is the existence statement's own
+            # index analysis under the same read settings; the existence
+            # statement repeats it before reading a row, so it is issued only
+            # when the estimate's observed time fits what is left here (at
+            # most half the wall). Basis: the twelve-month text estimate on
+            # the largest tenant at eight threads measured 135-456 ms server
+            # (95 parts, 16k marks; 3.2 s at one thread on a cold index), the
+            # boolean-key estimate 114-117 ms (395 parts, 33k marks).
+            ("USER_LIST_WALK_PROBE_WALL_MS", 1_000, 25, 60_000),
             ("FILTER_VALUE_READ_MAX_THREADS", 2, 1, 16),
             ("FILTER_SELECTOR_QUERY_TIMEOUT_MS", 2_500, 25, 10_000),
             ("FILTER_SELECTOR_MAX_OPT_IN_QUERY_TIMEOUT_MS", 3_000, 25, 30_000),
@@ -995,6 +1005,11 @@ def validate_interactive_read_settings(values: Mapping[str, Numeric]) -> None:
         values["USER_LIST_WALK_MIN_SLICE_SECONDS"],
         values["USER_LIST_WALK_INITIAL_SLICE_SECONDS"],
         "USER_LIST_WALK_MIN_SLICE_SECONDS cannot exceed USER_LIST_WALK_INITIAL_SLICE_SECONDS",
+    )
+    _require_at_most(
+        values["USER_LIST_WALK_PROBE_WALL_MS"],
+        values["USER_LIST_PAGE_WALL_MS"],
+        "USER_LIST_WALK_PROBE_WALL_MS cannot exceed USER_LIST_PAGE_WALL_MS",
     )
     _require_at_most(
         values["FILTER_SELECTOR_QUERY_TIMEOUT_MS"],

@@ -703,7 +703,12 @@ class UserListQueryBuilder(BaseQueryBuilder):
         statement before the walk issues it; it never decides coverage,
         because a planner's estimate is not a row read. The wrapped text is
         exactly the existence statement, settings clause included, so the
-        cost proven is the cost paid.
+        rows it reports are the rows that statement reads. The estimate
+        itself is that statement's index analysis, and costs what the
+        analysis costs - the index granules of every selected part, read at
+        the caller's thread count and cache state - which is why the walk
+        runs it under the existence statement's own read settings and
+        inside the probe's wall.
         """
         query, params = self.build_matching_activity_existence_query(
             range_start=range_start, range_end=range_end
