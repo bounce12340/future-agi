@@ -831,10 +831,30 @@ class ClickHouseFilterBuilder:
         self._params: dict[str, Any] = {}
 
     def _candidate_filter(self, column: str) -> str:
-        """Bound a relational/filter subquery to the active <=200-ID batch."""
+        """Bound a relational/filter subquery to the active <=200-ID batch.
+
+        The spans table's ``trace_id`` is compared bare. It is a ``String``
+        column (``002_spans_v2.sql``) and is not one of ``_UUID_COLUMNS``, so
+        the ``toString`` every other column takes here changed no value on it;
+        it only hid the column from ``idx_trace_id`` and from the sorting key.
+        Each classifier residual membership subquery therefore read the
+        project's whole retained span history per candidate chunk, whatever
+        its ``IN`` set held. Measured on production's high-volume tenant, the
+        user-detail Traces page at thirty days: the seed completed, and the
+        classifier died at the 9.5 s wall as ``ExceptionBeforeStart`` with
+        zero bytes read, on eighteen candidates - the set is built while
+        planning, before the first progress packet. The same statement already
+        binds ``trace_id IN %(candidate_trace_ids)s`` bare in its innermost
+        replay with the same literals, so the bare form admits exactly the rows
+        the cast did and fails nowhere the statement did not already fail.
+        Every other column keeps the cast: the trace-tags table's ``id`` and
+        the Score-side expressions are not this column.
+        """
 
         if self.candidate_ids_param is None:
             return ""
+        if column == "trace_id":
+            return f" AND {column} IN %({self.candidate_ids_param})s"
         return f" AND toString({column}) IN %({self.candidate_ids_param})s"
 
     def _candidate_span_entity_filter(
@@ -1406,7 +1426,8 @@ class ClickHouseFilterBuilder:
             # Annotation controls retain legacy/native routing, but never
             # override an explicit raw attribute or eval-value source.
             if col_id == "my_annotations" and col_type not in {
-                self.SPAN_ATTRIBUTE, self.EVAL_METRIC,
+                self.SPAN_ATTRIBUTE,
+                self.EVAL_METRIC,
             }:
                 cond = self._build_my_annotations_condition(
                     filter_value, config, filter_op
@@ -1416,7 +1437,8 @@ class ClickHouseFilterBuilder:
                 continue
 
             if col_id == "annotator" and col_type not in {
-                self.SPAN_ATTRIBUTE, self.EVAL_METRIC,
+                self.SPAN_ATTRIBUTE,
+                self.EVAL_METRIC,
             }:
                 cond = self._build_annotator_condition(filter_value, filter_op)
                 if cond:
@@ -1425,7 +1447,9 @@ class ClickHouseFilterBuilder:
 
             # Handle has_eval filter — subquery against tracer_eval_logger
             if col_id == "has_eval" and col_type not in {
-                self.SPAN_ATTRIBUTE, self.EVAL_METRIC, self.ANNOTATION,
+                self.SPAN_ATTRIBUTE,
+                self.EVAL_METRIC,
+                self.ANNOTATION,
             }:
                 cond = self._build_has_eval_condition(filter_value, filter_op)
                 if cond:
@@ -1434,7 +1458,8 @@ class ClickHouseFilterBuilder:
 
             # Handle has_annotation filter — subquery against model_hub_score
             if col_id == "has_annotation" and col_type not in {
-                self.SPAN_ATTRIBUTE, self.EVAL_METRIC,
+                self.SPAN_ATTRIBUTE,
+                self.EVAL_METRIC,
             }:
                 cond = self._build_has_annotation_condition(filter_value, filter_op)
                 if cond:
