@@ -13,12 +13,16 @@ byte-identical on both lanes, which is the property
 ``test_gate_never_narrows_the_statement_window`` states directly.
 """
 
+import time
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from inspect import unwrap
 from types import SimpleNamespace
 
 import pytest
 
 from tracer.services.clickhouse import graph_dispatch, graph_read_cost
+from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
 
 PROJECT_ID = "3f7d5b3a-2c41-4f8e-9b0d-5a1c7e2f4d60"
 ORG_ID = "6a2b1c4d-8e3f-4a5b-9c7d-0e1f2a3b4c5d"
@@ -941,3 +945,223 @@ def test_users_graph_rate_keeps_the_reference_windows_where_measured():
     assert graph_read_cost.raw_graph_scan_fits_wall(
         SIX_MONTHS_ON_THE_REFERENCE_TENANT, remaining_ms=background
     )
+
+
+# --- a probe that stalls past the wall is "cannot answer", on both gates ----
+#
+# The review of this gate found the one way it still differed from the raw
+# gate it mirrors. ``_DeadlineBoundGraphAnalytics.remaining_read_ms`` RAISES
+# ``ReadDeadlineExceeded`` once the interactive wall is spent, and the users
+# gate asked it twice outside any ``except`` - once for the probe's timeout
+# and once for the affordability arithmetic. A probe that stalled past the
+# wall therefore left the gate as an exception rather than a verdict. The
+# view (``ProjectView.get_users_aggregate_graph_data``) re-raises whatever
+# this reader throws, and its outer handler answers HTTP 503
+# ``service_unavailable`` - a terminal "retry" for a read that was owed a
+# scheduled refresh, and every retry re-probes, stalls and refuses again, so
+# the chart never arrives - where the raw gate under the identical stall
+# returns its degraded-or-scheduled payload. On the candidate base the same
+# stall degraded and scheduled, because ``is_read_budget_error`` accepts the
+# deadline error; the gate must not be the one place the deadline escapes.
+
+A_SHORT_WALL_MS = 100
+A_STALL_PAST_IT_S = 0.15
+# Fits every wall at BOTH statements' rates (553 and 1,796 rows/ms), so the
+# two gates diverge only if one of them lets the expired wall escape.
+A_WEEK_ON_THE_REFERENCE_TENANT = 2_140_000
+
+
+class _StalledProbeAnalytics(Analytics):
+    """The cost probe answers, but only after the interactive wall is spent."""
+
+    def execute_ch_query(self, query, params, **kwargs):
+        if "graph_cost_project_id" in query:
+            time.sleep(A_STALL_PAST_IT_S)
+        return super().execute_ch_query(query, params, **kwargs)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "organization_id",
+    [
+        pytest.param(None, id="no_background_lane_degrades"),
+        pytest.param(ORG_ID, id="background_lane_schedules"),
+    ],
+)
+def test_users_graph_probe_that_stalls_past_the_wall_answers_like_the_raw_gate(
+    scheduled, users_reader, organization_id
+):
+    """The reviewer's reproduction, kept: a stalled probe is a verdict, not a 500.
+
+    Both gates are given the identical shape - a probe that sleeps past a
+    100 ms wall and then answers a row count every wall affords - and the
+    users gate must return byte-for-byte the payload the raw gate returns:
+    the degraded ``read_budget_exceeded`` / ``read_cost_gate`` envelope when
+    there is no background lane to schedule to, and the pending envelope of
+    one scheduled refresh when there is. Neither issues its statement.
+    """
+
+    raw = _StalledProbeAnalytics(estimated_rows=A_WEEK_ON_THE_REFERENCE_TENANT)
+    raw_response = graph_dispatch.fetch_system_metric_graph_ch(
+        analytics=raw,
+        project_id=PROJECT_ID,
+        filters=[_window(), _attribute_filter()],
+        interval="day",
+        metric_id="traffic",
+        observe_type="trace",
+        timeout_ms=A_SHORT_WALL_MS,
+        organization_id=organization_id,
+        workspace_id=None,
+    )
+
+    users = _StalledProbeAnalytics(estimated_rows=A_WEEK_ON_THE_REFERENCE_TENANT)
+    try:
+        users_response = graph_dispatch.fetch_user_system_metric_graph_ch(
+            analytics=users,
+            project_id=PROJECT_ID,
+            filters=[_window()],
+            interval="day",
+            metric_id="traffic",
+            timeout_ms=A_SHORT_WALL_MS,
+            organization_id=organization_id,
+            workspace_id=None,
+        )
+    except ReadDeadlineExceeded:
+        pytest.fail(
+            "the users gate let the expired wall escape as an exception; "
+            "the view refuses that as a 503 instead of scheduling the read"
+        )
+
+    assert users_response == raw_response, (
+        "a stalled probe must produce the same verdict on both gates"
+    )
+    assert users_reader == [], "the users statement must not be issued"
+    assert raw.statements == [], "the raw statement must not be issued"
+    assert len(users.cost_probes) == 1
+    assert len(raw.cost_probes) == 1
+    if organization_id is None:
+        assert scheduled.enqueued == []
+        assert users_response["query_status"] == "degraded"
+        assert users_response["query_error_code"] == "read_budget_exceeded"
+        assert users_response["query_provenance"] == "read_cost_gate"
+    else:
+        assert users_response["query_status"] == "pending"
+        assert users_response["query_refreshing"] is True
+        assert {call[0] for call in scheduled.enqueued} == {
+            "observe-system-graph",
+            "observe-user-system-graph",
+        }
+        assert len(scheduled.enqueued) == 2, "one refresh per gate, no retry"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("estimated_rows", "expected_status", "expected_code"),
+    [
+        pytest.param(
+            A_WEEK_ON_THE_REFERENCE_TENANT,
+            200,
+            None,
+            id="schedulable_read_returns_the_pending_envelope",
+        ),
+        pytest.param(
+            SIX_MONTHS_ON_THE_REFERENCE_TENANT,
+            503,
+            "service_unavailable",
+            id="hopeless_read_is_refused_as_unavailable",
+        ),
+    ],
+)
+def test_the_users_graph_view_never_sees_the_expired_wall_from_the_gate(
+    monkeypatch, scheduled, users_reader, estimated_rows, expected_status, expected_code
+):
+    """The public action, the real dispatcher, and a probe that stalls.
+
+    ``ProjectView.get_users_aggregate_graph_data`` re-raises anything the
+    dispatcher throws (``logger.warning(...); raise``) into an outer handler
+    that answers HTTP 503 ``service_unavailable``. A 503 is also what a
+    DEGRADED payload legitimately becomes at this view, so status alone
+    cannot tell the escape from the verdict: the guard records the view's
+    own logger and requires that neither of its exception handlers fired -
+    the deadline must never reach the view as an exception at all. Only the
+    request's PostgreSQL scope, its namespace validation and its project
+    lookup are stubbed; the dispatcher, its deadline wrapper, the gate and
+    the payload contract are the production code. The action's remaining
+    budget is injected as 100 ms so the probe's stall spends it.
+    """
+
+    from tracer.views import project as project_view
+
+    seen_by_the_view = []
+
+    class _RecordingLogger:
+        def __getattr__(self, method):
+            def _record(event=None, *_args, **fields):
+                seen_by_the_view.append((method, event, fields))
+
+            return _record
+
+    monkeypatch.setattr(project_view, "logger", _RecordingLogger())
+
+    @contextmanager
+    def postgres_scope(_deadline):
+        yield
+
+    monkeypatch.setattr(project_view, "graph_action_postgres_budget", postgres_scope)
+    monkeypatch.setattr(
+        project_view,
+        "validate_property_graph_namespace",
+        lambda *_args, **_kwargs: None,
+    )
+    analytics = _StalledProbeAnalytics(estimated_rows=estimated_rows)
+    monkeypatch.setattr(project_view, "V2AnalyticsQueryService", lambda: analytics)
+
+    view = project_view.ProjectView()
+    monkeypatch.setattr(
+        view,
+        "_get_project_in_scope",
+        lambda _project_id: SimpleNamespace(organization_id=ORG_ID),
+    )
+    request = SimpleNamespace(
+        validated_query_data={"allow_sampled": False, "refresh": False},
+        validated_data={
+            "project_id": PROJECT_ID,
+            "filters": [_window()],
+            "interval": "day",
+            "req_data_config": {"id": "active_users", "type": "SYSTEM_METRIC"},
+        },
+        workspace=SimpleNamespace(id=None, is_default=False),
+        user=SimpleNamespace(organization=SimpleNamespace(id=ORG_ID)),
+    )
+    view.request = request
+
+    class _RemainingActionWall:
+        def remaining_ms(self, cap_ms=None, *, floor_ms=1):
+            return A_SHORT_WALL_MS
+
+    action = unwrap(project_view.ProjectView.get_users_aggregate_graph_data)
+    response = action(view, request, _graph_action_deadline=_RemainingActionWall())
+
+    assert response.status_code == expected_status
+    if expected_code is not None:
+        assert response.data["code"] == expected_code
+    else:
+        assert response.data["result"]["query_status"] == "pending"
+    # The deadline never reached the view as an exception: neither the
+    # reader's re-raise nor the outer handler that maps it to a 503 fired.
+    handlers_fired = [
+        record
+        for record in seen_by_the_view
+        if record[1]
+        in {
+            "CH user time-series failed",
+            "project_users_graph_unavailable",
+            "project_users_graph_failed",
+        }
+        or record[2].get("error_type") == "ReadDeadlineExceeded"
+    ]
+    assert handlers_fired == [], handlers_fired
+    # The guard holds for the right reason: the gate ran, stalled, and ruled;
+    # the statement was never issued on the spent wall.
+    assert len(analytics.cost_probes) == 1
+    assert users_reader == []

@@ -2115,18 +2115,29 @@ def _affordable_user_graph_read(
     if analyzed.empty or analyzed.start is None or analyzed.end is None:
         return None
     scan_start, scan_end = user_graph_scan_window(analyzed.start, analyzed.end)
-    estimated_rows = estimate_user_graph_scan_rows(
-        analytics=analytics,
-        project_id=project_id,
-        scan_start=scan_start,
-        scan_end=scan_end,
-        timeout_ms=analytics.remaining_read_ms(interactive_deadline_ms),
-    )
-    if user_graph_scan_fits_wall(
-        estimated_rows,
-        remaining_ms=analytics.remaining_read_ms(interactive_deadline_ms),
-    ):
-        return None
+    estimated_rows: int | None = None
+    try:
+        estimated_rows = estimate_user_graph_scan_rows(
+            analytics=analytics,
+            project_id=project_id,
+            scan_start=scan_start,
+            scan_end=scan_end,
+            timeout_ms=analytics.remaining_read_ms(interactive_deadline_ms),
+        )
+        if user_graph_scan_fits_wall(
+            estimated_rows,
+            remaining_ms=analytics.remaining_read_ms(interactive_deadline_ms),
+        ):
+            return None
+    except ReadDeadlineExceeded:
+        # The request wall is already gone - a probe that stalled past it, or
+        # a wall that had expired before the probe was even issued. That is
+        # the plainest possible proof that this statement cannot run on it,
+        # and the same verdict the raw gate returns: schedule, never scan, and
+        # never let the deadline escape as an exception the view would turn
+        # into a 503 refusal. ``estimated_rows`` carries whatever the probe managed to
+        # answer so the background wall is costed from it, not re-probed.
+        return _GraphReadUnaffordable(estimated_rows)
     return _GraphReadUnaffordable(estimated_rows)
 
 
