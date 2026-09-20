@@ -29,13 +29,23 @@ row rediscovers them. Moving the LIMIT from resolved users to raw ids keeps
 that rule: every raw id with a witnessed row above the floor is returned, so
 every user with such a row is represented and its newest witness is exact.
 
-Empty tail. After an untruncated empty slice, when the rest of the window
-needs more slices at the cap than the statement budget has left, one
-existence statement (``build_matching_activity_existence_query``, ``LIMIT 1``
-through the same blooms) asks whether any witnessed row lies below the slice
-at all; none proves the window exhausted by the same rule an empty slice
-uses, a row leaves the walk exactly where it was. It is issued at most once
-per page and once more after each populated slice, never twice in a row.
+Empty tail, costed. After an untruncated empty slice, when the rest of the
+window needs more slices at the cap than the statement budget has left, the
+walk may prove the whole tail empty in one existence statement
+(``build_matching_activity_existence_query``, ``LIMIT 1`` through the same
+blooms) instead of one slice per day. That statement is wider than the slice
+cap, and nothing on the application read path bounds a statement's rows,
+bytes or time, so it is COSTED FIRST: ``EXPLAIN ESTIMATE`` of the identical
+text (``build_matching_activity_existence_estimate_query``, index marks only,
+no column data) reports the rows the blooms leave in the tail, and the
+existence statement is issued only when that count fits
+``USER_LIST_WALK_PROBE_TARGET_READ_ROWS``. An estimate over the target, or
+one the walk cannot read, licenses nothing: the walk slices at the cap. The
+estimate never decides coverage - only the existence statement's own answer
+does: none proves the tail exhausted by the same rule an empty slice uses; a
+row proves existence, never a position, and leaves the walk slicing at the
+cap exactly where it was. The pair is asked at most once per page and once
+more after each populated slice, never twice in a row.
 
 Budget. The walk owns a wall (``USER_LIST_PAGE_WALL_MS``) and a statement
 budget (``USER_LIST_WALK_MAX_STATEMENTS``). On exhaustion it returns the users
@@ -90,6 +100,9 @@ USER_LIST_WALK_SLICE_USER_LIMIT = settings.USER_LIST_WALK_SLICE_USER_LIMIT
 USER_LIST_WALK_MIN_SLICE = timedelta(seconds=settings.USER_LIST_WALK_MIN_SLICE_SECONDS)
 # Users certified per enrichment statement and replayed per materialisation.
 USER_LIST_WALK_CERTIFY_BATCH_SIZE = settings.USER_LIST_WALK_CERTIFY_BATCH_SIZE
+# The rows a tail existence statement may knowingly read (its EXPLAIN
+# ESTIMATE must fit here before it is issued).
+USER_LIST_WALK_PROBE_TARGET_READ_ROWS = settings.USER_LIST_WALK_PROBE_TARGET_READ_ROWS
 _TICK = timedelta(microseconds=1)
 
 
@@ -387,12 +400,51 @@ def _read_slice(
 def _tail_is_empty(state: _WalkState, *, below: datetime) -> bool | None:
     """Whether no witnessed row lies in ``[window_start, below)``.
 
-    ``None`` when the walk's budget stops the statement, or when it fails on
-    a read budget: a probe that fails licenses nothing, the walk goes on
-    slicing at the cap exactly as it would have without it.
+    Two statements: the estimate, which costs the existence statement and
+    refuses it when the blooms leave more than
+    ``USER_LIST_WALK_PROBE_TARGET_READ_ROWS`` rows in the tail (or when the
+    estimate cannot be read), then the existence statement itself, whose
+    answer alone decides. ``None`` when the walk's budget stops either, when
+    the estimate refuses, or when the existence statement fails on a read
+    budget: a probe that fails licenses nothing, the walk goes on slicing at
+    the cap exactly as it would have without it.
     """
     from tracer.services import users_list_manager as ulm
 
+    if not state.budget.take(1):
+        return None
+    query, params = state.builder.build_matching_activity_existence_estimate_query(
+        range_start=state.window_start, range_end=below
+    )
+    try:
+        estimate = ulm.V2AnalyticsQueryService().execute_ch_query(
+            query,
+            params,
+            timeout_ms=state.budget.deadline.remaining_ms(),
+            settings=ulm._page_read_settings(
+                max_result_rows=ulm._USER_LIST_ATTR_RESULT_ROWS
+            ),
+        )
+    except ReadDeadlineExceeded:
+        state.budget.exhausted_by = "wall"
+        return None
+    except Exception as exc:
+        if not is_read_budget_error(exc):
+            raise
+        logger.warning(
+            "users_matching_walk_tail_estimate_failed", error_type=type(exc).__name__
+        )
+        return None
+    rows = state.builder.matching_activity_existence_estimate(
+        list(estimate.data or ()), getattr(estimate, "columns", None)
+    )
+    if rows is None or rows > USER_LIST_WALK_PROBE_TARGET_READ_ROWS:
+        logger.info(
+            "users_matching_walk_tail_probe_refused",
+            estimated_rows=rows,
+            target_rows=USER_LIST_WALK_PROBE_TARGET_READ_ROWS,
+        )
+        return None
     if not state.budget.take(1):
         return None
     query, params = state.builder.build_matching_activity_existence_query(
@@ -662,9 +714,11 @@ def walk_matching_activity_page(
             > state.budget.remaining_statements()
         ):
             # The tail below this empty slice does not fit the statements
-            # left at the cap: ask once whether anything witnessed is down
-            # there at all. Nothing means the window is exhausted; a row, or
-            # a probe the budget refuses or that fails, changes nothing.
+            # left at the cap: cost one existence statement over it and, if
+            # it fits, ask once whether anything witnessed is down there at
+            # all. Nothing means the window is exhausted; a row, an estimate
+            # over the target, or a statement the budget refuses or that
+            # fails, changes nothing: the walk slices on at the cap.
             probed = True
             empty = _tail_is_empty(state, below=slice_end)
             if empty is None and state.budget.exhausted_by is not None:

@@ -381,6 +381,18 @@ INTERACTIVE_READ_SETTING_SPECS = {
             # materialisation; the enrichment result is bounded by this times
             # the requested keys.
             ("USER_LIST_WALK_CERTIFY_BATCH_SIZE", 25, 1, 1_000),
+            # The rows a walk's tail existence statement may knowingly read.
+            # After an empty slice whose tail does not fit the statement
+            # budget at the slice cap, the walk asks EXPLAIN ESTIMATE how many
+            # rows the blooms leave in the whole tail and issues the one
+            # existence statement only when that count fits here; otherwise
+            # it keeps slicing at the cap. Rows, not bytes: neither the
+            # estimate nor the transport's result carries bytes. Basis: on the
+            # largest tenant an uncosted tail statement read 1.38M rows =
+            # 4.7 GB in 1.66 s (rig run r2b); a million rows there is about
+            # 3.3 GB and 1.2 s at eight threads, a fifth of the page wall, and
+            # a slice of a common value at the one-day cap reads 2.4M.
+            ("USER_LIST_WALK_PROBE_TARGET_READ_ROWS", 1_000_000, 8_192, 50_000_000),
             ("FILTER_VALUE_READ_MAX_THREADS", 2, 1, 16),
             ("FILTER_SELECTOR_QUERY_TIMEOUT_MS", 2_500, 25, 10_000),
             ("FILTER_SELECTOR_MAX_OPT_IN_QUERY_TIMEOUT_MS", 3_000, 25, 30_000),

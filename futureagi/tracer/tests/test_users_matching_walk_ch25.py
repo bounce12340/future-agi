@@ -22,6 +22,9 @@ from clickhouse_driver import Client
 from conftest import _require_safe_ch25_test_target
 from tracer.services import users_matching_walk as walk
 from tracer.services.clickhouse.list_cursor import ListCursor
+from tracer.services.clickhouse.v2.query_builders.user_list import (
+    UserListQueryBuilderV2,
+)
 from tracer.services.users_list_manager import UsersListManager
 
 CH_HOST = os.environ.get("CH25_HOST", "127.0.0.1")
@@ -87,10 +90,12 @@ def ch_client(ch_database):
 
 @pytest.fixture(scope="module")
 def seeded_tables(ch_client):
-    suffix = uuid.uuid4().hex[:8]
-    spans = f"_test_walk_spans_{suffix}"
-    end_users = f"_test_walk_end_users_{suffix}"
-    remap = f"_test_walk_remap_{suffix}"
+    # The production names, inside this module's own throwaway database: the
+    # walk's EXPLAIN ESTIMATE reducer accepts the ``spans`` table alone, so
+    # the statements must reach the server naming it.
+    spans = "spans"
+    end_users = "end_users"
+    remap = "end_user_id_remap"
     ch_client.execute(
         f"""
         CREATE TABLE {spans} (
@@ -111,11 +116,18 @@ def seeded_tables(ch_client):
             prompt_tokens Int32,
             completion_tokens Int32,
             is_deleted UInt8,
-            _version UInt64
+            _version UInt64,
+            INDEX idx_attrs_str_keys mapKeys(attrs_string) TYPE bloom_filter(0.01) GRANULARITY 1,
+            INDEX idx_attrs_num_keys mapKeys(attrs_number) TYPE bloom_filter(0.01) GRANULARITY 1,
+            INDEX idx_attrs_bool_keys mapKeys(attrs_bool) TYPE bloom_filter(0.01) GRANULARITY 1,
+            INDEX idx_attrs_str_values arrayMap(x -> lower(x), mapValues(attrs_string))
+                TYPE bloom_filter(0.01) GRANULARITY 1,
+            INDEX idx_attrs_num_values mapValues(attrs_number) TYPE bloom_filter(0.01) GRANULARITY 1
         ) ENGINE = ReplacingMergeTree(_version, is_deleted)
         PARTITION BY toDate(start_time)
         ORDER BY (project_id, observation_type, service_name,
                   toStartOfHour(start_time), trace_id, id)
+        SETTINGS index_granularity = 2
         """
     )
     ch_client.execute(
@@ -264,11 +276,12 @@ class _LiveExecutor:
         names = [name for name, _type in columns]
         return SimpleNamespace(
             data=[dict(zip(names, row, strict=True)) for row in rows],
+            columns=names,
             query_time_ms=1.0,
         )
 
 
-def _manager():
+def _manager(*, value="gold", window_start=WINDOW_START):
     return UsersListManager(
         organization_id=ORGANIZATION,
         allowed_project_ids=[PROJECT],
@@ -279,7 +292,7 @@ def _manager():
                 "filter_config": {
                     "filter_type": "datetime",
                     "filter_op": "between",
-                    "filter_value": [WINDOW_START.isoformat(), WINDOW_END.isoformat()],
+                    "filter_value": [window_start.isoformat(), WINDOW_END.isoformat()],
                 },
             },
             {
@@ -288,7 +301,7 @@ def _manager():
                     "col_type": "SPAN_ATTRIBUTE",
                     "filter_type": "text",
                     "filter_op": "equals",
-                    "filter_value": "gold",
+                    "filter_value": value,
                 },
             },
         ],
@@ -301,8 +314,16 @@ def _never_seed(**kwargs):
     raise AssertionError("the whole-window candidate statement must never run")
 
 
-def _read_page(ch_client, tables, *, page_size, cursor=None):
-    manager = _manager()
+def _read_page(
+    ch_client,
+    tables,
+    *,
+    page_size,
+    cursor=None,
+    value="gold",
+    window_start=WINDOW_START,
+):
+    manager = _manager(value=value, window_start=window_start)
     executor = _LiveExecutor(ch_client, tables)
     with (
         patch(SERVICE, return_value=executor),
@@ -378,3 +399,63 @@ def test_published_totals_are_whole_window_not_slice(ch_client, seeded_tables):
         "HAVING end_user_id IN %(candidate_end_user_ids)s" in s for s in replays
     )
     assert read.has_more is False
+
+
+def test_empty_thirty_day_tail_is_proven_by_one_costed_existence_statement(
+    ch_client, seeded_tables
+):
+    """Live: the estimate is a row of zeros for a value the value bloom
+    excludes, the existence statement then reads nothing, and the page says
+    empty in three statements instead of one slice per day. The estimate of
+    a present value is smaller than the table: the blooms are applied to it,
+    so it is the cost of the statement it wraps and not the window's size.
+    """
+    read, executor = _read_page(
+        ch_client,
+        seeded_tables,
+        page_size=25,
+        value="platinum",
+        window_start=WINDOW_END - timedelta(days=30),
+    )
+    assert read.payload["table"] == [] and read.has_more is False
+    statements = executor.statements
+    assert len(statements) == 3, [s.split()[0] for s in statements]
+    assert "AS raw_end_user_id" in statements[0]
+    assert statements[1].lstrip().startswith("EXPLAIN ESTIMATE")
+    assert "AS witnessed" in statements[2] and "LIMIT 1" in statements[2]
+
+    builder = UserListQueryBuilderV2(
+        organization_id=ORGANIZATION,
+        project_ids=[PROJECT],
+        filters=_manager(value="gold").filters,
+        search="",
+        empty_scope=False,
+    )
+    spans = seeded_tables[0]
+    total_rows = ch_client.execute(f"SELECT count() FROM {spans}")[0][0]
+
+    def estimate_for(value):
+        candidate = UserListQueryBuilderV2(
+            organization_id=ORGANIZATION,
+            project_ids=[PROJECT],
+            filters=_manager(value=value).filters,
+            search="",
+            empty_scope=False,
+        )
+        sql, params = candidate.build_matching_activity_existence_estimate_query(
+            range_start=WINDOW_START, range_end=WINDOW_END
+        )
+        rows, columns = ch_client.execute(
+            _bind(sql, seeded_tables), params, with_column_types=True
+        )
+        names = [name for name, _type in columns]
+        data = [dict(zip(names, row, strict=True)) for row in rows]
+        return data, builder.matching_activity_existence_estimate(data, names)
+
+    absent_rows, absent = estimate_for("platinum")
+    assert absent == 0
+    assert absent_rows and all(row["parts"] == 0 for row in absent_rows), (
+        "ClickHouse 25.3 reports a selection of no part as a row of zeros"
+    )
+    _present_rows, present = estimate_for("gold")
+    assert 0 < present < total_rows

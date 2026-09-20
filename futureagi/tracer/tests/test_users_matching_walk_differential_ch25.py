@@ -40,9 +40,11 @@ from tracer.services.clickhouse.list_cursor import ListCursor
 from tracer.services.users_list_manager import UsersListManager
 
 CH_HOST = os.environ.get("CH25_HOST", "127.0.0.1")
-CH_NATIVE_PORT = int(
-    os.environ.get("CH25_NATIVE_PORT") or os.environ.get("CH25_TCP_PORT") or "19000"
-)
+# No default port: a loopback port-forward to a shared server passes the
+# loopback trust of ``_require_safe_ch25_test_target``, so this module runs
+# only against a port the environment names explicitly (the test target).
+_CONFIGURED_PORT = os.environ.get("CH25_NATIVE_PORT") or os.environ.get("CH25_TCP_PORT")
+CH_NATIVE_PORT = int(_CONFIGURED_PORT or 0)
 CH_USER = os.environ.get("CH25_USER") or os.environ.get("CH_USERNAME") or "default"
 CH_PASSWORD = os.environ.get("CH25_PASSWORD") or os.environ.get("CH_PASSWORD") or ""
 
@@ -54,8 +56,8 @@ ALIAS_OF_E = str(uuid.UUID(int=89))
 USER_I, USER_J, USER_K1, USER_K2 = (str(uuid.UUID(int=n)) for n in (90, 91, 92, 93))
 USER_L, USER_M = (str(uuid.UUID(int=n)) for n in (94, 95))
 # Typed populations: N* carry a number, Q* a boolean.
-USER_N1, USER_N2, USER_N3, USER_N4, USER_N5 = (
-    str(uuid.UUID(int=n)) for n in (101, 102, 103, 104, 105)
+USER_N1, USER_N2, USER_N3, USER_N4, USER_N5, USER_N6 = (
+    str(uuid.UUID(int=n)) for n in (101, 102, 103, 104, 105, 106)
 )
 USER_Q1, USER_Q2, USER_Q3, USER_Q4 = (
     str(uuid.UUID(int=n)) for n in (111, 112, 113, 114)
@@ -79,6 +81,8 @@ def _ch_client(*, database):
 @pytest.fixture(scope="module")
 def ch_database():
     database = f"test_walk_differential_{uuid.uuid4().hex}"
+    if not _CONFIGURED_PORT:
+        pytest.skip("CH25_NATIVE_PORT / CH25_TCP_PORT must name the local test CH")
     _require_safe_ch25_test_target(host=CH_HOST, database=database)
     admin = _ch_client(database="default")
     created = False
@@ -257,6 +261,9 @@ def seeded_tables(ch_client):
         [span("t-n4", "n4", USER_N4, "9", 1, hours=22)],
         [span("t-n5", "n5", USER_N5, None, 1, hours=24, number=6)],
         [span("t-n5", "n5", USER_N5, None, 2, hours=24, number=6, deleted=1)],
+        # N6: the value zero, the missing-key default the graph witness
+        # declines; the walk discovers it on the compiler's raw witness.
+        [span("t-n6", "n6", USER_N6, None, 1, hours=18, number=0, cost=2.5)],
         # Booleans, filter ``flag = false``. Q1: false at hour 15 (and true at
         # hour 44: key = hour 15... no, the newest FALSE decides the key; the
         # true row still counts as activity). Q2: stale false at hour 55 that
@@ -307,6 +314,7 @@ def seeded_tables(ch_client):
                 (USER_N3, "november-3"),
                 (USER_N4, "november-4"),
                 (USER_N5, "november-5"),
+                (USER_N6, "november-6"),
                 (USER_Q1, "quebec-1"),
                 (USER_Q2, "quebec-2"),
                 (USER_Q3, "quebec-3"),
@@ -346,6 +354,7 @@ class _LiveExecutor:
         names = [name for name, _type in columns]
         return SimpleNamespace(
             data=[dict(zip(names, row, strict=True)) for row in rows],
+            columns=names,
             query_time_ms=1.0,
         )
 
@@ -366,6 +375,15 @@ NUMBER = {
         "filter_type": "number",
         "filter_op": "greater_than",
         "filter_value": 5,
+    },
+}
+ZERO = {
+    "column_id": "score",
+    "filter_config": {
+        "col_type": "SPAN_ATTRIBUTE",
+        "filter_type": "number",
+        "filter_op": "equals",
+        "filter_value": 0,
     },
 }
 BOOLEAN = {
@@ -542,16 +560,27 @@ def test_seeded_page_publishes_the_same_set_and_totals(ch_client, seeded_tables)
 
 
 @pytest.mark.parametrize(
-    "attribute, expected_order, totals, witness_column",
+    "attribute, expected_order, totals, witness_column, seeded_witnessed",
     [
         (
             NUMBER,
             # N1 key hour 12 (its 9), N2 key hour 8 (live 7; the hour-50 nine
             # is stale). N3 equals the bound, N4 is string-typed, N5 is
-            # tombstoned: never published.
+            # tombstoned, N6 is zero: never published.
             ["november-1", "november-2"],
             {"november-1": (3.0, 2), "november-2": (2.0, 2)},
             "attrs_number[",
+            True,
+        ),
+        (
+            ZERO,
+            # Only N6 carries the value zero on a live row; the seeded page
+            # has no witness for it (the graph witness declines the missing
+            # key default) and reads the whole window.
+            ["november-6"],
+            {"november-6": (2.5, 1)},
+            "attrs_number[",
+            False,
         ),
         (
             BOOLEAN,
@@ -561,12 +590,19 @@ def test_seeded_page_publishes_the_same_set_and_totals(ch_client, seeded_tables)
             ["quebec-1", "quebec-2"],
             {"quebec-1": (4.0, 2), "quebec-2": (2.0, 2)},
             "attrs_bool[",
+            False,
         ),
     ],
-    ids=["number-greater_than", "boolean-equals-false"],
+    ids=["number-greater_than", "number-equals-zero", "boolean-equals-false"],
 )
 def test_typed_walk_matches_the_seeded_page_set_and_totals(
-    ch_client, seeded_tables, attribute, expected_order, totals, witness_column
+    ch_client,
+    seeded_tables,
+    attribute,
+    expected_order,
+    totals,
+    witness_column,
+    seeded_witnessed,
 ):
     walk_pages, statements = _walk_all(ch_client, seeded_tables, attribute, page_size=1)
     order = [row["user_id"] for page in walk_pages for row in page]
@@ -581,10 +617,12 @@ def test_typed_walk_matches_the_seeded_page_set_and_totals(
     walk_rows = {row["user_id"]: row for page in walk_pages for row in page}
     seeded_rows, seeded_statements = _seeded_all(ch_client, seeded_tables, attribute)
     # The seeded page keeps the witnesses it always had: the number comparison
-    # seeds on the numeric scalar witness, the boolean has none and reads the
-    # whole window; Python membership decides both.
-    seeded_witnessed = any("scalar_witness_identities" in s for s in seeded_statements)
-    assert seeded_witnessed is (witness_column == "attrs_number[")
+    # seeds on the numeric scalar witness, the boolean and the number zero
+    # have none and read the whole window; Python membership decides all.
+    assert (
+        any("scalar_witness_identities" in s for s in seeded_statements)
+        is seeded_witnessed
+    )
     assert set(seeded_rows) == set(walk_rows), sorted(set(seeded_rows) ^ set(walk_rows))
     for user_id, (cost, traces) in totals.items():
         for rows in (walk_rows, seeded_rows):

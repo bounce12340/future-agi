@@ -88,6 +88,8 @@ class World:
 def kind_of(query: str) -> str:
     if "AS raw_end_user_id" in query:
         return "slice"
+    if query.lstrip().startswith("EXPLAIN ESTIMATE"):
+        return "estimate"
     if "AS witnessed" in query:
         return "probe"
     if "dimension_candidate_ids" in query:
@@ -113,6 +115,13 @@ class Engine:
         self.remapped: list[tuple[str, ...]] = []
         self.slice_ranges: list[tuple[datetime, datetime]] = []
         self.probe_ranges: list[tuple[datetime, datetime]] = []
+        self.estimate_ranges: list[tuple[datetime, datetime]] = []
+        # The estimate table the scripted server returns for a tail: by
+        # default the raw rows in range (a true index estimate); a test may
+        # set an integer to over-report (bloom false positives with no real
+        # row), an empty list for a plan the reducer cannot read, or a list
+        # of rows for any other shape.
+        self.estimate_override: int | list | None = None
 
     def execute_ch_query(self, query, params=None, timeout_ms=None, settings=None):
         self.calls.append(query)
@@ -120,6 +129,8 @@ class Engine:
         kind = kind_of(query)
         if kind == "slice":
             return self._slice(params)
+        if kind == "estimate":
+            return self._estimate(params)
         if kind == "probe":
             return self._probe(params)
         if kind == "remap":
@@ -161,6 +172,32 @@ class Engine:
         found = bool(self._witnessed(params, self.probe_ranges))
         return SimpleNamespace(
             data=[{"witnessed": 1}] if found else [], query_time_ms=1.0
+        )
+
+    def _estimate(self, params):
+        in_range = self._witnessed(params, self.estimate_ranges)
+        columns = ["database", "table", "parts", "rows", "marks"]
+        if isinstance(self.estimate_override, list):
+            return SimpleNamespace(
+                data=list(self.estimate_override), columns=columns, query_time_ms=1.0
+            )
+        rows = (
+            self.estimate_override
+            if self.estimate_override is not None
+            else len(in_range)
+        )
+        return SimpleNamespace(
+            data=[
+                {
+                    "database": "default",
+                    "table": "spans",
+                    "parts": int(bool(rows)),
+                    "rows": rows,
+                    "marks": rows,
+                }
+            ],
+            columns=columns,
+            query_time_ms=1.0,
         )
 
     def _remap(self, params):
@@ -550,32 +587,91 @@ def test_a_slice_that_fails_on_a_read_budget_is_retried_narrower_never_wider():
     assert len(widths) >= 2 and widths[1] == widths[0] // 4
 
 
-def test_empty_default_window_is_proven_by_one_existence_probe_within_budget():
-    """An empty thirty-day window is two statements, not thirty-one.
+def test_empty_default_window_is_proven_by_one_costed_existence_probe():
+    """An empty thirty-day window is three statements, not thirty-one.
 
     After the first empty slice the tail needs more slices at the one-day
-    cap than the statement budget holds, so the walk asks once whether any
-    witnessed row lies below at all; none proves the window exhausted.
+    cap than the statement budget holds, so the walk costs one existence
+    statement over the whole tail (EXPLAIN ESTIMATE of the identical text,
+    no column data) and, the estimate fitting the target, asks it whether
+    any witnessed row lies below at all; none proves the window exhausted.
+    The estimate alone never does: a planner's count is not a row read.
     """
     thirty_days = _filters(window_start=WINDOW_END - timedelta(days=30))
     read, engine = _page(World(), page_size=25, filters=thirty_days)
 
-    assert _kinds(engine) == ["slice", "probe"]
+    assert _kinds(engine) == ["slice", "estimate", "probe"]
     assert read.payload["table"] == []
     assert read.has_more is False and read.checkpoint_order is None
-    probe = engine.calls[1]
+    estimate, probe = engine.calls[1], engine.calls[2]
+    assert estimate == "EXPLAIN ESTIMATE\n" + probe.lstrip()
     assert "LIMIT 1" in probe and "GROUP BY" not in probe
-    assert engine.probe_ranges == [
-        (WINDOW_END - timedelta(days=30), engine.slice_ranges[0][0])
-    ]
+    tail = (WINDOW_END - timedelta(days=30), engine.slice_ranges[0][0])
+    assert engine.estimate_ranges == [tail] and engine.probe_ranges == [tail]
     assert "AND 0 = 1" not in probe
+
+
+def test_an_estimate_over_the_target_or_unreadable_licenses_no_wide_statement():
+    """Nothing bounds a statement wider than the cap but its cost proof.
+
+    Over the target (bloom false positives across a long tail), or a result
+    the reducer cannot read (an empty estimate table, another table, no
+    integer): the existence statement is not issued and the walk slices at
+    the cap, partial + cursor when the budget runs out.
+    """
+    thirty_days = _filters(window_start=WINDOW_END - timedelta(days=30))
+    for override in (
+        walk.USER_LIST_WALK_PROBE_TARGET_READ_ROWS + 1,
+        [],
+        [{"database": "default", "table": "traces", "parts": 0, "rows": 0, "marks": 0}],
+        [
+            {
+                "database": "default",
+                "table": "spans",
+                "parts": 0,
+                "rows": None,
+                "marks": 0,
+            }
+        ],
+    ):
+        engine = Engine(World())
+        engine.estimate_override = override
+        with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 4):
+            read, engine = _page(
+                World(), page_size=25, filters=thirty_days, engine=engine
+            )
+        assert _kinds(engine) == ["slice", "estimate", "slice", "slice"], override
+        assert "probe" not in _kinds(engine)
+        assert read.has_more is True and read.payload["table"] == []
+        cap = walk.USER_LIST_WALK_MAX_SLICE
+        assert max(high - low for low, high in engine.slice_ranges) <= cap
+
+    # Exactly at the target the statement is issued.
+    engine = Engine(World())
+    engine.estimate_override = walk.USER_LIST_WALK_PROBE_TARGET_READ_ROWS
+    read, engine = _page(World(), page_size=25, filters=thirty_days, engine=engine)
+    assert _kinds(engine) == ["slice", "estimate", "probe"]
+    assert read.has_more is False
+
+
+def test_a_costed_probe_that_reads_only_false_positives_still_proves_the_tail():
+    """The estimate over-reports (granules the blooms could not exclude, no
+    witnessed row in them); the existence statement reads them and finds
+    nothing: the tail is exhausted on the statement's answer, not the count.
+    """
+    thirty_days = _filters(window_start=WINDOW_END - timedelta(days=30))
+    engine = Engine(World())
+    engine.estimate_override = 12_345
+    read, engine = _page(World(), page_size=25, filters=thirty_days, engine=engine)
+    assert _kinds(engine) == ["slice", "estimate", "probe"]
+    assert read.has_more is False and read.checkpoint_order is None
 
 
 def test_a_probe_that_finds_a_row_leaves_the_walk_slicing_at_the_cap():
     """A row proves existence, never a position: the slices go on at the cap.
 
     The populated slice re-arms the probe, so the twenty empty days below it
-    are proven by one more statement instead of spending the rest of the
+    are proven by one more costed pair instead of spending the rest of the
     budget one day at a time.
     """
 
@@ -590,8 +686,9 @@ def test_a_probe_that_finds_a_row_leaves_the_walk_slicing_at_the_cap():
 
     kinds = _kinds(engine)
     assert _names(read) == ["user-1"] and read.has_more is False
-    assert kinds[:2] == ["slice", "probe"] and kinds.count("probe") == 2
-    assert kinds[-1] == "probe"
+    assert kinds[:3] == ["slice", "estimate", "probe"]
+    assert kinds.count("estimate") == 2 and kinds.count("probe") == 2
+    assert kinds[-2:] == ["estimate", "probe"]
     cap = walk.USER_LIST_WALK_MAX_SLICE
     assert max(high - low for low, high in engine.slice_ranges) <= cap
     assert kinds.count("slice") >= 3
@@ -617,7 +714,30 @@ def test_a_probe_the_budget_refuses_or_that_fails_licenses_nothing():
         read, engine = _page(world, page_size=25, filters=thirty_days, engine=engine)
     # The failed probe changed nothing: the walk went on slicing at the cap
     # and stopped on its statement budget with a cursor.
-    assert _kinds(engine) == ["slice", "probe", "slice", "slice"]
+    assert _kinds(engine) == ["slice", "estimate", "probe", "slice"]
+    assert read.has_more is True and read.payload["table"] == []
+
+    # A failing estimate is the same: no existence statement, slice on.
+    engine = Engine(world)
+    original = engine.execute_ch_query
+
+    def failing_estimate(query, params=None, timeout_ms=None, settings=None):
+        if kind_of(query) == "estimate":
+            engine.calls.append(query)
+            raise ServerException("memory", code=241)
+        return original(query, params, timeout_ms, settings)
+
+    engine.execute_ch_query = failing_estimate
+    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 4):
+        read, engine = _page(world, page_size=25, filters=thirty_days, engine=engine)
+    assert _kinds(engine) == ["slice", "estimate", "slice", "slice"]
+    assert read.has_more is True and read.payload["table"] == []
+
+    # With the budget spent on the estimate itself, the page ends there.
+    engine = Engine(world)
+    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 2):
+        read, engine = _page(world, page_size=25, filters=thirty_days, engine=engine)
+    assert _kinds(engine) == ["slice", "estimate"]
     assert read.has_more is True and read.payload["table"] == []
 
 
@@ -712,6 +832,29 @@ def test_slice_statement_is_bounded_by_the_slice_and_carries_no_sorting_key_in_s
     assert "end_user_id_remap" not in compact
     assert probe_params["slice_end_us"] == params["slice_start_us"]
     assert "slice_user_limit" not in probe_params
+
+    # The estimate is EXPLAIN ESTIMATE of the identical text, settings clause
+    # included, with the identical parameters: the cost proven is the cost
+    # paid.
+    estimate, estimate_params = (
+        builder.build_matching_activity_existence_estimate_query(
+            range_start=WINDOW_START, range_end=minutes_before_end(60)
+        )
+    )
+    assert estimate == "EXPLAIN ESTIMATE\n" + probe.lstrip()
+    assert estimate_params == probe_params
+    assert estimate.count("SETTINGS") == 1
+    reduce = builder.matching_activity_existence_estimate
+    columns = ["database", "table", "parts", "rows", "marks"]
+    assert (
+        reduce([{"table": "spans", "rows": 7}, {"table": "spans", "rows": 5}], columns)
+        == 12
+    )
+    assert reduce([{"table": "spans", "rows": 0, "parts": 0, "marks": 0}], columns) == 0
+    assert reduce([], columns) is None
+    assert reduce([{"table": "spans", "rows": 7}], ["rows"]) is None
+    assert reduce([{"table": "traces", "rows": 7}], columns) is None
+    assert reduce([{"table": "spans", "rows": "7"}], columns) is None
 
 
 @pytest.mark.parametrize(
@@ -1022,4 +1165,7 @@ def test_walk_limits_are_runtime_settings_not_module_constants():
     )
     assert walk.USER_LIST_WALK_CERTIFY_BATCH_SIZE == (
         settings.USER_LIST_WALK_CERTIFY_BATCH_SIZE
+    )
+    assert walk.USER_LIST_WALK_PROBE_TARGET_READ_ROWS == (
+        settings.USER_LIST_WALK_PROBE_TARGET_READ_ROWS
     )

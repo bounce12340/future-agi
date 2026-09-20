@@ -1,5 +1,6 @@
 """ClickHouse query builder for Observe end-user list and detail metrics."""
 
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from tracer.services.clickhouse.eval_logger_table import eval_logger_source
@@ -18,6 +19,13 @@ from tracer.services.clickhouse.v2.id_remap_sql import (
 
 class UnsupportedBoundedUserListQuery(ValueError):
     """Raised when an exact user page cannot use the bounded query path."""
+
+
+# The estimate table ``EXPLAIN ESTIMATE`` returns on ClickHouse 25.3; the
+# matching-activity walk reads its ``rows`` to cost a tail existence statement.
+_MATCHING_ACTIVITY_ESTIMATE_COLUMNS = frozenset(
+    {"database", "table", "parts", "rows", "marks"}
+)
 
 
 # Execution shape of a SEEDED candidate page (a scalar attribute witness or a
@@ -667,7 +675,10 @@ class UserListQueryBuilder(BaseQueryBuilder):
         it stops at the first witnessed row, and for a value the blooms
         exclude everywhere it reads nothing but index marks. The walk uses it
         to prove a long empty tail in one statement instead of one statement
-        per day; a row proves only existence, never a position.
+        per day; a row proves only existence, never a position. It is issued
+        only after ``build_matching_activity_existence_estimate_query`` has
+        costed it: nothing else bounds a statement wider than the slice cap
+        (application reads carry no server row, byte or time cap).
         """
         params = self._matching_activity_range_params(range_start, range_end)
         query = f"""
@@ -679,6 +690,56 @@ class UserListQueryBuilder(BaseQueryBuilder):
         {_SEEDED_PAGE_READ_SETTINGS}
         """
         return query, params
+
+    def build_matching_activity_existence_estimate_query(
+        self, *, range_start: Any, range_end: Any
+    ) -> tuple[str, dict[str, Any]]:
+        """``EXPLAIN ESTIMATE`` of the existence statement, text for text.
+
+        Reads no column data: the server answers from the primary index and
+        the deployed key and value blooms with the parts, granules and rows
+        the existence statement WOULD read (verified on ClickHouse 25.3: a
+        value the value bloom excludes selects zero parts). It costs that
+        statement before the walk issues it; it never decides coverage,
+        because a planner's estimate is not a row read. The wrapped text is
+        exactly the existence statement, settings clause included, so the
+        cost proven is the cost paid.
+        """
+        query, params = self.build_matching_activity_existence_query(
+            range_start=range_start, range_end=range_end
+        )
+        return "EXPLAIN ESTIMATE\n" + query.lstrip(), params
+
+    @staticmethod
+    def matching_activity_existence_estimate(
+        rows: Iterable[Mapping[str, Any]], columns: Iterable[str] | None
+    ) -> int | None:
+        """Reduce the estimate to the rows the existence statement would read.
+
+        Every ``spans`` row of the estimate table sums. ``None`` means the
+        answer cannot be read - the estimate table's columns are missing, a
+        row names another table or carries no integer, or the result is EMPTY.
+        ClickHouse 25.3 reports a selection of no part as a row of zeros, so
+        an empty result is a plan this reducer does not understand (the same
+        signal ``graph_dispatch`` refuses); the walk then slices at its cap
+        rather than issue a statement it has not costed.
+        """
+        names = {str(name) for name in (columns or ())}
+        if not _MATCHING_ACTIVITY_ESTIMATE_COLUMNS.issubset(names):
+            return None
+        estimate = 0
+        counted_any = False
+        for row in rows or ():
+            counted_any = True
+            if not isinstance(row, Mapping):
+                return None
+            if str(row.get("table") or "") != "spans":
+                return None
+            counted = row.get("rows")
+            if isinstance(counted, bool) or not isinstance(counted, (int, float)):
+                return None
+            estimate += max(0, int(counted))
+        return estimate if counted_any else None
 
     def _matching_activity_range_params(
         self, range_start: Any, range_end: Any
