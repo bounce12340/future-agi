@@ -619,24 +619,12 @@ def read_bounded_filter_page(
                         "recommended classify read settings must be positive integers"
                     )
                 effective_classify_read_settings[setting_name] = setting_value
-    # A caller may state a worker budget for the CLASSIFIER alone. The page's
-    # ``read_settings`` worker count sizes every other statement kind; this
-    # one replaces it on ``classify`` statements only, so a caller can raise
-    # the statement that replays latest state over the seeded sessions - on
-    # the session list the fused classifier is over ninety percent of a
-    # filtered page's server time and scales with workers (measured on the
-    # high-volume tenant, one 15.8 M-row chunk: 3.5 s at two workers, 1.1 s
-    # at four, 0.7 s at eight, same rows, same bytes, identical result) -
-    # without widening every seed and probe with it. Rows, bytes and results
-    # never depend on this number; peak memory per statement rises with it.
-    classify_workers: int | None = None
     if classify_read_settings is not None:
         if not isinstance(classify_read_settings, dict):
             raise ValueError("classify read settings must be a dict")
         unsupported_settings = set(classify_read_settings) - {
             "max_block_size",
             "preferred_max_column_in_block_size_bytes",
-            "max_threads",
         }
         if unsupported_settings:
             raise ValueError("unsupported classify read setting")
@@ -646,9 +634,6 @@ def read_bounded_filter_page(
             setting_value = int(raw_value)
             if setting_value <= 0:
                 raise ValueError("classify read settings must be positive integers")
-            if setting_name == "max_threads":
-                classify_workers = setting_value
-                continue
             previous_cap = effective_classify_read_settings.get(setting_name)
             effective_classify_read_settings[setting_name] = (
                 min(previous_cap, setting_value)
@@ -2014,10 +1999,6 @@ def read_bounded_filter_page(
                         int(settings.get(setting_name, setting_cap)),
                         setting_cap,
                     )
-            if kind == "classify" and classify_workers is not None:
-                # The caller's classifier worker budget, and only there: a
-                # prefilter, a seed and every probe keep the page's count.
-                settings["max_threads"] = classify_workers
             if max_bytes_to_read_cap is not None:
                 if max_bytes_to_read_cap <= 0:
                     raise ValueError("query byte cap must be positive")

@@ -16,18 +16,10 @@ from typing import Any
 
 from django.conf import settings
 
-from tracer.selectors.filter_seed_width import (
-    EmptyDensityEstimate,
-    reduce_density_estimate,
-)
 from tracer.services.clickhouse.eval_logger_table import (
     eval_logger_live_state_columns,
     eval_logger_source,
     eval_logger_version_column,
-)
-from tracer.services.clickhouse.list_cursor import (
-    TYPED_WITNESS_LANE_SEEDED,
-    TYPED_WITNESS_LANES,
 )
 from tracer.services.clickhouse.query_builders.base import (
     NIL_UUID,
@@ -1334,34 +1326,6 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         preference cost. A plan compiled to JSON-only provenance still keeps
         the candidate lane: it has no key bloom for a seed or a gate to prune
         on, so the walk has nothing cheaper to offer it.
-
-        THE WITNESS-COST GATE. The walk is the safe lane, not always the cheap
-        one: on a sparse tenant every forty-eight-hour slice is empty and an
-        empty twelve-month answer that was ONE complete 2 s statement on the
-        candidate lane becomes thirty-two seed statements and a cursor. So a
-        typed-leaf page may be pinned back to the candidate lane
-        (``pin_typed_witness_lane``) by ``selectors.session_witness_cost_gate``,
-        and ONLY by it: the pin is minted from an index-only ``EXPLAIN
-        ESTIMATE`` of the witness scan this statement would be seeded by,
-        judged against a runtime row target. With no pin - session navigation,
-        an export, any caller that ran no probe - the answer is the walk. A
-        probe that fails, times out, or cannot be read never licenses the
-        seeded statement either; that is the gate's contract, stated there.
-        The gate decides the lane and nothing else: both lanes are exact for
-        the same predicate on the list's own cursor order.
-        """
-        if self._typed_witness_walk_plans() is None:
-            return False
-        return self._pinned_typed_witness_lane != TYPED_WITNESS_LANE_SEEDED
-
-    def _typed_witness_walk_plans(self) -> tuple[Any, ...] | None:
-        """The scalar plans of a page the typed-witness policy governs.
-
-        ``None`` for every other shape: a native identity or aggregate
-        predicate (their specialized paths stay), a plan without a positive raw
-        witness or with a negated leaf, or a plan compiled to JSON-only
-        provenance. This is the pure plan test ``prefers_bounded_filter_page``
-        and the cost gate both rest on.
         """
         # Native identity/aggregate predicates retain their specialized paths.
         if any(
@@ -1370,152 +1334,18 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             not in {"created_at", "start_time"}
             for item in self.filters
         ):
-            return None
+            return False
         plans = self._candidate_scalar_page_plans()
         if not plans or any(
             plan.raw_witness_predicate is None or plan.exclude_group_matches
             for plan in plans
         ):
-            return None
+            return False
         # Compiled storage provenance includes typed picker branches; any one
         # typed key witness is the necessary condition the seed gate and the
         # sparse anchor probe rest on, and the classifier applies every plan.
         keys = " ".join(plan.raw_key_witness_predicate or "" for plan in plans)
-        if not any(column in keys for column in self._TYPED_WITNESS_MAPS):
-            return None
-        return tuple(plans)
-
-    _pinned_typed_witness_lane: str | None = None
-
-    def pin_typed_witness_lane(self, lane: str | None) -> None:
-        """Take the lane a probe decided, or the lane a running cursor carries.
-
-        ``None`` clears the pin: the walk, which is what every caller that ran
-        no probe gets. Only ``selectors.session_witness_cost_gate`` mints
-        ``seeded``, and only from an estimate under the runtime target.
-        """
-
-        if lane is not None and lane not in TYPED_WITNESS_LANES:
-            raise ValueError("unknown typed witness lane")
-        self._pinned_typed_witness_lane = lane
-
-    def typed_witness_lane(self) -> str | None:
-        """The lane pinned on this read, for its continuation to carry."""
-
-        return self._pinned_typed_witness_lane
-
-    @classmethod
-    def _candidate_witness_plan(
-        cls, root_filter_plans: tuple[Any, ...] | list[Any]
-    ) -> tuple[Any, str | None]:
-        """The any-span witness the candidate statement seeds from, and its predicate.
-
-        Cost tie-break only; every plan is retained for latest group
-        membership. Prefer the compiler's proven numeric value-index companion,
-        not a same-span conjunction or a new discovery scan. The compiler
-        proves that value witness exhaustive even when missing-key defaults and
-        independent argMax fields matter; otherwise the plan's conservative
-        necessary raw witness is used. One helper, used by the statement AND by
-        the cost probe, so the probe prices exactly the scan the statement is
-        seeded by.
-        """
-
-        witness_plans = sorted(
-            root_filter_plans,
-            key=lambda plan: (
-                not (
-                    plan.raw_graph_value_witness_predicate
-                    and "mapValues(span_attr_num)"
-                    in plan.raw_graph_value_witness_predicate
-                )
-            ),
-        )
-        witness = cls._bounded_root_witness_plan(witness_plans)
-        if witness is None:
-            return None, None
-        return witness, (
-            witness.raw_graph_value_witness_predicate or witness.raw_witness_predicate
-        )
-
-    def _candidate_witness_scan_sql(self, predicate: str) -> str:
-        """The witness scalar's scan, from ``FROM`` to its last predicate."""
-
-        return f"""FROM {self.TABLE}
-         PREWHERE {self.project_filter_sql()}
-           AND start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')
-           AND start_time < fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC')
-         WHERE isNotNull(trace_session_id)
-           AND trace_session_id != toUUID('{NIL_UUID}')
-           AND ({predicate})"""
-
-    def build_typed_witness_cost_probe_query(
-        self,
-    ) -> tuple[str, dict[str, Any]] | None:
-        """Cost the candidate statement's witness scan from its indexes only.
-
-        ``EXPLAIN ESTIMATE`` over the SAME scan the statement's
-        ``candidate_witness_session_ids`` scalar performs - project, the
-        request window, the session guards and the plan's witness predicate,
-        rendered by the one helper the statement itself uses - reports, per
-        part, the rows the key condition and the skip indexes leave, reading
-        no column data. On production's high-volume tenant at twelve months
-        with one boolean leaf the ``attrs_bool`` keys bloom leaves 238 M rows
-        in 396 parts: that is the number the statement dies on at the 30 s
-        wall, and the number this probe returns for the price of reading the
-        index. On the sparse tenant the same probe prices the scan its one
-        complete 2 s statement performs.
-
-        ``None`` when the page is not governed by the typed-witness policy:
-        there is no witness scalar to cost and no lane to choose.
-
-        The probe is a cost question only. It never decides membership,
-        coverage or order - the walk and the candidate statement are both
-        exact for the same predicate - and its answer is read by
-        ``typed_witness_cost_estimate``.
-        """
-
-        plans = self._typed_witness_walk_plans()
-        if plans is None:
-            return None
-        witness, predicate = self._candidate_witness_plan(plans)
-        if witness is None or not predicate:
-            return None
-        # The statement binds every plan's params; the probe binds the ones its
-        # predicate names, from the same plans, so a shared name resolves to
-        # the same value the statement would use.
-        params: dict[str, Any] = dict(self.params)
-        for plan in plans:
-            params.update(
-                {
-                    key: value
-                    for key, value in (getattr(plan, "params", None) or {}).items()
-                    if f"%({key})s" in predicate
-                }
-            )
-        return (
-            f"""
-        EXPLAIN ESTIMATE
-        SELECT count()
-         {self._candidate_witness_scan_sql(predicate)}
-        """,
-            params,
-        )
-
-    def typed_witness_cost_estimate(
-        self,
-        rows: Any,
-        columns: Any = None,
-    ) -> int | EmptyDensityEstimate | None:
-        """Reduce one probe result to summed rows, an empty marker, or unknown.
-
-        The reader is the module-level ``reduce_density_estimate`` the other
-        seed lanes consume ``EXPLAIN ESTIMATE`` through, so the three readings
-        - part rows summed, the ambiguous empty estimate, and a result that is
-        not this statement's - cannot drift between lanes. The gate treats the
-        empty marker as unreadable.
-        """
-
-        return reduce_density_estimate(rows, columns, table=self.TABLE)
+        return any(column in keys for column in self._TYPED_WITNESS_MAPS)
 
     def supports_candidate_first_page(self) -> bool:
         """Return true for the exact root-time ordered fast path.
@@ -1951,15 +1781,41 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             and root_filter_plans
             and self._positive_user_scalar_page_plans() is None
         ):
-            witness, predicate = self._candidate_witness_plan(root_filter_plans)
+            # Cost tie-break only; retain every plan for latest group membership.
+            # Prefer the compiler's proven numeric value-index companion, not
+            # a same-span conjunction or a new discovery scan.
+            witness_plans = sorted(
+                root_filter_plans,
+                key=lambda plan: (
+                    not (
+                        plan.raw_graph_value_witness_predicate
+                        and "mapValues(span_attr_num)"
+                        in plan.raw_graph_value_witness_predicate
+                    )
+                ),
+            )
+            witness = self._bounded_root_witness_plan(witness_plans)
             if witness is not None:
                 # Complete any-span candidates, materialized once. Values only
                 # select a superset here; every touched session's whole physical
                 # state and all roots are replayed below before ordering.
                 candidate_array_sql = "candidate_witness_session_ids"
+                # The compiler proves this value witness exhaustive even when
+                # missing-key defaults and independent argMax fields matter.
+                # Otherwise retain its conservative necessary raw witness.
+                predicate = (
+                    witness.raw_graph_value_witness_predicate
+                    or witness.raw_witness_predicate
+                )
                 witness_cte = f"""
         (SELECT groupUniqArray(assumeNotNull(trace_session_id))
-         {self._candidate_witness_scan_sql(predicate)}
+         FROM {self.TABLE}
+         PREWHERE {self.project_filter_sql()}
+           AND start_time >= fromUnixTimestamp64Micro(%(start_date_us)s, 'UTC')
+           AND start_time < fromUnixTimestamp64Micro(%(end_date_us)s, 'UTC')
+         WHERE isNotNull(trace_session_id)
+           AND trace_session_id != toUUID('{NIL_UUID}')
+           AND ({predicate})
         ) AS candidate_witness_session_ids,
                 """
         has_candidate_scope = bool(seed_session_ids or candidate_array_sql)

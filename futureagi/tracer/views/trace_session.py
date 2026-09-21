@@ -61,7 +61,6 @@ from tracer.models.project import Project, ProjectSourceChoices
 from tracer.models.trace import Trace
 from tracer.models.trace_session import TraceSession
 from tracer.selectors.session_candidate_slice import read_candidate_slice_page
-from tracer.selectors.session_witness_cost_gate import decide_typed_witness_lane
 from tracer.selectors.trace_filter_reads import (
     PAGE_DEPTH_EXCEEDED_CODE,
     PAGE_DEPTH_EXCEEDED_MESSAGE,
@@ -115,7 +114,6 @@ from tracer.services.clickhouse.list_cursor import (
     list_cursor_boundary_fingerprint,
     pin_filter_seed_witness_slack,
     read_filter_seed_witness_slack,
-    read_typed_witness_lane,
 )
 from tracer.services.clickhouse.query_builders.base import NIL_UUID, BaseQueryBuilder
 from tracer.services.clickhouse.query_builders.eval_status import (
@@ -247,21 +245,6 @@ def _session_page_depth_exceeded(validated_data):
     )
 
 
-def _session_classify_read_settings() -> dict[str, int] | None:
-    """The walk's classifier worker budget, or ``None`` to follow the page.
-
-    Read at call time so an operator's flip reaches the next request. Zero is
-    the default and changes nothing: every statement keeps
-    ``SESSION_LIST_READ_MAX_THREADS``. Above zero the walk runs its classify
-    statements - the fused latest-state replay that is over ninety percent of
-    a filtered page's server time on the high-volume tenant - at this many
-    workers, and every seed, prefilter and probe keeps the page's count.
-    """
-
-    workers = int(settings.SESSION_LIST_CLASSIFY_MAX_THREADS)
-    return {"max_threads": workers} if workers > 0 else None
-
-
 def _read_session_filter_page(
     builder: SessionListQueryBuilderV2,
     analytics: V2AnalyticsQueryService,
@@ -285,7 +268,6 @@ def _read_session_filter_page(
         read_settings=_session_read_settings(
             max_result_rows=SESSION_LIST_FILTER_MAX_CANDIDATES
         ),
-        classify_read_settings=_session_classify_read_settings(),
         cursor_start_time=cursor_state.order[0] if cursor_state is not None else None,
         cursor_order_token=cursor_state.order[1] if cursor_state is not None else None,
         include_incomplete_rows=cursor_enabled,
@@ -380,9 +362,6 @@ class SessionPageSelection:
             window_end=end,
             seen_rows=seen,
             witness_slack_hours=read_filter_seed_witness_slack(self.builder),
-            # The lane this page took travels with its continuation, so every
-            # hop of the pagination takes the same lane without a second probe.
-            typed_witness_lane=read_typed_witness_lane(self.builder),
             **boundary,
         )
         return seen, token, True
@@ -3001,25 +2980,6 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
         # Pin before any route or seed decision reads the slack, so every
         # statement of this hop uses the value the pagination started with.
         pin_filter_seed_witness_slack(builder, cursor_state)
-
-        def _page_read_settings(max_result_rows):
-            # The cursor freezes window/keyset progress only. Each finite read
-            # resolves current latest state without a merge-unstable ceiling.
-            return _session_read_settings(max_result_rows=max_result_rows)
-
-        # A typed span-attribute page has two exact lanes; which one runs is a
-        # cost question the gate answers from the index before the first
-        # statement, or from the lane the pagination's cursor carries. The
-        # probe runs at the same read settings as the statement it costs.
-        decide_typed_witness_lane(
-            builder=builder,
-            analytics=analytics,
-            deadline=read_deadline,
-            read_settings=_page_read_settings,
-            pinned_lane=(
-                cursor_state.typed_witness_lane if cursor_state is not None else None
-            ),
-        )
         prefer_bounded = builder.prefers_bounded_filter_page() is True
         candidate_cursor = bool(
             cursor_enabled
@@ -3038,6 +2998,11 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                 )
             cursor_enabled = False
             builder._bounded_internal_scan = False
+
+        def _page_read_settings(max_result_rows):
+            # The cursor freezes window/keyset progress only. Each finite read
+            # resolves current latest state without a merge-unstable ceiling.
+            return _session_read_settings(max_result_rows=max_result_rows)
 
         # Phase 1: select the exact page identities before hydrating cost/token,
         # content, and attributes. Default/session-level shapes use the narrow

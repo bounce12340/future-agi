@@ -33,15 +33,6 @@ DEFAULT_CURSOR_MAX_AGE_SECONDS = 24 * 60 * 60
 # was not minted by this codec.
 MAX_CURSOR_WITNESS_SLACK_HOURS = 168
 
-# The lane a typed span-attribute Session page took, carried by its cursor so
-# every hop of one pagination takes the same lane as its first page. The
-# seeded lane is the candidate cursor statement (seeded by a whole-window
-# any-span witness); the walk is the bounded filter walk. Only a probe run by
-# ``selectors.session_witness_cost_gate`` may mint ``seeded``.
-TYPED_WITNESS_LANE_SEEDED = "seeded"
-TYPED_WITNESS_LANE_WALK = "walk"
-TYPED_WITNESS_LANES = frozenset({TYPED_WITNESS_LANE_SEEDED, TYPED_WITNESS_LANE_WALK})
-
 
 class ListCursorError(ValueError):
     """A sanitized cursor validation error safe to expose at the API edge."""
@@ -70,14 +61,6 @@ class ListCursor:
     # would 400 the grid down to the numbered lane for a field whose absence
     # is already well defined.
     witness_slack_hours: int | None = None
-    # The lane a typed span-attribute Session page took (``seeded`` or
-    # ``walk``), when the read that minted this token was governed by the
-    # typed-witness policy. ``None`` is the legacy shape - a token minted
-    # before this field, or by a shape the policy does not govern - and on a
-    # typed-leaf pagination it resolves to the walk, which is the lane every
-    # such pagination was on before the field existed. Same deliberate
-    # non-bump of CURSOR_VERSION as the slack field above.
-    typed_witness_lane: str | None = None
 
 
 def _utc_datetime(value: datetime, field_name: str) -> datetime:
@@ -339,7 +322,6 @@ def encode_list_cursor(
     scan_before_start_time: datetime | None = None,
     scan_before_id: Any = None,
     witness_slack_hours: int | None = None,
-    typed_witness_lane: str | None = None,
 ) -> str:
     window_start = _utc_datetime(window_start, "window_start")
     window_end = _utc_datetime(window_end, "window_end")
@@ -377,8 +359,6 @@ def encode_list_cursor(
         or not 0 <= witness_slack_hours <= MAX_CURSOR_WITNESS_SLACK_HOURS
     ):
         raise ValueError("invalid list cursor witness slack")
-    if typed_witness_lane is not None and typed_witness_lane not in TYPED_WITNESS_LANES:
-        raise ValueError("invalid list cursor witness lane")
     payload = {
         "v": CURSOR_VERSION,
         "resource": resource,
@@ -400,9 +380,6 @@ def encode_list_cursor(
         # payload - and therefore the same boundary fingerprint - as before
         # this field existed.
         payload["witness_slack_hours"] = int(witness_slack_hours)
-    if typed_witness_lane is not None:
-        # Absent, not null, for the same reason as the slack field.
-        payload["typed_witness_lane"] = str(typed_witness_lane)
     return signing.dumps(
         payload, key=settings.SECRET_KEY, salt=CURSOR_SALT, compress=True
     )
@@ -513,9 +490,6 @@ def decode_list_cursor(
         or not 0 <= witness_slack_hours <= MAX_CURSOR_WITNESS_SLACK_HOURS
     ):
         raise ListCursorError("invalid_cursor", "The continuation cursor is invalid.")
-    typed_witness_lane = payload.get("typed_witness_lane")
-    if typed_witness_lane is not None and typed_witness_lane not in TYPED_WITNESS_LANES:
-        raise ListCursorError("invalid_cursor", "The continuation cursor is invalid.")
     if scan_before_start_time is not None and (
         not isinstance(scan_before_start_time, datetime)
         or not (scan_slice_start or window_start)
@@ -538,7 +512,6 @@ def decode_list_cursor(
         scan_before_start_time=scan_before_start_time,
         scan_before_id=scan_before_id,
         witness_slack_hours=witness_slack_hours,
-        typed_witness_lane=typed_witness_lane,
     )
 
 
@@ -604,19 +577,6 @@ def read_filter_seed_witness_slack(builder) -> int | None:
     return read() if callable(read) else None
 
 
-def read_typed_witness_lane(builder) -> str | None:
-    """The typed-witness lane this read was pinned to, for its continuation.
-
-    ``None`` for every builder that has no pin and every builder that has no
-    such policy at all, which keeps their cursors byte-identical to the ones
-    minted before the field existed. Only a known lane is carried.
-    """
-
-    read = getattr(builder, "typed_witness_lane", None)
-    lane = read() if callable(read) else None
-    return lane if lane in TYPED_WITNESS_LANES else None
-
-
 def pin_filter_seed_witness_slack(builder, cursor_state) -> None:
     """Finish a pagination under the slack its first hop was minted with.
 
@@ -654,9 +614,6 @@ def frozen_window_filter(cursor: ListCursor) -> dict[str, Any]:
 __all__ = [
     "ListCursor",
     "ListCursorError",
-    "TYPED_WITNESS_LANES",
-    "TYPED_WITNESS_LANE_SEEDED",
-    "TYPED_WITNESS_LANE_WALK",
     "cursor_page_metadata",
     "cursor_scope_for_request",
     "decode_list_cursor",
@@ -667,6 +624,5 @@ __all__ = [
     "normalize_cursor_query",
     "pin_filter_seed_witness_slack",
     "read_filter_seed_witness_slack",
-    "read_typed_witness_lane",
     "snapshot_cursor_supported",
 ]
