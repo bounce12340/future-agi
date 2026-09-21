@@ -68,6 +68,18 @@ def test_missing_eval_config_raises_config_error_at_builder(
         build_monitor_ch_builder(user_alert_monitor)
 
 
+def test_missing_project_id_raises_before_building_ch_query(
+    user_alert_monitor,
+) -> None:
+    user_alert_monitor.project = None
+    user_alert_monitor.save(update_fields=["project"])
+
+    with pytest.raises(
+        MonitorConfigError, match=f"Monitor {user_alert_monitor.id} has no project"
+    ):
+        build_monitor_ch_builder(user_alert_monitor)
+
+
 def test_unknown_eval_output_type_raises_config_error(user_alert_monitor) -> None:
     user_alert_monitor.metric_type = "evaluation_metrics"
     user_alert_monitor.metric = "22222222-2222-2222-2222-222222222222"
