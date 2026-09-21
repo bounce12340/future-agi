@@ -26,6 +26,14 @@ order are never touched by this decision: both lanes are exact on the list's
 own cursor order, and set-valued session predicates stay whole-window per
 candidate on either.
 
+WHICH PAGES IT GOVERNS. Number and boolean leaves - the shapes the walk
+routing demoted from the candidate lane, and the shapes whose witness rows
+price their statement (57 B per estimated row on the sparse tenant's numeric
+case). A string leaf is never probed and keeps the walk it has always had: the
+seeded statement reads the wide string map in every scan, and on the same
+tenant a string witness estimated at 0.49 M rows ran a 4.9 s statement over
+7.3 GB, about 15 KB per estimated row. A row estimate is not a cost there.
+
 WHAT A FAILED PROBE MEANS. The walk, always. A probe that raises, a result
 that is not an estimate table, an estimate that names no part (ambiguous
 between "nothing to read" and "no readable step" - the reading the other seed

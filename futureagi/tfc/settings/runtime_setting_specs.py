@@ -607,8 +607,12 @@ INTERACTIVE_READ_SETTING_SPECS = {
             ("SESSION_LIST_FILTER_MAX_SEED_ATTEMPTS", 24, 1, 512),
             ("SESSION_LIST_FILTER_MAX_QUERIES", 48, 1, 1_024),
             # The witness-cost gate for a Session page filtered by a typed
-            # span-attribute leaf (a string, number or boolean picker value
-            # with a positive raw witness). The candidate statement is seeded
+            # NUMBER or BOOLEAN span-attribute leaf with a positive raw
+            # witness - the shapes the walk routing demoted from the candidate
+            # lane. A string leaf keeps the walk it has always had: its row
+            # estimate does not price its statement, which reads the wide
+            # string map in every scan (measured on the sparse tenant: 0.49 M
+            # estimated rows, 4.9 s and 7.3 GB). The candidate statement is seeded
             # by ONE whole-window any-span witness that ClickHouse materialises
             # while planning, so its cost is that scan's; the bounded walk is
             # exact for the same predicate and bounded per statement, but on a
@@ -643,7 +647,14 @@ INTERACTIVE_READ_SETTING_SPECS = {
             # a statement with no socket deadline, so this cannot cut a probe
             # short: it bounds what the gate ACCEPTS. A probe that returns
             # after it routes the page to the walk whatever it estimated.
-            ("SESSION_LIST_TYPED_WITNESS_PROBE_BUDGET_MS", 1_500, 25, 30_000),
+            # Measured probes ran 0.07-1.4 s of server time at two workers
+            # (the high end is a cold index cache on the high-volume tenant's
+            # twelve-month window; the sparse tenant's own cold probe reached
+            # 1.4 s on a client clock that also paid a port-forward's round
+            # trip). The default sits above every observed cold probe and
+            # about at the sparse tenant's seeded statement itself: a probe
+            # slower than the statement it would admit is not worth believing.
+            ("SESSION_LIST_TYPED_WITNESS_PROBE_BUDGET_MS", 2_500, 25, 30_000),
             ("ANNOTATION_QUEUE_ADD_ITEMS_SYNC_MAX", 1_000, 1, 10_000),
             ("ANNOTATION_QUEUE_EXPORT_SYNC_MAX_ITEMS", 1_000, 1, 10_000),
             (
