@@ -627,7 +627,18 @@ def test_attribute_filter_preserves_storage_type_provenance(
     assert not manager._row_matches_filters(row)
 
 
-def test_positive_text_attribute_filter_uses_larger_witness_candidate_batch():
+def test_positive_text_attribute_filter_walks_matching_activity_not_the_seed():
+    """A plain-text attribute filter never reads the whole-window candidate page.
+
+    The seeded 65-row witness batch is the shape that dies on the largest
+    tenants; the page walks witnessed spans newest-first instead and says so
+    in its provenance and ordering. An empty default thirty-day window is
+    proven in three statements: the first empty slice, then the EXPLAIN
+    ESTIMATE that costs one existence statement over the rest of the window
+    (index marks only), then that existence statement, which returns nothing
+    here; the walk never spends its statement budget one day at a time on an
+    empty tail whose cost proof fits the target.
+    """
     manager = _manager(
         filters=[
             {
@@ -647,12 +658,53 @@ def test_positive_text_attribute_filter_uses_larger_witness_candidate_batch():
         captured_limits.append(kwargs["limit"])
         return []
 
-    with patch.object(manager, "_read_dimension_candidates", side_effect=no_candidates):
+    with (
+        patch.object(manager, "_read_dimension_candidates", side_effect=no_candidates),
+        patch(
+            "tracer.services.users_list_manager.V2AnalyticsQueryService"
+        ) as analytics_cls,
+    ):
+
+        def empty_server(query, params=None, timeout_ms=None, settings=None):
+            if query.lstrip().startswith("EXPLAIN ESTIMATE"):
+                # The estimate table for a tail the blooms exclude entirely:
+                # ClickHouse 25.3 reports a row of zeros, not an empty result.
+                return SimpleNamespace(
+                    data=[
+                        {
+                            "database": "default",
+                            "table": "spans",
+                            "parts": 0,
+                            "rows": 0,
+                            "marks": 0,
+                        }
+                    ],
+                    columns=["database", "table", "parts", "rows", "marks"],
+                    query_time_ms=1.0,
+                )
+            return SimpleNamespace(data=[], query_time_ms=1.0)
+
+        analytics_cls.return_value.execute_ch_query.side_effect = empty_server
         result = manager.list_cursor_payload(page_size=25)
 
     assert manager.attribute_exact_text_filters == {"call_id": ("call-a",)}
-    assert captured_limits == [USER_LIST_ATTRIBUTE_WITNESS_BATCH_SIZE + 1]
+    assert captured_limits == []
     assert result.payload["table"] == []
+    assert result.payload["query_provenance"] == "matching_activity_walk"
+    assert result.payload["ordering"] == "latest_matching_activity"
+    assert result.payload["has_more"] is False
+    statements = [
+        call.args[0]
+        for call in analytics_cls.return_value.execute_ch_query.call_args_list
+    ]
+    assert len(statements) == 3
+    assert "AS raw_end_user_id" in statements[0]
+    assert statements[1] == "EXPLAIN ESTIMATE\n" + statements[2].lstrip()
+    assert "SELECT 1 AS witnessed" in statements[2] and "LIMIT 1" in statements[2]
+    for statement in statements:
+        assert "scalar_witness_identities" not in statement
+        assert "end_user_id_remap" not in statement
+    assert USER_LIST_ATTRIBUTE_WITNESS_BATCH_SIZE == 64
 
 
 def test_negative_attribute_filter_never_uses_positive_candidate_pruning():

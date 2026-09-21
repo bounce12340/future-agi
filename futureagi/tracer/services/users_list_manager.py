@@ -11,7 +11,7 @@ import json
 from collections.abc import Iterator
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -35,8 +35,16 @@ from tracer.services.clickhouse.v2.query_builders.user_list import (
 )
 from tracer.services.clickhouse.v2.query_service import V2AnalyticsQueryService
 from tracer.services.user_attribute_contract import unsupported_user_attribute_keys
+from tracer.services.users_matching_walk import (
+    USER_LIST_MATCHING_CURSOR_ORDER,
+    walk_matching_activity_page,
+)
+from tracer.services.users_walk_witness import WalkedTypedFilter, typed_walk_filter
 
 logger = structlog.get_logger(__name__)
+
+# ``maxIf`` over DateTime64 yields the epoch when nothing matched.
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 # (header, source field) — column order is the frontend export contract.
@@ -181,6 +189,7 @@ def _users_attr_enrichment_query(
     end_date: datetime | None = None,
     candidate_end_user_id_map: dict[str, str] | None = None,
     candidate_text_values_by_key: dict[str, tuple[str, ...]] | None = None,
+    walked_typed_filter: WalkedTypedFilter | None = None,
 ):
     """Project only requested keys for a finite Observe-Users page.
 
@@ -188,6 +197,11 @@ def _users_attr_enrichment_query(
     versions are collapsed before tombstones, reassignments, or attribute
     presence are evaluated. All distinct typed values on the surviving spans
     are retained for any-span filter membership, not just the last value.
+
+    ``walked_typed_filter`` is the number/boolean predicate a matching-activity
+    walk is decided on: it narrows the physical seed exactly as the exact-text
+    values do and projects that filter's order key; it is read in its own
+    statement, never alongside text values.
     """
     from tracer.services.clickhouse.v2.id_remap_sql import (
         bounded_survivor_map_subquery,
@@ -230,9 +244,7 @@ def _users_attr_enrichment_query(
     candidate_user_filter = "end_user_id IN %(eu_scan_ids)s"
     if not finite_map:
         # Numbered pages have canonical IDs but no pre-expanded scan aliases.
-        candidate_user_filter = (
-            f"({candidate_user_filter} OR end_user_id IN (SELECT any_id FROM eu_survivor_map))"
-        )
+        candidate_user_filter = f"({candidate_user_filter} OR end_user_id IN (SELECT any_id FROM eu_survivor_map))"
     if (start_date is None) != (end_date is None):
         raise ValueError("attribute enrichment window must be provided together")
     time_filter = ""
@@ -269,9 +281,49 @@ def _users_attr_enrichment_query(
             """
         )
     params.update(candidate_value_params)
+    if walked_typed_filter is not None:
+        if candidate_value_clauses:
+            raise ValueError("a walked typed filter is read in its own statement")
+        params.update(walked_typed_filter.witness_params)
+        candidate_value_clauses.append(walked_typed_filter.witness_sql)
     candidate_value_filter = (
         "AND ((" + ") OR (".join(candidate_value_clauses) + "))"
         if candidate_value_clauses
+        else ""
+    )
+    # The matching-activity walk orders a filtered page by each user's newest
+    # LIVE span whose LATEST value matches. That key is decided here, on the
+    # same latest-state rows and the same lowercase comparison that admit the
+    # identities above, so a user can never carry an order key without the
+    # value that makes it a member. It is a projection, never a predicate:
+    # the candidate values narrow only the physical seed above, and the
+    # order key carries its own parameters to keep that visible. Epoch when
+    # no latest value matches.
+    matching_activity_clauses = []
+    for index in range(len(candidate_text_values_by_key or {})):
+        key_param = f"candidate_attribute_key_{index}"
+        if key_param not in candidate_value_params:
+            continue
+        params[f"matching_activity_key_{index}"] = candidate_value_params[key_param]
+        params[f"matching_activity_values_{index}"] = candidate_value_params[
+            f"candidate_attribute_values_{index}"
+        ]
+        matching_activity_clauses.append(
+            f"""
+            attribute_key = %(matching_activity_key_{index})s
+            AND latest_attribute_value_type = 'string'
+            AND lowerUTF8(JSONExtractString(latest_attribute_value_json))
+                IN %(matching_activity_values_{index})s
+            """
+        )
+    if walked_typed_filter is not None:
+        params.update(walked_typed_filter.order_params)
+        matching_activity_clauses.append(walked_typed_filter.order_clause)
+    matching_activity_projection = (
+        ",\n        maxIf(latest_start_time, (("
+        + ") OR (".join(matching_activity_clauses)
+        + "))) AS latest_matching_start_time"
+        if matching_activity_clauses
         else ""
     )
     sql = f"""
@@ -374,7 +426,7 @@ def _users_attr_enrichment_query(
             groupUniqArray(
                 tuple(latest_attribute_value_type, latest_attribute_value_json)
             )
-        ) AS attribute_typed_values
+        ) AS attribute_typed_values{matching_activity_projection}
     FROM latest_candidate_attribute_values
     LEFT JOIN eu_survivor_map AS eu_remap
         ON latest_end_user_id = eu_remap.any_id
@@ -456,6 +508,12 @@ class UsersListManager:
         # Keep raw attributes separate from native response fields. A custom
         # user_id or latency_ms must not read or overwrite the native value.
         self._attribute_values_by_user: dict[str, dict[str, object]] = {}
+        # Newest live span per user and walked key whose latest value matches
+        # the filter: the matching-activity walk's certified order key.
+        self._matching_activity_by_user: dict[str, dict[str, datetime]] = {}
+        # The number/boolean predicate the current walk is decided on, set by
+        # ``matching_activity_walk_applies`` for the page it applies to.
+        self._walked_typed_filter: WalkedTypedFilter | None = None
         # Public cost rounding/JSON dates are presentation, never filter truth.
         self._native_filter_values_by_user: dict[str, dict[str, Any]] = {}
         self._unqualified_attribute_fallback_used = False
@@ -701,6 +759,7 @@ class UsersListManager:
             str,
             dict[str, dict[tuple[str, str], tuple[object, str]]],
         ] = {}
+        matching_activity: dict[str, dict[str, datetime]] = {}
 
         def _collect(rows_to_collect: list[dict]) -> None:
             for attr_row in rows_to_collect:
@@ -708,6 +767,16 @@ class UsersListManager:
                 key = str(attr_row.get("attribute_key", ""))
                 if not uid or not key:
                     continue
+                newest_match = attr_row.get("latest_matching_start_time")
+                if isinstance(newest_match, datetime):
+                    if newest_match.tzinfo is None:
+                        newest_match = newest_match.replace(tzinfo=UTC)
+                    # ``maxIf`` with no matching latest value is the epoch.
+                    if newest_match > _EPOCH:
+                        by_key = matching_activity.setdefault(uid, {})
+                        previous = by_key.get(key)
+                        if previous is None or newest_match > previous:
+                            by_key[key] = newest_match
                 typed_values = attr_row.get("attribute_typed_values")
                 if typed_values is not None:
                     raw_values = [
@@ -756,6 +825,7 @@ class UsersListManager:
             bucket_end: datetime | None,
             *,
             candidate_text_values_by_key: dict[str, tuple[str, ...]] | None = None,
+            walked_typed_filter: WalkedTypedFilter | None = None,
         ) -> None:
             attr_query, attr_params = _users_attr_enrichment_query(
                 project_id=self.project_id,
@@ -765,6 +835,7 @@ class UsersListManager:
                 end_date=bucket_end,
                 candidate_end_user_id_map=candidate_end_user_id_map,
                 candidate_text_values_by_key=candidate_text_values_by_key,
+                walked_typed_filter=walked_typed_filter,
             )
             attr_params["eu_ids"] = tuple(str(e) for e in end_user_ids)
             attr_params["eu_scan_ids"] = tuple(
@@ -804,28 +875,38 @@ class UsersListManager:
                     bucket_start,
                     midpoint,
                     candidate_text_values_by_key=candidate_text_values_by_key,
+                    walked_typed_filter=walked_typed_filter,
                 )
                 _read_key_bucket(
                     keys,
                     midpoint,
                     bucket_end,
                     candidate_text_values_by_key=candidate_text_values_by_key,
+                    walked_typed_filter=walked_typed_filter,
                 )
                 return
             _collect(list(attr_result.data or ()))
 
+        walked = self._walked_typed_filter
+        walked_key = walked.key if walked is not None else None
         accelerated_keys = tuple(
             key
             for key in self.attribute_keys
-            if key in self.attribute_exact_text_filters
+            if key in self.attribute_exact_text_filters or key == walked_key
         )
         ordinary_keys = tuple(
-            key
-            for key in self.attribute_keys
-            if key not in self.attribute_exact_text_filters
+            key for key in self.attribute_keys if key not in accelerated_keys
         )
         key_batches = [
-            ((key,), {key: self.attribute_exact_text_filters[key]})
+            (
+                (key,),
+                (
+                    {key: self.attribute_exact_text_filters[key]}
+                    if key in self.attribute_exact_text_filters
+                    else None
+                ),
+                walked if key == walked_key else None,
+            )
             for key in accelerated_keys
         ]
         key_batches.extend(
@@ -834,17 +915,19 @@ class UsersListManager:
                     key_start : key_start + _USER_LIST_ATTRIBUTE_KEY_BATCH_SIZE
                 ],
                 None,
+                None,
             )
             for key_start in range(
                 0, len(ordinary_keys), _USER_LIST_ATTRIBUTE_KEY_BATCH_SIZE
             )
         )
-        for keys, candidate_values in key_batches:
+        for keys, candidate_values, typed_filter in key_batches:
             _read_key_bucket(
                 keys,
                 start_date,
                 end_date,
                 candidate_text_values_by_key=candidate_values,
+                walked_typed_filter=typed_filter,
             )
 
         user_attrs: dict[str, dict[str, object]] = {}
@@ -879,6 +962,9 @@ class UsersListManager:
                 ).items()
                 if key in current_attrs
             }
+            self._matching_activity_by_user[user_key] = matching_activity.get(
+                user_key, {}
+            )
         return user_attrs
 
     @staticmethod
@@ -1014,8 +1100,15 @@ class UsersListManager:
         end_date: datetime | None,
         candidate_scan_ids: list[str] | None = None,
         candidate_end_user_id_map: dict[str, str] | None = None,
+        skip_attribute_read: bool = False,
     ) -> None:
-        """Run only explicitly requested finite enrichments."""
+        """Run only explicitly requested finite enrichments.
+
+        ``skip_attribute_read`` is for a caller that already holds this batch's
+        span attributes in ``_attribute_values_by_user`` (the matching-activity
+        walk reads them before it decides which users to replay); the values
+        are applied from that cache instead of being read a second time.
+        """
 
         # ClickHouse read caps apply per statement, while concurrent statements
         # add their resident memory.  Run optional page enrichments serially so
@@ -1023,7 +1116,17 @@ class UsersListManager:
         if self.metric_keys:
             metrics = self._read_page_metrics(rows, builder, deadline)
             self._apply_page_metrics(rows, metrics)
-        if self.attribute_keys:
+        if self.attribute_keys and skip_attribute_read:
+            self._apply_span_attributes(
+                rows,
+                {
+                    str(row.get("end_user_id", "")): self._attribute_values_by_user.get(
+                        str(row.get("end_user_id", "")), {}
+                    )
+                    for row in rows
+                },
+            )
+        elif self.attribute_keys:
             attributes = self._read_span_attributes(
                 rows,
                 deadline,
@@ -1059,6 +1162,46 @@ class UsersListManager:
                 },
             },
         ]
+
+    def matching_activity_walk_applies(self, builder: UserListQueryBuilderV2) -> bool:
+        """Whether this page walks newest matching activity instead of seeding.
+
+        True exactly when the first scalar witness is the ONLY filter item on
+        its key and either (text) the manager accelerates that key as an
+        exact-text filter, or (number/boolean) the item is a shape whose
+        Python and SQL comparisons are provably the same
+        (``users_walk_witness``): the walk reuses that one witness to discover
+        users, to narrow their certification and to project the order key.
+        A key carrying more than one filter item keeps the seeded page: the
+        walk's order key and its witness must be one predicate, and the
+        exact-text values of a key are the union of all its items.
+        Every other filter shape keeps its path. Sets the typed predicate the
+        certification reads when the walk applies.
+        """
+        self._walked_typed_filter = None
+        if self.sort_params:
+            return False
+        witness = builder.matching_activity_witness()
+        if witness is None:
+            return False
+        key, kind = witness[0], witness[1]
+        items = [
+            item
+            for item in self.filters
+            if not UserListQueryBuilderV2._is_date_filter(item)
+            and not UserListQueryBuilderV2._is_relation_filter(item)
+            and str(item.get("column_id") or item.get("columnId")) == key
+            and not UserListQueryBuilderV2._is_output_filter(item)
+        ]
+        if len(items) != 1:
+            return False
+        if kind == "text":
+            return key in self.attribute_exact_text_filters
+        typed = typed_walk_filter(witness, items[0])
+        if typed is None:
+            return False
+        self._walked_typed_filter = typed
+        return True
 
     def _prune_attribute_candidate_batch(
         self,
@@ -1253,6 +1396,7 @@ class UsersListManager:
         deadline: ReadDeadline | None,
         enrich_rows: bool = True,
         candidate_rows: list[dict] | None = None,
+        skip_attribute_read: bool = False,
     ) -> list[dict]:
         if not candidate_ids:
             return []
@@ -1317,6 +1461,7 @@ class UsersListManager:
                 end_date=window_end,
                 candidate_scan_ids=candidate_scan_ids,
                 candidate_end_user_id_map=candidate_end_user_id_map,
+                skip_attribute_read=skip_attribute_read,
             )
         return rows
 
@@ -1687,6 +1832,32 @@ class UsersListManager:
         )
         return _unix_microseconds(instant)
 
+    def _attribute_filters_match(self, row: dict[str, Any]) -> bool:
+        """Only the raw span-attribute predicates, from the enrichment cache.
+
+        The matching-activity walk decides these before it spends a replay on
+        a user; ``_row_matches_filters`` re-decides them, unchanged, on the
+        replayed row together with every native and relation predicate.
+        """
+        for item in self.filters:
+            if UserListQueryBuilderV2._is_date_filter(item):
+                continue
+            if UserListQueryBuilderV2._is_relation_filter(item):
+                continue
+            column_id = item.get("column_id") or item.get("columnId")
+            if not column_id or UserListQueryBuilderV2._is_output_filter(item):
+                continue
+            if (
+                column_id == "eval_score"
+                and UserListQueryBuilderV2._filter_col_type(item) != "SPAN_ATTRIBUTE"
+            ):
+                continue
+            if not self._attribute_value_matches(
+                row=row, key=column_id, config=item.get("filter_config") or {}
+            ):
+                return False
+        return True
+
     def _row_matches_filters(self, row: dict[str, Any]) -> bool:
         for item in self.filters:
             if UserListQueryBuilderV2._is_date_filter(item):
@@ -1759,6 +1930,8 @@ class UsersListManager:
         self._unqualified_attribute_fallback_used = False
         self._attribute_values_by_user.clear()
         self._attribute_value_types_by_user.clear()
+        self._matching_activity_by_user.clear()
+        self._walked_typed_filter = None
         self._native_filter_values_by_user.clear()
         self._relation_matching_user_ids.clear()
         base_builder = UserListQueryBuilderV2(
@@ -1777,6 +1950,19 @@ class UsersListManager:
             seen_before = 0
             before_first_seen = None
             before_end_user_id = None
+            # A plain-text span-attribute filter orders the page by newest
+            # matching activity and walks witnessed spans newest-first: the
+            # whole-window candidate statement is never issued for it.
+            if self.matching_activity_walk_applies(base_builder):
+                return walk_matching_activity_page(
+                    self,
+                    page_size=page_size,
+                    window_start=window_start,
+                    window_end=window_end,
+                    frozen_filters=frozen_filters,
+                    cursor_order=None,
+                    seen_before=0,
+                )
         else:
             window_start, window_end = cursor.window_start, cursor.window_end
             frozen_filters = self._frozen_filters(
@@ -1785,6 +1971,20 @@ class UsersListManager:
                 window_end=window_end,
             )
             seen_before = cursor.seen_rows
+            if cursor.order and cursor.order[0] == USER_LIST_MATCHING_CURSOR_ORDER:
+                if not self.matching_activity_walk_applies(base_builder):
+                    raise ListCursorError(
+                        "invalid_cursor", "User ordering changed; restart pagination."
+                    )
+                return walk_matching_activity_page(
+                    self,
+                    page_size=page_size,
+                    window_start=window_start,
+                    window_end=window_end,
+                    frozen_filters=frozen_filters,
+                    cursor_order=tuple(cursor.order),
+                    seen_before=seen_before,
+                )
             if len(cursor.order) != 3 or cursor.order[0] != USER_LIST_CURSOR_ORDER:
                 raise ListCursorError(
                     "invalid_cursor", "User ordering changed; restart pagination."

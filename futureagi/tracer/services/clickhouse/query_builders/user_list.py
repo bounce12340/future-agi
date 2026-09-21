@@ -1,5 +1,6 @@
 """ClickHouse query builder for Observe end-user list and detail metrics."""
 
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from tracer.services.clickhouse.eval_logger_table import eval_logger_source
@@ -18,6 +19,13 @@ from tracer.services.clickhouse.v2.id_remap_sql import (
 
 class UnsupportedBoundedUserListQuery(ValueError):
     """Raised when an exact user page cannot use the bounded query path."""
+
+
+# The estimate table ``EXPLAIN ESTIMATE`` returns on ClickHouse 25.3; the
+# matching-activity walk reads its ``rows`` to cost a tail existence statement.
+_MATCHING_ACTIVITY_ESTIMATE_COLUMNS = frozenset(
+    {"database", "table", "parts", "rows", "marks"}
+)
 
 
 # Execution shape of a SEEDED candidate page (a scalar attribute witness or a
@@ -445,7 +453,47 @@ class UserListQueryBuilder(BaseQueryBuilder):
         return " AND ".join(clauses), params
 
     def _positive_scalar_user_witness(self) -> tuple[str, dict[str, Any]]:
-        """Reuse complete numeric or ordinary text witnesses for group acquisition."""
+        """Reuse complete numeric or ordinary text witnesses for group acquisition.
+
+        The seeded page keeps exactly the witnesses it always had: the first
+        text or number filter whose compiler graph witness compares a value.
+        The witnesses that qualify only the matching-activity walk (boolean,
+        and a positive equality the graph witness declines) are skipped here;
+        seeding the whole-window statement on them would move that statement
+        out of its reviewed shapes for no measured gain.
+        """
+        for _item, _kind, witness, params, seedable in self._scalar_user_witnesses():
+            if seedable:
+                return witness, params
+        return "", {}
+
+    def matching_activity_witness(
+        self,
+    ) -> tuple[str, str, str, dict[str, Any]] | None:
+        """The scalar witness the walk discovers on: ``(key, kind, sql, params)``.
+
+        The walk prefers exactly the witness the seeded candidate page would
+        have used, so both paths admit the same raw superset; when the page
+        has none it takes the first witness that qualifies the walk alone (a
+        boolean typed-map witness, or a positive equality whose missing-key
+        default the graph witness declines). It needs the key to read that
+        filter's certified order key back from the page enrichment. ``kind``
+        is ``text``, ``number`` or ``boolean``.
+        """
+        chosen = None
+        for item, kind, witness, params, seedable in self._scalar_user_witnesses():
+            found = (
+                str(item.get("column_id") or item.get("columnId")),
+                kind,
+                witness,
+                params,
+            )
+            if seedable:
+                return found
+            chosen = chosen or found
+        return chosen
+
+    def _scalar_user_witnesses(self):
         from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
             compile_trace_filter_plans,
         )
@@ -474,7 +522,20 @@ class UserListQueryBuilder(BaseQueryBuilder):
             if len(plans) != 1:
                 continue
             plan = plans[0]
+            operation = config.get("filter_op") or config.get("filterOp")
             witness = plan.raw_graph_value_witness_predicate or ""
+            seedable = bool(witness)
+            if not witness and operation in {"equals", "in"}:
+                # The graph witness declines a positive equality whose missing
+                # key default could satisfy it (boolean false, number zero):
+                # its classifier aggregates key presence and value separately,
+                # so on a version tie those may come from different rows. The
+                # Users enrichment reads type and value of one row and drops an
+                # absent key as an empty value, so for it the compiler's raw
+                # witness (key present AND value equal on a physical row) is
+                # exhaustive: every latest live match has such a row. It
+                # qualifies the walk alone; the seeded page keeps declining it.
+                witness = plan.raw_witness_predicate or ""
             raw_values = config.get("filter_value", config.get("filterValue"))
             values = raw_values if isinstance(raw_values, list) else [raw_values]
             # Users canonicalizes boolean/JSON-looking text and uses Python's
@@ -483,8 +544,7 @@ class UserListQueryBuilder(BaseQueryBuilder):
             plain_text = (
                 (config.get("filter_type") or config.get("filterType"))
                 in {"text", "string"}
-                and (config.get("filter_op") or config.get("filterOp"))
-                in {"equals", "in"}
+                and operation in {"equals", "in"}
                 and bool(values)
                 and all(
                     isinstance(value, str)
@@ -495,23 +555,36 @@ class UserListQueryBuilder(BaseQueryBuilder):
                     for value in values
                 )
             )
-            numeric_witness = (
-                "span_attr_num[" in witness and "span_attr_str" not in witness
-            )
-            text_witness = (
+            # One typed map, compared by value (``column[key]``), nothing else.
+            mentioned = {
+                name
+                for name in ("span_attr_str", "span_attr_num", "span_attr_bool")
+                if name in witness
+            }
+            kind = None
+            if mentioned == {"span_attr_num"} and "span_attr_num[" in witness:
+                kind = "number"
+            elif mentioned == {"span_attr_bool"} and "span_attr_bool[" in witness:
+                kind = "boolean"
+            elif (
                 plain_text
+                and mentioned == {"span_attr_str"}
                 and "span_attr_str[" in witness
-                and "span_attr_num" not in witness
-            )
+            ):
+                kind = "text"
             if (
-                plan.scope == "any"
+                kind is not None
+                and plan.scope == "any"
                 and not plan.exclude_group_matches
-                and (numeric_witness or text_witness)
-                and "span_attr_bool" not in witness
                 and "JSONExtract" not in witness
             ):
-                return rewrite_v1_sql_to_v2(witness), dict(plan.params)
-        return "", {}
+                yield (
+                    item,
+                    kind,
+                    rewrite_v1_sql_to_v2(witness),
+                    dict(plan.params),
+                    seedable and kind != "boolean",
+                )
 
     def build_dimension_survivor_query(
         self,
@@ -532,6 +605,183 @@ class UserListQueryBuilder(BaseQueryBuilder):
             f"FROM ({remap})",
             {"dimension_candidate_ids": ids},
         )
+
+    def build_matching_activity_slice_query(
+        self,
+        *,
+        slice_start: Any,
+        slice_end: Any,
+        limit: int,
+        before: tuple[Any, str] | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Newest-first witnessed RAW user ids of one time slice.
+
+        ``before`` continues a truncated slice past its last returned raw id in
+        ``(raw_newest DESC, raw_end_user_id DESC)`` order, so ids tied on the
+        floor's timestamp cannot be re-served for ever; it filters groups after
+        aggregation and adds no scan.
+
+        One PREWHERE-bounded scan of ``[slice_start, slice_end)`` through the
+        deployed key and value blooms, grouped by the raw ``end_user_id`` the
+        span carries. It touches no other table: an empty slice therefore costs
+        only the granules the blooms cannot exclude, and the statement carries
+        no ``IN (subquery)`` over the sorting key, so ClickHouse materialises
+        nothing while planning; its work is bounded by the slice, never by the
+        window. Aliases are resolved afterwards, and only for a populated
+        slice, by the existing bounded survivor statement
+        (``build_dimension_survivor_query``) over exactly the ids returned.
+        Rows are a raw superset (stale versions, moved users, tombstones); the
+        page certifies each resolved user afterwards against latest state over
+        the whole window. ``raw_newest`` is only the slice's coverage floor
+        when the LIMIT truncates: every raw id with a witnessed row newer than
+        the last returned row is in the result, so every resolved user with
+        such a row is too.
+        """
+        if limit <= 0:
+            raise ValueError("matching activity slice limit must be positive")
+        params = self._matching_activity_range_params(slice_start, slice_end)
+        params["slice_user_limit"] = int(limit)
+        keyset = ""
+        if before is not None:
+            before_time, before_id = before
+            params["slice_before_us"] = _unix_microseconds(before_time)
+            params["slice_before_end_user_id"] = str(before_id)
+            keyset = """
+        HAVING raw_newest < fromUnixTimestamp64Micro(%(slice_before_us)s, 'UTC')
+            OR (
+                raw_newest = fromUnixTimestamp64Micro(%(slice_before_us)s, 'UTC')
+                AND raw_end_user_id < %(slice_before_end_user_id)s
+            )
+            """
+        query = f"""
+        SELECT toString(end_user_id) AS raw_end_user_id, max(start_time) AS raw_newest
+        FROM spans
+        PREWHERE {self._matching_activity_range_predicate()}
+        WHERE {params.pop("_witness_sql")}
+        GROUP BY raw_end_user_id
+        {keyset}
+        ORDER BY raw_newest DESC, raw_end_user_id DESC
+        LIMIT %(slice_user_limit)s
+        {_SEEDED_PAGE_READ_SETTINGS}
+        """
+        return query, params
+
+    def build_matching_activity_existence_query(
+        self, *, range_start: Any, range_end: Any
+    ) -> tuple[str, dict[str, Any]]:
+        """Whether any witnessed row lies in ``[range_start, range_end)``.
+
+        The same scan shape as a slice, with no aggregation and ``LIMIT 1``:
+        it stops at the first witnessed row, and for a value the blooms
+        exclude everywhere it reads nothing but index marks. The walk uses it
+        to prove a long empty tail in one statement instead of one statement
+        per day; a row proves only existence, never a position. It is issued
+        only after ``build_matching_activity_existence_estimate_query`` has
+        costed it: nothing else bounds a statement wider than the slice cap
+        (application reads carry no server row, byte or time cap).
+        """
+        params = self._matching_activity_range_params(range_start, range_end)
+        query = f"""
+        SELECT 1 AS witnessed
+        FROM spans
+        PREWHERE {self._matching_activity_range_predicate()}
+        WHERE {params.pop("_witness_sql")}
+        LIMIT 1
+        {_SEEDED_PAGE_READ_SETTINGS}
+        """
+        return query, params
+
+    def build_matching_activity_existence_estimate_query(
+        self, *, range_start: Any, range_end: Any
+    ) -> tuple[str, dict[str, Any]]:
+        """``EXPLAIN ESTIMATE`` of the existence statement, text for text.
+
+        Reads no column data: the server answers from the primary index and
+        the deployed key and value blooms with the parts, granules and rows
+        the existence statement WOULD read (verified on ClickHouse 25.3: a
+        value the value bloom excludes selects zero parts). It costs that
+        statement before the walk issues it; it never decides coverage,
+        because a planner's estimate is not a row read. The wrapped text is
+        exactly the existence statement, settings clause included, so the
+        rows it reports are the rows that statement reads. The estimate
+        itself is that statement's index analysis, and costs what the
+        analysis costs - the index granules of every selected part, read at
+        the caller's thread count and cache state - which is why the walk
+        runs it under the existence statement's own read settings and
+        inside the probe's wall.
+        """
+        query, params = self.build_matching_activity_existence_query(
+            range_start=range_start, range_end=range_end
+        )
+        return "EXPLAIN ESTIMATE\n" + query.lstrip(), params
+
+    @staticmethod
+    def matching_activity_existence_estimate(
+        rows: Iterable[Mapping[str, Any]], columns: Iterable[str] | None
+    ) -> int | None:
+        """Reduce the estimate to the rows the existence statement would read.
+
+        Every ``spans`` row of the estimate table sums. ``None`` means the
+        answer cannot be read - the estimate table's columns are missing, a
+        row names another table or carries no integer, or the result is EMPTY.
+        ClickHouse 25.3 reports a selection of no part as a row of zeros, so
+        an empty result is a plan this reducer does not understand (the same
+        signal ``graph_dispatch`` refuses); the walk then slices at its cap
+        rather than issue a statement it has not costed.
+        """
+        names = {str(name) for name in (columns or ())}
+        if not _MATCHING_ACTIVITY_ESTIMATE_COLUMNS.issubset(names):
+            return None
+        estimate = 0
+        counted_any = False
+        for row in rows or ():
+            counted_any = True
+            if not isinstance(row, Mapping):
+                return None
+            if str(row.get("table") or "") != "spans":
+                return None
+            counted = row.get("rows")
+            if isinstance(counted, bool) or not isinstance(counted, (int, float)):
+                return None
+            estimate += max(0, int(counted))
+        return estimate if counted_any else None
+
+    def _matching_activity_range_params(
+        self, range_start: Any, range_end: Any
+    ) -> dict[str, Any]:
+        if range_start is None or range_end is None or range_start >= range_end:
+            raise ValueError("matching activity slice is invalid")
+        witness = self.matching_activity_witness()
+        if witness is None:
+            raise UnsupportedBoundedUserListQuery(
+                "user list filters carry no scalar span attribute witness"
+            )
+        _key, _kind, witness_sql, witness_params = witness
+        params: dict[str, Any] = {
+            **witness_params,
+            "slice_start_date": range_start,
+            "slice_end_date": range_end,
+            "slice_start_us": _unix_microseconds(range_start),
+            "slice_end_us": _unix_microseconds(range_end),
+            "_witness_sql": witness_sql,
+        }
+        if self.project_ids is not None:
+            params["project_ids"] = tuple(self.project_ids)
+        else:
+            params["project_id"] = self.project_id
+        return params
+
+    def _matching_activity_range_predicate(self) -> str:
+        return f"""{self._project_predicate("spans")}
+          AND toDate(start_time) BETWEEN toDate(%(slice_start_date)s) AND toDate(%(slice_end_date)s)
+          AND toStartOfHour(start_time) >= toStartOfHour(
+              fromUnixTimestamp64Micro(%(slice_start_us)s, 'UTC')
+          )
+          AND toStartOfHour(start_time) < fromUnixTimestamp64Micro(%(slice_end_us)s, 'UTC')
+          AND start_time >= fromUnixTimestamp64Micro(%(slice_start_us)s, 'UTC')
+          AND start_time < fromUnixTimestamp64Micro(%(slice_end_us)s, 'UTC')
+          AND isNotNull(end_user_id)
+          {"AND 0 = 1" if self.empty_scope else ""}"""
 
     def supports_candidate_first_page(self) -> bool:
         """Whether the request can page exactly from latest physical spans.
