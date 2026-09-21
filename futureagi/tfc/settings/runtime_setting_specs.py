@@ -560,19 +560,14 @@ INTERACTIVE_READ_SETTING_SPECS = {
             # prefilters and probes keep the page's count. Measured read-only
             # against production on the high-volume tenant's twelve-month
             # boolean page, one classify chunk of fifty sessions reading
-            # 15.8 M rows and 1.7 GB, re-issued three times in a row (a WARM
-            # cache): 3.5 s at two workers, 1.1 s at four, 0.7 s at eight -
-            # same rows, same bytes, identical result digest. The same page
-            # replayed through the rig with the classifier at four workers
-            # over whatever cache the sweep had left: 6.3 s of classify time
-            # against 6.1 s at two - a chunk that has to READ its 1.7 GB is
-            # bound by that read and workers do not shorten it. The lever is
-            # therefore conditional: it pays on a warm cache (a user refining
-            # a filter over the window they just read) and nothing on a cold
-            # one. Rows, bytes and results never depend on this number; peak
-            # memory per classify statement rises with it, and so does the
-            # load one request places on the cluster, which is the owner's
-            # capacity call - the default changes nothing.
+            # 15.8 M rows: 3.5 s at two workers, 1.1 s at four, 0.7 s at
+            # eight - same rows, same bytes, identical result digest. Three
+            # such chunks are over ninety percent of that page's 9.9 s, so
+            # four workers would put it near 3.5 s and eight near 2.5 s. Rows,
+            # bytes and results never depend on this number; peak memory per
+            # classify statement rises with it, and so does the load one
+            # request places on the cluster, which is the owner's capacity
+            # call - the default changes nothing.
             ("SESSION_LIST_CLASSIFY_MAX_THREADS", 0, 0, 16),
             ("SESSION_LIST_MAX_RESULT_BYTES", 32 * 1024**2, 64 * 1024, 512 * 1024**2),
             ("SESSION_LIST_FILTER_MAX_CANDIDATES", 200, 1, 5_000),
