@@ -80,6 +80,21 @@ def test_missing_project_id_raises_before_building_ch_query(
         build_monitor_ch_builder(user_alert_monitor)
 
 
+def test_missing_project_id_is_skipped_without_ch_call(
+    user_alert_monitor,
+) -> None:
+    user_alert_monitor.project = None
+    user_alert_monitor.save(update_fields=["project"])
+    task_fn = process_monitor_task._original_func
+
+    with mock.patch.object(monitor_mod.logger, "warning") as warning:
+        with _patch_ch([]):
+            task_fn(str(user_alert_monitor.id), timezone.now().isoformat())
+
+    warning.assert_called_once()
+    assert warning.call_args.args[0] == "monitor_misconfigured"
+
+
 def test_unknown_eval_output_type_raises_config_error(user_alert_monitor) -> None:
     user_alert_monitor.metric_type = "evaluation_metrics"
     user_alert_monitor.metric = "22222222-2222-2222-2222-222222222222"
