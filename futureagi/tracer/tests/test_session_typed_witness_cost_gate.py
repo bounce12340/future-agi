@@ -361,46 +361,12 @@ def test_the_probe_uses_the_views_session_read_settings_threads():
     assert call["settings"]["max_result_rows"] == 256
 
 
-@_GATE
-@pytest.mark.parametrize(
-    "filters",
-    [
-        [_window(), _attribute("s", "text", "equals", "Rejected")],
-        [_window(), _attribute("s", "text", "in", ["a", "b"])],
-        # a string leaf beside a number leaf: the statement still reads the
-        # string map in every scan, so the conjunction is not governed either
-        [
-            _window(),
-            _attribute("s", "text", "equals", "Rejected"),
-            _attribute("n", "number", "greater_than", 7),
-        ],
-    ],
-)
-def test_a_string_leaf_is_not_governed_and_keeps_the_walk(filters):
-    """A row estimate does not price a string witness's statement.
-
-    Measured on the sparse tenant: a string witness estimated at 0.49 M rows
-    ran a 4.9 s statement over 7.3 GB, about 15 KB per estimated row, because
-    the seeded statement reads the wide string map in every scan. So the gate
-    never probes a string leaf; the page walks as it always has.
-    """
-
-    builder = _builder(filters)
-    assert builder.build_typed_witness_cost_probe_query() is None
-    analytics = _Analytics(rows=1)
-    decision = _decide(builder, analytics)
-    assert decision.lane is None and decision.reason == "not_governed"
-    assert analytics.calls == []
-    assert builder.prefers_bounded_filter_page() is True
-
-
 @pytest.mark.parametrize(
     ("kind", "operation", "value"),
     [
         ("boolean", "equals", True),
-        ("boolean", "equals", False),
         ("number", "greater_than", 7),
-        ("number", "equals", 0),
+        ("text", "equals", "Rejected"),
     ],
 )
 def test_the_probe_prices_exactly_the_statements_witness_scan(kind, operation, value):

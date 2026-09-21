@@ -1744,19 +1744,15 @@ def test_string_page_public_dispatch_and_old_order_token(org, cursor, kind, pref
     # The candidate cursor route costs its slice width against an index-only
     # density probe before the page statement; this double reports no columns,
     # so the width reducer says "unknown" and the page is read unnarrowed. A
-    # number or boolean leaf costs its witness scan against an index-only
-    # probe before the route is chosen; this double cannot be read either, so
-    # that page walks - one EXPLAIN, no witness statement, the walk read
-    # once. A page carrying a string leaf (the text, mixed and "number" shapes
-    # here, whose number leaf sits beside a string ``in``) is never probed: a
-    # row estimate does not price a statement that reads the string map.
-    probed = preferred and kind == "boolean"
-    expected_reads = int(probed) if preferred else (2 if cursor else 1)
+    # typed-leaf page costs its witness scan against an index-only probe
+    # before the route is chosen; this double cannot be read either, so that
+    # page walks - one EXPLAIN, no witness statement, the walk read once.
+    expected_reads = 1 if preferred else (2 if cursor else 1)
     assert (
         bounded.call_count == int(preferred)
         and analytics.execute_ch_query.call_count == expected_reads
     )
-    if probed:
+    if preferred:
         (probe_call,) = analytics.execute_ch_query.call_args_list
         assert probe_call.args[0].lstrip().startswith("EXPLAIN ESTIMATE")
     assert selected.candidate_cursor is (cursor and not preferred)

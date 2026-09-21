@@ -1466,16 +1466,7 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         complete 2 s statement performs.
 
         ``None`` when the page is not governed by the typed-witness policy:
-        there is no witness scalar to cost and no lane to choose. ``None``
-        also when any plan witnesses through the STRING map, which keeps the
-        walk string leaves have always had. A row estimate is not a cost proxy
-        there: the seeded statement reads the wide ``attrs_string`` values in
-        every scan it makes, and on the sparse tenant a string witness
-        estimated at 0.49 M rows ran a 4.9 s statement over 7.3 GB - about
-        15 KB per estimated row, against 57 B per row for the numeric witness
-        whose statement the gate exists to give back. Number and boolean maps
-        are the shapes the walk routing demoted from the candidate lane, and
-        the shapes whose witness rows price their statement.
+        there is no witness scalar to cost and no lane to choose.
 
         The probe is a cost question only. It never decides membership,
         coverage or order - the walk and the candidate statement are both
@@ -1485,10 +1476,6 @@ class SessionListQueryBuilder(BaseQueryBuilder):
 
         plans = self._typed_witness_walk_plans()
         if plans is None:
-            return None
-        if any(
-            "span_attr_str" in (plan.raw_key_witness_predicate or "") for plan in plans
-        ):
             return None
         witness, predicate = self._candidate_witness_plan(plans)
         if witness is None or not predicate:
