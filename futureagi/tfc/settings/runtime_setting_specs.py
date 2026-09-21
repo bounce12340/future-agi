@@ -552,6 +552,23 @@ INTERACTIVE_READ_SETTING_SPECS = {
             # measuring that tenant's voice child-witness lag.
             ("VOICE_FILTER_TEXT_SEED_WITNESS_SLACK_HOURS", 0, 0, 168),
             ("SESSION_LIST_READ_MAX_THREADS", 2, 1, 16),
+            # Workers for the session walk's CLASSIFIER statements alone - the
+            # fused latest-state replay over one chunk of seeded sessions.
+            # ZERO (the default) follows SESSION_LIST_READ_MAX_THREADS, so
+            # every statement of a filtered page keeps today's count; above
+            # zero, classify statements run at this many workers while seeds,
+            # prefilters and probes keep the page's count. Measured read-only
+            # against production on the high-volume tenant's twelve-month
+            # boolean page, one classify chunk of fifty sessions reading
+            # 15.8 M rows: 3.5 s at two workers, 1.1 s at four, 0.7 s at
+            # eight - same rows, same bytes, identical result digest. Three
+            # such chunks are over ninety percent of that page's 9.9 s, so
+            # four workers would put it near 3.5 s and eight near 2.5 s. Rows,
+            # bytes and results never depend on this number; peak memory per
+            # classify statement rises with it, and so does the load one
+            # request places on the cluster, which is the owner's capacity
+            # call - the default changes nothing.
+            ("SESSION_LIST_CLASSIFY_MAX_THREADS", 0, 0, 16),
             ("SESSION_LIST_MAX_RESULT_BYTES", 32 * 1024**2, 64 * 1024, 512 * 1024**2),
             ("SESSION_LIST_FILTER_MAX_CANDIDATES", 200, 1, 5_000),
             # Whether the bounded session seed narrows candidacy by the
@@ -589,6 +606,44 @@ INTERACTIVE_READ_SETTING_SPECS = {
             ("SESSION_LIST_FILTER_SEED_WITNESS_SLACK_HOURS", -1, -1, 168),
             ("SESSION_LIST_FILTER_MAX_SEED_ATTEMPTS", 24, 1, 512),
             ("SESSION_LIST_FILTER_MAX_QUERIES", 48, 1, 1_024),
+            # The witness-cost gate for a Session page filtered by a typed
+            # span-attribute leaf (a string, number or boolean picker value
+            # with a positive raw witness). The candidate statement is seeded
+            # by ONE whole-window any-span witness that ClickHouse materialises
+            # while planning, so its cost is that scan's; the bounded walk is
+            # exact for the same predicate and bounded per statement, but on a
+            # sparse tenant it turns an empty twelve-month answer from one 2 s
+            # statement into thirty-two seed statements and a cursor. Before
+            # the first statement the gate prices the witness scan from the
+            # index only (``EXPLAIN ESTIMATE`` of exactly that scan, at the
+            # statement's own read settings, projections off): an estimate AT
+            # OR UNDER this many rows takes the seeded lane; above it, or on
+            # any probe that fails, times out or cannot be read, the walk.
+            # ZERO turns the gate off and every such page walks.
+            #
+            # Measured read-only against production at the product's two
+            # workers: the high-volume tenant's twelve-month boolean witness
+            # estimates 238 M rows (the ``attrs_bool`` keys bloom leaves 59%
+            # of the window's granules) and its statement dies at the 30 s
+            # wall; the sparse tenant's twelve-month numeric witness estimates
+            # under a million rows and its statement completes in about two
+            # seconds. The default sits between them, on the sparse tenant's
+            # side of the gap, and is a cost preference only: the estimate
+            # never decides membership, coverage or order.
+            (
+                "SESSION_LIST_TYPED_WITNESS_SEEDED_MAX_ESTIMATED_ROWS",
+                2_000_000,
+                0,
+                2_000_000_000,
+            ),
+            # The client-clock budget one witness-cost probe may take and still
+            # be believed. Production sends no server ``max_execution_time`` on
+            # any statement (``application_read_settings`` zeroes it and is
+            # re-applied over every caller) and the application transport runs
+            # a statement with no socket deadline, so this cannot cut a probe
+            # short: it bounds what the gate ACCEPTS. A probe that returns
+            # after it routes the page to the walk whatever it estimated.
+            ("SESSION_LIST_TYPED_WITNESS_PROBE_BUDGET_MS", 1_500, 25, 30_000),
             ("ANNOTATION_QUEUE_ADD_ITEMS_SYNC_MAX", 1_000, 1, 10_000),
             ("ANNOTATION_QUEUE_EXPORT_SYNC_MAX_ITEMS", 1_000, 1, 10_000),
             (

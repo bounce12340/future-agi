@@ -7097,6 +7097,67 @@ def test_candidate_first_seed_keeps_exact_classifier_and_page_hydration() -> Non
     )
 
 
+def _classify_worker_budget_page(classify_read_settings):
+    row = {
+        "id": "trace-user",
+        "root_span_id": "root-user",
+        "start_time": END - timedelta(days=180),
+        "name": "user trace",
+    }
+    builder = _CandidateFirstIdentityHydrationFakeBuilder(
+        rows=[row],
+        start=END - timedelta(days=365),
+        end=END,
+        key_field="id",
+        recommended_batch_size=80,
+        recommended_seed_batch_size=200,
+    )
+    executor = _IdentityHydrationFakeExecutor(builder)
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=executor,
+        filters=[_time_filter(END - timedelta(days=365), END)],
+        key_field="id",
+        page_number=0,
+        page_size=25,
+        deadline_ms=30_000,
+        max_candidates=512,
+        max_seed_attempts=128,
+        max_query_count=128,
+        read_settings={"max_threads": 2},
+        classify_read_settings=classify_read_settings,
+        include_incomplete_rows=True,
+        bounded_continuation=True,
+    )
+    assert page.complete is True
+    assert page.rows == [row]
+    return dict(executor.settings_by_query)
+
+
+def test_a_callers_classifier_worker_budget_raises_classify_statements_only() -> None:
+    """The classifier alone runs at the caller's budget; seeds keep the page's."""
+
+    by_query = _classify_worker_budget_page({"max_threads": 4})
+    assert by_query["match_identity"]["max_threads"] == 4
+    # A wide seed is min(wide-seed workers, the page's explicit two).
+    assert by_query["candidate_seed"]["max_threads"] == min(
+        settings.FILTER_SELECTOR_WIDE_SEED_MAX_THREADS, 2
+    )
+    assert by_query["hydrate"]["max_threads"] == 2
+
+
+def test_without_a_classifier_worker_budget_every_statement_keeps_the_pages_count() -> (
+    None
+):
+    by_query = _classify_worker_budget_page(None)
+    assert by_query["match_identity"]["max_threads"] == 2
+    assert by_query["hydrate"]["max_threads"] == 2
+    with pytest.raises(ValueError):
+        _classify_worker_budget_page({"max_threads": 0})
+    with pytest.raises(ValueError):
+        _classify_worker_budget_page({"max_memory_usage": 4})
+
+
 @dataclass
 class _CandidateWitnessHydrationFakeBuilder(_IdentityHydrationFakeBuilder):
     @staticmethod
