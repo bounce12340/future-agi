@@ -624,11 +624,14 @@ def read_bounded_filter_page(
     # one replaces it on ``classify`` statements only, so a caller can raise
     # the statement that replays latest state over the seeded sessions - on
     # the session list the fused classifier is over ninety percent of a
-    # filtered page's server time and scales with workers (measured on the
-    # high-volume tenant, one 15.8 M-row chunk: 3.5 s at two workers, 1.1 s
-    # at four, 0.7 s at eight, same rows, same bytes, identical result) -
-    # without widening every seed and probe with it. Rows, bytes and results
-    # never depend on this number; peak memory per statement rises with it.
+    # filtered page's server time and scales with workers when its data is
+    # in memory (measured on the high-volume tenant, one 15.8 M-row chunk
+    # re-issued three times in a row: 3.5 s at two workers, 1.1 s at four,
+    # 0.7 s at eight, same rows, same bytes, identical result) and not when
+    # it has to read its 1.7 GB (the same page through the rig at four
+    # workers: 6.3 s of classify time against 6.1 s at two) - without
+    # widening every seed and probe with it. Rows, bytes and results never
+    # depend on this number; peak memory per statement rises with it.
     classify_workers: int | None = None
     if classify_read_settings is not None:
         if not isinstance(classify_read_settings, dict):
