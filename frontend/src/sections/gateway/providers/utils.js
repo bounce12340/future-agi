@@ -1,9 +1,7 @@
 export const DEFAULT_API_PATH_PREFIX = "/v1";
 
 export function getApiPathPrefix(config) {
-  return (
-    config?.api_path_prefix ?? config?.apiPathPrefix ?? DEFAULT_API_PATH_PREFIX
-  );
+  return config?.api_path_prefix ?? DEFAULT_API_PATH_PREFIX;
 }
 
 export function withApiPathPrefix(config, apiFormat, apiPathPrefix) {

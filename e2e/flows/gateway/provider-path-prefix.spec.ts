@@ -47,6 +47,11 @@ test('GW-E2E-002: custom provider keeps an explicitly empty API path prefix', {
     ],
   }),
 }, async ({ page, actor }, testInfo) => {
+  // Five UI_READY-budgeted waits (60s each), the seeding POST, and the ~15s
+  // upstream model fetch below exceed the config's 120s per-test default. The
+  // harness precedent is 300s for OBS-E2E-001. Under-budgeting means the outer
+  // timeout fires first and hides which assertion actually ran out.
+  test.setTimeout(300_000);
   const suffix = `${testInfo.workerIndex}-${Date.now().toString(36)}`;
   const providerName = `e2e-prefix-${suffix}`;
   const modelName = `e2e-model-${suffix}`;
@@ -54,6 +59,12 @@ test('GW-E2E-002: custom provider keeps an explicitly empty API path prefix', {
 
   // Pinned from AgentccProviderCredentialCreateSerializer. Seed through the
   // credential API so model discovery never needs a live external provider.
+  // The prefix is deliberately not `/v1`: that is also the Django read default
+  // (`views/gateway.py`) and the form default (`utils.js`), so the hydration
+  // assertion below would pass off a default even if the seed never landed.
+  // `base_url` is the one public host under `e2e/flows/`; listing models from it
+  // is EXPECTED to fail, and that failure is load-bearing, because the "type
+  // manually" placeholder only renders while `modelOptions` is empty.
   const created = await actor.api.post<ProviderCredentialResponse>(
     '/agentcc/provider-credentials/',
     {
@@ -62,7 +73,7 @@ test('GW-E2E-002: custom provider keeps an explicitly empty API path prefix', {
       base_url: 'https://api.perplexity.ai',
       api_format: 'openai',
       models_list: [modelName],
-      extra_config: { api_path_prefix: '/v1' },
+      extra_config: { api_path_prefix: '/openai/v1' },
     },
   );
   await testInfo.attach('provider-credential-id', {
@@ -76,7 +87,7 @@ test('GW-E2E-002: custom provider keeps an explicitly empty API path prefix', {
   await providerCard.getByTitle('Edit provider').click();
 
   const prefixInput = page.getByLabel('API Path Prefix');
-  await expect(prefixInput).toHaveValue('/v1', { timeout: UI_READY });
+  await expect(prefixInput).toHaveValue('/openai/v1', { timeout: UI_READY });
   await prefixInput.fill('');
   await page.getByPlaceholder(/type manually/i).fill(manuallyAddedModel);
   await page.getByPlaceholder(/type manually/i).press('Enter');
