@@ -7,7 +7,10 @@ import {
   FILTER_STRING_MAX_UTF8_BYTES,
   TYPED_ATTRIBUTE_STRING_FILTER_MAX_UTF8_BYTES,
 } from "src/api/contracts/filter-contract";
-import { FILTER_VALUE_PAGE_SIZE } from "src/config/runtime_limits";
+import {
+  FILTER_VALUE_PAGE_SIZE,
+  PROPERTY_CATALOG_PAGE_SIZE,
+} from "src/config/runtime_limits";
 import axios, { endpoints } from "src/utils/axios";
 import TraceFilterPanel, {
   buildManualAttributeProperty,
@@ -2268,6 +2271,499 @@ describe("voice-call property search aliases", () => {
     expect(
       screen.getByLabelText("Attributes property count"),
     ).toHaveTextContent("190");
+    document.body.removeChild(anchorEl);
+  });
+
+  it("keeps current-catalog counts unknown as loaded pages grow without count metadata", async () => {
+    let metrics = Array.from({ length: 20 }, (_, index) => ({
+      name: `customer.field${index}`,
+      property_id: `custom_attribute:customer.field${index}`,
+      category: "custom_attribute",
+      source: "traces",
+      type: "string",
+    }));
+    propertyCatalogMock.mockImplementation(() => ({
+      ...settledPropertyCatalog({ metrics }),
+      categoryCounts: null,
+      categoryCountsExact: false,
+      hasNextPage: true,
+    }));
+    const { anchorEl, rerenderPanel } = renderPanel({
+      projectId: "current-catalog-without-counts",
+      source: "traces",
+      tab: "trace",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Property" }));
+    for (const label of [
+      "All",
+      "System",
+      "Evals",
+      "Annotations",
+      "Attributes",
+    ]) {
+      expect(
+        screen.getByLabelText(`${label} property count unavailable`),
+      ).toHaveTextContent("…");
+    }
+    expect(
+      screen.queryByLabelText("Property search result count"),
+    ).not.toBeInTheDocument();
+    metrics = [
+      ...metrics,
+      {
+        ...metrics[0],
+        name: "customer.more",
+        property_id: "custom_attribute:customer.more",
+      },
+    ];
+    rerenderPanel();
+    expect(
+      screen.getByLabelText("All property count unavailable"),
+    ).toHaveTextContent("…");
+    expect(
+      screen.getByLabelText("Attributes property count unavailable"),
+    ).toHaveTextContent("…");
+    fireEvent.change(screen.getByPlaceholderText("Search properties..."), {
+      target: { value: "customer" },
+    });
+    await waitFor(() =>
+      expect(propertyCatalogMock).toHaveBeenCalledWith(
+        expect.objectContaining({ search: "customer" }),
+      ),
+    );
+    expect(
+      screen.queryByLabelText("Property search result count"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByLabelText("All property count unavailable"),
+    ).toHaveTextContent("…");
+    document.body.removeChild(anchorEl);
+  });
+
+  it("uses exact legacy catalog totals for the active category while keeping sections search-wide", async () => {
+    const counts = {
+      all: 516,
+      system_metric: 20,
+      eval_metric: 2,
+      annotation_metric: 1,
+      custom_attribute: 493,
+      custom_column: 0,
+    };
+    const metrics = Array.from({ length: 20 }, (_, index) => ({
+      name: `customer.field${index}`,
+      property_id: `custom_attribute:customer.field${index}`,
+      category: "custom_attribute",
+      source: "traces",
+      type: "string",
+    }));
+    propertyCatalogMock.mockImplementation(({ search = "" }) => ({
+      ...settledPropertyCatalog({
+        metrics: search ? metrics.slice(0, 1) : metrics,
+        categoryCounts: search
+          ? {
+              ...counts,
+              all: 6,
+              system_metric: 1,
+              annotation_metric: 0,
+              custom_attribute: 3,
+            }
+          : counts,
+      }),
+      hasNextPage: true,
+    }));
+    const { anchorEl } = renderPanel({
+      projectId: "current-catalog-counts",
+      source: "traces",
+      tab: "trace",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Property" }));
+    expect(
+      screen.getByLabelText("Property search result count"),
+    ).toHaveTextContent(/^516$/);
+    fireEvent.click(screen.getByText("Attributes"));
+    expect(
+      screen.getByLabelText("Property search result count"),
+    ).toHaveTextContent(/^493$/);
+    expect(screen.getByLabelText("All property count")).toHaveTextContent(
+      /^516$/,
+    );
+    fireEvent.change(screen.getByPlaceholderText("Search properties..."), {
+      target: { value: "customer" },
+    });
+    await waitFor(() =>
+      expect(propertyCatalogMock).toHaveBeenCalledWith(
+        expect.objectContaining({ search: "customer" }),
+      ),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByLabelText("Property search result count"),
+      ).toHaveTextContent(/^3$/),
+    );
+    fireEvent.click(screen.getByText("Evals"));
+    expect(
+      screen.getByLabelText("Property search result count"),
+    ).toHaveTextContent(/^2$/);
+    expect(
+      screen.getByLabelText("Attributes property count"),
+    ).toHaveTextContent(/^3$/);
+    expect(screen.getByLabelText("All property count")).toHaveTextContent(
+      /^6$/,
+    );
+    fireEvent.click(screen.getByText("Annotations"));
+    expect(
+      screen.getByLabelText("Property search result count"),
+    ).toHaveTextContent(/^0$/);
+    expect(screen.getByLabelText("All property count")).toHaveTextContent(
+      /^6$/,
+    );
+    document.body.removeChild(anchorEl);
+  });
+
+  it("does not count a local date replacement twice when catalog eligibility removes its definition", async () => {
+    const lastActive = {
+      name: "last_active",
+      display_name: "Last Active",
+      property_id: "system_attribute:users:last_active",
+      category: "system_metric",
+      source: "users",
+      type: "datetime",
+    };
+    // Native date fields are supplied locally even though the catalog's
+    // current filter adapter drops them from its dynamic options.
+    expect(
+      buildTraceFilterProperties([lastActive], { sourceScope: "users" }),
+    ).toEqual([]);
+    propertyCatalogMock.mockReturnValue(
+      settledPropertyCatalog({
+        metrics: [lastActive],
+        categoryCounts: {
+          all: 1,
+          system_metric: 1,
+          eval_metric: 0,
+          annotation_metric: 0,
+          custom_attribute: 0,
+          custom_column: 0,
+        },
+      }),
+    );
+    const { anchorEl } = renderPanel({
+      projectId: "users-native-date-count",
+      source: "users",
+      tab: "users",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Property" }));
+    fireEvent.change(screen.getByPlaceholderText("Search properties..."), {
+      target: { value: "Last Active" },
+    });
+    await waitFor(() =>
+      expect(propertyCatalogMock).toHaveBeenCalledWith(
+        expect.objectContaining({ search: "Last Active" }),
+      ),
+    );
+    expect(
+      document.querySelector('[data-filter-property-option="last_active"]'),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("All property count")).toHaveTextContent(
+      /^1$/,
+    );
+    expect(screen.getByLabelText("System property count")).toHaveTextContent(
+      /^1$/,
+    );
+    expect(
+      screen.getByLabelText("Property search result count"),
+    ).toHaveTextContent(/^1$/);
+    document.body.removeChild(anchorEl);
+  });
+
+  it("counts only selectable current system definitions and local fields in All", async () => {
+    const native = [
+      ["status", "string"],
+      ["start_time", "datetime"],
+      ["has_eval", "boolean"],
+      ["trace_count", "number"],
+      ["latency", "number"],
+    ].map(([name, type]) => ({
+      name,
+      type,
+      category: "system_metric",
+      source: "traces",
+      property_id: `system_attribute:traces:${name}`,
+    }));
+    const dynamic = [
+      ["customer.plan", "custom_attribute"],
+      ["customer.region", "custom_attribute"],
+      ["quality", "eval_metric"],
+      ["feedback", "annotation_metric"],
+    ].map(([name, category]) => ({
+      name,
+      category,
+      type: "string",
+      source: "traces",
+      property_id: `${category}:${name}`,
+    }));
+    const counts = {
+      all: 9,
+      system_metric: 5,
+      eval_metric: 1,
+      annotation_metric: 1,
+      custom_attribute: 2,
+      custom_column: 0,
+    };
+    const fetchNextSystemPage = vi.fn();
+    let systemComplete = false;
+    propertyCatalogMock.mockImplementation(
+      ({ category = "", search = "", pageSize }) => {
+        if (
+          category === "system_metric" &&
+          pageSize === PROPERTY_CATALOG_PAGE_SIZE
+        ) {
+          return {
+            ...settledPropertyCatalog({
+              metrics: systemComplete ? native : native.slice(0, 2),
+              categoryCounts: counts,
+            }),
+            queryProvenance: "current_property_catalog",
+            hasNextPage: !systemComplete,
+            continuationKey: systemComplete ? null : "native-next",
+            fetchNextPage: fetchNextSystemPage,
+          };
+        }
+        return {
+          ...settledPropertyCatalog({
+            metrics: search
+              ? category === "custom_attribute"
+                ? []
+                : [native[4]]
+              : [...native, ...dynamic],
+            categoryCounts: search
+              ? {
+                  all: 1,
+                  system_metric: 1,
+                  eval_metric: 0,
+                  annotation_metric: 0,
+                  custom_attribute: 0,
+                  custom_column: 0,
+                }
+              : counts,
+          }),
+          queryProvenance: "current_property_catalog",
+        };
+      },
+    );
+    const { anchorEl, rerenderPanel } = renderPanel({
+      projectId: "current-parity",
+      source: "traces",
+      tab: "trace",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Property" }));
+    expect(
+      screen.getByLabelText("All property count unavailable"),
+    ).toHaveTextContent("…");
+    expect(
+      screen.getByLabelText("System property count unavailable"),
+    ).toHaveTextContent("…");
+    expect(
+      screen.getByLabelText("Attributes property count"),
+    ).toHaveTextContent(/^2$/);
+    await waitFor(() => expect(fetchNextSystemPage).toHaveBeenCalledTimes(1));
+    expect(propertyCatalogMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        category: "system_metric",
+        projectIds: ["current-parity"],
+        source: "traces",
+        perEvalConfig: true,
+        pageSize: PROPERTY_CATALOG_PAGE_SIZE,
+        enabled: true,
+      }),
+    );
+    systemComplete = true;
+    rerenderPanel();
+    // Eight local trace fields plus Latency; Date/Boolean/population fields
+    // are excluded, Status is replaced once, and Annotator is an extra row.
+    expect(screen.getByLabelText("System property count")).toHaveTextContent(
+      /^9$/,
+    );
+    expect(
+      screen.getByLabelText("Annotations property count"),
+    ).toHaveTextContent(/^2$/);
+    expect(screen.getByLabelText("All property count")).toHaveTextContent(
+      /^14$/,
+    );
+    expect(
+      document.querySelectorAll("[data-filter-property-option]"),
+    ).toHaveLength(14);
+    for (const id of ["start_time", "has_eval", "trace_count"]) {
+      expect(
+        document.querySelector(`[data-filter-property-option="${id}"]`),
+      ).not.toBeInTheDocument();
+    }
+    fireEvent.click(screen.getByText("Attributes"));
+    expect(screen.getByLabelText("All property count")).toHaveTextContent(
+      /^14$/,
+    );
+    expect(
+      screen.getByLabelText("Property search result count"),
+    ).toHaveTextContent(/^2$/);
+    fireEvent.change(screen.getByPlaceholderText("Search properties..."), {
+      target: { value: "latency" },
+    });
+    await waitFor(() =>
+      expect(screen.getByLabelText("All property count")).toHaveTextContent(
+        /^1$/,
+      ),
+    );
+    expect(screen.getByLabelText("System property count")).toHaveTextContent(
+      /^1$/,
+    );
+    expect(
+      screen.getByLabelText("Property search result count"),
+    ).toHaveTextContent(/^0$/);
+    fireEvent.click(screen.getByText("System"));
+    expect(
+      screen.getByLabelText("Property search result count"),
+    ).toHaveTextContent(/^1$/);
+    expect(
+      document.querySelectorAll("[data-filter-property-option]"),
+    ).toHaveLength(1);
+    expect(
+      document.querySelector('[data-filter-property-option="latency"]'),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("All property count")).toHaveTextContent(
+      /^1$/,
+    );
+    document.body.removeChild(anchorEl);
+  });
+
+  it.each(["traces", "voice_calls"])(
+    "keeps %s annotation totals stable when a later attribute is named annotator",
+    (source) => {
+      const label = {
+        name: "review-label",
+        display_name: "Review label",
+        property_id: "annotation:review-label",
+        category: "annotation_metric",
+        source: "traces",
+        type: "string",
+      };
+      const attribute = {
+        name: "annotator",
+        property_id: "custom_attribute:annotator",
+        category: "custom_attribute",
+        source: "traces",
+        type: "string",
+      };
+      let laterPageLoaded = false;
+      propertyCatalogMock.mockImplementation(({ category = "" }) => ({
+        ...settledPropertyCatalog({
+          metrics:
+            category === "system_metric"
+              ? []
+              : category === "annotation_metric" || !laterPageLoaded
+                ? [label]
+                : [label, attribute],
+          categoryCounts: {
+            all: 2,
+            system_metric: 0,
+            eval_metric: 0,
+            annotation_metric: 1,
+            custom_attribute: 1,
+            custom_column: 0,
+          },
+        }),
+        queryProvenance: "current_property_catalog",
+        hasNextPage: category === "" && !laterPageLoaded,
+      }));
+      const { anchorEl, rerenderPanel } = renderPanel({
+        projectId: "annotator-identity-counts",
+        source,
+        tab: source === "voice_calls" ? "voiceCalls" : "trace",
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Property" }));
+      expect(
+        screen.getByLabelText("Annotations property count"),
+      ).toHaveTextContent(/^2$/);
+      laterPageLoaded = true;
+      rerenderPanel();
+      expect(
+        screen.getByLabelText("Annotations property count"),
+      ).toHaveTextContent(/^2$/);
+      fireEvent.click(screen.getByText("Annotations"));
+      expect(
+        document.querySelectorAll("[data-filter-property-option]"),
+      ).toHaveLength(2);
+      expect(
+        screen.getByLabelText("Property search result count"),
+      ).toHaveTextContent(/^2$/);
+      document.body.removeChild(anchorEl);
+    },
+  );
+
+  it("hides stale totals during search debounce and after an optional count failure", async () => {
+    propertyCatalogMock.mockImplementation(({ search = "" }) => ({
+      ...settledPropertyCatalog({
+        categoryCounts: {
+          all: 516,
+          system_metric: 20,
+          eval_metric: 2,
+          annotation_metric: 1,
+          custom_attribute: 493,
+          custom_column: 0,
+        },
+      }),
+      ...(search === "missing-counts"
+        ? { categoryCounts: null, categoryCountsExact: false }
+        : {}),
+    }));
+    const { anchorEl } = renderPanel({
+      projectId: "current-catalog-search-counts",
+      source: "traces",
+      tab: "trace",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Property" }));
+    expect(screen.getByLabelText("All property count")).toHaveTextContent(
+      /^516$/,
+    );
+    fireEvent.change(screen.getByPlaceholderText("Search properties..."), {
+      target: { value: "customer" },
+    });
+    expect(
+      screen.queryByLabelText("Property search result count"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByLabelText("All property count unavailable"),
+    ).toHaveTextContent("…");
+    await waitFor(() =>
+      expect(screen.getByLabelText("All property count")).toHaveTextContent(
+        /^516$/,
+      ),
+    );
+    fireEvent.change(screen.getByPlaceholderText("Search properties..."), {
+      target: { value: "missing-counts" },
+    });
+    expect(
+      screen.queryByLabelText("Property search result count"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByLabelText("All property count unavailable"),
+    ).toHaveTextContent("…");
+    await waitFor(() =>
+      expect(propertyCatalogMock).toHaveBeenCalledWith(
+        expect.objectContaining({ search: "missing-counts" }),
+      ),
+    );
+    expect(
+      screen.queryByLabelText("Property search result count"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByLabelText("All property count unavailable"),
+    ).toHaveTextContent("…");
+    fireEvent.change(screen.getByPlaceholderText("Search properties..."), {
+      target: { value: "" },
+    });
+    expect(screen.getByLabelText("All property count")).toHaveTextContent(
+      /^516$/,
+    );
     document.body.removeChild(anchorEl);
   });
 

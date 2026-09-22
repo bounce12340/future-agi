@@ -1038,16 +1038,8 @@ class CurrentDefinitionSource:
             _dataset_column_definition,
         )
 
-    def read_page(self, *, scope, query, after, limit):
-        """Each requested family returns at most limit rows, ordered before slicing."""
-        definitions = []
-        if not query.get("category") or query["category"] == "system_metric":
-            definitions.extend(
-                definition
-                for definition in canonical_system_definitions()
-                if definition_matches(definition, query)
-                and (after is None or definition_order(definition) > after)
-            )
+    def _matching_families(self, scope, query):
+        """Share scope, search and role predicates between pages and counts."""
         for (
             rank,
             source_rank,
@@ -1063,7 +1055,6 @@ class CurrentDefinitionSource:
                 (query.get("category") and query["category"] != category)
                 or (query.get("property_kind") and query["property_kind"] != kind)
                 or not source_matches(query.get("source", ""), primary, ())
-                or (after is not None and prefix < after[:3])
             ):
                 continue
             role = query.get("role")
@@ -1076,8 +1067,6 @@ class CurrentDefinitionSource:
                 )
             elif role == "dimension":
                 continue
-            if after is not None and prefix == after[:3]:
-                queryset = queryset.filter(id__gt=after[4])
             # Use the native PostgreSQL search contract. Ordering is UUID based,
             # never a page-local re-sort of locale-dependent display names.
             search = query.get("search", "")
@@ -1094,6 +1083,37 @@ class CurrentDefinitionSource:
                 except ValueError:
                     pass
                 queryset = queryset.filter(condition)
+            yield prefix, category, queryset, fields, convert
+
+    def category_counts(
+        self, *, scope: Mapping[str, object], query: Mapping[str, object]
+    ) -> dict[str, int]:
+        """Count matching current definitions without loading their payloads."""
+        counts: dict[str, int] = dict.fromkeys(PropertyCategory, 0)
+        counts[PropertyCategory.SYSTEM_METRIC] = sum(
+            definition_matches(definition, query)
+            for definition in canonical_system_definitions()
+        )
+        for _, category, queryset, _, _ in self._matching_families(scope, query):
+            counts[category] += self._read(queryset.count)
+        return counts
+
+    def read_page(self, *, scope, query, after, limit):
+        """Each requested family returns at most limit rows, ordered before slicing."""
+        definitions = [
+            definition
+            for definition in canonical_system_definitions()
+            if definition_matches(definition, query)
+            and (after is None or definition_order(definition) > after)
+        ]
+        for prefix, _, queryset, fields, convert in self._matching_families(
+            scope, query
+        ):
+            if after is not None:
+                if prefix < after[:3]:
+                    continue
+                if prefix == after[:3]:
+                    queryset = queryset.filter(id__gt=after[4])
             rows = self._read(
                 lambda queryset=queryset, fields=fields: list(
                     queryset.order_by("id").values(*fields)[:limit]

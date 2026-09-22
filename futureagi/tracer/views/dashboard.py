@@ -2486,6 +2486,7 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                     },
                     page_size=query_params["page_size"],
                     cursor_token=query_params.get("cursor"),
+                    include_counts=not query_params.get("cursor"),
                 )
             except PropertyCatalogCursorError as exc:
                 return self._gm.custom_error_response(
@@ -2519,6 +2520,14 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                     "query_exact": False,
                     "query_status": "complete",
                     "query_provenance": "current_property_catalog",
+                    **(
+                        {
+                            "category_counts": page.category_counts,
+                            "category_counts_exact": True,
+                        }
+                        if page.category_counts_exact
+                        else {}
+                    ),
                 }
             )
 

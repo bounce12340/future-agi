@@ -334,13 +334,18 @@ def test_filter_values_maps_reader_value_error_to_400(settings):
 
 
 @pytest.mark.parametrize("has_more", [False, True])
-def test_current_metrics_envelope_describes_the_index_page_only(settings, has_more):
+@pytest.mark.parametrize("counts", [None, {"all": 516, "custom_attribute": 516}])
+def test_current_metrics_envelope_describes_the_index_page_only(
+    settings, has_more, counts
+):
     settings.PROPERTY_CATALOG_DATABASE = "test_index"
     reader = Mock()
     reader.read_page.return_value = SimpleNamespace(
         metrics=({"id": "custom_attribute:key"},) if has_more else (),
         has_more=has_more,
         next_cursor="next-page" if has_more else None,
+        category_counts=counts,
+        category_counts_exact=counts is not None,
     )
     with (
         patch(
@@ -364,13 +369,18 @@ def test_current_metrics_envelope_describes_the_index_page_only(settings, has_mo
     assert result["query_complete"] is True and result["query_status"] == "complete"
     assert result["has_more"] is has_more
     assert result["next_cursor"] == ("next-page" if has_more else None)
+    assert reader.read_page.call_args.kwargs["include_counts"] is True
+    if counts is not None:
+        assert result["category_counts"] == counts
+        assert result["category_counts_exact"] is True
+    else:
+        assert "category_counts" not in result
     extra_client.assert_not_called()
     assert not (
         {
             "catalog_epoch",
             "catalog_revision",
             "activation_fingerprint",
-            "category_counts",
             "coverage_reason",
             "coverage_floor",
         }

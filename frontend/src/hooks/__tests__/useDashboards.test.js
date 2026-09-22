@@ -448,7 +448,6 @@ describe("usePropertyCatalog", () => {
     const result = page({
       query_provenance: "current_property_catalog",
       query_exact: false,
-      ...overrides,
     });
     for (const key of [
       "catalog_epoch",
@@ -458,7 +457,7 @@ describe("usePropertyCatalog", () => {
       "category_counts_exact",
     ])
       delete result[key];
-    return result;
+    return { ...result, ...overrides };
   };
 
   it("accepts current pages without activation or exact category counts", () => {
@@ -467,6 +466,121 @@ describe("usePropertyCatalog", () => {
     expect(
       validatePropertyCatalogPage(currentPage({ query_exact: true })),
     ).toHaveProperty("__propertyCatalogCursorStopped", "malformed_page");
+  });
+
+  it("accepts exact current-catalog counts without claiming an exact total", () => {
+    const result = currentPage({
+      category_counts: page().category_counts,
+      category_counts_exact: true,
+    });
+    expect(validatePropertyCatalogPage(result)).toBe(result);
+    expect(result.total).toBeNull();
+    expect(result.total_is_exact).toBe(false);
+  });
+
+  it.each([
+    { category_counts_exact: true },
+    { category_counts: page().category_counts },
+    { category_counts: page().category_counts, category_counts_exact: false },
+    { category_counts: { all: 516 }, category_counts_exact: true },
+    {
+      category_counts: { ...page().category_counts, all: 516 },
+      category_counts_exact: true,
+    },
+    {
+      category_counts: { ...page().category_counts, eval_metric: -1 },
+      category_counts_exact: true,
+    },
+  ])("rejects incomplete or invalid current-catalog counts: %j", (counts) => {
+    expect(validatePropertyCatalogPage(currentPage(counts))).toHaveProperty(
+      "__propertyCatalogCursorStopped",
+      "malformed_page",
+    );
+  });
+
+  it("retains search-wide first-page counts when current continuation pages omit them", async () => {
+    const counts = {
+      all: 516,
+      system_metric: 20,
+      eval_metric: 2,
+      annotation_metric: 1,
+      custom_attribute: 493,
+      custom_column: 0,
+    };
+    mocks.get
+      .mockResolvedValueOnce({
+        data: {
+          result: currentPage({
+            category_counts: counts,
+            category_counts_exact: true,
+            has_more: true,
+            next_cursor: "current-next",
+          }),
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          result: currentPage({
+            metrics: [
+              {
+                name: "customer.tier",
+                property_id: "custom_attribute:customer.tier",
+              },
+            ],
+          }),
+        },
+      });
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const { result } = renderHook(
+      () =>
+        usePropertyCatalog({
+          category: "custom_attribute",
+          search: "customer",
+        }),
+      { wrapper: createQueryWrapper(client) },
+    );
+    await waitFor(() => expect(result.current.hasNextPage).toBe(true));
+    expect(result.current.categoryCounts).toEqual(counts);
+    await act(async () => result.current.fetchNextPage());
+    await waitFor(() => expect(result.current.metrics).toHaveLength(2));
+    expect(result.current.cursorChainStopped).toBe(false);
+    expect(result.current.categoryCounts).toEqual(counts);
+    expect(result.current.categoryCountsExact).toBe(true);
+    expect(result.current.total).toBeNull();
+    expect(result.current.totalIsExact).toBe(false);
+  });
+
+  it("does not carry exact counts into a new search whose count read failed", async () => {
+    mocks.get
+      .mockResolvedValueOnce({
+        data: {
+          result: currentPage({
+            category_counts: page().category_counts,
+            category_counts_exact: true,
+          }),
+        },
+      })
+      .mockResolvedValueOnce({ data: { result: currentPage() } });
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const { result, rerender } = renderHook(
+      ({ search }) => usePropertyCatalog({ search }),
+      {
+        initialProps: { search: "customer" },
+        wrapper: createQueryWrapper(client),
+      },
+    );
+    await waitFor(() => expect(result.current.categoryCountsExact).toBe(true));
+    rerender({ search: "tier" });
+    expect(result.current.categoryCounts).toBeNull();
+    expect(result.current.categoryCountsExact).toBe(false);
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.categoryCounts).toBeNull();
+    expect(result.current.categoryCountsExact).toBe(false);
+    expect(result.current.cursorChainStopped).toBe(false);
   });
 
   it("accepts usable false/partial current pages from older APIs", () => {

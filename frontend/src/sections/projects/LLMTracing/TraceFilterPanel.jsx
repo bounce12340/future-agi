@@ -87,6 +87,7 @@ import {
   PROPERTY_CATALOG_LEGACY_CACHE_TIME_MS,
   PROPERTY_CATALOG_LEGACY_PAGE_SIZE,
   PROPERTY_CATALOG_LEGACY_STALE_TIME_MS,
+  PROPERTY_CATALOG_PAGE_SIZE,
   PROPERTY_PICKER_PREFETCH_MARGIN_PX,
   PROPERTY_PICKER_RENDER_BATCH_SIZE,
   PROPERTY_CATALOG_SEARCH_DEBOUNCE_MS,
@@ -1463,7 +1464,7 @@ export function buildTraceFilterProperties(
     (property) => property.category === "annotation",
   );
   const alreadyHasAnnotator = properties.some(
-    (property) => property.id === ANNOTATOR_FILTER_PROPERTY.id,
+    (property) => property.registryId === ANNOTATOR_FILTER_PROPERTY.registryId,
   );
 
   // The base inventory owns global synthetic fields even when its first
@@ -1780,6 +1781,7 @@ function PropertyPicker({
   loadNextCatalogPage,
   catalogCategoryCounts = null,
   catalogCategoryCountsExact = false,
+  catalogQueryProvenance = null,
   propertyFilter,
 }) {
   const [search, setSearch] = useState("");
@@ -1844,6 +1846,74 @@ function PropertyPicker({
     allowLegacyNotReadyFallback: true,
     fallbackScopeKey: `${pickerCatalogFallbackScope}:all-search`,
   });
+  const currentCatalogActive =
+    unifiedCatalogActive &&
+    catalogQueryProvenance === "current_property_catalog";
+  // The finite native manifest needs its own complete read: catalog totals
+  // include system fields that this picker excludes or replaces locally.
+  // Keep this inventory independent of both category navigation and search.
+  const systemCatalog = usePropertyCatalog({
+    category: "system_metric",
+    projectIds: projectId ? [projectId] : [],
+    source,
+    perEvalConfig: true,
+    pageSize: PROPERTY_CATALOG_PAGE_SIZE,
+    enabled: Boolean(
+      currentCatalogActive && open && (projectId || allowWorkspaceScope),
+    ),
+  });
+  const systemInventoryComplete = Boolean(
+    systemCatalog.isSuccess &&
+      !systemCatalog.hasNextPage &&
+      !systemCatalog.isFetching &&
+      !systemCatalog.isError &&
+      !systemCatalog.cursorChainStopped,
+  );
+  const loadSystemPage = useSingleFlightPageRequest({
+    identity: JSON.stringify([projectId, allowWorkspaceScope, source]),
+    enabled: Boolean(systemCatalog.hasNextPage && !systemCatalog.isFetching),
+    request: systemCatalog.fetchNextPage,
+  });
+  useEffect(() => {
+    if (
+      currentCatalogActive &&
+      open &&
+      systemCatalog.hasNextPage &&
+      !systemCatalog.isFetching &&
+      !systemCatalog.isError &&
+      !systemCatalog.isFetchNextPageError &&
+      !systemCatalog.cursorChainStopped
+    )
+      loadSystemPage();
+  }, [
+    currentCatalogActive,
+    open,
+    systemCatalog.hasNextPage,
+    systemCatalog.isFetching,
+    systemCatalog.isError,
+    systemCatalog.isFetchNextPageError,
+    systemCatalog.cursorChainStopped,
+    systemCatalog.continuationKey,
+    loadSystemPage,
+  ]);
+  const completeSystemProperties = useMemo(() => {
+    const nativeProperties = buildTraceFilterProperties(
+      systemCatalog.metrics || [],
+      {
+        isSimulator,
+        sourceScope: source,
+      },
+    ).filter((property) => property.category === "system");
+    return mergeCatalogSearchProperties({
+      baseProperties: properties.filter(
+        (property) => property.category === "system",
+      ),
+      catalogProperties: propertyFilter
+        ? nativeProperties.filter(propertyFilter)
+        : nativeProperties,
+      search: "",
+    });
+  }, [systemCatalog.metrics, isSimulator, source, properties, propertyFilter]);
   const searchedCatalogProperties = useMemo(() => {
     const catalogProperties = buildTraceFilterProperties(
       searchedCatalog.metrics || [],
@@ -1856,20 +1926,14 @@ function PropertyPicker({
       ? catalogProperties.filter(propertyFilter)
       : catalogProperties;
   }, [isSimulator, propertyFilter, searchedCatalog.metrics, source]);
-  const allSearchCatalogProperties = useMemo(() => {
-    const catalogProperties = buildTraceFilterProperties(
-      allSearchCatalog.metrics || [],
-      {
-        isSimulator,
-        sourceScope: source,
-      },
-    );
-    return propertyFilter
-      ? catalogProperties.filter(propertyFilter)
-      : catalogProperties;
-  }, [allSearchCatalog.metrics, isSimulator, propertyFilter, source]);
   const allSearchCatalogHasExactCounts = Boolean(
-    allSearchCatalog.categoryCountsExact && allSearchCatalog.categoryCounts,
+    allSearchCatalog.categoryCountsExact &&
+      allSearchCatalog.categoryCounts &&
+      !allSearchCatalog.isPlaceholderData &&
+      !allSearchCatalog.isRemoteCatalogSearchPending &&
+      !allSearchCatalog.isError &&
+      !allSearchCatalog.cursorChainStopped &&
+      !allSearchCatalog.legacyFallbackRequired,
   );
   const searchedCatalogOwnsResults = Boolean(
     unifiedCatalogScopeActive &&
@@ -1883,52 +1947,68 @@ function PropertyPicker({
       trimmedSearch &&
       !catalogSearchSettled,
   );
-  const effectiveCatalogProperties = useMemo(
-    () =>
-      searchedCatalogOwnsResults
-        ? mergeCatalogSearchProperties({
-            baseProperties: properties,
-            catalogProperties: searchedCatalogProperties,
-            search: trimmedSearch,
-            category,
-            hasCategorySidebar,
-          })
-        : properties,
-    [
-      category,
-      hasCategorySidebar,
-      properties,
-      searchedCatalogOwnsResults,
-      searchedCatalogProperties,
-      trimmedSearch,
-    ],
-  );
+  const effectiveCatalogProperties = useMemo(() => {
+    const scopedProperties = searchedCatalogOwnsResults
+      ? mergeCatalogSearchProperties({
+          baseProperties: properties,
+          catalogProperties: searchedCatalogProperties,
+          search: trimmedSearch,
+          category,
+          hasCategorySidebar,
+        })
+      : properties;
+    // Render the same canonical system inventory used for the totals, so
+    // local search aliases and excluded types cannot produce hidden extras.
+    return currentCatalogActive && systemInventoryComplete
+      ? [
+          ...completeSystemProperties,
+          ...scopedProperties.filter(
+            (property) => property.category !== "system",
+          ),
+        ]
+      : scopedProperties;
+  }, [
+    currentCatalogActive,
+    systemInventoryComplete,
+    completeSystemProperties,
+    category,
+    hasCategorySidebar,
+    properties,
+    searchedCatalogOwnsResults,
+    searchedCatalogProperties,
+    trimmedSearch,
+  ]);
   const supplementedAllSearchCategoryCounts = useMemo(
     () =>
-      supplementCatalogSearchCategoryCounts({
-        categoryCounts: allSearchCatalog.categoryCounts,
-        baseProperties: properties,
-        catalogProperties: allSearchCatalogProperties,
-        search: trimmedSearch,
-      }),
+      currentCatalogActive
+        ? allSearchCatalog.categoryCounts
+        : supplementCatalogSearchCategoryCounts({
+            categoryCounts: allSearchCatalog.categoryCounts,
+            baseProperties: properties,
+            // Counts describe returned catalog definitions. Check ownership before
+            // UI eligibility filters remove native date/boolean fields, otherwise
+            // their local replacements are incorrectly counted as extra fields.
+            catalogProperties: (allSearchCatalog.metrics || []).map(
+              metricToTraceFilterProperty,
+            ),
+            search: trimmedSearch,
+          }),
     [
+      currentCatalogActive,
       allSearchCatalog.categoryCounts,
-      allSearchCatalogProperties,
+      allSearchCatalog.metrics,
       properties,
       trimmedSearch,
     ],
   );
   const searchCountsOwnSidebar = Boolean(
-    trimmedSearch &&
+    unifiedCatalogActive &&
+      trimmedSearch &&
       catalogSearchSettled &&
-      searchedCatalogOwnsResults &&
       allSearchCatalogHasExactCounts,
   );
   const searchCountsPending = Boolean(
-    trimmedSearch &&
-      catalogSearchSettled &&
-      searchedCatalogOwnsResults &&
-      !allSearchCatalogHasExactCounts,
+    unifiedCatalogActive && trimmedSearch && !searchCountsOwnSidebar,
   );
   // Category navigation only changes the visible result page. Search-wide
   // counts always come from the independent All-search request; until that
@@ -2147,7 +2227,46 @@ function PropertyPicker({
       c.eval = effectiveCatalogCategoryCounts.eval_metric;
       c.annotation = effectiveCatalogCategoryCounts.annotation_metric;
       c.attribute = effectiveCatalogCategoryCounts.custom_attribute;
+      if (currentCatalogActive) {
+        c.system = systemInventoryComplete
+          ? filterPropertiesForPicker({
+              properties: completeSystemProperties,
+              search,
+            }).length
+          : null;
+        // Annotator is a frontend-owned filter, not a persisted label
+        // definition. Add it exactly once when it is actually selectable.
+        c.annotation += filterPropertiesForPicker({
+          properties: properties.filter(
+            (property) =>
+              property.registryId === ANNOTATOR_FILTER_PROPERTY.registryId,
+          ),
+          search,
+        }).length;
+        if (propertyFilter) {
+          // An arbitrary caller predicate cannot be applied to unseen pages.
+          c.eval = null;
+          c.annotation = null;
+          c.attribute = null;
+        }
+        c.all = [c.system, c.eval, c.annotation, c.attribute].every(
+          Number.isSafeInteger,
+        )
+          ? c.system + c.eval + c.annotation + c.attribute
+          : null;
+      }
       return c;
+    }
+    if (unifiedCatalogActive) {
+      // A current-catalog page is only a window into the inventory, even
+      // when its cursor is exhausted. Missing optional counts stay unknown.
+      return {
+        all: null,
+        system: null,
+        eval: null,
+        annotation: null,
+        attribute: null,
+      };
     }
     const exactLookupOwnsAttributeInventory =
       (legacyAttributeFallbackOwnsInventory || enableExactAttributeLookup) &&
@@ -2178,14 +2297,23 @@ function PropertyPicker({
     legacyAttributeFallbackOwnsInventory,
     propertiesWithExactAttribute,
     source,
+    unifiedCatalogActive,
+    currentCatalogActive,
+    systemInventoryComplete,
+    completeSystemProperties,
+    properties,
+    propertyFilter,
+    search,
   ]);
   const visibleProperties = filtered.slice(0, visiblePropertyLimit);
   const hiddenCount = Math.max(filtered.length - visiblePropertyLimit, 0);
-  const displayedPropertyCount = search.trim()
-    ? Number.isSafeInteger(counts[category])
-      ? counts[category]
-      : filtered.length
-    : counts.all;
+  const displayedPropertyCount = unifiedCatalogActive
+    ? counts[hasCategorySidebar ? category : "all"]
+    : search.trim()
+      ? Number.isSafeInteger(counts[category])
+        ? counts[category]
+        : filtered.length
+      : counts.all;
   const catalogCategoryCanContinue = (
     unifiedCatalogActive
       ? ["all", "system", "eval", "annotation", "attribute"]
@@ -2532,7 +2660,7 @@ function PropertyPicker({
                         }
                         title={
                           counts[cat.key] === null
-                            ? "Exact count is still loading"
+                            ? "Exact count unavailable"
                             : undefined
                         }
                         sx={{ fontSize: 10, color: "text.disabled" }}
@@ -3566,6 +3694,7 @@ function FilterRow({
   loadNextCatalogPage,
   catalogCategoryCounts,
   catalogCategoryCountsExact,
+  catalogQueryProvenance,
   attributeSource,
   propertyFilter,
 }) {
@@ -4096,6 +4225,7 @@ function FilterRow({
         loadNextCatalogPage={loadNextCatalogPage}
         catalogCategoryCounts={catalogCategoryCounts}
         catalogCategoryCountsExact={catalogCategoryCountsExact}
+        catalogQueryProvenance={catalogQueryProvenance}
         propertyFilter={propertyFilter}
       />
 
@@ -4233,6 +4363,7 @@ const TraceFilterPanel = ({
     isFetchNextPageError: isNextDynamicPropsPageError,
     categoryCounts: dynamicPropertyCategoryCounts,
     categoryCountsExact: dynamicPropertyCategoryCountsExact,
+    queryProvenance: dynamicPropertyQueryProvenance,
     usesUnifiedCatalog,
   } = useTraceFilterProperties(observeId, {
     // Several pages keep trace/session/voice filter panels mounted at once.
@@ -5236,6 +5367,7 @@ const TraceFilterPanel = ({
                         exactAttributeSource === "spans"),
                   )}
                   unifiedCatalogActive={unifiedPropertyCatalogActive}
+                  catalogQueryProvenance={dynamicPropertyQueryProvenance}
                   isSimulator={isSimulator}
                   catalogError={
                     skipDynamicProperties

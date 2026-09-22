@@ -87,11 +87,6 @@ const PROPERTY_CATALOG_COUNT_KEYS = [
 ];
 
 const validPropertyCatalogCategoryCounts = (page) => {
-  if (
-    page?.query_provenance === "current_property_catalog" &&
-    !Object.prototype.hasOwnProperty.call(page, "category_counts")
-  )
-    return true;
   const hasCounts = Object.prototype.hasOwnProperty.call(
     page || {},
     "category_counts",
@@ -100,9 +95,9 @@ const validPropertyCatalogCategoryCounts = (page) => {
     page || {},
     "category_counts_exact",
   );
-  // Keep rolling deploys safe: an older activated-catalog response has
-  // neither field. Once either field is present, require the complete exact
-  // contract so a partial response cannot masquerade as trustworthy counts.
+  // Counts are optional on current continuations, failed count reads, and
+  // older APIs. Once either field is present, require the complete exact
+  // contract independently of query_exact (current definitions are mutable).
   if (!hasCounts && !hasExactFlag) return true;
   if (!hasCounts || !hasExactFlag) return false;
   const counts = page?.category_counts;
@@ -761,8 +756,11 @@ export function usePropertyCatalog({
     pageCount: checkedPages.length,
     hasNextPage: cursorChainStopped ? false : query.hasNextPage,
     metrics,
+    queryProvenance: baselinePage?.query_provenance || null,
     total: null,
     totalIsExact: false,
+    // Current continuations may omit counts or observe newer definitions.
+    // Only the first page owns this walk's search-wide category totals.
     categoryCounts: cursorChainStopped
       ? null
       : baselinePage?.category_counts || null,

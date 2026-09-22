@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any
 
-from tracer.services.clickhouse.read_budget import ReadDeadline
+from django.db import DatabaseError
+
+from tracer.services.clickhouse.read_budget import ReadDeadline, ReadDeadlineExceeded
 from tracer.utils.property_registry import normalize_custom_attribute_source
 
 from .codec import like_contains_pattern
@@ -30,6 +33,7 @@ from .source_adapters import (
 
 PROPERTY_CATALOG_MAX_SEARCH_BYTES = RUNTIME_LIMITS.max_search_bytes
 PROPERTY_CATALOG_QUERY_WALL_MS = RUNTIME_LIMITS.query_wall_ms
+logger = logging.getLogger(__name__)
 
 
 class PropertyCatalogUnavailable(RuntimeError):
@@ -120,7 +124,15 @@ class PropertyCatalogReader:
             self.observed.deadline
         )
 
-    def read_page(self, *, scope, query, page_size, cursor_token=None):
+    def read_page(
+        self,
+        *,
+        scope: dict[str, Any],
+        query: dict[str, Any],
+        page_size: int,
+        cursor_token: str | None = None,
+        include_counts: bool = False,
+    ) -> PropertyCatalogPage:
         scope = self._validate_scope(scope)
         query = self._validate_query(query)
         validate_page_size(page_size)
@@ -157,17 +169,71 @@ class PropertyCatalogReader:
             if has_more
             else None
         )
+        counts = None
+        if include_counts and cursor is None:
+            try:
+                counts = self._category_counts(scope, query)
+            except (PropertyCatalogUnavailable, DatabaseError, ReadDeadlineExceeded):
+                # An unavailable total must not hide successfully loaded suggestions.
+                logger.warning("property_catalog_counts_unavailable", exc_info=True)
         return PropertyCatalogPage(
-            tuple(definition_metric(d) for d in visible), has_more, next_cursor
+            tuple(definition_metric(d) for d in visible),
+            has_more,
+            next_cursor,
+            category_counts=counts,
+            category_counts_exact=counts is not None,
         )
 
+    @staticmethod
+    def _includes_observed_keys(scope, query):
+        return (
+            bool(scope["project_ids"])
+            and query.get("category") in {"", "custom_attribute"}
+            and query.get("property_kind") in {"", "custom_attribute"}
+            and source_matches(query.get("source", ""), "traces", ())
+        )
+
+    def _category_counts(self, scope, query):
+        # Category navigation changes the page, not the search-wide sidebar totals.
+        query = {**query, "category": ""}
+        counts = self.definitions.category_counts(scope=scope, query=query)
+        if self._includes_observed_keys(scope, query):
+            sql = f"""
+SELECT count() AS total FROM (
+  SELECT k.attribute_key,
+         arraySort(groupUniqArray(toString(k.attribute_type))) AS attribute_types
+  FROM {observed_table(self.observed.database, "observed_attribute_keys")} AS k
+  PREWHERE k.organization_id = %(organization_id)s AND k.workspace_id = %(workspace_id)s
+    AND k.project_id IN %(project_ids)s AND k.source_kind = 'custom_attribute'
+  WHERE k.attribute_key != '' AND k.key_folded LIKE %(search)s
+  GROUP BY k.attribute_key
+  HAVING (%(role)s = '' OR (%(role)s = 'metric' AND attribute_types = ['number'])
+          OR (%(role)s = 'dimension' AND attribute_types != ['number']))
+)
+"""
+            rows = self.observed.execute(
+                sql,
+                {
+                    **ObservedRead.scope_params(scope),
+                    "search": like_contains_pattern(query["search"]),
+                    "role": query.get("role", ""),
+                },
+                1,
+            )
+            if (
+                len(rows) != 1
+                or type(rows[0].get("total")) is not int
+                or rows[0]["total"] < 0
+            ):
+                raise PropertyCatalogUnavailable("invalid_observed_count")
+            counts[PropertyCategory.CUSTOM_ATTRIBUTE] = rows[0]["total"]
+        counts["all"] = sum(counts.values())
+        self.observed.deadline.remaining_ms(floor_ms=1)
+        return counts
+
     def _observed_keys(self, scope, query, after, limit):
-        if (
-            not scope["project_ids"]
-            or query.get("category") not in {"", "custom_attribute"}
-            or query.get("property_kind") not in {"", "custom_attribute"}
-            or not source_matches(query.get("source", ""), "traces", ())
-            or (after is not None and after[:3] > (3, 0, "traces"))
+        if not self._includes_observed_keys(scope, query) or (
+            after is not None and after[:3] > (3, 0, "traces")
         ):
             return ()
         key_after = (

@@ -280,6 +280,95 @@ def test_observed_keys_use_string_scope_grouped_history_not_current_types():
     assert "toUUID" not in sql and "catalog_epoch" not in sql
 
 
+def test_catalog_counts_cover_search_not_page_or_selected_category():
+    row = {
+        "attribute_key": "call.key",
+        "key_folded": "call.key",
+        "attribute_types": ["number"],
+    }
+    executor = Executor(
+        [row, {**row, "attribute_key": "call.next", "key_folded": "call.next"}],
+        [{"total": 516}],
+        [],
+    )
+    native = Mock()
+    native.read_page.return_value = ()
+    native.category_counts.return_value = {
+        "system_metric": 2,
+        "eval_metric": 3,
+        "annotation_metric": 4,
+        "custom_attribute": 0,
+        "custom_column": 0,
+    }
+    reader = PropertyCatalogReader(
+        executor, catalog_database="test_index", definition_source=native
+    )
+    query = {**QUERY, "search": "CALL", "role": "metric"}
+    first = reader.read_page(scope=SCOPE, query=query, page_size=1, include_counts=True)
+    assert len(first.metrics) == 1 and first.has_more
+    assert first.category_counts_exact
+    assert first.category_counts == {
+        "system_metric": 2,
+        "eval_metric": 3,
+        "annotation_metric": 4,
+        "custom_attribute": 516,
+        "custom_column": 0,
+        "all": 525,
+    }
+    assert native.category_counts.call_args.kwargs["query"]["category"] == ""
+    sql, params, options = executor.calls[1]
+    assert "GROUP BY k.attribute_key" in sql and "FINAL" not in sql
+    assert "LIMIT" not in sql and "after" not in params
+    assert params == {
+        "organization_id": ORG,
+        "workspace_id": WS,
+        "project_ids": (PROJECT,),
+        "search": "%call%",
+        "role": "metric",
+    }
+    assert options["settings"]["max_result_rows"] == 1
+    second = reader.read_page(
+        scope=SCOPE,
+        query=query,
+        page_size=1,
+        cursor_token=first.next_cursor,
+        include_counts=True,
+    )
+    assert second.category_counts is None and not second.category_counts_exact
+    native.category_counts.assert_called_once()
+
+
+@pytest.mark.parametrize("total", [-1, True, "516", None])
+def test_unavailable_counts_do_not_fake_loaded_page_totals(total, caplog):
+    executor = Executor([], [{"total": total}])
+    native = Mock()
+    native.read_page.return_value = ()
+    native.category_counts.return_value = {"custom_attribute": 0}
+    page = PropertyCatalogReader(
+        executor, catalog_database="test_index", definition_source=native
+    ).read_page(scope=SCOPE, query=QUERY, page_size=20, include_counts=True)
+    assert page.metrics == () and page.category_counts is None
+    assert not page.category_counts_exact
+    assert caplog.records[-1].message == "property_catalog_counts_unavailable"
+    assert caplog.records[-1].exc_info is not None
+
+
+def test_empty_project_scope_counts_native_definitions_without_clickhouse():
+    executor, native = Mock(), Mock()
+    native.read_page.return_value = ()
+    native.category_counts.return_value = {"system_metric": 7, "custom_attribute": 0}
+    page = PropertyCatalogReader(
+        executor, catalog_database="test_index", definition_source=native
+    ).read_page(
+        scope={**SCOPE, "project_ids": []},
+        query=QUERY,
+        page_size=20,
+        include_counts=True,
+    )
+    assert page.category_counts == {"system_metric": 7, "custom_attribute": 0, "all": 7}
+    executor.execute.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "value,kind",
     [
@@ -458,6 +547,79 @@ def definitions(tenant, **query):
         PropertyCatalogReader(catalog_database="unused_for_native")
         .read_page(scope=tenant.scope, query=query, page_size=50)
         .metrics
+    )
+
+
+@pytest.mark.parametrize("search", ["", "matching", "unmatched"])
+def test_native_section_counts_match_full_search_and_exclude_other_tenants(
+    current_tenant, search
+):
+    from model_hub.models.develop_annotations import AnnotationsLabels
+    from model_hub.models.evals_metric import EvalTemplate
+    from tracer.models.custom_eval_config import CustomEvalConfig
+    from tracer.services.clickhouse.read_budget import ReadDeadline
+    from tracer.services.clickhouse.v2.property_catalog.source_adapters import (
+        CurrentDefinitionSource,
+    )
+
+    t = current_tenant
+    template = EvalTemplate(
+        name="matching evaluation",
+        organization=t.organization,
+        workspace=t.workspace,
+        config={"output": "score"},
+    )
+    hidden = EvalTemplate(
+        name="matching hidden evaluation",
+        organization=t.organization,
+        workspace=t.other_workspace,
+        config={"output": "score"},
+    )
+    EvalTemplate.no_workspace_objects.bulk_create([template, hidden])
+    CustomEvalConfig.no_workspace_objects.bulk_create(
+        [
+            CustomEvalConfig(
+                name="matching config", project=t.project, eval_template=template
+            ),
+            CustomEvalConfig(
+                name="matching hidden config", project=t.project, eval_template=hidden
+            ),
+        ]
+    )
+    AnnotationsLabels.no_workspace_objects.bulk_create(
+        [
+            AnnotationsLabels(
+                name="matching label",
+                type="categorical",
+                organization=t.organization,
+                workspace=t.workspace,
+                project=t.project,
+                settings={"options": ["yes"]},
+            ),
+            AnnotationsLabels(
+                name="matching hidden label",
+                type="categorical",
+                organization=t.organization,
+                workspace=t.other_workspace,
+                settings={"options": ["no"]},
+            ),
+        ]
+    )
+    source = CurrentDefinitionSource(ReadDeadline.start(10000))
+    query = {"source": "traces", "search": search, "per_eval_config": True}
+    counts = source.category_counts(scope=t.scope, query=query)
+    all_matches = source.read_page(scope=t.scope, query=query, after=None, limit=1000)
+    for category, count in counts.items():
+        assert count == sum(d.category == category for d in all_matches)
+    assert (
+        counts["eval_metric"] == counts["annotation_metric"] == (search != "unmatched")
+    )
+    assert counts["custom_column"] == counts["custom_attribute"] == 0
+    assert (
+        source.category_counts(scope=t.scope, query={**query, "role": "dimension"})[
+            "eval_metric"
+        ]
+        == 0
     )
 
 
@@ -1118,6 +1280,8 @@ def test_real_clickhouse_grouped_observed_index_and_scoped_keysets():
 
     import clickhouse_connect
 
+    from tracer.services.clickhouse.v2.property_catalog.models import PropertyCategory
+
     host = os.environ.get("OBSERVED_CATALOG_TEST_CH_HOST")
     if not host:
         pytest.skip("requires an explicitly isolated observed catalog test ClickHouse")
@@ -1171,6 +1335,9 @@ def test_real_clickhouse_grouped_observed_index_and_scoped_keysets():
             req.organization.id = req.organization.pk = ORG
             definitions = Mock()
             definitions.read_page.return_value = ()
+            definitions.category_counts.side_effect = lambda **_: dict.fromkeys(
+                PropertyCategory, 0
+            )
             with (
                 override_settings(PROPERTY_CATALOG_DATABASE=database),
                 patch(
@@ -1211,7 +1378,10 @@ def test_real_clickhouse_grouped_observed_index_and_scoped_keysets():
             extra_client.assert_not_called()
             return result
 
-        assert api_page("metrics")["metrics"] == []
+        empty_page = api_page("metrics")
+        assert empty_page["metrics"] == []
+        assert empty_page["category_counts"]["all"] == 0
+        assert empty_page["category_counts_exact"] is True
         assert api_page("filter_values")["values"] == []
 
         rows = [value_row("a"), value_row("b")]
@@ -1220,6 +1390,13 @@ def test_real_clickhouse_grouped_observed_index_and_scoped_keysets():
             "observed_attribute_keys",
             [
                 keys + [rows[0]["first_seen"], rows[0]["last_seen"]],
+                keys + [rows[0]["first_seen"], rows[0]["last_seen"]],
+                [str(uuid4()), *keys[1:]]
+                + [rows[0]["first_seen"], rows[0]["last_seen"]],
+                [ORG, str(uuid4()), *keys[2:]]
+                + [rows[0]["first_seen"], rows[0]["last_seen"]],
+                [ORG, WS, str(uuid4()), *keys[3:]]
+                + [rows[0]["first_seen"], rows[0]["last_seen"]],
                 [
                     ORG,
                     WS,
@@ -1268,7 +1445,10 @@ def test_real_clickhouse_grouped_observed_index_and_scoped_keysets():
             values + values + [[str(uuid4()), *values[0][1:]]],
             column_names=value_columns,
         )
-        assert [item["name"] for item in api_page("metrics")["metrics"]] == ["key"]
+        populated_page = api_page("metrics")
+        assert [item["name"] for item in populated_page["metrics"]] == ["key"]
+        assert populated_page["category_counts"]["all"] == 1
+        assert populated_page["category_counts"]["custom_attribute"] == 1
         value_page = api_page("filter_values")
         assert value_page["values"] == [{"value": "a", "type": "string", "label": "a"}]
         assert value_page["has_more"] and value_page["next_cursor"]
@@ -1284,6 +1464,9 @@ def test_real_clickhouse_grouped_observed_index_and_scoped_keysets():
         } == {"a", "b"}
         native = Mock()
         native.read_page.return_value = ()
+        native.category_counts.side_effect = lambda **_: dict.fromkeys(
+            PropertyCategory, 0
+        )
         keypage = PropertyCatalogReader(
             HTTPExecutor(), catalog_database=database, definition_source=native
         ).read_page(scope=SCOPE, query=QUERY, page_size=2)
@@ -1331,6 +1514,23 @@ def test_real_clickhouse_grouped_observed_index_and_scoped_keysets():
         assert names == sorted(
             ["key", *EXACT_ATTRIBUTE_KEYS], key=lambda key: (key.casefold(), key)
         )
+        for search, role, expected in (
+            ("", "", 4),
+            ("KeY", "", 1),
+            ("unmatched", "", 0),
+            ("%", "", 0),
+            ("", "metric", 0),
+            ("", "dimension", 4),
+        ):
+            page = keyreader.read_page(
+                scope=SCOPE,
+                query={**QUERY, "search": search, "role": role},
+                page_size=1,
+                include_counts=True,
+            )
+            assert page.category_counts_exact
+            assert page.category_counts["all"] == expected
+            assert len(page.metrics) == min(expected, 1)
         for key in EXACT_ATTRIBUTE_KEYS:
             client.insert(
                 "observed_attribute_values",
