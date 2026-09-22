@@ -83,14 +83,16 @@ def eval_wall_clock_scope(*, budget_seconds: int | None = None):
     ``budget_seconds`` additionally gives every bounded call in the block one
     shared deadline, so the block as a whole is bounded however many
     evaluations it runs. A caller that passes none keeps the per-call bound
-    only, which is what a single evaluation wants.
+    only, which is what a single evaluation wants — and **inherits** an
+    enclosing budget rather than clearing it, so a scope opened deeper inside
+    an entry's run cannot hand its evaluations more time than the entry has.
     """
     record: list[str] = []
     token = _timeouts.set(record)
     deadline_token = _deadline.set(
         time.monotonic() + budget_seconds
         if budget_seconds is not None and budget_seconds > 0
-        else None
+        else _deadline.get()
     )
     try:
         yield record

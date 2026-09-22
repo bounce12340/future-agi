@@ -225,6 +225,23 @@ def test_a_scope_without_a_budget_keeps_the_per_evaluation_wall():
     assert timeouts == []
 
 
+def test_a_budgetless_scope_inside_an_entrys_run_cannot_clear_its_budget():
+    """A scope is opened by whoever collects timeouts, and nothing stops one
+    being opened deeper inside an entry's run than ``run_entry``'s own. If a
+    scope without a budget of its own reset the deadline, that inner block's
+    evaluations would run unbounded inside an entry the ceiling still bounds —
+    exactly the hole the budget exists to close."""
+    from evaluations.engine.wall_clock import remaining_budget_seconds
+
+    with eval_wall_clock_scope(budget_seconds=60):
+        outer = remaining_budget_seconds()
+        with eval_wall_clock_scope():
+            inner = remaining_budget_seconds()
+        assert inner is not None
+        assert 0 < inner <= outer
+    assert remaining_budget_seconds() is None
+
+
 @pytest.mark.django_db(transaction=True)
 def test_run_eval_func_bounds_a_composite_childs_own_run(
     monkeypatch, organization, workspace
