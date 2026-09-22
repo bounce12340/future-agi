@@ -65,6 +65,7 @@ from tracer.selectors.trace_filter_reads import (
     PAGE_DEPTH_EXCEEDED_CODE,
     PAGE_DEPTH_EXCEEDED_MESSAGE,
     BoundedFilterPage,
+    bounded_filter_floor_order,
     bounded_numbered_page_depth_exceeded,
     numbered_page_depth_exceeded,
     read_bounded_filter_page,
@@ -469,8 +470,26 @@ def _bounded_session_graph_request(view_method):
 
 
 def _session_list_cursor_order_for_partial_page(*, rows, bounded_page, cursor_state):
-    """Return a stable public order tuple, including checkpoint-only pages."""
+    """Return a stable public order tuple, including checkpoint-only pages.
 
+    The next hop reads this tuple as an exclusive upper bound: everything at or
+    above it is already published. A page that FILLED its prefix and left
+    matches over says so with its last row and drops its scan checkpoint, so
+    the walk re-descends from that rank. A page that stopped at its wall says
+    so with the floor the selector proves - not with its last row, whose rank
+    can sit far below the scan position on a route that ranks a session by its
+    oldest root, and not with the scan checkpoint, which is in seed order.
+    """
+
+    if bounded_page.has_more and rows:
+        last = rows[-1]
+        return (
+            last.get("start_time"),
+            str(last.get("session_id") or ""),
+        )
+    floor = bounded_page.continuation_published_order_floor
+    if floor is not None:
+        return bounded_filter_floor_order(floor, lowest_components=1)
     if rows:
         last = rows[-1]
         return (
@@ -479,6 +498,11 @@ def _session_list_cursor_order_for_partial_page(*, rows, bounded_page, cursor_st
         )
     if cursor_state is not None:
         return tuple(cursor_state.order)
+    # A checkpoint the reader could not name in result order, on a first page:
+    # fall back to the scan position, which is what this route published before
+    # the floor existed. It is in seed order, so it is an approximation, and it
+    # is reached only when a page has no rows, no incoming cursor and a keyset
+    # whose token is not the one the list publishes.
     if bounded_page.continuation_before_start_time is not None:
         return (
             bounded_page.continuation_before_start_time,

@@ -8648,6 +8648,9 @@ def test_observe_span_cursor_publishes_safe_checkpoint_after_failed_attempt() ->
         ),
         continuation_slice_start=START,
         continuation_slice_end=END,
+        # The reader commits a publication floor with every checkpoint it
+        # commits; an exhausted slice's floor is its end, below every token.
+        continuation_published_order_floor=(END, None),
     )
     view = ObservationSpanView.__new__(ObservationSpanView)
     view._gm = SimpleNamespace(
@@ -8934,6 +8937,9 @@ def test_observe_trace_exact_cursor_chunk_is_enriched_ordered_and_continuable(
         attempts=(),
         continuation_slice_start=START,
         continuation_slice_end=END,
+        # The reader commits a publication floor with every checkpoint it
+        # commits; an exhausted slice's floor is its end, below every token.
+        continuation_published_order_floor=(END, None),
     )
 
     class RecordingAnalytics:
@@ -9032,6 +9038,9 @@ def test_observe_trace_cursor_publishes_safe_checkpoint_after_failed_attempt() -
         ),
         continuation_slice_start=START,
         continuation_slice_end=END,
+        # The reader commits a publication floor with every checkpoint it
+        # commits; an exhausted slice's floor is its end, below every token.
+        continuation_published_order_floor=(END, None),
     )
 
     response, bounded_reader, analytics, _request = (
@@ -9631,6 +9640,9 @@ def test_voice_page_size_500_cursor_publishes_safe_exact_partial_chunk() -> None
         attempts=(),
         continuation_slice_start=START,
         continuation_slice_end=END,
+        # The reader commits a publication floor with every checkpoint it
+        # commits; an exhausted slice's floor is its end, below every token.
+        continuation_published_order_floor=(END, None),
         continuation_before_start_time=started,
         continuation_before_id="trace-a",
     )
@@ -9734,6 +9746,9 @@ def test_voice_cursor_publishes_safe_checkpoint_after_failed_attempt() -> None:
         ),
         continuation_slice_start=START,
         continuation_slice_end=END,
+        # The reader commits a publication floor with every checkpoint it
+        # commits; an exhausted slice's floor is its end, below every token.
+        continuation_published_order_floor=(END, None),
     )
     view = TraceView.__new__(TraceView)
     view._gm = SimpleNamespace(
@@ -16664,3 +16679,759 @@ def test_an_interrupted_flush_leaves_no_position_past_the_chunk_it_lost() -> Non
         (row["id"] in published) or bound is None or (row["start_time"] < bound)
         for row in rows
     )
+
+
+# A route whose classifier ranks a row OLDER than the seed that discovered it.
+# This is the production session shape: a seed row is a session's newest root
+# inside the slice, while the classifier publishes ``min`` over the session's
+# live roots, so a long-lived session is DISCOVERED in a recent slice and
+# RANKED months earlier. Every rank below is one of the id's own seed roots,
+# exactly as ``min(live root start_time)`` always is.
+_RANK_LAG_WINDOW_START = END - timedelta(hours=6)
+_RANK_LAG_SEED_ROOTS: tuple[tuple[str, timedelta], ...] = (
+    ("long-new", timedelta(minutes=10)),
+    ("short-a", timedelta(minutes=70)),
+    ("short-a", timedelta(minutes=75)),
+    ("short-b", timedelta(minutes=80)),
+    ("long-old", timedelta(minutes=85)),
+    ("short-b", timedelta(minutes=95)),
+    ("long-old", timedelta(hours=5)),
+    ("long-new", timedelta(hours=5, minutes=30)),
+)
+
+
+def _rank_lag_seed_rows() -> list[dict[str, Any]]:
+    return [
+        {"id": row_id, "start_time": END - offset}
+        for row_id, offset in _RANK_LAG_SEED_ROOTS
+    ]
+
+
+def _rank_lag_match_rows() -> list[dict[str, Any]]:
+    """One classified row per id, ranked at that id's OLDEST seed root."""
+
+    ranks: dict[str, datetime] = {}
+    for row_id, offset in _RANK_LAG_SEED_ROOTS:
+        rank = END - offset
+        if row_id not in ranks or rank < ranks[row_id]:
+            ranks[row_id] = rank
+    return [{"id": row_id, "start_time": rank} for row_id, rank in ranks.items()]
+
+
+class _WalledFakeExecutor(_FakeExecutor):
+    """Charge each statement to a manual clock, like a page wall does."""
+
+    def __init__(
+        self,
+        builder: _FakeBuilder,
+        *,
+        clock: _ManualMonotonic,
+        durations_ms: dict[str, int],
+    ):
+        super().__init__(builder)
+        self.clock = clock
+        self.durations_ms = durations_ms
+
+    def execute_ch_query(self, query, params, *, timeout_ms, settings):
+        self.clock.advance_ms(self.durations_ms.get(query, 50))
+        return super().execute_ch_query(
+            query,
+            params,
+            timeout_ms=timeout_ms,
+            settings=settings,
+        )
+
+
+_RANK_LAG_CURSOR_SCOPE = {"organization_id": "org-a", "project_id": PROJECT_ID}
+_RANK_LAG_CURSOR_QUERY = {"filters": "rank-lag"}
+
+
+def _session_view_cursor(
+    page: BoundedFilterPage,
+    rows: list[dict[str, Any]],
+    previous_cursor: Any,
+    *,
+    page_size: int,
+) -> Any:
+    """Mint the next hop's cursor the way the session VIEW mints it.
+
+    The view's own boundary rule and the real signed codec, not a local copy of
+    either: a divergence between what the reader proves and what the product
+    hands out is exactly the class of defect this walk is being tested for, and
+    a re-implementation here would hide it.
+    """
+
+    from tracer.services.clickhouse.list_cursor import (
+        decode_list_cursor,
+        encode_list_cursor,
+    )
+    from tracer.views.trace_session import (
+        _session_list_cursor_order_for_partial_page,
+    )
+
+    order = _session_list_cursor_order_for_partial_page(
+        rows=[
+            {"session_id": row["id"], "start_time": row["start_time"]} for row in rows
+        ],
+        bounded_page=page,
+        cursor_state=previous_cursor,
+    )
+    partial = not page.has_more
+    token = encode_list_cursor(
+        resource="observe_sessions",
+        scope=_RANK_LAG_CURSOR_SCOPE,
+        query=_RANK_LAG_CURSOR_QUERY,
+        page_size=page_size,
+        window_start=_RANK_LAG_WINDOW_START,
+        window_end=END,
+        order=order,
+        seen_rows=(previous_cursor.seen_rows if previous_cursor else 0) + len(rows),
+        scan_slice_start=page.continuation_slice_start if partial else None,
+        scan_slice_end=page.continuation_slice_end if partial else None,
+        scan_before_start_time=(
+            page.continuation_before_start_time if partial else None
+        ),
+        scan_before_id=page.continuation_before_id if partial else None,
+    )
+    return decode_list_cursor(
+        token,
+        resource="observe_sessions",
+        scope=_RANK_LAG_CURSOR_SCOPE,
+        query=_RANK_LAG_CURSOR_QUERY,
+        page_size=page_size,
+    )
+
+
+def _walk_rank_lagging_cursor_hops(
+    *, max_hops: int = 16, page_size: int = 2
+) -> list[dict[str, Any]]:
+    """Follow a wall-stopped cursor to exhaustion and record every hop."""
+
+    seed_rows = _rank_lag_seed_rows()
+    match_rows = _rank_lag_match_rows()
+    hops: list[dict[str, Any]] = []
+    cursor: Any = None
+    scan: dict[str, Any] = {}
+    for _ in range(max_hops):
+        builder = _WideInitialSliceFakeBuilder(
+            seed_rows,
+            start=_RANK_LAG_WINDOW_START,
+            end=END,
+            match_rows=match_rows,
+            recommended_seed_batch_size=200,
+        )
+        clock = _ManualMonotonic()
+        executor = _WalledFakeExecutor(
+            builder,
+            clock=clock,
+            durations_ms={"seed": 100, "match": 900},
+        )
+        with mock.patch("tracer.selectors.trace_filter_reads.monotonic", new=clock):
+            page = read_bounded_filter_page(
+                builder=builder,
+                analytics=executor,
+                filters=[_time_filter(_RANK_LAG_WINDOW_START, END)],
+                key_field="id",
+                page_number=0,
+                page_size=page_size,
+                # One seed plus one classifier fits; the next statement is
+                # refused for want of its own envelope. This is the page wall.
+                deadline_ms=2_400,
+                max_seed_attempts=24,
+                max_candidates=200,
+                max_query_count=50,
+                classify_batch_size=50,
+                include_incomplete_rows=True,
+                bounded_continuation=True,
+                cursor_start_time=cursor.order[0] if cursor is not None else None,
+                cursor_order_token=cursor.order[1] if cursor is not None else None,
+                **scan,
+            )
+        classified = [
+            candidate_id
+            for query, params in executor.calls
+            if query == "match"
+            for candidate_id in params["candidate_ids"]
+        ]
+        hops.append(
+            {
+                "rows": list(page.rows),
+                "classified": classified,
+                "complete": page.complete,
+                "has_more": page.has_more,
+                "cursor_in": tuple(cursor.order) if cursor is not None else None,
+                "slice_end": page.continuation_slice_end,
+                "before_start_time": page.continuation_before_start_time,
+                "floor": getattr(page, "continuation_published_order_floor", None),
+            }
+        )
+        if page.complete and not page.has_more:
+            break
+        cursor = _session_view_cursor(
+            page, list(page.rows), cursor, page_size=page_size
+        )
+        scan = {
+            "continuation_slice_start": cursor.scan_slice_start,
+            "continuation_slice_end": cursor.scan_slice_end,
+            "continuation_before_start_time": cursor.scan_before_start_time,
+            "continuation_before_id": cursor.scan_before_id,
+        }
+    return hops
+
+
+@pytest.mark.unit
+def test_wall_stopped_continuation_publishes_every_rank_lagging_match() -> None:
+    """A wall-stopped cursor may not drop a match its classifier accepted.
+
+    The classifier's boundary is the rank the previous page PUBLISHED, so it
+    is a dedup key only while "everything at or above it is published" holds.
+    A page that stops at its wall never proved that, and the walk's scan
+    checkpoint advances in seed order regardless: every later match that
+    outranks the boundary was silently discarded and its seed consumed, so
+    those rows left the list permanently.
+    """
+
+    hops = _walk_rank_lagging_cursor_hops()
+
+    published = [row["id"] for hop in hops for row in hop["rows"]]
+    classified = {row_id for hop in hops for row_id in hop["classified"]}
+    expected = {row["id"] for row in _rank_lag_match_rows()}
+
+    assert classified == expected
+    # Every accepted match reaches the list exactly once.
+    assert sorted(published) == sorted(expected)
+    assert len(published) == len(set(published))
+    # ... and in the list's own order, which is what makes the next hop's
+    # boundary a sound dedup key rather than a ceiling.
+    ranks = {row["id"]: row["start_time"] for row in _rank_lag_match_rows()}
+    assert [ranks[row_id] for row_id in published] == sorted(
+        ranks.values(), reverse=True
+    )
+
+
+@pytest.mark.unit
+def test_wall_stopped_continuation_never_publishes_an_unbounded_rank() -> None:
+    """No hop publishes a row its own checkpoint cannot bound.
+
+    A published row must rank at or above the boundary the page hands out, or
+    the page has claimed a prefix its scan never proved and the next hop's
+    exclusive bound would hide the rows that belong above it.
+    """
+
+    for hop in _walk_rank_lagging_cursor_hops():
+        floor = hop["floor"]
+        if floor is None or hop["has_more"]:
+            continue
+        floor_time, _ = floor
+        assert all(row["start_time"] >= floor_time for row in hop["rows"]), hop
+        if hop["cursor_in"] is not None:
+            # The signed cursor normalises its instants to UTC; the reader
+            # strips the zone again on the way in, so compare like for like.
+            bound = (hop["cursor_in"][0].replace(tzinfo=None), hop["cursor_in"][1])
+            assert all(
+                (row["start_time"], str(row["id"])) < bound for row in hop["rows"]
+            ), hop
+
+
+@pytest.mark.unit
+def test_wall_stopped_floor_never_sits_below_the_committed_checkpoint() -> None:
+    """A failed hydration rolls the position back; the floor must follow it.
+
+    The floor is read off the committed position, and a page that loses its
+    hydration commits an OLDER position than the one its matches were filtered
+    against. A floor remembered from before that rollback would sit below the
+    checkpoint the page publishes, and the next hop, resuming at the checkpoint
+    but bounded by the floor, would classify the rows in between and discard
+    every one of them as already published.
+    """
+
+    request_start = END - timedelta(minutes=30)
+    rows = [
+        {
+            "id": row_id,
+            "root_span_id": f"root-{row_id}",
+            "start_time": END - timedelta(minutes=minute),
+            "trace_name": f"presented-{row_id}",
+        }
+        for row_id, minute in (("newer-nonmatch", 1), ("match-a", 6), ("match-b", 16))
+    ]
+    builder = _IdentityHydrationFakeBuilder(
+        rows,
+        start=request_start,
+        end=END,
+        match_rows=rows[1:],
+        recommended_batch_size=10,
+        recommended_seed_batch_size=10,
+    )
+    drifted = {**rows[1], "root_span_id": "replacement-root"}
+    page = read_bounded_filter_page(
+        builder=builder,
+        analytics=_IdentityHydrationFakeExecutor(builder, hydration_rows=[drifted]),
+        filters=[_time_filter(request_start, END)],
+        key_field="id",
+        page_number=0,
+        page_size=5,
+        deadline_ms=5_000,
+        max_seed_attempts=24,
+        max_candidates=10,
+        max_query_count=50,
+        classify_batch_size=10,
+        include_incomplete_rows=True,
+        bounded_continuation=True,
+    )
+
+    assert page.rows == []
+    assert page.error_code == "classification_drift"
+    floor = page.continuation_published_order_floor
+    assert floor is not None
+    committed = page.continuation_before_start_time or page.continuation_slice_end
+    assert floor[0] >= committed
+
+    # Neither match was published by the rolled-back page, so the hops that
+    # resume from it must still publish both, each exactly once.
+    published: list[str] = []
+    order: tuple[Any, ...] = (floor[0], "" if floor[1] is None else str(floor[1]))
+    scan = {
+        "continuation_slice_start": page.continuation_slice_start,
+        "continuation_slice_end": page.continuation_slice_end,
+        "continuation_before_start_time": page.continuation_before_start_time,
+        "continuation_before_id": page.continuation_before_id,
+    }
+    for _ in range(8):
+        hop = read_bounded_filter_page(
+            builder=builder,
+            analytics=_IdentityHydrationFakeExecutor(builder),
+            filters=[_time_filter(request_start, END)],
+            key_field="id",
+            page_number=0,
+            page_size=5,
+            deadline_ms=5_000,
+            max_seed_attempts=24,
+            max_candidates=10,
+            max_query_count=50,
+            classify_batch_size=10,
+            include_incomplete_rows=True,
+            bounded_continuation=True,
+            cursor_start_time=order[0],
+            cursor_order_token=order[1],
+            **scan,
+        )
+        published.extend(row["id"] for row in hop.rows)
+        if hop.complete and not hop.has_more:
+            break
+        hop_floor = hop.continuation_published_order_floor
+        if hop_floor is None:
+            break
+        order = (hop_floor[0], "" if hop_floor[1] is None else str(hop_floor[1]))
+        scan = {
+            "continuation_slice_start": hop.continuation_slice_start,
+            "continuation_slice_end": hop.continuation_slice_end,
+            "continuation_before_start_time": hop.continuation_before_start_time,
+            "continuation_before_id": hop.continuation_before_id,
+        }
+
+    assert sorted(published) == ["match-a", "match-b"]
+    assert len(published) == len(set(published))
+
+
+@dataclass
+class _SeedTokenFakeBuilder(_WideInitialSliceFakeBuilder):
+    """A route that keysets on a token of its own, not on the published one."""
+
+    @staticmethod
+    def bounded_filter_seed_order_token(row: dict[str, Any]) -> str:
+        return f"s-{row['id']}"
+
+
+class _SeedTokenFakeExecutor(_FakeExecutor):
+    """Keyset the seed page on the SEED token, as such a route's SQL does."""
+
+    def __init__(
+        self,
+        builder: _FakeBuilder,
+        *,
+        clock: _ManualMonotonic,
+        durations_ms: dict[str, int],
+    ):
+        super().__init__(builder)
+        self.clock = clock
+        self.durations_ms = durations_ms
+
+    def execute_ch_query(self, query, params, *, timeout_ms, settings):
+        self.clock.advance_ms(self.durations_ms.get(query, 50))
+        self.calls.append((query, params))
+        if query == "match":
+            wanted = set(params["candidate_ids"])
+            source = self.builder.match_rows or self.builder.rows
+            rows = [row for row in source if row["id"] in wanted]
+            return QueryResult(rows, len(rows), "clickhouse", 1.0)
+        rows = [
+            row
+            for row in self.builder.rows
+            if params["slice_start"] <= row["start_time"] < params["slice_end"]
+        ]
+        rows.sort(key=lambda row: (row["start_time"], f"s-{row['id']}"), reverse=True)
+        before_time, before_id = params["before_start_time"], params["before_id"]
+        if before_time is not None:
+            rows = [
+                row
+                for row in rows
+                if (row["start_time"], f"s-{row['id']}") < (before_time, before_id)
+            ]
+        rows = rows[: params["limit"]]
+        return QueryResult(rows, len(rows), "clickhouse", 1.0)
+
+
+@pytest.mark.unit
+def test_a_keyset_the_bound_cannot_name_publishes_what_it_classified() -> None:
+    """A position the bound cannot name publishes no floor at all.
+
+    Inside one instant, result order cannot separate the rows a keyset has
+    passed from the rows it has not, and the public boundary is a single value
+    in result order. Naming the instant claims the unread remainder as
+    published; naming one microsecond above it holds the keyset row nothing
+    will re-read; giving the keyset up to re-read the instant stalls on an
+    instant wider than a hop. So this page publishes every match it classified
+    and hands out its last published row, exactly as the reader did before the
+    floor existed, and the floor is left to the positions a bound CAN name.
+    """
+
+    window_start = END - timedelta(hours=6)
+    rows = [
+        {"id": "a", "start_time": END - timedelta(minutes=10)},
+        {"id": "b", "start_time": END - timedelta(minutes=20)},
+        {"id": "d", "start_time": END - timedelta(minutes=30)},
+    ]
+    published: list[str] = []
+    classified: set[str] = set()
+    order: tuple[Any, ...] | None = None
+    scan: dict[str, Any] = {}
+    for _ in range(12):
+        builder = _SeedTokenFakeBuilder(
+            rows,
+            start=window_start,
+            end=END,
+            match_rows=rows,
+            recommended_batch_size=3,
+            recommended_seed_batch_size=3,
+        )
+        clock = _ManualMonotonic()
+        executor = _SeedTokenFakeExecutor(
+            builder, clock=clock, durations_ms={"seed": 100, "match": 900}
+        )
+        with mock.patch("tracer.selectors.trace_filter_reads.monotonic", new=clock):
+            page = read_bounded_filter_page(
+                builder=builder,
+                analytics=executor,
+                filters=[_time_filter(window_start, END)],
+                key_field="id",
+                page_number=0,
+                # Room for the whole boundary instant: a tie group wider than
+                # the page falls to the reader's pre-existing has_more
+                # contract, which ``test_boundary_instant_continuations.py``
+                # covers on its own.
+                page_size=3,
+                deadline_ms=2_400,
+                max_seed_attempts=24,
+                max_candidates=200,
+                max_query_count=50,
+                classify_batch_size=50,
+                include_incomplete_rows=True,
+                bounded_continuation=True,
+                cursor_start_time=order[0] if order is not None else None,
+                cursor_order_token=order[1] if order is not None else None,
+                **scan,
+            )
+        classified.update(
+            candidate
+            for query, params in executor.calls
+            if query == "match"
+            for candidate in params["candidate_ids"]
+        )
+        published.extend(row["id"] for row in page.rows)
+        if page.complete and not page.has_more:
+            break
+        floor = page.continuation_published_order_floor
+        if floor is not None:
+            # A floor is published only for a position the bound can name: a
+            # keyset whose token is the one this list publishes, or a slice
+            # boundary. Never for a keyset inside an instant it cannot resolve.
+            assert page.continuation_before_start_time is None or (
+                floor
+                == (
+                    page.continuation_before_start_time,
+                    page.continuation_before_id,
+                )
+            )
+            order = (floor[0], "" if floor[1] is None else str(floor[1]))
+        elif page.rows:
+            order = (page.rows[-1]["start_time"], str(page.rows[-1]["id"]))
+        scan = (
+            {}
+            if page.has_more or page.continuation_slice_end is None
+            else {
+                "continuation_slice_start": page.continuation_slice_start,
+                "continuation_slice_end": page.continuation_slice_end,
+                "continuation_before_start_time": (page.continuation_before_start_time),
+                "continuation_before_id": page.continuation_before_id,
+            }
+        )
+
+    assert classified == {"a", "b", "d"}
+    assert sorted(published) == ["a", "b", "d"]
+    assert len(published) == len(set(published))
+
+
+@pytest.mark.unit
+def test_every_cursor_view_mints_its_partial_boundary_from_the_reader_floor() -> None:
+    """Span, trace and session all publish the boundary the reader proves.
+
+    Each of them shares the reader, so each of them now gets pages whose rows
+    were held back against a floor. A view that kept minting from its scan
+    checkpoint would hand out a bound in SEED order while its rows are ordered
+    by rank, which is the defect this floor exists to remove.
+    """
+
+    from tracer.views.observation_span import _span_cursor_order_for_partial_page
+    from tracer.views.trace import _trace_list_cursor_order_for_partial_page
+    from tracer.views.trace_session import (
+        _session_list_cursor_order_for_partial_page,
+    )
+
+    floor_time = END - timedelta(hours=2)
+    keyset_page = SimpleNamespace(
+        has_more=False,
+        continuation_published_order_floor=(floor_time, "row-token"),
+    )
+    slice_page = SimpleNamespace(
+        has_more=False,
+        continuation_published_order_floor=(floor_time, None),
+    )
+    span_page = SimpleNamespace(
+        has_more=False,
+        continuation_published_order_floor=(
+            floor_time,
+            ("span-id", "trace-id", "project-id"),
+        ),
+    )
+
+    assert _session_list_cursor_order_for_partial_page(
+        rows=[{"session_id": "published", "start_time": END}],
+        bounded_page=keyset_page,
+        cursor_state=None,
+    ) == (floor_time, "row-token")
+    assert _session_list_cursor_order_for_partial_page(
+        rows=[], bounded_page=slice_page, cursor_state=None
+    ) == (floor_time, "")
+    assert _trace_list_cursor_order_for_partial_page(
+        rows=[{"trace_id": "published", "start_time": END}],
+        bounded_page=keyset_page,
+        cursor_state=None,
+        org_scope=False,
+    ) == (floor_time, "row-token")
+    assert _trace_list_cursor_order_for_partial_page(
+        rows=[], bounded_page=slice_page, cursor_state=None, org_scope=True
+    ) == (floor_time, "", "")
+    assert _span_cursor_order_for_partial_page(
+        rows=[{"id": "published", "start_time": END}],
+        bounded_page=span_page,
+        cursor_state=None,
+    ) == (floor_time, "span-id", "trace-id", "project-id")
+    assert _span_cursor_order_for_partial_page(
+        rows=[], bounded_page=slice_page, cursor_state=None
+    ) == (floor_time, "", "", "", "", "")
+
+    # A page that filled its prefix and left matches over keeps resuming at its
+    # last published row, where the reader re-descends from that rank.
+    filled = SimpleNamespace(
+        has_more=True,
+        continuation_published_order_floor=(floor_time, "row-token"),
+    )
+    assert _session_list_cursor_order_for_partial_page(
+        rows=[{"session_id": "last", "start_time": END}],
+        bounded_page=filled,
+        cursor_state=None,
+    ) == (END, "last")
+
+    # Every one of those boundaries survives the signed codec unchanged.
+    from tracer.services.clickhouse.list_cursor import (
+        decode_list_cursor,
+        encode_list_cursor,
+    )
+
+    scope = {"organization_id": "org-a", "project_id": PROJECT_ID}
+    query = {"filters": "floor-order"}
+    for order in (
+        (floor_time, "row-token"),
+        (floor_time, ""),
+        (floor_time, "", ""),
+        (floor_time, "span-id", "trace-id", "project-id"),
+        (floor_time, "", "", "", "", ""),
+    ):
+        token = encode_list_cursor(
+            resource="observe_spans",
+            scope=scope,
+            query=query,
+            page_size=25,
+            window_start=START,
+            window_end=END,
+            order=order,
+            seen_rows=0,
+        )
+        restored = decode_list_cursor(
+            token,
+            resource="observe_spans",
+            scope=scope,
+            query=query,
+            page_size=25,
+        )
+        assert restored.order == (order[0].replace(tzinfo=UTC), *order[1:])
+
+
+def _trace_view_cursor(
+    page: BoundedFilterPage,
+    rows: list[dict[str, Any]],
+    previous_cursor: Any,
+    *,
+    page_size: int,
+    window_start: datetime,
+) -> Any:
+    """Mint the next hop's cursor the way the TRACE view mints it.
+
+    The trace list is the route whose seed order token is a space of its own,
+    so it is the one that exercises the boundary instant. Drive its real
+    helper and the real signed codec: the token shape, the dropped scan fields
+    on a filled page and the floor on a checkpoint page all have to survive
+    the round trip for the next hop to resume where this one stopped.
+    """
+
+    from tracer.services.clickhouse.list_cursor import (
+        decode_list_cursor,
+        encode_list_cursor,
+    )
+    from tracer.views.trace import _trace_list_cursor_order_for_partial_page
+
+    order = _trace_list_cursor_order_for_partial_page(
+        rows=[{"trace_id": row["id"], "start_time": row["start_time"]} for row in rows],
+        bounded_page=page,
+        cursor_state=previous_cursor,
+        org_scope=False,
+    )
+    partial = not page.has_more
+    scope = {"organization_id": "org-a", "project_id": PROJECT_ID}
+    query = {"filters": "differing-token"}
+    token = encode_list_cursor(
+        resource="observe_traces",
+        scope=scope,
+        query=query,
+        page_size=page_size,
+        window_start=window_start,
+        window_end=END,
+        order=order,
+        seen_rows=(previous_cursor.seen_rows if previous_cursor else 0) + len(rows),
+        scan_slice_start=page.continuation_slice_start if partial else None,
+        scan_slice_end=page.continuation_slice_end if partial else None,
+        scan_before_start_time=(
+            page.continuation_before_start_time if partial else None
+        ),
+        scan_before_id=page.continuation_before_id if partial else None,
+    )
+    return decode_list_cursor(
+        token,
+        resource="observe_traces",
+        scope=scope,
+        query=query,
+        page_size=page_size,
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("match_count", [25, 26])
+def test_differing_token_hops_publish_every_match_through_a_real_cursor(
+    match_count: int,
+) -> None:
+    """The route with its own seed token, driven through its own cursor.
+
+    ``match_count`` straddles the page size deliberately. At the page size the
+    hop carries a checkpoint and publishes the floor beside it. One match more
+    and the page is FULL with matches left over: the view resumes at the last
+    published row and drops the scan checkpoint, so the walk re-descends from
+    that rank - more work, but the remainder is re-found rather than held.
+    Two rows share the boundary instant, which is the one the floor cannot
+    resolve in this token space, so the checkpoint has to re-read it.
+    """
+
+    page_size = 25
+    window_start = END - timedelta(hours=6)
+    rows = [
+        {"id": f"t{index:02d}", "start_time": END - timedelta(minutes=10 + index)}
+        for index in range(match_count)
+    ]
+    # Two rows at one instant: one of them will be the last classified seed.
+    rows[-1]["start_time"] = rows[-2]["start_time"]
+
+    published: list[str] = []
+    classified: set[str] = set()
+    cursor: Any = None
+    scan: dict[str, Any] = {}
+    filled_page_seen = False
+    for _ in range(24):
+        builder = _SeedTokenFakeBuilder(
+            rows,
+            start=window_start,
+            end=END,
+            match_rows=rows,
+            recommended_batch_size=50,
+            recommended_seed_batch_size=match_count,
+        )
+        clock = _ManualMonotonic()
+        executor = _SeedTokenFakeExecutor(
+            builder, clock=clock, durations_ms={"seed": 100, "match": 900}
+        )
+        with mock.patch("tracer.selectors.trace_filter_reads.monotonic", new=clock):
+            page = read_bounded_filter_page(
+                builder=builder,
+                analytics=executor,
+                filters=[_time_filter(window_start, END)],
+                key_field="id",
+                page_number=0,
+                page_size=page_size,
+                deadline_ms=2_400,
+                max_seed_attempts=24,
+                max_candidates=200,
+                max_query_count=50,
+                classify_batch_size=50,
+                include_incomplete_rows=True,
+                bounded_continuation=True,
+                cursor_start_time=cursor.order[0] if cursor is not None else None,
+                cursor_order_token=cursor.order[1] if cursor is not None else None,
+                **scan,
+            )
+        classified.update(
+            candidate
+            for query, params in executor.calls
+            if query == "match"
+            for candidate in params["candidate_ids"]
+        )
+        published.extend(row["id"] for row in page.rows)
+        filled_page_seen = filled_page_seen or page.has_more
+        if page.complete and not page.has_more:
+            break
+        cursor = _trace_view_cursor(
+            page,
+            list(page.rows),
+            cursor,
+            page_size=page_size,
+            window_start=window_start,
+        )
+        scan = {
+            "continuation_slice_start": cursor.scan_slice_start,
+            "continuation_slice_end": cursor.scan_slice_end,
+            "continuation_before_start_time": cursor.scan_before_start_time,
+            "continuation_before_id": cursor.scan_before_id,
+        }
+
+    assert classified == {row["id"] for row in rows}
+    assert sorted(published) == sorted(row["id"] for row in rows)
+    assert len(published) == len(set(published))
+    assert filled_page_seen is (match_count > page_size)
