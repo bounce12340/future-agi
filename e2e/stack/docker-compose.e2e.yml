@@ -18,6 +18,9 @@ services:
     environment:
       MODEL_SERVING_URL: http://mock-llm:8080
       FUTURE_AGI_TELEMETRY_DISABLED: "true"
+      # Request logs reach Django over this shared secret; without it the
+      # webhook rejects every batch the gateway sends.
+      AGENTCC_WEBHOOK_SECRET: ${AGENTCC_WEBHOOK_SECRET:-e2e-agentcc-webhook-secret}
   worker:
     restart: "no"
     environment:
