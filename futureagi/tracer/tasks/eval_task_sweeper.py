@@ -101,11 +101,17 @@ def find_stranded_tasks(*, limit: int | None = None) -> list[EvalTask]:
     else: ``recover_task`` asks before it writes, so a progressing workflow's
     entries are neither reaped nor restarted.
 
-    ``candidates`` therefore counts stranded tasks *in a sweepable status*, and
-    never the rest: a paused, delete-status or failed task holding undrained
-    entries, or an entry whose task row is gone, contributes nothing to the
-    count and produces no event. ``candidates: 0`` means nothing sweepable is
-    stranded, not that nothing is.
+    ``candidates`` therefore counts every task in a sweepable status holding
+    undrained entries — which, on a working fleet, is mostly tasks that are
+    draining normally. It is the sweep's *working set*, not a count of stranded
+    tasks: the describe is what tells the two apart, and it happens per
+    candidate in ``recover_task``. ``candidates - progressing`` is what the
+    tick acted on.
+
+    It also never counts the rest: a paused, delete-status or failed task
+    holding undrained entries, or an entry whose task row is gone, contributes
+    nothing and produces no event. ``candidates: 0`` means nothing sweepable
+    holds undrained work at all, not that nothing is stranded.
 
     The per-tick cap is applied **after** the sweepable-status filter, not
     before it. A task the sweep refuses to act on — paused, delete-status,
@@ -208,7 +214,12 @@ def recover_task(task: EvalTask, *, stale_running_seconds: int) -> dict:
     )
 
     if describe_eval_task_workflow_sync(task.id) == WF_PROGRESSING:
-        return {"requeued": 0, "failed": 0, "restarted": False}
+        # Reported, not merely skipped: after the describe moved in front of
+        # the reap, a healthy draining task is a candidate that costs one
+        # describe and nothing else, so without this the tick has no field that
+        # separates the fleet's ordinary working set from the tasks it acted
+        # on.
+        return {"requeued": 0, "failed": 0, "restarted": False, "progressing": True}
 
     requeued, failed = reap_stale_running(
         task,
@@ -219,7 +230,12 @@ def recover_task(task: EvalTask, *, stale_running_seconds: int) -> dict:
         older_than_seconds=effective_stale_seconds(stale_running_seconds),
         max_attempts=_MAX_ENTRY_ATTEMPTS,
     )
-    outcome = {"requeued": requeued, "failed": failed, "restarted": False}
+    outcome = {
+        "requeued": requeued,
+        "failed": failed,
+        "restarted": False,
+        "progressing": False,
+    }
 
     try:
         if task.status == EvalTaskStatus.FAILED:
@@ -253,12 +269,18 @@ def sweep_stranded_eval_tasks():
     own event rather than as an empty tick, because "disabled" and "nothing is
     stranded" are the two readings an operator has to tell apart, and this job
     only ever speaks in counts.
+
+    ``candidates`` is the working set the tick read, healthy tasks included;
+    ``progressing`` is how many of them had a live workflow and were left
+    alone. The difference is what the sweep acted on, and it is the only
+    reading of this line that means "something was stranded".
     """
     limit = int(settings.EVAL_TASK_SWEEP_MAX_TASKS)
     if limit <= 0:
         logger.info("eval_task_sweep_disabled")
         return {
             "candidates": 0,
+            "progressing": 0,
             "restarted": 0,
             "entries_requeued": 0,
             "entries_poisoned": 0,
@@ -267,7 +289,7 @@ def sweep_stranded_eval_tasks():
         }
     stale_running_seconds = int(settings.EVAL_TASK_SWEEP_STALE_RUNNING_SECONDS)
     tasks = find_stranded_tasks(limit=limit)
-    restarted = requeued = poisoned = errors = 0
+    progressing = restarted = requeued = poisoned = errors = 0
     for task in tasks:
         try:
             outcome = recover_task(task, stale_running_seconds=stale_running_seconds)
@@ -284,11 +306,13 @@ def sweep_stranded_eval_tasks():
             errors += 1
             logger.warning("eval_task_sweep_task_failed", error_type=type(exc).__name__)
             continue
+        progressing += int(outcome["progressing"])
         restarted += int(outcome["restarted"])
         requeued += outcome["requeued"]
         poisoned += outcome["failed"]
     result = {
         "candidates": len(tasks),
+        "progressing": progressing,
         "restarted": restarted,
         "entries_requeued": requeued,
         "entries_poisoned": poisoned,

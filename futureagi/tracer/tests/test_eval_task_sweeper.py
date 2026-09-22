@@ -123,6 +123,12 @@ def make_entry(db, sweep_config):
     return _make
 
 
+def client_progressing():
+    from tfc.temporal.eval_tasks import client
+
+    return client.WF_PROGRESSING
+
+
 @pytest.fixture
 def temporal(monkeypatch):
     """Stand in for the Temporal client: record describes and starts."""
@@ -379,6 +385,33 @@ class TestSweepActivity:
         assert result["restarted"] == 1
         assert result["errors"] == 0
         assert temporal["started"] == [(str(task.id), {"replace_existing": False})]
+
+    def test_a_healthy_draining_task_is_a_candidate_and_is_reported_as_one(
+        self, make_task, make_entry, temporal
+    ):
+        """``candidates`` is the sweep's working set, not a count of stranded
+        tasks.
+
+        ``find_stranded_tasks`` selects every sweepable task holding undrained
+        entries, which on a working fleet is mostly tasks draining normally.
+        Before the describe moved in front of the reap each one was reaped and
+        restarted, so the count really did mean "acted on"; now a candidate
+        with a live workflow costs one describe and nothing else. An operator
+        reading ``candidates`` as stranded tasks would see a false alarm on
+        every busy tick, so the tick says how many were merely progressing and
+        the difference is what it acted on.
+        """
+        healthy = make_task()
+        make_entry(healthy)
+        temporal["verdict"] = client_progressing()
+
+        result = sweeper.sweep_stranded_eval_tasks._original_func()
+
+        assert result["candidates"] == 1
+        assert result["progressing"] == 1
+        assert result["candidates"] - result["progressing"] == 0
+        assert (result["restarted"], result["entries_requeued"]) == (0, 0)
+        assert temporal["started"] == []
 
     def test_an_unreachable_temporal_does_not_restart_anything(
         self, make_task, make_entry, temporal
