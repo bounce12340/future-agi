@@ -420,6 +420,36 @@ class TestSweepActivity:
         assert entry.status == EvalEntryStatus.RUNNING
         assert entry.attempts == 0
 
+    def test_a_restart_that_fails_still_reports_the_reap_it_performed(
+        self, make_task, make_entry, temporal, monkeypatch
+    ):
+        """A describe answers, the reap writes, and only then the start fails.
+
+        Round 2 closed the half where the describe itself raises — nothing is
+        written there, so reporting nothing is correct. This is the other half:
+        the rows really were requeued and really did spend an attempt, and
+        discarding the outcome made ``entries_requeued: 0`` a lie in the one
+        line the runbook tells an operator to watch. The entries are recovered
+        by the next tick either way; the count is what was wrong.
+        """
+        from tfc.temporal.eval_tasks import client
+
+        task = make_task()
+        entry = make_entry(task, status=EvalEntryStatus.RUNNING, age_seconds=10_000)
+
+        def _start_refused(_task, **_kwargs):
+            raise RuntimeError("temporal refused the start")
+
+        monkeypatch.setattr(client, "start_eval_task_workflow_sync", _start_refused)
+
+        result = sweeper.sweep_stranded_eval_tasks._original_func()
+
+        entry.refresh_from_db()
+        assert (entry.status, entry.attempts) == (EvalEntryStatus.PENDING, 1)
+        assert result["entries_requeued"] == 1
+        assert result["errors"] == 1
+        assert result["restarted"] == 0
+
     def test_the_sweep_can_be_turned_off_without_a_deploy_of_its_own(
         self, make_task, make_entry, temporal, settings
     ):

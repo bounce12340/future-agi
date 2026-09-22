@@ -66,6 +66,24 @@ _MAX_ENTRY_ATTEMPTS = 3
 _UNDRAINED = (EvalEntryStatus.PENDING, EvalEntryStatus.RUNNING)
 
 
+class RecoveryInterrupted(Exception):
+    """A recovery that had already written rows when it failed.
+
+    The describe is a gate and its failure propagates bare: nothing is written
+    before it answers, so a tick that loses it loses nothing to report. Every
+    later step can have reaped rows already, and those requeues and the
+    attempts they spent are real whether or not the restart that follows them
+    succeeds — so the failure has to carry them out to the tick rather than
+    discard them. ``entries_requeued`` is the line the runbook tells an
+    operator to watch; it must not read 0 for a reap that happened.
+    """
+
+    def __init__(self, outcome: dict, cause: Exception):
+        super().__init__(str(cause))
+        self.outcome = outcome
+        self.cause = cause
+
+
 def sweepable_statuses() -> list[str]:
     statuses = list(_SWEEPABLE)
     if getattr(settings, "EVAL_TASK_SWEEP_RECOVER_FAILED", False):
@@ -161,7 +179,9 @@ def recover_task(task: EvalTask, *, stale_running_seconds: int) -> dict:
     more, and a healthy task really does cost one describe and nothing else.
 
     A describe that cannot answer (Temporal unreachable) propagates before
-    anything is written, so the tick's counts describe what it actually did.
+    anything is written. A failure after it — the status flip, or the start —
+    raises ``RecoveryInterrupted`` carrying the reap already performed, so
+    either way the tick's counts describe what it actually did.
 
     The reap still reaches what the workflow-start reaper cannot: a workflow
     that stopped mid-drain leaves entries abandoned in ``running``, and nothing
@@ -201,18 +221,22 @@ def recover_task(task: EvalTask, *, stale_running_seconds: int) -> dict:
     )
     outcome = {"requeued": requeued, "failed": failed, "restarted": False}
 
-    if task.status == EvalTaskStatus.FAILED:
-        # A failed row makes ``get_eval_task_state_activity`` report the task
-        # inactive, so a restart would exit on its first state check. Clear it
-        # the way Resume does, guarded so a concurrent pause or delete wins.
-        changed = EvalTask.objects.filter(
-            id=task.id, status=EvalTaskStatus.FAILED
-        ).update(status=EvalTaskStatus.PENDING)
-        if not changed:
-            return outcome
-        task.status = EvalTaskStatus.PENDING
+    try:
+        if task.status == EvalTaskStatus.FAILED:
+            # A failed row makes ``get_eval_task_state_activity`` report the
+            # task inactive, so a restart would exit on its first state check.
+            # Clear it the way Resume does, guarded so a concurrent pause or
+            # delete wins.
+            changed = EvalTask.objects.filter(
+                id=task.id, status=EvalTaskStatus.FAILED
+            ).update(status=EvalTaskStatus.PENDING)
+            if not changed:
+                return outcome
+            task.status = EvalTaskStatus.PENDING
 
-    start_eval_task_workflow_sync(task, replace_existing=False)
+        start_eval_task_workflow_sync(task, replace_existing=False)
+    except Exception as exc:
+        raise RecoveryInterrupted(outcome, exc) from exc
     outcome["restarted"] = True
     return outcome
 
@@ -247,6 +271,15 @@ def sweep_stranded_eval_tasks():
     for task in tasks:
         try:
             outcome = recover_task(task, stale_running_seconds=stale_running_seconds)
+        except RecoveryInterrupted as exc:
+            # The restart is gone, but the reap before it is not: those rows
+            # are pending again and have spent an attempt, and the next tick
+            # recovers them as ordinary stranded work.
+            errors += 1
+            logger.warning(
+                "eval_task_sweep_task_failed", error_type=type(exc.cause).__name__
+            )
+            outcome = exc.outcome
         except Exception as exc:
             errors += 1
             logger.warning("eval_task_sweep_task_failed", error_type=type(exc).__name__)
@@ -267,6 +300,7 @@ def sweep_stranded_eval_tasks():
 
 
 __all__ = [
+    "RecoveryInterrupted",
     "find_stranded_tasks",
     "recover_task",
     "sweep_stranded_eval_tasks",
