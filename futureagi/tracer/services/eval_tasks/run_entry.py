@@ -46,18 +46,25 @@ def run_entry(entry: EvalLogger) -> str:
     if fresh is None:
         return "deleted"
 
-    # Take the claim before doing anything that costs money. The activity has
-    # no schedule-to-start timeout, so a claimed entry can wait in the queue
-    # past the stale threshold, be requeued by the reaper and re-claimed by
-    # another worker before this run ever begins — at which point the row is
-    # RUNNING again and evaluating it is a pure double charge.
+    # Open a write fence before doing anything that costs money, and re-stamp
+    # the claim so staleness means "running for this long" rather than "claimed
+    # this long ago": ``claim_pending_batch`` marks a whole batch RUNNING at
+    # once and the drain runs it a few at a time, so a batch tail can sit
+    # claimed for hours before its run starts. Every write this run makes is
+    # then fenced on the new stamp, and a run whose entry was requeued and
+    # re-claimed while it worked has its result refused rather than landing on
+    # somebody else's claim.
     #
-    # The compare-and-set on the claim stamp is what takes it, and re-stamping
-    # it is what makes staleness mean "running for this long" rather than
-    # "claimed this long ago": ``claim_pending_batch`` marks a whole batch
-    # RUNNING at once and the drain runs it a few at a time, so a batch tail
-    # can sit claimed for hours before its run starts. Every write this run
-    # makes is then fenced on the new stamp.
+    # What this cannot see is a claim that was superseded *before* the run
+    # began: the activity is handed an entry id and nothing else, so a row that
+    # is RUNNING again under a newer claim is indistinguishable from one still
+    # under ours, and the compare-and-set takes it. The "reclaimed" branch below
+    # catches only a row that has left RUNNING. Reaching the blind case needs a
+    # reaper to requeue an entry whose activity is still queued, which is why
+    # the scheduled sweep asks Temporal before it reaps and leaves a progressing
+    # workflow alone (``tracer.tasks.eval_task_sweeper.recover_task``). Carrying
+    # the claim epoch through ClaimBatchOutput -> RunEntryInput would close it
+    # at the fence itself; that is a wire-format change and its own decision.
     if fresh.status != EvalEntryStatus.RUNNING:
         return "reclaimed"
     run_epoch = timezone.now()

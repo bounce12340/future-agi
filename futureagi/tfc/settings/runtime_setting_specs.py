@@ -195,15 +195,27 @@ DATASET_READ_SETTING_SPECS = {
 # rather than silently loosening the bounds below.
 RUN_ENTRY_CEILING_SECONDS = 1_800
 RUN_ENTRY_MAX_ATTEMPTS = 3
-# The longest one entry can legitimately stay ``running``. ``run_entry``
-# re-stamps ``updated_at`` when a run actually begins, so this bounds one
-# execution rather than a claim that may still be sitting in the queue.
+# The longest a run the sweep can still meet may legitimately last. The sweep
+# asks Temporal before it reaps and skips a task whose workflow is progressing,
+# so the only run it can overlap belongs to an execution that has since closed:
+# one activity attempt already in flight on a worker, bounded by the run-entry
+# start-to-close ceiling, with no retries because a closed execution dispatches
+# none. The retry count is kept in the product as headroom rather than as the
+# bound it models, so the floor stays conservative if that gate ever moves.
+#
+# This deliberately does NOT model a claim waiting in the queue. An entry is
+# ``RUNNING`` from the moment ``claim_pending_batch`` stamps its batch, and the
+# drain runs ``max_concurrent`` of a ``batch_size`` batch at a time, so a batch
+# tail can hold a frozen claim stamp for several waves — a span no threshold in
+# this range would cover. The describe-first gate is what makes that safe: a
+# task with a queued tail has a progressing workflow, so the sweep never reaps
+# it. See ``tracer.tasks.eval_task_sweeper.recover_task``.
 LONGEST_RUNNING_ENTRY_SECONDS = RUN_ENTRY_CEILING_SECONDS * RUN_ENTRY_MAX_ATTEMPTS
 
-# The sweep runs beside live workflows, so ``SWEEP_STALE_RUNNING_SECONDS`` must
-# stay above that bound at every value an operator can configure — not merely
-# at the default. Below it the sweep requeues an entry a worker is still
-# evaluating and spends one of the entry's three reclaims on it.
+# ``SWEEP_STALE_RUNNING_SECONDS`` must stay above that bound at every value an
+# operator can configure — not merely at the default. Below it the sweep can
+# requeue an entry whose run is still in flight from a closed execution and
+# spend one of the entry's three reclaims on it.
 EVAL_EXECUTION_SETTING_SPECS = {
     **_specs(
         (

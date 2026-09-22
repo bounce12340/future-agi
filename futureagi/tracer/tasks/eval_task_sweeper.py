@@ -13,13 +13,19 @@ Per tick, bounded and idempotent:
 
 * take tasks in a sweepable status that still have undrained entries, oldest
   activity first, capped at ``EVAL_TASK_SWEEP_MAX_TASKS``;
-* reclaim entries stuck ``running`` past ``EVAL_TASK_SWEEP_STALE_RUNNING_SECONDS``
-  — this is what lets the reaper reach a task whose workflow is alive but no
-  longer draining it. The threshold is measured from the moment a run actually
-  began, and a reclaim retires the claim the abandoned run was writing under,
-  so reaping cannot cost an evaluation twice;
-* ask Temporal whether a workflow is progressing, and restart only those where
-  none is.
+* ask Temporal whether a workflow is progressing, and leave that task alone if
+  one is — a healthy task costs one describe and nothing else;
+* for the rest, reclaim entries stuck ``running`` past
+  ``EVAL_TASK_SWEEP_STALE_RUNNING_SECONDS`` and restart the workflow.
+
+Asking before reaping is what makes the reap safe to run on a timer. An entry
+is ``RUNNING`` from the moment its batch is claimed, not from the moment its
+run starts: ``claim_pending_batch`` stamps a whole batch at once and the drain
+runs ``max_concurrent`` of them at a time, so a batch tail waits several waves
+under a frozen claim stamp. Reaping such a task would requeue an entry whose
+own activity is still queued, and that activity would then take the re-claim
+and pay for the evaluation a second time. The sweep therefore only ever
+retires claims belonging to an execution that is no longer running.
 
 ``paused`` and ``deleted`` tasks are never touched: restarting them spends
 evaluation calls on work their owner stopped on purpose. ``failed`` is out of
@@ -71,7 +77,14 @@ def find_stranded_tasks(*, limit: int | None = None) -> list[EvalTask]:
     is always served before tasks that are draining normally — otherwise a busy
     fleet would spend every tick's budget on healthy tasks and never reach the
     stranded one. A healthy task selected anyway costs one describe and nothing
-    else: its workflow is progressing, so it is left alone.
+    else: ``recover_task`` asks before it writes, so a progressing workflow's
+    entries are neither reaped nor restarted.
+
+    ``candidates`` therefore counts stranded tasks *in a sweepable status*, and
+    never the rest: a paused, delete-status or failed task holding undrained
+    entries, or an entry whose task row is gone, contributes nothing to the
+    count and produces no event. ``candidates: 0`` means nothing sweepable is
+    stranded, not that nothing is.
 
     The per-tick cap is applied **after** the sweepable-status filter, not
     before it. A task the sweep refuses to act on — paused, delete-status,
@@ -133,25 +146,37 @@ def find_stranded_tasks(*, limit: int | None = None) -> list[EvalTask]:
 
 
 def recover_task(task: EvalTask, *, stale_running_seconds: int) -> dict:
-    """Reap the task's stale ``running`` entries, then restart it if nothing is
-    draining it.
+    """Ask whether anything is draining the task; if nothing is, reap its stale
+    ``running`` entries and restart it.
 
-    The reap runs whatever the workflow is doing — that is the point: the
-    workflow-start reaper can never reach a task whose workflow is still alive
-    but no longer draining. Two things make it safe beside a live worker.
-    ``run_entry`` re-stamps ``updated_at`` when a run actually begins, so the
-    threshold is measured against one execution rather than against a claim
-    that may still be queued, and it is longer than one execution can
-    legitimately last. And every write a run makes is fenced on that claim
-    stamp, not merely on ``RUNNING`` — after a requeue and a re-claim the row
-    is ``RUNNING`` again, so ``RUNNING`` alone would let an abandoned run's
-    result land on the re-claimed row.
+    The describe comes first and is a gate, not a hint. An entry is ``RUNNING``
+    from the moment its batch is claimed, so a task that is draining normally
+    holds a tail of claimed-but-unstarted entries whose stamp is as old as the
+    claim — reaping those requeues work a queued activity is about to run, and
+    that activity then takes the re-claim and pays for the evaluation twice. By
+    asking first the sweep only ever retires a claim no execution owns any
+    more, and a healthy task really does cost one describe and nothing else.
+
+    A describe that cannot answer (Temporal unreachable) propagates before
+    anything is written, so the tick's counts describe what it actually did.
+
+    The reap still reaches what the workflow-start reaper cannot: a workflow
+    that stopped mid-drain leaves entries abandoned in ``running``, and nothing
+    else looks at them until something starts a workflow. The one run that can
+    still be in flight here belongs to an execution that has since closed —
+    bounded by a single activity attempt, because a closed execution dispatches
+    no retries — which is what ``EVAL_TASK_SWEEP_STALE_RUNNING_SECONDS`` is
+    floored to exceed. Its writes are fenced on the claim stamp it took, not
+    merely on ``RUNNING``, so a requeue and a re-claim refuse them.
 
     The restart coalesces (``replace_existing=False``) rather than terminating:
     the workflow id is per task, so the Temporal server decides atomically
     whether a live execution already owns it. A describe is a read taken a
     moment earlier, so terminating on it would kill a workflow a user started
-    in between — the exact failure this whole change exists to prevent.
+    in between — the exact failure this whole change exists to prevent. For the
+    same reason ``restarted`` counts starts *issued*: one that coalesced onto an
+    execution started in the gap is counted too, because the server resolves
+    that and does not report which way it went.
     """
     from tfc.temporal.eval_tasks.client import (
         WF_PROGRESSING,
@@ -159,14 +184,15 @@ def recover_task(task: EvalTask, *, stale_running_seconds: int) -> dict:
         start_eval_task_workflow_sync,
     )
 
+    if describe_eval_task_workflow_sync(task.id) == WF_PROGRESSING:
+        return {"requeued": 0, "failed": 0, "restarted": False}
+
     requeued, failed = reap_stale_running(
         task,
         older_than_seconds=stale_running_seconds,
         max_attempts=_MAX_ENTRY_ATTEMPTS,
     )
     outcome = {"requeued": requeued, "failed": failed, "restarted": False}
-    if describe_eval_task_workflow_sync(task.id) == WF_PROGRESSING:
-        return outcome
 
     if task.status == EvalTaskStatus.FAILED:
         # A failed row makes ``get_eval_task_state_activity`` report the task

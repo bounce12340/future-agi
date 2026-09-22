@@ -337,9 +337,9 @@ def claim_pending_batch(task: EvalTask, n: int) -> list[EvalLogger]:
 
     ``FOR UPDATE SKIP LOCKED`` lets many workers pull disjoint batches without
     blocking each other. ``updated_at`` is stamped to "now": it is both the
-    claim's epoch -- ``run_entry`` compare-and-sets it to take the claim, so two
-    workers cannot evaluate the same entry -- and, until the run re-stamps it,
-    how long the entry has been waiting for one.
+    claim's epoch -- ``run_entry`` compare-and-sets it when a run starts, so a
+    run that is superseded while it works cannot land its result -- and, until
+    the run re-stamps it, how long the entry has been waiting for one.
     """
     now = timezone.now()
     with transaction.atomic():

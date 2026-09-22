@@ -343,11 +343,21 @@ class TestRunEntryWallClock:
 class TestOneClaimIsOneEvaluation:
     """A reclaim must end the run it took the entry from.
 
-    The scheduled sweep reaps stale ``running`` entries beside live workflows,
-    so a worker can be holding an entry the reaper has already requeued and
-    another worker has re-claimed. ``RUNNING`` alone cannot tell those two runs
-    apart: the row is ``RUNNING`` again under the new claim, so the old run's
+    A worker can be holding an entry the reaper has already requeued and another
+    worker has re-claimed: the workflow-start reaper requeues whatever a
+    previous, closed execution abandoned, and an activity of that execution can
+    still be running on a worker. ``RUNNING`` alone cannot tell those two runs
+    apart — the row is ``RUNNING`` again under the new claim, so the old run's
     writes land on it. The claim's ``updated_at`` stamp is the epoch that can.
+
+    The fence is a write fence: it is taken when the run starts and refuses
+    every write made under a stamp the row no longer carries. It is not, and
+    cannot be, a check that the claim the *activity was scheduled under* is
+    still the row's — the activity is handed an entry id and nothing else. What
+    keeps that gap from being reachable is upstream: the scheduled sweep asks
+    Temporal before it reaps and leaves a progressing workflow's entries alone,
+    so no reaper requeues an entry whose activity is still queued for a live
+    execution (``tracer/tests/test_eval_task_sweeper.py``).
     """
 
     @staticmethod
@@ -435,10 +445,12 @@ class TestOneClaimIsOneEvaluation:
     ):
         """``claim_pending_batch`` stamps a whole batch ``RUNNING`` at once and
         the drain runs it a few at a time, so the tail of a batch can sit
-        claimed for hours before its run begins. Measuring staleness from the
-        claim would requeue an entry a worker is still evaluating; the run
-        re-stamps ``updated_at`` when it actually starts, so the threshold
-        bounds one execution, which is what the pinned invariant models."""
+        claimed for hours before its run begins. The run re-stamps
+        ``updated_at`` when it actually starts, so a reap that meets a started
+        run measures that run rather than the claim it came from — which is
+        what the pinned threshold invariant models. (The claimed-but-unstarted
+        tail is out of the sweep's reach for a different reason: its workflow is
+        progressing, and the sweep asks before it reaps.)"""
         from tracer.services.eval_tasks.reaper import reap_stale_running
 
         entry = self._claimed_entry(

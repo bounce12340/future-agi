@@ -292,16 +292,43 @@ class TestRecoverTask:
         assert outcome["restarted"] is False
         assert temporal["started"] == []
 
-    def test_a_stale_running_entry_is_reclaimed_even_under_a_live_workflow(
+    def test_a_progressing_workflows_entries_are_never_reclaimed(
         self, make_task, make_entry, temporal
     ):
-        """The whole point of putting the reap on a schedule: the workflow-start
-        reaper can never reach a task whose workflow is still alive."""
+        """The sweep asks before it reaps, so a task something is still draining
+        costs one describe and nothing else.
+
+        ``claim_pending_batch`` stamps a whole batch ``RUNNING`` at once and the
+        drain runs ``max_concurrent`` of them at a time, so the tail of a batch
+        is ``RUNNING`` under a frozen claim stamp for as many waves as the batch
+        has — four of them at the shipped 50/10, each bounded only by the
+        activity ceiling times its retries. Reaping on a stale *claim* therefore
+        requeues an entry whose own activity is still sitting in the queue, and
+        that activity then takes the re-claim and pays for the evaluation twice.
+        Asking first removes the whole class: the only claim the sweep can
+        retire belongs to an execution that is no longer running.
+        """
         from tfc.temporal.eval_tasks.client import WF_PROGRESSING
 
         task = make_task()
         entry = make_entry(task, status=EvalEntryStatus.RUNNING, age_seconds=10_000)
         temporal["verdict"] = WF_PROGRESSING
+
+        outcome = sweeper.recover_task(task, stale_running_seconds=7_200)
+
+        entry.refresh_from_db()
+        assert outcome["requeued"] == 0
+        assert entry.status == EvalEntryStatus.RUNNING
+        assert entry.attempts == 0
+
+    def test_a_stale_running_entry_is_reclaimed_once_nothing_is_draining(
+        self, make_task, make_entry, temporal
+    ):
+        """The reap itself is unchanged for the case it exists for: a workflow
+        that stopped leaves entries abandoned in ``running`` and the
+        workflow-start reaper cannot reach them until something starts one."""
+        task = make_task()
+        entry = make_entry(task, status=EvalEntryStatus.RUNNING, age_seconds=10_000)
 
         outcome = sweeper.recover_task(task, stale_running_seconds=7_200)
 
@@ -368,6 +395,30 @@ class TestSweepActivity:
         assert result["errors"] == 1
         assert result["restarted"] == 0
         assert temporal["started"] == []
+
+    def test_a_describe_that_cannot_answer_leaves_the_entries_untouched(
+        self, make_task, make_entry, temporal
+    ):
+        """An unreachable Temporal is not an answer, and the tick's counts have
+        to match what it really did.
+
+        Reaping before asking made both halves wrong at once: the entries of a
+        task whose describe raised were requeued and an attempt spent on them,
+        and then the exception discarded the outcome, so the very line the
+        runbook tells an operator to watch reported ``entries_requeued: 0``
+        for a reap that had already happened.
+        """
+        task = make_task()
+        entry = make_entry(task, status=EvalEntryStatus.RUNNING, age_seconds=10_000)
+        temporal["verdict"] = RuntimeError("temporal unreachable")
+
+        result = sweeper.sweep_stranded_eval_tasks._original_func()
+
+        entry.refresh_from_db()
+        assert result["errors"] == 1
+        assert result["entries_requeued"] == 0
+        assert entry.status == EvalEntryStatus.RUNNING
+        assert entry.attempts == 0
 
     def test_the_sweep_can_be_turned_off_without_a_deploy_of_its_own(
         self, make_task, make_entry, temporal, settings
@@ -453,11 +504,13 @@ def test_the_mirrored_run_entry_ceiling_matches_the_workflow():
 
 
 def test_sweep_stale_threshold_exceeds_a_live_entrys_longest_run():
-    """The scheduled reap runs beside live workflows, so its threshold must stay
-    above the longest a legitimately running entry can live: the workflow's
-    run-entry start-to-close ceiling times its retry attempts. Below that bound
-    the sweep requeues an entry a worker is still evaluating and spends one of
-    that entry's three reclaims on it.
+    """The scheduled reap never runs beside a progressing workflow — the sweep
+    asks first — but it can still meet one run: an activity already in flight on
+    a worker for an execution that has since closed. Its threshold must stay
+    above the longest such a run can live, the workflow's run-entry
+    start-to-close ceiling (times its retry attempts, kept as headroom: a closed
+    execution dispatches no retries). Below that bound the sweep requeues an
+    entry a worker is still evaluating and spends one of its three reclaims.
 
     Asserted against the spec's **minimum**, not against the live setting. The
     setting resolves from the process environment through ``load_numeric_settings``
