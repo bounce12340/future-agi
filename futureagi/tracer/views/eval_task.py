@@ -2843,18 +2843,37 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
             except EvalTask.DoesNotExist:
                 return self._gm.bad_request("Eval task not found")
 
-            if eval_task.status != EvalTaskStatus.PAUSED:
+            # FAILED is resumable for the same reason PAUSED is: both leave the
+            # entries untouched and exit the workflow, so a fresh run reconciles,
+            # reaps and drains whatever is left. A task fails when one control
+            # activity exhausts its retry budget, so without this a brief
+            # infrastructure blip stranded every remaining entry permanently —
+            # no endpoint accepted a failed task at all.
+            resumable = {EvalTaskStatus.PAUSED, EvalTaskStatus.FAILED}
+            if eval_task.status not in resumable:
                 return self._gm.bad_request(
                     f"Cannot unpause eval task with status '{eval_task.status}'. "
-                    "Only paused tasks can be resumed."
+                    "Only paused or failed tasks can be resumed."
                 )
 
+            recovered_from = eval_task.status
+            undrained = EvalLogger.objects.filter(
+                eval_task_id=str(eval_task.id),
+                status__in=[EvalEntryStatus.PENDING, EvalEntryStatus.RUNNING],
+            ).count()
             eval_task.status = EvalTaskStatus.PENDING
             eval_task.save(update_fields=["status"])
 
             # Pause exits the workflow; resuming starts a fresh run that picks up
             # the remaining pending/running entries.
             start_eval_task_workflow_sync(eval_task, replace_existing=True)
+            # Counts and the previous status only — never an entry payload or
+            # any tenant-identifying value.
+            logger.info(
+                "eval_task_recovered",
+                recovered_from=str(recovered_from),
+                undrained_entries=undrained,
+            )
 
             return self._gm.success_response(
                 {"message": "Eval task unpaused successfully"}
