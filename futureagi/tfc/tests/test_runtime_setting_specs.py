@@ -1,7 +1,10 @@
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from tfc.settings import runtime_setting_specs
 from tfc.settings.runtime_setting_specs import (
     DATASET_READ_SETTING_SPECS,
     INTERACTIVE_READ_SETTING_SPECS,
@@ -583,3 +586,115 @@ def test_interactive_default_page_sizes_cannot_exceed_their_maximum(
 
     with pytest.raises(ValueError):
         validate_interactive_read_settings(values)
+
+
+def _declared_spec_names_by_collection():
+    """Read the spec SOURCE and return every declared name per collection.
+
+    The built dictionaries cannot answer this question. ``_specs`` is a dict
+    comprehension and a collection is a ``{**_specs(...), **_specs(...)}``
+    merge, so a name declared twice inside one collection is silently
+    last-wins: both copies collapse to a single key and, when the tuples
+    agree, to an identical spec. Only the source text still carries the
+    second declaration, so only the source can prove there is one.
+
+    A collection that merges other collections rather than declaring rows of
+    its own is not returned: it holds no ``_specs`` call, and cross-collection
+    collisions are already refused at import by ``runtime_setting_specs``
+    itself.
+    """
+
+    tree = ast.parse(Path(runtime_setting_specs.__file__).read_text())
+    collections = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Dict):
+            continue
+        targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        if not targets or not targets[0].endswith("_SETTING_SPECS"):
+            continue
+        names = []
+        for key, value in zip(node.value.keys, node.value.values, strict=True):
+            # ``key is None`` is a ``**`` spread; anything else is an explicit
+            # entry and carries no rows.
+            if key is not None or not isinstance(value, ast.Call):
+                continue
+            if not isinstance(value.func, ast.Name) or value.func.id != "_specs":
+                continue
+            prefix = next(
+                (
+                    keyword.value.value
+                    for keyword in value.keywords
+                    if keyword.arg == "prefix"
+                    and isinstance(keyword.value, ast.Constant)
+                ),
+                "",
+            )
+            for row in value.args[0].elts:
+                names.append(f"{prefix}{row.elts[0].value}")
+        if names:
+            collections[targets[0]] = names
+    return collections
+
+
+def test_the_source_reader_sees_the_rows_it_is_meant_to_guard():
+    """A scan that found nothing must not read as a clean scan."""
+
+    collections = _declared_spec_names_by_collection()
+
+    assert set(collections) == {
+        "PROPERTY_CATALOG_RUNTIME_SETTING_SPECS",
+        "DATASET_READ_SETTING_SPECS",
+        "INTERACTIVE_READ_SETTING_SPECS",
+    }
+    interactive = collections["INTERACTIVE_READ_SETTING_SPECS"]
+    assert "INTERACTIVE_READ_DEFAULT_WALL_MS" in interactive
+    assert "USER_LIST_PAGE_WALL_MS" in interactive
+    # The prefixed collections are reconstructed, not read verbatim.
+    assert (
+        "PROPERTY_CATALOG_QUERY_WALL_MS"
+        in collections["PROPERTY_CATALOG_RUNTIME_SETTING_SPECS"]
+    )
+    # Every declared name resolves to a real spec, so the reader is reading
+    # the same rows the runtime loads.
+    for collection, names in collections.items():
+        built = getattr(runtime_setting_specs, collection)
+        assert set(names) == set(built)
+
+
+def test_no_setting_name_is_declared_twice_inside_one_spec_collection():
+    """A second declaration of the same name is a silent last-wins edit.
+
+    Two PRs adding the same wall to the same collection produce no error,
+    no warning and no behaviour change while their tuples happen to agree;
+    the day one of them moves its bounds, the winner is whichever row is
+    written later in the file.
+    """
+
+    duplicates = {
+        collection: sorted({name for name in names if names.count(name) > 1})
+        for collection, names in _declared_spec_names_by_collection().items()
+        if len(set(names)) != len(names)
+    }
+
+    assert not duplicates, (
+        "these runtime setting names are declared more than once inside a "
+        "single spec collection, where the dict comprehension silently keeps "
+        f"the last row: {duplicates}"
+    )
+
+
+def test_env_example_declares_each_setting_once():
+    """The documented default must not disagree with itself either."""
+
+    env_example = Path(__file__).resolve().parents[2] / ".env.example"
+    keys = [
+        line.split("=", 1)[0]
+        for line in env_example.read_text().splitlines()
+        if "=" in line and not line.lstrip().startswith("#")
+    ]
+
+    assert keys, f"{env_example} parsed to no assignments at all"
+    duplicates = sorted({key for key in keys if keys.count(key) > 1})
+    assert not duplicates, (
+        f"{env_example.name} assigns these keys more than once: {duplicates}"
+    )
