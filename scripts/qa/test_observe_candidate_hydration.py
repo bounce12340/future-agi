@@ -249,7 +249,13 @@ class HydrationTests(unittest.TestCase):
     def test_session_entity_dispatch_hydrates_once_under_public_route_policy(self):
         import replay_observe_queries_readonly as queries
         from tracer.tests.test_session_positive_witness_page import builder, leaf
-        for kind, preferred in (("text", True), ("mixed", True), ("number", False), ("boolean", False)):
+        # Every typed picker map takes the walk, so a number or boolean leaf
+        # routes exactly like a string one. Those two kinds used to keep the
+        # candidate lane, whose any-span witness dies before start at long
+        # windows on a high-volume tenant (see ``prefers_bounded_filter_page``).
+        # Same matrix as the public-route dispatch test in
+        # ``tracer.tests.test_session_list_bounded_view``.
+        for kind, preferred in (("text", True), ("mixed", True), ("number", True), ("boolean", True)):
             filters = [leaf("company", ["alpha"], "text", "in")]
             if kind in {"mixed", "number"}:
                 filters.append(leaf("other", False, "boolean") if kind == "mixed" else leaf("other", 7))
