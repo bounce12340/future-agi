@@ -15,7 +15,9 @@ Per tick, bounded and idempotent:
   activity first, capped at ``EVAL_TASK_SWEEP_MAX_TASKS``;
 * reclaim entries stuck ``running`` past ``EVAL_TASK_SWEEP_STALE_RUNNING_SECONDS``
   — this is what lets the reaper reach a task whose workflow is alive but no
-  longer draining it, and the threshold is why it cannot race one that is;
+  longer draining it. The threshold is measured from the moment a run actually
+  began, and a reclaim retires the claim the abandoned run was writing under,
+  so reaping cannot cost an evaluation twice;
 * ask Temporal whether a workflow is progressing, and restart only those where
   none is.
 
@@ -131,11 +133,14 @@ def recover_task(task: EvalTask, *, stale_running_seconds: int) -> dict:
 
     The reap runs whatever the workflow is doing — that is the point: the
     workflow-start reaper can never reach a task whose workflow is still alive
-    but no longer draining. It is safe beside a live worker because the
-    threshold is longer than a running entry's longest legitimate life, and
-    because ``persist_eval_result`` / ``mark_terminal`` fence their writes on
-    ``RUNNING``, so a late result from a requeued entry no-ops instead of
-    landing on the re-claimed row.
+    but no longer draining. Two things make it safe beside a live worker.
+    ``run_entry`` re-stamps ``updated_at`` when a run actually begins, so the
+    threshold is measured against one execution rather than against a claim
+    that may still be queued, and it is longer than one execution can
+    legitimately last. And every write a run makes is fenced on that claim
+    stamp, not merely on ``RUNNING`` — after a requeue and a re-claim the row
+    is ``RUNNING`` again, so ``RUNNING`` alone would let an abandoned run's
+    result land on the re-claimed row.
 
     The restart coalesces (``replace_existing=False``) rather than terminating:
     the workflow id is per task, so the Temporal server decides atomically

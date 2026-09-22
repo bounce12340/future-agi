@@ -13,16 +13,22 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from django.utils import timezone
+
 from evaluations.engine.wall_clock import EvalWallClockExceeded, eval_wall_clock_scope
 from tracer.models.custom_eval_config import CustomEvalConfig
 from tracer.models.eval_task import EvalTask
 from tracer.models.observation_span import EvalEntryStatus, EvalLogger, EvalTargetType
 from tracer.services.clickhouse.v2.eval_loader import EvalTelemetryReadError
 from tracer.services.eval_tasks.config_hash import resolved_config_hash
-from tracer.services.eval_tasks.entries import mark_terminal, writing_onto_entry
+from tracer.services.eval_tasks.entries import (
+    mark_terminal,
+    running_entry_epoch,
+    writing_onto_entry,
+)
 
 if TYPE_CHECKING:
-    pass
+    from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -31,13 +37,37 @@ def run_entry(entry: EvalLogger) -> str:
     """Run the eval for one entry and record its terminal status; returns it.
 
     No-op (returns ``"deleted"``) if the entry was soft-deleted mid-run — a
-    Delete & rerun landing while it ran. Eval/data failures converge to a
-    terminal state; infrastructure read failures propagate to the activity's
-    bounded retry policy.
+    Delete & rerun landing while it ran, or ``"reclaimed"`` if the claim this
+    activity was scheduled for is no longer the row's. Eval/data failures
+    converge to a terminal state; infrastructure read failures propagate to the
+    activity's bounded retry policy.
     """
     fresh = EvalLogger.objects.filter(id=entry.id).first()
     if fresh is None:
         return "deleted"
+
+    # Take the claim before doing anything that costs money. The activity has
+    # no schedule-to-start timeout, so a claimed entry can wait in the queue
+    # past the stale threshold, be requeued by the reaper and re-claimed by
+    # another worker before this run ever begins — at which point the row is
+    # RUNNING again and evaluating it is a pure double charge.
+    #
+    # The compare-and-set on the claim stamp is what takes it, and re-stamping
+    # it is what makes staleness mean "running for this long" rather than
+    # "claimed this long ago": ``claim_pending_batch`` marks a whole batch
+    # RUNNING at once and the drain runs it a few at a time, so a batch tail
+    # can sit claimed for hours before its run starts. Every write this run
+    # makes is then fenced on the new stamp.
+    if fresh.status != EvalEntryStatus.RUNNING:
+        return "reclaimed"
+    run_epoch = timezone.now()
+    if not EvalLogger.objects.filter(
+        id=fresh.id,
+        status=EvalEntryStatus.RUNNING,
+        updated_at=fresh.updated_at,
+    ).update(updated_at=run_epoch):
+        return "reclaimed"
+    fresh.updated_at = run_epoch
 
     config = CustomEvalConfig.objects.select_related("project").get(
         id=fresh.custom_eval_config_id
@@ -50,7 +80,7 @@ def run_entry(entry: EvalLogger) -> str:
     )
     config_hash = resolved_config_hash(config)
 
-    with eval_wall_clock_scope() as wall_timeouts:
+    with running_entry_epoch(run_epoch), eval_wall_clock_scope() as wall_timeouts:
         try:
             _run_for_target(fresh, config, task_project=task_project)
         except EvalTelemetryReadError:
@@ -59,7 +89,7 @@ def run_entry(entry: EvalLogger) -> str:
             # same still-RUNNING entry instead of freezing a transient miss.
             raise
         except EvalWallClockExceeded as e:
-            return _fail_timed_out(fresh, config_hash, str(e))
+            return _fail_timed_out(fresh, config_hash, str(e), epoch=run_epoch)
         except Exception as e:  # Every failure becomes a terminal state.
             skipped_reason = getattr(e, "skipped_reason", None)
             if skipped_reason:
@@ -69,6 +99,7 @@ def run_entry(entry: EvalLogger) -> str:
                     config_hash=config_hash,
                     error=False,
                     skipped_reason=skipped_reason,
+                    epoch=run_epoch,
                 )
                 return EvalEntryStatus.SKIPPED
             logger.warning("run_entry failed for %s: %s", fresh.id, e, exc_info=True)
@@ -78,6 +109,7 @@ def run_entry(entry: EvalLogger) -> str:
                 config_hash=config_hash,
                 error=True,
                 error_message=str(e),
+                epoch=run_epoch,
             )
             return EvalEntryStatus.ERRORED
 
@@ -86,19 +118,26 @@ def run_entry(entry: EvalLogger) -> str:
             # writes a generic "Error during evaluation" onto the entry rather
             # than re-raising, so a wall-clock timeout has to be read back here
             # instead of caught. Restating it gives the row the real reason.
-            return _fail_timed_out(fresh, config_hash, wall_timeouts[0])
+            return _fail_timed_out(
+                fresh, config_hash, wall_timeouts[0], epoch=run_epoch
+            )
 
     # The evaluator wrote the result onto the entry; read its error flag to pick
     # the terminal status, then stamp status + hash.
     fresh.refresh_from_db()
     status = EvalEntryStatus.ERRORED if fresh.error else EvalEntryStatus.COMPLETED
-    mark_terminal(fresh, status, config_hash=config_hash)
+    # Explicit rather than scoped: this call is outside ``running_entry_epoch``,
+    # and the refresh above has already replaced ``fresh.updated_at`` with
+    # whatever the row now carries — which, after a reclaim, is someone else's.
+    mark_terminal(fresh, status, config_hash=config_hash, epoch=run_epoch)
     if status == EvalEntryStatus.COMPLETED:
         _reseed_eval_clustering(fresh, config.project_id)
     return status
 
 
-def _fail_timed_out(entry: EvalLogger, config_hash: str, message: str) -> str:
+def _fail_timed_out(
+    entry: EvalLogger, config_hash: str, message: str, *, epoch: datetime
+) -> str:
     """Terminalize an entry whose evaluation outlived its wall clock.
 
     Errored once, with the real reason rather than the engine's generic wrapper,
@@ -113,6 +152,7 @@ def _fail_timed_out(entry: EvalLogger, config_hash: str, message: str) -> str:
         error=True,
         error_message=message,
         count_attempt=True,
+        epoch=epoch,
     )
     return EvalEntryStatus.ERRORED
 

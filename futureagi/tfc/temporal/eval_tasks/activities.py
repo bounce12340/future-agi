@@ -99,7 +99,9 @@ def _run_entry_sync(entry_id: str) -> dict:
     Delegates to the ``run_entry`` service, which executes the eval, writes the
     result, and stamps the entry ``completed`` / ``errored`` / ``skipped`` plus
     its config hash. Returns ``"deleted"`` if the entry was soft-deleted mid-run
-    (a Delete & rerun landing while it ran), so the workflow just moves on.
+    (a Delete & rerun landing while it ran) or ``"reclaimed"`` if the claim this
+    activity was scheduled for is no longer the row's, so the workflow just
+    moves on.
     """
     close_old_connections()
     try:
@@ -127,8 +129,9 @@ def _fail_entry_sync(entry_id: str) -> dict:
 
     ``run_entry`` self-converges for eval failures, so an activity reaching this
     path failed at the infra level, not the eval level. Only a still-running
-    entry is touched, so a late failure can't clobber a result that completed (or
-    a Delete & rerun that soft-deleted it) in the meantime.
+    entry is touched, and only under the claim this read saw, so a late failure
+    can't clobber a result that completed, a Delete & rerun that soft-deleted
+    the entry, or a claim the reaper handed to another worker in the meantime.
     """
     close_old_connections()
     try:
@@ -149,6 +152,9 @@ def _fail_entry_sync(entry_id: str) -> dict:
             config_hash=resolved_config_hash(config),
             error=True,
             error_message="run_entry activity failed after retries",
+            # This caller reads the row itself rather than running under a
+            # ``running_entry_epoch`` scope, so it fences on its own read.
+            epoch=entry.updated_at,
         )
         return {"entry_id": str(entry_id), "status": str(EvalEntryStatus.ERRORED)}
     finally:
