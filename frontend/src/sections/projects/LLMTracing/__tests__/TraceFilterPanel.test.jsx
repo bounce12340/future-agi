@@ -413,218 +413,476 @@ function renderPanel({
 }
 
 describe("OBS007 Users frontend regressions", () => {
-  const nativeMetrics = ["user", "user_id_type", "user_id_hash"].map((name) => ({
-    name, display_name: name, type: "string", category: "system_metric",
-    source: "traces", property_id: `system_attribute:traces:${name}`,
-  }));
+  const nativeMetrics = ["user", "user_id_type", "user_id_hash"].map(
+    (name) => ({
+      name,
+      display_name: name,
+      type: "string",
+      category: "system_metric",
+      source: "traces",
+      property_id: `system_attribute:traces:${name}`,
+    }),
+  );
   const customMetric = {
-    name: "user_id_type", display_name: "Raw user type", type: "string",
-    category: "custom_attribute", source: "traces", property_id: "custom_attribute:user_id_type",
+    name: "user_id_type",
+    display_name: "Raw user type",
+    type: "string",
+    category: "custom_attribute",
+    source: "traces",
+    property_id: "custom_attribute:user_id_type",
   };
-  const usersProperties = () => mergeTraceFilterProperties({
-    source: "sessions", propertyNamespace: "users",
-    dynamicProperties: buildTraceFilterProperties([...nativeMetrics, customMetric]),
-  });
+  const usersProperties = () =>
+    mergeTraceFilterProperties({
+      source: "sessions",
+      propertyNamespace: "users",
+      dynamicProperties: buildTraceFilterProperties([
+        ...nativeMetrics,
+        customMetric,
+      ]),
+    });
 
   it("owns native Users identities but preserves same-name raw trace attributes", () => {
     const properties = usersProperties();
     for (const id of ["user_id", "user_id_type", "user_id_hash"]) {
-      expect(properties.filter((property) => property.category === "system" && property.id === id))
-        .toEqual([expect.objectContaining({
+      expect(
+        properties.filter(
+          (property) => property.category === "system" && property.id === id,
+        ),
+      ).toEqual([
+        expect.objectContaining({
           registryId: `system_attribute:users:${id === "user_id" ? "user" : id}`,
           apiColType: "SYSTEM_METRIC",
-        })]);
+        }),
+      ]);
     }
-    expect(properties.filter((property) => property.category === "system" && property.id === "user"))
-      .toEqual([]);
-    expect(properties).toContainEqual(expect.objectContaining({
-      id: "user_id_type", registryId: "custom_attribute:user_id_type", apiColType: "SPAN_ATTRIBUTE",
-    }));
+    expect(
+      properties.filter(
+        (property) => property.category === "system" && property.id === "user",
+      ),
+    ).toEqual([]);
+    expect(properties).toContainEqual(
+      expect.objectContaining({
+        id: "user_id_type",
+        registryId: "custom_attribute:user_id_type",
+        apiColType: "SPAN_ATTRIBUTE",
+      }),
+    );
   });
 
   it("keeps canonical Users identities through remote search without merging custom names", () => {
     const results = mergeCatalogSearchProperties({
       baseProperties: usersProperties(),
-      catalogProperties: buildTraceFilterProperties([nativeMetrics[1], customMetric]),
-      search: "user", category: "all",
+      catalogProperties: buildTraceFilterProperties([
+        nativeMetrics[1],
+        customMetric,
+      ]),
+      search: "user",
+      category: "all",
     });
-    expect(results.filter((property) => property.id === "user_id_type").map((property) => property.registryId).sort())
-      .toEqual(["custom_attribute:user_id_type", "system_attribute:users:user_id_type"]);
-    const canonical = results.find((property) => property.registryId === "system_attribute:users:user_id_type");
+    expect(
+      results
+        .filter((property) => property.id === "user_id_type")
+        .map((property) => property.registryId)
+        .sort(),
+    ).toEqual([
+      "custom_attribute:user_id_type",
+      "system_attribute:users:user_id_type",
+    ]);
+    const canonical = results.find(
+      (property) =>
+        property.registryId === "system_attribute:users:user_id_type",
+    );
     const sameIdentity = { ...canonical, name: "Catalog user type" };
-    expect(mergeCatalogSearchProperties({
-      baseProperties: usersProperties(), catalogProperties: [sameIdentity], search: "user",
-    }).filter((property) => property.registryId === canonical.registryId)).toEqual([canonical]);
-    expect(supplementCatalogSearchCategoryCounts({
-      categoryCounts: { all: 2, system_metric: 1, custom_attribute: 1 },
-      baseProperties: usersProperties(),
-      catalogProperties: buildTraceFilterProperties([nativeMetrics[1], customMetric]),
-      search: "user_id_type",
-    })).toEqual({ all: 2, system_metric: 1, custom_attribute: 1 });
+    expect(
+      mergeCatalogSearchProperties({
+        baseProperties: usersProperties(),
+        catalogProperties: [sameIdentity],
+        search: "user",
+      }).filter((property) => property.registryId === canonical.registryId),
+    ).toEqual([canonical]);
+    expect(
+      supplementCatalogSearchCategoryCounts({
+        categoryCounts: { all: 2, system_metric: 1, custom_attribute: 1 },
+        baseProperties: usersProperties(),
+        catalogProperties: buildTraceFilterProperties([
+          nativeMetrics[1],
+          customMetric,
+        ]),
+        search: "user_id_type",
+      }),
+    ).toEqual({ all: 2, system_metric: 1, custom_attribute: 1 });
   });
 
   it("includes the finite per-user native inventory, including supported dates", () => {
-    expect(getTraceFilterFields("users").map((field) => field.value).sort()).toEqual([
-      "user_id", "user_id_type", "user_id_hash", "activated_at", "last_active", "num_active_days",
-      "total_cost", "total_tokens", "input_tokens", "output_tokens", "num_traces", "num_sessions",
-      "avg_session_duration", "avg_trace_latency", "num_llm_calls", "num_guardrails_triggered", "num_traces_with_errors",
-    ].sort());
+    expect(
+      getTraceFilterFields("users")
+        .map((field) => field.value)
+        .sort(),
+    ).toEqual(
+      [
+        "user_id",
+        "user_id_type",
+        "user_id_hash",
+        "activated_at",
+        "last_active",
+        "num_active_days",
+        "total_cost",
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+        "num_traces",
+        "num_sessions",
+        "avg_session_duration",
+        "avg_trace_latency",
+        "num_llm_calls",
+        "num_guardrails_triggered",
+        "num_traces_with_errors",
+      ].sort(),
+    );
     for (const id of ["activated_at", "last_active"]) {
-      expect(usersProperties()).toContainEqual(expect.objectContaining({
-        id, type: "datetime", registryId: `system_attribute:users:${id}`,
-      }));
+      expect(usersProperties()).toContainEqual(
+        expect.objectContaining({
+          id,
+          type: "datetime",
+          registryId: `system_attribute:users:${id}`,
+        }),
+      );
     }
   });
 
-  it.each(["user_id_type", "user_id_hash"])("selects searched native %s with sessions values and trace custom discovery", async (id) => {
-    propertyCatalogMock.mockReturnValue(settledPropertyCatalog({ metrics: nativeMetrics }));
-    dashboardFilterValuesMock.mockReturnValue({
-      ...defaultDashboardFilterValues(), data: [{ value: "email", label: "email" }],
-    });
-    const { anchorEl, onApply } = renderPanel({
-      source: "sessions", propertyNamespace: "users", attributeSource: "traces", projectId: "users-project",
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Property", exact: true }));
-    fireEvent.change(screen.getByPlaceholderText("Search properties..."), { target: { value: id } });
-    await waitFor(() => expect(propertyCatalogMock).toHaveBeenCalledWith(expect.objectContaining({
-      source: "traces", search: id, enabled: true,
-    })));
-    fireEvent.click(document.querySelector(`[data-filter-property-option="${id}"]`));
-    fireEvent.click(document.querySelector(`[data-filter-value-trigger="${id}"]`));
-    fireEvent.click(await screen.findByRole("checkbox", { name: "email" }));
-    expect(dashboardFilterValuesMock).toHaveBeenCalledWith(expect.objectContaining({
-      source: "sessions", propertyId: `system_attribute:users:${id}`, metricName: id, enabled: true,
-    }));
-    await waitFor(() => expect(onApply).toHaveBeenCalled());
-    expect(buildApiFilterFromPanelRow(onApply.mock.calls.at(-1)[0][0])).toMatchObject({
-      column_id: id, property_id: `system_attribute:users:${id}`,
-      filter_config: { col_type: "SYSTEM_METRIC", filter_value: ["email"] },
-    });
-    document.body.removeChild(anchorEl);
-  });
+  it.each(["user_id_type", "user_id_hash"])(
+    "selects searched native %s with sessions values and trace custom discovery",
+    async (id) => {
+      propertyCatalogMock.mockReturnValue(
+        settledPropertyCatalog({ metrics: nativeMetrics }),
+      );
+      dashboardFilterValuesMock.mockReturnValue({
+        ...defaultDashboardFilterValues(),
+        data: [{ value: "email", label: "email" }],
+      });
+      const { anchorEl, onApply } = renderPanel({
+        source: "sessions",
+        propertyNamespace: "users",
+        attributeSource: "traces",
+        projectId: "users-project",
+      });
+      fireEvent.click(
+        screen.getByRole("button", { name: "Property", exact: true }),
+      );
+      fireEvent.change(screen.getByPlaceholderText("Search properties..."), {
+        target: { value: id },
+      });
+      await waitFor(() =>
+        expect(propertyCatalogMock).toHaveBeenCalledWith(
+          expect.objectContaining({
+            source: "traces",
+            search: id,
+            enabled: true,
+          }),
+        ),
+      );
+      fireEvent.click(
+        document.querySelector(`[data-filter-property-option="${id}"]`),
+      );
+      fireEvent.click(
+        document.querySelector(`[data-filter-value-trigger="${id}"]`),
+      );
+      fireEvent.click(await screen.findByRole("checkbox", { name: "email" }));
+      expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          source: "sessions",
+          propertyId: `system_attribute:users:${id}`,
+          metricName: id,
+          enabled: true,
+        }),
+      );
+      await waitFor(() => expect(onApply).toHaveBeenCalled());
+      expect(
+        buildApiFilterFromPanelRow(onApply.mock.calls.at(-1)[0][0]),
+      ).toMatchObject({
+        column_id: id,
+        property_id: `system_attribute:users:${id}`,
+        filter_config: { col_type: "SYSTEM_METRIC", filter_value: ["email"] },
+      });
+      document.body.removeChild(anchorEl);
+    },
+  );
 
-  it.each(["activated_at", "last_active"])("discovers %s and applies the existing datetime control", async (id) => {
-    propertyCatalogMock.mockReturnValue(settledPropertyCatalog());
-    const { anchorEl, onApply } = renderPanel({
-      source: "sessions", propertyNamespace: "users", attributeSource: "traces", projectId: "users-project",
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Property", exact: true }));
-    fireEvent.change(screen.getByPlaceholderText("Search properties..."), { target: { value: id } });
-    await waitFor(() => expect(propertyCatalogMock).toHaveBeenCalledWith(expect.objectContaining({ search: id, enabled: true })));
-    const option = document.querySelector(`[data-filter-property-option="${id}"]`);
-    expect(option).toBeInTheDocument();
-    fireEvent.click(option);
-    const input = document.querySelector('input[type="datetime-local"]');
-    expect(input).toBeInTheDocument();
-    fireEvent.change(input, { target: { value: "2026-09-08T09:00" } });
-    await waitFor(() => expect(onApply).toHaveBeenCalled());
-    expect(buildApiFilterFromPanelRow(onApply.mock.calls.at(-1)[0][0])).toMatchObject({
-      column_id: id, property_id: `system_attribute:users:${id}`,
-      filter_config: { filter_type: "datetime", col_type: "SYSTEM_METRIC", filter_value: "2026-09-08T09:00" },
-    });
-    fireEvent.mouseDown(screen.getByRole("combobox"));
-    fireEvent.click(screen.getByRole("option", { name: "between", exact: true }));
-    const bounds = document.querySelectorAll('input[type="datetime-local"]');
-    expect(bounds).toHaveLength(2);
-    fireEvent.change(bounds[0], { target: { value: "2026-09-07T09:00" } });
-    fireEvent.change(bounds[1], { target: { value: "2026-09-08T09:00" } });
-    await waitFor(() => expect(onApply.mock.calls.at(-1)[0][0].value).toEqual(["2026-09-07T09:00", "2026-09-08T09:00"]));
-    expect(buildApiFilterFromPanelRow(onApply.mock.calls.at(-1)[0][0]).filter_config).toMatchObject({
-      filter_type: "datetime", filter_op: "between", filter_value: ["2026-09-07T09:00", "2026-09-08T09:00"],
-    });
-    fireEvent.mouseDown(screen.getByRole("combobox"));
-    fireEvent.click(screen.getByRole("option", { name: "is null", exact: true }));
-    expect(document.querySelector('input[type="datetime-local"]')).not.toBeInTheDocument();
-    await waitFor(() => expect(onApply.mock.calls.at(-1)[0][0].operator).toBe("is_null"));
-    expect(buildApiFilterFromPanelRow(onApply.mock.calls.at(-1)[0][0])).toMatchObject({
-      property_id: `system_attribute:users:${id}`,
-      filter_config: { filter_type: "datetime", col_type: "SYSTEM_METRIC", filter_op: "is_null", filter_value: null },
-    });
-    document.body.removeChild(anchorEl);
-  });
+  it.each(["activated_at", "last_active"])(
+    "discovers %s and applies the existing datetime control",
+    async (id) => {
+      propertyCatalogMock.mockReturnValue(settledPropertyCatalog());
+      const { anchorEl, onApply } = renderPanel({
+        source: "sessions",
+        propertyNamespace: "users",
+        attributeSource: "traces",
+        projectId: "users-project",
+      });
+      fireEvent.click(
+        screen.getByRole("button", { name: "Property", exact: true }),
+      );
+      fireEvent.change(screen.getByPlaceholderText("Search properties..."), {
+        target: { value: id },
+      });
+      await waitFor(() =>
+        expect(propertyCatalogMock).toHaveBeenCalledWith(
+          expect.objectContaining({ search: id, enabled: true }),
+        ),
+      );
+      const option = document.querySelector(
+        `[data-filter-property-option="${id}"]`,
+      );
+      expect(option).toBeInTheDocument();
+      fireEvent.click(option);
+      const input = document.querySelector('input[type="datetime-local"]');
+      expect(input).toBeInTheDocument();
+      fireEvent.change(input, { target: { value: "2026-09-08T09:00" } });
+      await waitFor(() => expect(onApply).toHaveBeenCalled());
+      expect(
+        buildApiFilterFromPanelRow(onApply.mock.calls.at(-1)[0][0]),
+      ).toMatchObject({
+        column_id: id,
+        property_id: `system_attribute:users:${id}`,
+        filter_config: {
+          filter_type: "datetime",
+          col_type: "SYSTEM_METRIC",
+          filter_value: "2026-09-08T09:00",
+        },
+      });
+      fireEvent.mouseDown(screen.getByRole("combobox"));
+      fireEvent.click(
+        screen.getByRole("option", { name: "between", exact: true }),
+      );
+      const bounds = document.querySelectorAll('input[type="datetime-local"]');
+      expect(bounds).toHaveLength(2);
+      fireEvent.change(bounds[0], { target: { value: "2026-09-07T09:00" } });
+      fireEvent.change(bounds[1], { target: { value: "2026-09-08T09:00" } });
+      await waitFor(() =>
+        expect(onApply.mock.calls.at(-1)[0][0].value).toEqual([
+          "2026-09-07T09:00",
+          "2026-09-08T09:00",
+        ]),
+      );
+      expect(
+        buildApiFilterFromPanelRow(onApply.mock.calls.at(-1)[0][0])
+          .filter_config,
+      ).toMatchObject({
+        filter_type: "datetime",
+        filter_op: "between",
+        filter_value: ["2026-09-07T09:00", "2026-09-08T09:00"],
+      });
+      fireEvent.mouseDown(screen.getByRole("combobox"));
+      fireEvent.click(
+        screen.getByRole("option", { name: "is null", exact: true }),
+      );
+      expect(
+        document.querySelector('input[type="datetime-local"]'),
+      ).not.toBeInTheDocument();
+      await waitFor(() =>
+        expect(onApply.mock.calls.at(-1)[0][0].operator).toBe("is_null"),
+      );
+      expect(
+        buildApiFilterFromPanelRow(onApply.mock.calls.at(-1)[0][0]),
+      ).toMatchObject({
+        property_id: `system_attribute:users:${id}`,
+        filter_config: {
+          filter_type: "datetime",
+          col_type: "SYSTEM_METRIC",
+          filter_op: "is_null",
+          filter_value: null,
+        },
+      });
+      document.body.removeChild(anchorEl);
+    },
+  );
 
-  it.each([["7", 7, "number"], ["0", 0, "number"], ["false", false, "boolean"]])(
+  it.each([
+    ["7", 7, "number"],
+    ["0", 0, "number"],
+    ["false", false, "boolean"],
+  ])(
     "visibly distinguishes typed %s options and preserves each applied wire value",
     async (label, scalar, type) => {
       dashboardFilterValuesMock.mockReturnValue({
-        ...defaultDashboardFilterValues(), data: [
-          { value: label, label, type: "string" }, { value: scalar, label, type },
+        ...defaultDashboardFilterValues(),
+        data: [
+          { value: label, label, type: "string" },
+          { value: scalar, label, type },
         ],
       });
       const { anchorEl, onApply, rerenderPanel } = renderPanel({
-        source: "sessions", propertyNamespace: "users", attributeSource: "traces", projectId: "users-project",
-        properties: [{ id: "mixed", name: "Mixed", category: "attribute", type: "json",
-          apiColType: "SPAN_ATTRIBUTE", attributeTypes: ["string", type] }],
+        source: "sessions",
+        propertyNamespace: "users",
+        attributeSource: "traces",
+        projectId: "users-project",
+        properties: [
+          {
+            id: "mixed",
+            name: "Mixed",
+            category: "attribute",
+            type: "json",
+            apiColType: "SPAN_ATTRIBUTE",
+            attributeTypes: ["string", type],
+          },
+        ],
         // A selected mixed-scalar property uses string membership plus the
         // separate storage-type vector, not a JSON-container operator.
-        currentFilters: [{ field: "mixed", fieldName: "Mixed", fieldCategory: "attribute", fieldType: "string",
-          apiColType: "SPAN_ATTRIBUTE", registryId: "custom_attribute:mixed", operator: "in", value: [] }],
+        currentFilters: [
+          {
+            field: "mixed",
+            fieldName: "Mixed",
+            fieldCategory: "attribute",
+            fieldType: "string",
+            apiColType: "SPAN_ATTRIBUTE",
+            registryId: "custom_attribute:mixed",
+            operator: "in",
+            value: [],
+          },
+        ],
       });
-      fireEvent.click(document.querySelector('[data-filter-value-trigger="mixed"]'));
-      const textOption = screen.getByRole("checkbox", { name: `${label} string` });
-      const scalarOption = screen.getByRole("checkbox", { name: `${label} ${type}` });
+      fireEvent.click(
+        document.querySelector('[data-filter-value-trigger="mixed"]'),
+      );
+      const textOption = screen.getByRole("checkbox", {
+        name: `${label} string`,
+      });
+      const scalarOption = screen.getByRole("checkbox", {
+        name: `${label} ${type}`,
+      });
       expect(textOption).toHaveTextContent("string");
       expect(scalarOption).toHaveTextContent(type);
       fireEvent.click(textOption);
       await waitFor(() => expect(onApply).toHaveBeenCalled());
-      expect(onApply.mock.calls.at(-1)[0][0]).toMatchObject({ value: [label], valueTypes: ["string"] });
-      fireEvent.click(scalarOption);
-      await waitFor(() => expect(onApply.mock.calls.at(-1)[0][0].value).toEqual([label, scalar]));
-      expect(buildApiFilterFromPanelRow(onApply.mock.calls.at(-1)[0][0])).toMatchObject({
-        property_id: "custom_attribute:mixed",
-        filter_config: { filter_value: [label, scalar], attribute_value_types: ["string", type], col_type: "SPAN_ATTRIBUTE" },
+      expect(onApply.mock.calls.at(-1)[0][0]).toMatchObject({
+        value: [label],
+        valueTypes: ["string"],
       });
-      expect(dashboardFilterValuesMock).toHaveBeenCalledWith(expect.objectContaining({
-        source: "traces", propertyId: "custom_attribute:mixed", enabled: true,
-      }));
+      fireEvent.click(scalarOption);
+      await waitFor(() =>
+        expect(onApply.mock.calls.at(-1)[0][0].value).toEqual([label, scalar]),
+      );
+      expect(
+        buildApiFilterFromPanelRow(onApply.mock.calls.at(-1)[0][0]),
+      ).toMatchObject({
+        property_id: "custom_attribute:mixed",
+        filter_config: {
+          filter_value: [label, scalar],
+          attribute_value_types: ["string", type],
+          col_type: "SPAN_ATTRIBUTE",
+        },
+      });
+      expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          source: "traces",
+          propertyId: "custom_attribute:mixed",
+          enabled: true,
+        }),
+      );
       const applied = onApply.mock.calls.at(-1)[0];
-      fireEvent.keyDown(screen.getByPlaceholderText("Search values..."), { key: "Escape" });
-      await waitFor(() => expect(screen.queryByPlaceholderText("Search values...")).not.toBeInTheDocument());
-      expect(screen.getByRole("button", { name: `${label} · string`, exact: true })).toBeVisible();
-      expect(screen.getByRole("button", { name: `${label} · ${type}`, exact: true })).toBeVisible();
+      fireEvent.keyDown(screen.getByPlaceholderText("Search values..."), {
+        key: "Escape",
+      });
+      await waitFor(() =>
+        expect(
+          screen.queryByPlaceholderText("Search values..."),
+        ).not.toBeInTheDocument(),
+      );
+      expect(
+        screen.getByRole("button", { name: `${label} · string`, exact: true }),
+      ).toBeVisible();
+      expect(
+        screen.getByRole("button", { name: `${label} · ${type}`, exact: true }),
+      ).toBeVisible();
       rerenderPanel({ open: false, currentFilters: applied });
-      await waitFor(() => expect(screen.queryByRole("button", { name: "Mixed", exact: true })).not.toBeInTheDocument());
+      await waitFor(() =>
+        expect(
+          screen.queryByRole("button", { name: "Mixed", exact: true }),
+        ).not.toBeInTheDocument(),
+      );
       rerenderPanel({ open: true, currentFilters: applied });
       await screen.findByRole("button", { name: "Mixed", exact: true });
-      fireEvent.click(document.querySelector('[data-filter-value-trigger="mixed"]'));
-      expect(await screen.findByRole("checkbox", { name: `${label} string` })).toHaveAttribute("aria-checked", "true");
-      expect(screen.getByRole("checkbox", { name: `${label} ${type}` })).toHaveAttribute("aria-checked", "true");
-      fireEvent.click(screen.getByRole("checkbox", { name: `${label} string` }));
-      await waitFor(() => expect(onApply.mock.calls.at(-1)[0][0]).toMatchObject({ value: [scalar], valueTypes: [type] }));
+      fireEvent.click(
+        document.querySelector('[data-filter-value-trigger="mixed"]'),
+      );
+      expect(
+        await screen.findByRole("checkbox", { name: `${label} string` }),
+      ).toHaveAttribute("aria-checked", "true");
+      expect(
+        screen.getByRole("checkbox", { name: `${label} ${type}` }),
+      ).toHaveAttribute("aria-checked", "true");
+      fireEvent.click(
+        screen.getByRole("checkbox", { name: `${label} string` }),
+      );
+      await waitFor(() =>
+        expect(onApply.mock.calls.at(-1)[0][0]).toMatchObject({
+          value: [scalar],
+          valueTypes: [type],
+        }),
+      );
       document.body.removeChild(anchorEl);
     },
   );
 });
 
 describe("TraceFilterPanel custom value picker", () => {
-  it.each(["text", "string"])("honors a supplied picker for dataset %s fields", (type) => {
-    const Picker = ({ value, onChange, property, projectId }) => (
-      <input aria-label={`${projectId}:${property.id}`} value={value}
-        onChange={(event) => onChange(event.target.value)} />
-    );
-    Picker.propTypes = {
-      value: PropTypes.string,
-      onChange: PropTypes.func.isRequired,
-      property: PropTypes.shape({ id: PropTypes.string.isRequired }).isRequired,
-      projectId: PropTypes.string.isRequired,
-    };
-    const { onApply } = renderPanel({
-      source: "dataset", projectId: "dataset-one", ValuePickerOverride: Picker,
-      properties: [{ id: "region", name: "Region", category: "custom", type }],
-      currentFilters: [{ field: "region", fieldType: type, operator: "equals", value: "west" }],
-    });
-    const input = screen.getByRole("textbox", { name: "dataset-one:region" });
-    expect(input).toHaveValue("west");
-    fireEvent.change(input, { target: { value: "east" } });
-    expect(onApply.mock.lastCall[0][0].value).toBe("east");
-    expect(screen.queryByPlaceholderText("Enter text...")).not.toBeInTheDocument();
-  });
+  it.each(["text", "string"])(
+    "honors a supplied picker for dataset %s fields",
+    (type) => {
+      const Picker = ({ value, onChange, property, projectId }) => (
+        <input
+          aria-label={`${projectId}:${property.id}`}
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+        />
+      );
+      Picker.propTypes = {
+        value: PropTypes.string,
+        onChange: PropTypes.func.isRequired,
+        property: PropTypes.shape({ id: PropTypes.string.isRequired })
+          .isRequired,
+        projectId: PropTypes.string.isRequired,
+      };
+      const { onApply } = renderPanel({
+        source: "dataset",
+        projectId: "dataset-one",
+        ValuePickerOverride: Picker,
+        properties: [
+          { id: "region", name: "Region", category: "custom", type },
+        ],
+        currentFilters: [
+          {
+            field: "region",
+            fieldType: type,
+            operator: "equals",
+            value: "west",
+          },
+        ],
+      });
+      const input = screen.getByRole("textbox", { name: "dataset-one:region" });
+      expect(input).toHaveValue("west");
+      fireEvent.change(input, { target: { value: "east" } });
+      expect(onApply.mock.lastCall[0][0].value).toBe("east");
+      expect(
+        screen.queryByPlaceholderText("Enter text..."),
+      ).not.toBeInTheDocument();
+    },
+  );
 
   it("retains free text when no custom picker is supplied", () => {
     renderPanel({
-      source: "dataset", projectId: "dataset-one",
-      properties: [{ id: "region", name: "Region", category: "custom", type: "string" }],
-      currentFilters: [{ field: "region", fieldType: "string", operator: "equals", value: "west" }],
+      source: "dataset",
+      projectId: "dataset-one",
+      properties: [
+        { id: "region", name: "Region", category: "custom", type: "string" },
+      ],
+      currentFilters: [
+        {
+          field: "region",
+          fieldType: "string",
+          operator: "equals",
+          value: "west",
+        },
+      ],
     });
     expect(screen.getByPlaceholderText("Enter text...")).toHaveValue("west");
   });
@@ -1194,7 +1452,8 @@ describe("catalog search global property supplements", () => {
     "keeps native %s controls identical before and after server search",
     (id) => {
       const baseProperties = mergeTraceFilterProperties({
-        tab: "voiceCalls", source: "voice_calls",
+        tab: "voiceCalls",
+        source: "voice_calls",
       });
       const native = baseProperties.find((property) => property.id === id);
       const server = { ...native, name: "Server label", type: "string" };
@@ -1202,17 +1461,27 @@ describe("catalog search global property supplements", () => {
       delete server.choices;
       delete server.allowCustomValue;
       const rawAttribute = {
-        id, registryId: `custom_attribute:${id}`, name: id,
-        category: "attribute", apiColType: "SPAN_ATTRIBUTE", type: "string",
+        id,
+        registryId: `custom_attribute:${id}`,
+        name: id,
+        category: "attribute",
+        apiColType: "SPAN_ATTRIBUTE",
+        type: "string",
       };
       for (const catalogProperties of [[], [server], [rawAttribute, server]]) {
         const result = mergeCatalogSearchProperties({
-          baseProperties, catalogProperties, search: id,
+          baseProperties,
+          catalogProperties,
+          search: id,
         });
-        expect(result.filter((property) => property.category === "system"))
-          .toEqual([native]);
-        expect(result.filter((property) => property.category === "attribute"))
-          .toEqual(catalogProperties.includes(rawAttribute) ? [rawAttribute] : []);
+        expect(
+          result.filter((property) => property.category === "system"),
+        ).toEqual([native]);
+        expect(
+          result.filter((property) => property.category === "attribute"),
+        ).toEqual(
+          catalogProperties.includes(rawAttribute) ? [rawAttribute] : [],
+        );
       }
     },
   );
@@ -1372,7 +1641,11 @@ describe("catalog search global property supplements", () => {
     };
 
     expect(
-      mergeCatalogSearchProperties({ baseProperties, catalogProperties, search: alias }),
+      mergeCatalogSearchProperties({
+        baseProperties,
+        catalogProperties,
+        search: alias,
+      }),
     ).toEqual([canonical, catalogProperties[1]]);
     expect(
       supplementCatalogSearchCategoryCounts({
@@ -4235,76 +4508,177 @@ describe("exact manual attribute fallback", () => {
 
 describe("filter-value picker bounded-read UX", () => {
   it.each([
-    ["system", "SYSTEM_METRIC", "system_attribute:traces:trace_name", "trace_name"],
+    [
+      "system",
+      "SYSTEM_METRIC",
+      "system_attribute:traces:trace_name",
+      "trace_name",
+    ],
     ["attribute", "SPAN_ATTRIBUTE", "custom_attribute:name", "name"],
-  ])("keeps %s Trace Name suggestions separate from raw name attributes", async (
-    category, apiColType, propertyId, metricName,
-  ) => {
-    const onApply = vi.fn();
-    dashboardFilterValuesMock.mockImplementation((request) => ({
-      ...defaultDashboardFilterValues(),
-      data: request.propertyId === propertyId && request.metricName === metricName
-        ? [{ value: "example-trace", label: "example-trace" }]
-        : [],
-    }));
-    const { anchorEl } = renderPanel({
-      source: "traces",
-      propertyNamespace: "traces",
-      projectId: "project-trace-values",
-      properties: [{ id: "name", name: "Trace Name", category, type: "string", apiColType }],
-      currentFilters: [{
-        field: "name", fieldName: "Trace Name", fieldCategory: category,
-        fieldType: "string", apiColType, operator: "in", value: [],
-      }],
-      onApply,
-    });
-    fireEvent.click(document.querySelector('[data-filter-value-trigger="name"]'));
-    fireEvent.click(await screen.findByRole("checkbox", { name: "example-trace" }));
-    expect(dashboardFilterValuesMock).toHaveBeenCalledWith(expect.objectContaining({
-      propertyId, metricName, source: "traces", enabled: true,
-    }));
-    await waitFor(() => expect(onApply).toHaveBeenCalledWith(expect.arrayContaining([
-      expect.objectContaining({ field: "name", apiColType, value: ["example-trace"] }),
-    ])));
-    document.body.removeChild(anchorEl);
-  });
+  ])(
+    "keeps %s Trace Name suggestions separate from raw name attributes",
+    async (category, apiColType, propertyId, metricName) => {
+      const onApply = vi.fn();
+      dashboardFilterValuesMock.mockImplementation((request) => ({
+        ...defaultDashboardFilterValues(),
+        data:
+          request.propertyId === propertyId && request.metricName === metricName
+            ? [{ value: "example-trace", label: "example-trace" }]
+            : [],
+      }));
+      const { anchorEl } = renderPanel({
+        source: "traces",
+        propertyNamespace: "traces",
+        projectId: "project-trace-values",
+        properties: [
+          {
+            id: "name",
+            name: "Trace Name",
+            category,
+            type: "string",
+            apiColType,
+          },
+        ],
+        currentFilters: [
+          {
+            field: "name",
+            fieldName: "Trace Name",
+            fieldCategory: category,
+            fieldType: "string",
+            apiColType,
+            operator: "in",
+            value: [],
+          },
+        ],
+        onApply,
+      });
+      fireEvent.click(
+        document.querySelector('[data-filter-value-trigger="name"]'),
+      );
+      fireEvent.click(
+        await screen.findByRole("checkbox", { name: "example-trace" }),
+      );
+      expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          propertyId,
+          metricName,
+          source: "traces",
+          enabled: true,
+        }),
+      );
+      await waitFor(() =>
+        expect(onApply).toHaveBeenCalledWith(
+          expect.arrayContaining([
+            expect.objectContaining({
+              field: "name",
+              apiColType,
+              value: ["example-trace"],
+            }),
+          ]),
+        ),
+      );
+      document.body.removeChild(anchorEl);
+    },
+  );
 
   it.each([
-    ["users", "system", "SYSTEM_METRIC", "system_attribute:users:user", "user", "sessions"],
-    ["sessions", "system", "SYSTEM_METRIC", "system_attribute:sessions:user", "user", "sessions"],
-    ["users", "attribute", "SPAN_ATTRIBUTE", "custom_attribute:user_id", "user_id", "traces"],
-  ])("keeps %s %s User ID suggestions consistent with their registry identity", async (
-    propertyNamespace, category, apiColType, propertyId, metricName, valueSource,
-  ) => {
-    const onApply = vi.fn();
-    dashboardFilterValuesMock.mockImplementation((request) => ({
-      ...defaultDashboardFilterValues(),
-      data: request.propertyId === propertyId && request.metricName === metricName
-        ? [{ value: "example-user", label: "example-user" }]
-        : [],
-    }));
-    const { anchorEl } = renderPanel({
-      source: "sessions",
+    [
+      "users",
+      "system",
+      "SYSTEM_METRIC",
+      "system_attribute:users:user",
+      "user",
+      "sessions",
+    ],
+    [
+      "sessions",
+      "system",
+      "SYSTEM_METRIC",
+      "system_attribute:sessions:user",
+      "user",
+      "sessions",
+    ],
+    [
+      "users",
+      "attribute",
+      "SPAN_ATTRIBUTE",
+      "custom_attribute:user_id",
+      "user_id",
+      "traces",
+    ],
+  ])(
+    "keeps %s %s User ID suggestions consistent with their registry identity",
+    async (
       propertyNamespace,
-      projectId: "project-user-values",
-      properties: [{ id: "user_id", name: "User ID", category, type: "string", apiColType }],
-      currentFilters: [{
-        field: "user_id", fieldName: "User ID", fieldCategory: category,
-        fieldType: "string", apiColType, operator: "in", value: [],
-      }],
-      onApply,
-    });
+      category,
+      apiColType,
+      propertyId,
+      metricName,
+      valueSource,
+    ) => {
+      const onApply = vi.fn();
+      dashboardFilterValuesMock.mockImplementation((request) => ({
+        ...defaultDashboardFilterValues(),
+        data:
+          request.propertyId === propertyId && request.metricName === metricName
+            ? [{ value: "example-user", label: "example-user" }]
+            : [],
+      }));
+      const { anchorEl } = renderPanel({
+        source: "sessions",
+        propertyNamespace,
+        projectId: "project-user-values",
+        properties: [
+          {
+            id: "user_id",
+            name: "User ID",
+            category,
+            type: "string",
+            apiColType,
+          },
+        ],
+        currentFilters: [
+          {
+            field: "user_id",
+            fieldName: "User ID",
+            fieldCategory: category,
+            fieldType: "string",
+            apiColType,
+            operator: "in",
+            value: [],
+          },
+        ],
+        onApply,
+      });
 
-    fireEvent.click(document.querySelector('[data-filter-value-trigger="user_id"]'));
-    fireEvent.click(await screen.findByRole("checkbox", { name: "example-user" }));
-    expect(dashboardFilterValuesMock).toHaveBeenCalledWith(expect.objectContaining({
-      propertyId, metricName, source: valueSource, enabled: true,
-    }));
-    await waitFor(() => expect(onApply).toHaveBeenCalledWith(expect.arrayContaining([
-      expect.objectContaining({ field: "user_id", apiColType, value: ["example-user"] }),
-    ])));
-    document.body.removeChild(anchorEl);
-  });
+      fireEvent.click(
+        document.querySelector('[data-filter-value-trigger="user_id"]'),
+      );
+      fireEvent.click(
+        await screen.findByRole("checkbox", { name: "example-user" }),
+      );
+      expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          propertyId,
+          metricName,
+          source: valueSource,
+          enabled: true,
+        }),
+      );
+      await waitFor(() =>
+        expect(onApply).toHaveBeenCalledWith(
+          expect.arrayContaining([
+            expect.objectContaining({
+              field: "user_id",
+              apiColType,
+              value: ["example-user"],
+            }),
+          ]),
+        ),
+      );
+      document.body.removeChild(anchorEl);
+    },
+  );
 
   const statusProperty = {
     id: "call.status",
@@ -5024,18 +5398,35 @@ describe("filter-value picker bounded-read UX", () => {
         ],
       });
       const attributeTypes = ["string", "number", "boolean"];
-      const properties = source === "catalog"
-        ? buildTraceFilterProperties([{
-            name: "call.status", display_name: "Status", type: "json",
-            category: "custom_attribute", source: "traces",
-            property_id: "custom_attribute:call.status",
-            attribute_types: attributeTypes, attribute_types_exact: false,
-          }])
-        : [{ ...statusProperty, type: "json", attributeTypes,
-            attributeTypesExact: false }];
+      const properties =
+        source === "catalog"
+          ? buildTraceFilterProperties([
+              {
+                name: "call.status",
+                display_name: "Status",
+                type: "json",
+                category: "custom_attribute",
+                source: "traces",
+                property_id: "custom_attribute:call.status",
+                attribute_types: attributeTypes,
+                attribute_types_exact: false,
+              },
+            ])
+          : [
+              {
+                ...statusProperty,
+                type: "json",
+                attributeTypes,
+                attributeTypesExact: false,
+              },
+            ];
       const { anchorEl, onApply } = renderPanel({ properties });
-      fireEvent.click(screen.getByRole("button", { name: "Property", exact: true }));
-      fireEvent.click(document.querySelector('[data-filter-property-option="call.status"]'));
+      fireEvent.click(
+        screen.getByRole("button", { name: "Property", exact: true }),
+      );
+      fireEvent.click(
+        document.querySelector('[data-filter-property-option="call.status"]'),
+      );
       openValuePicker();
       fireEvent.click(screen.getByText("string with leading zeros"));
       fireEvent.click(screen.getByText("number one"));
@@ -5044,7 +5435,9 @@ describe("filter-value picker bounded-read UX", () => {
       await waitFor(() => expect(onApply).toHaveBeenCalled());
       const applied = onApply.mock.calls.at(-1)[0][0];
       expect(buildApiFilterFromPanelRow(applied).filter_config).toEqual({
-        filter_type: "text", filter_op: "in", col_type: "SPAN_ATTRIBUTE",
+        filter_type: "text",
+        filter_op: "in",
+        col_type: "SPAN_ATTRIBUTE",
         filter_value: ["001", 1, false],
         attribute_value_types: ["string", "number", "boolean"],
       });
@@ -5135,63 +5528,73 @@ describe("filter-value picker bounded-read UX", () => {
     document.body.removeChild(anchorEl);
   });
 
-  it.each(["string", "json"])("keeps Query-tab storage type for %s metadata and sends custom-attribute search", async (type) => {
-    dashboardFilterValuesMock.mockReturnValue({
-      ...defaultDashboardFilterValues(),
-      data: [
-        { value: "1", label: "string one", type: "string" },
-        { value: 1, label: "number one", type: "number" },
-      ],
-    });
-    const onApply = vi.fn();
-    const { anchorEl } = renderPanel({
-      properties: [{ ...statusProperty, type, attributeTypes: ["string", "number"] }],
-      onApply,
-      showQueryTab: true,
-    });
+  it.each(["string", "json"])(
+    "keeps Query-tab storage type for %s metadata and sends custom-attribute search",
+    async (type) => {
+      dashboardFilterValuesMock.mockReturnValue({
+        ...defaultDashboardFilterValues(),
+        data: [
+          { value: "1", label: "string one", type: "string" },
+          { value: 1, label: "number one", type: "number" },
+        ],
+      });
+      const onApply = vi.fn();
+      const { anchorEl } = renderPanel({
+        properties: [
+          { ...statusProperty, type, attributeTypes: ["string", "number"] },
+        ],
+        onApply,
+        showQueryTab: true,
+      });
 
-    fireEvent.click(screen.getByRole("tab", { name: "Query" }));
-    const input = screen.getByRole("combobox");
-    fireEvent.focus(input);
-    fireEvent.change(input, { target: { value: "Status" } });
-    fireEvent.keyDown(input, { key: "ArrowDown" });
-    fireEvent.keyDown(input, { key: "Enter" });
-    await waitFor(() =>
-      expect(input).toHaveAttribute("placeholder", "pick operator..."),
-    );
+      fireEvent.click(screen.getByRole("tab", { name: "Query" }));
+      const input = screen.getByRole("combobox");
+      fireEvent.focus(input);
+      fireEvent.change(input, { target: { value: "Status" } });
+      fireEvent.keyDown(input, { key: "ArrowDown" });
+      fireEvent.keyDown(input, { key: "Enter" });
+      await waitFor(() =>
+        expect(input).toHaveAttribute("placeholder", "pick operator..."),
+      );
 
-    fireEvent.change(input, { target: { value: "equals" } });
-    fireEvent.keyDown(input, { key: "ArrowDown" });
-    fireEvent.keyDown(input, { key: "Enter" });
-    await waitFor(() =>
-      expect(input).toHaveAttribute("placeholder", "type or pick value..."),
-    );
+      fireEvent.change(input, { target: { value: "equals" } });
+      fireEvent.keyDown(input, { key: "ArrowDown" });
+      fireEvent.keyDown(input, { key: "Enter" });
+      await waitFor(() =>
+        expect(input).toHaveAttribute("placeholder", "type or pick value..."),
+      );
 
-    fireEvent.change(input, { target: { value: "number" } });
-    await waitFor(
-      () =>
-        expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
-          expect.objectContaining({
-            metricName: "call.status",
-            metricType: "custom_attribute",
-            search: "number",
-            pageSize: FILTER_VALUE_PAGE_SIZE,
-          }),
-        ),
-      { timeout: 1_200 },
-    );
-    fireEvent.click(await screen.findByText("number one"));
+      fireEvent.change(input, { target: { value: "number" } });
+      await waitFor(
+        () =>
+          expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
+            expect.objectContaining({
+              metricName: "call.status",
+              metricType: "custom_attribute",
+              search: "number",
+              pageSize: FILTER_VALUE_PAGE_SIZE,
+            }),
+          ),
+        { timeout: 1_200 },
+      );
+      fireEvent.click(await screen.findByText("number one"));
 
-    await waitFor(() => expect(onApply).toHaveBeenCalled());
-    expect(onApply.mock.calls.at(-1)[0][0]).toMatchObject({
-      field: "call.status",
-      value: [1],
-      valueTypes: ["number"],
-    });
-    expect(buildApiFilterFromPanelRow(onApply.mock.calls.at(-1)[0][0]).filter_config)
-      .toMatchObject({ filter_type: "text", attribute_value_types: ["number"] });
-    document.body.removeChild(anchorEl);
-  });
+      await waitFor(() => expect(onApply).toHaveBeenCalled());
+      expect(onApply.mock.calls.at(-1)[0][0]).toMatchObject({
+        field: "call.status",
+        value: [1],
+        valueTypes: ["number"],
+      });
+      expect(
+        buildApiFilterFromPanelRow(onApply.mock.calls.at(-1)[0][0])
+          .filter_config,
+      ).toMatchObject({
+        filter_type: "text",
+        attribute_value_types: ["number"],
+      });
+      document.body.removeChild(anchorEl);
+    },
+  );
 
   it("keeps an existing Query-tab token active through edit and commit", async () => {
     dashboardFilterValuesMock.mockReturnValue({
@@ -5979,7 +6382,15 @@ describe("filter-value picker bounded-read UX", () => {
 
   it("uses the Trace Name registry identity for Query-tab suggestions", async () => {
     const { anchorEl } = renderPanel({
-      properties: [{ id: "name", name: "Trace Name", category: "system", type: "string", apiColType: "SYSTEM_METRIC" }],
+      properties: [
+        {
+          id: "name",
+          name: "Trace Name",
+          category: "system",
+          type: "string",
+          apiColType: "SYSTEM_METRIC",
+        },
+      ],
       projectId: "project-trace-query",
       source: "traces",
       propertyNamespace: "traces",
@@ -5987,39 +6398,54 @@ describe("filter-value picker bounded-read UX", () => {
     });
     fireEvent.click(screen.getByRole("tab", { name: "Query" }));
     await selectQueryPhaseOption("Trace Name", "pick operator...");
-    await waitFor(() => expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        propertyId: "system_attribute:traces:trace_name",
-        metricName: "trace_name",
-        metricType: "system_metric",
-        source: "traces",
-        enabled: true,
-      }),
-    ));
+    await waitFor(() =>
+      expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          propertyId: "system_attribute:traces:trace_name",
+          metricName: "trace_name",
+          metricType: "system_metric",
+          source: "traces",
+          enabled: true,
+        }),
+      ),
+    );
     document.body.removeChild(anchorEl);
   });
 
-  it.each(["users", "sessions"])("uses the canonical %s identity for Query-tab User ID values", async (propertyNamespace) => {
-    const { anchorEl } = renderPanel({
-      properties: [{ id: "user_id", name: "User ID", category: "system", type: "string", apiColType: "SYSTEM_METRIC" }],
-      projectId: "project-user-query",
-      source: "sessions",
-      propertyNamespace,
-      showQueryTab: true,
-    });
-    fireEvent.click(screen.getByRole("tab", { name: "Query" }));
-    await selectQueryPhaseOption("User ID", "pick operator...");
-    await waitFor(() => expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        propertyId: `system_attribute:${propertyNamespace}:user`,
-        metricName: "user",
-        metricType: "system_metric",
+  it.each(["users", "sessions"])(
+    "uses the canonical %s identity for Query-tab User ID values",
+    async (propertyNamespace) => {
+      const { anchorEl } = renderPanel({
+        properties: [
+          {
+            id: "user_id",
+            name: "User ID",
+            category: "system",
+            type: "string",
+            apiColType: "SYSTEM_METRIC",
+          },
+        ],
+        projectId: "project-user-query",
         source: "sessions",
-        enabled: true,
-      }),
-    ));
-    document.body.removeChild(anchorEl);
-  });
+        propertyNamespace,
+        showQueryTab: true,
+      });
+      fireEvent.click(screen.getByRole("tab", { name: "Query" }));
+      await selectQueryPhaseOption("User ID", "pick operator...");
+      await waitFor(() =>
+        expect(dashboardFilterValuesMock).toHaveBeenCalledWith(
+          expect.objectContaining({
+            propertyId: `system_attribute:${propertyNamespace}:user`,
+            metricName: "user",
+            metricType: "system_metric",
+            source: "sessions",
+            enabled: true,
+          }),
+        ),
+      );
+      document.body.removeChild(anchorEl);
+    },
+  );
 
   it("uses the Sessions adapter identity for Query-tab Session ID values", async () => {
     const { anchorEl } = renderPanel({
@@ -6787,36 +7213,107 @@ describe("toStaticFilterProperty (spans Span Name)", () => {
 });
 
 describe("normalizeFilterRowOperator", () => {
-  it.each(["trace_id", "span_id", "session"])("mounted raw numeric %s keeps greater_than after edit", async (field) => {
-    const row = { field, fieldName: field, registryId: `custom_attribute:${field}`, apiColType: "SPAN_ATTRIBUTE", fieldCategory: "attribute", fieldType: "number", operator: "greater_than", value: 2 };
-    const { anchorEl, onApply } = renderPanel({
-      currentFilters: [row],
-      properties: [{ id: field, name: field, registryId: row.registryId, category: "attribute", type: "number", apiColType: "SPAN_ATTRIBUTE" }],
-    });
-    try {
-      fireEvent.change(screen.getByPlaceholderText("Value"), { target: { value: "3" } });
-      await waitFor(() => expect(onApply).toHaveBeenCalled());
-      expect(buildApiFilterFromPanelRow(onApply.mock.calls.at(-1)[0][0])).toEqual(buildApiFilterFromPanelRow({ ...row, value: 3 }));
-    } finally { anchorEl.remove(); }
-  });
+  it.each(["trace_id", "span_id", "session"])(
+    "mounted raw numeric %s keeps greater_than after edit",
+    async (field) => {
+      const row = {
+        field,
+        fieldName: field,
+        registryId: `custom_attribute:${field}`,
+        apiColType: "SPAN_ATTRIBUTE",
+        fieldCategory: "attribute",
+        fieldType: "number",
+        operator: "greater_than",
+        value: 2,
+      };
+      const { anchorEl, onApply } = renderPanel({
+        currentFilters: [row],
+        properties: [
+          {
+            id: field,
+            name: field,
+            registryId: row.registryId,
+            category: "attribute",
+            type: "number",
+            apiColType: "SPAN_ATTRIBUTE",
+          },
+        ],
+      });
+      try {
+        fireEvent.change(screen.getByPlaceholderText("Value"), {
+          target: { value: "3" },
+        });
+        await waitFor(() => expect(onApply).toHaveBeenCalled());
+        expect(
+          buildApiFilterFromPanelRow(onApply.mock.calls.at(-1)[0][0]),
+        ).toEqual(buildApiFilterFromPanelRow({ ...row, value: 3 }));
+      } finally {
+        anchorEl.remove();
+      }
+    },
+  );
 
-  it.each(["trace_id", "span_id", "session"])("mounted legacy native %s keeps negative membership after edit", async (field) => {
-    const { anchorEl, onApply } = renderPanel({
-      currentFilters: [{ field, fieldName: field, fieldType: "string", operator: "not_in", value: ["native-a"] }],
-      properties: [{ id: field, name: field, category: "system", type: "string", apiColType: "SYSTEM_METRIC", choices: ["native-a", "native-b"] }],
-    });
-    try {
-      fireEvent.click(document.querySelector(`[data-filter-value-trigger="${field}"]`));
-      fireEvent.click(await screen.findByText("native-b"));
-      await waitFor(() => expect(onApply).toHaveBeenCalled());
-      expect(buildApiFilterFromPanelRow(onApply.mock.calls.at(-1)[0][0]).filter_config).toEqual({ col_type: "SYSTEM_METRIC", filter_type: "text", filter_op: "not_in", filter_value: ["native-a", "native-b"] });
-    } finally { anchorEl.remove(); }
-  });
+  it.each(["trace_id", "span_id", "session"])(
+    "mounted legacy native %s keeps negative membership after edit",
+    async (field) => {
+      const { anchorEl, onApply } = renderPanel({
+        currentFilters: [
+          {
+            field,
+            fieldName: field,
+            fieldType: "string",
+            operator: "not_in",
+            value: ["native-a"],
+          },
+        ],
+        properties: [
+          {
+            id: field,
+            name: field,
+            category: "system",
+            type: "string",
+            apiColType: "SYSTEM_METRIC",
+            choices: ["native-a", "native-b"],
+          },
+        ],
+      });
+      try {
+        fireEvent.click(
+          document.querySelector(`[data-filter-value-trigger="${field}"]`),
+        );
+        fireEvent.click(await screen.findByText("native-b"));
+        await waitFor(() => expect(onApply).toHaveBeenCalled());
+        expect(
+          buildApiFilterFromPanelRow(onApply.mock.calls.at(-1)[0][0])
+            .filter_config,
+        ).toEqual({
+          col_type: "SYSTEM_METRIC",
+          filter_type: "text",
+          filter_op: "not_in",
+          filter_value: ["native-a", "native-b"],
+        });
+      } finally {
+        anchorEl.remove();
+      }
+    },
+  );
 
-  it.each(["trace_id", "span_id", "session"])("source audit: raw %s keeps its declared type operators", (field) => {
-    const row = { field, apiColType: "SPAN_ATTRIBUTE", fieldCategory: "attribute", fieldType: "number", operator: "greater_than", value: 2 };
-    expect(buildApiFilterFromPanelRow(normalizeFilterRowOperator(row))).toEqual(buildApiFilterFromPanelRow(row));
-  });
+  it.each(["trace_id", "span_id", "session"])(
+    "source audit: raw %s keeps its declared type operators",
+    (field) => {
+      const row = {
+        field,
+        apiColType: "SPAN_ATTRIBUTE",
+        fieldCategory: "attribute",
+        fieldType: "number",
+        operator: "greater_than",
+        value: 2,
+      };
+      expect(
+        buildApiFilterFromPanelRow(normalizeFilterRowOperator(row)),
+      ).toEqual(buildApiFilterFromPanelRow(row));
+    },
+  );
 
   it("maps list operators to canonical equality panel operators before apply", () => {
     expect(
@@ -7006,13 +7503,21 @@ describe("annotator annotation filter (TH-4710)", () => {
     ["json", ["json"], "array"],
     ["map", ["map"], "map"],
     ["json", ["string", "array"], "array"],
-  ])("retains structured attribute controls for %s / %j", (type, attributeTypes, expected) => {
-    const [property] = buildTraceFilterProperties([{
-      name: "structured", type, category: "custom_attribute", source: "traces",
-      attribute_types: attributeTypes,
-    }]);
-    expect(property.type).toBe(expected);
-  });
+  ])(
+    "retains structured attribute controls for %s / %j",
+    (type, attributeTypes, expected) => {
+      const [property] = buildTraceFilterProperties([
+        {
+          name: "structured",
+          type,
+          category: "custom_attribute",
+          source: "traces",
+          attribute_types: attributeTypes,
+        },
+      ]);
+      expect(property.type).toBe(expected);
+    },
+  );
 
   it("combines voice-call system fields with trace-derived attributes", () => {
     const metrics = [

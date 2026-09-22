@@ -1076,7 +1076,9 @@ def _finite_filter_value_cursor_page(
         "browse_status": (
             "continuation"
             if has_more
-            else "exhausted" if query_complete else "limit_reached"
+            else "exhausted"
+            if query_complete
+            else "limit_reached"
         ),
         "next_cursor": next_cursor,
     }
@@ -3083,7 +3085,9 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                     "label": (
                         "true"
                         if row.value is True
-                        else "false" if row.value is False else str(row.value)
+                        else "false"
+                        if row.value is False
+                        else str(row.value)
                     ),
                 }
                 for row in catalog_page.values
@@ -3998,8 +4002,9 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                     )
                     next_cursor = None
                     if page_read.has_more:
-                        appended_digests = page_read.appended_value_digests or (
-                            page_read.seen_value_digests[len(seen_state.digests) :]
+                        appended_digests = (
+                            page_read.appended_value_digests
+                            or (page_read.seen_value_digests[len(seen_state.digests) :])
                         )
                         seen_reference = persist_attribute_cursor_seen_state(
                             seen_state,
@@ -4998,8 +5003,13 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                         ]
                         next_cursor = None
                         if page_read.has_more:
-                            appended_digests = page_read.appended_value_digests or (
-                                page_read.seen_value_digests[len(seen_state.digests) :]
+                            appended_digests = (
+                                page_read.appended_value_digests
+                                or (
+                                    page_read.seen_value_digests[
+                                        len(seen_state.digests) :
+                                    ]
+                                )
                             )
                             seen_reference = persist_attribute_cursor_seen_state(
                                 seen_state,
@@ -5072,7 +5082,9 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                             "label": (
                                 "true"
                                 if row.value is True
-                                else "false" if row.value is False else str(row.value)
+                                else "false"
+                                if row.value is False
+                                else str(row.value)
                             ),
                         }
                         for row in read.rows
@@ -5455,7 +5467,9 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
         analytics = AnalyticsQueryService()
         search = query_params.get("search", "")
         evaluation_choices = column.data_type == "array" and column.source in (
-            "evaluation", "experiment_evaluation", "optimisation_evaluation"
+            "evaluation",
+            "experiment_evaluation",
+            "optimisation_evaluation",
         )
         max_values = (
             _FINITE_NATIVE_FILTER_VALUE_MAX
@@ -5469,7 +5483,8 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
             # Read a bounded complete inventory or refuse it; never sample.
             projection = (
                 "value AS val, groupBitOr(if(literal_choice, 2, 1)) AS choice_modes"
-                if evaluation_choices else "DISTINCT value AS val"
+                if evaluation_choices
+                else "DISTINCT value AS val"
             )
             # Choice labels are decoded in Python, so an eval-choice search
             # cannot be answered by matching the stored text. It can still be
@@ -5572,7 +5587,9 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
             if evaluation_choices:
                 if type(choice_modes) is not int or choice_modes not in (1, 2, 3):
                     raise InvalidChoiceCell("Invalid evaluation choice interpretation")
-                labels = evaluation_choice_labels(serialized) if choice_modes & 1 else []
+                labels = (
+                    evaluation_choice_labels(serialized) if choice_modes & 1 else []
+                )
                 if choice_modes & 2:
                     labels += evaluation_choice_labels(serialized, literal=True)
                 return labels

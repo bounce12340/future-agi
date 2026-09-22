@@ -201,7 +201,12 @@ const BASE_TRACE_FILTER_FIELDS = [
 // fields belong to the Users registry. Keep their identity and input type
 // authoritative even when that shared catalog publishes a trace-system alias.
 const USER_FILTER_FIELDS = [
-  { value: "user_id", label: "User ID", type: "string", dynamicAliases: ["user"] },
+  {
+    value: "user_id",
+    label: "User ID",
+    type: "string",
+    dynamicAliases: ["user"],
+  },
   { value: "user_id_type", label: "User ID Type", type: "string" },
   { value: "user_id_hash", label: "User ID Hash", type: "string" },
   { value: "activated_at", label: "First Active", type: "datetime" },
@@ -213,11 +218,27 @@ const USER_FILTER_FIELDS = [
   { value: "output_tokens", label: "Output Tokens", type: "number" },
   { value: "num_traces", label: "No. of Traces", type: "number" },
   { value: "num_sessions", label: "No. of Sessions", type: "number" },
-  { value: "avg_session_duration", label: "Avg Session Duration (s)", type: "number" },
-  { value: "avg_trace_latency", label: "Avg Latency / Trace (ms)", type: "number" },
+  {
+    value: "avg_session_duration",
+    label: "Avg Session Duration (s)",
+    type: "number",
+  },
+  {
+    value: "avg_trace_latency",
+    label: "Avg Latency / Trace (ms)",
+    type: "number",
+  },
   { value: "num_llm_calls", label: "No. of LLM Calls", type: "number" },
-  { value: "num_guardrails_triggered", label: "Guardrails Triggered", type: "number" },
-  { value: "num_traces_with_errors", label: "Traces with Errors", type: "number" },
+  {
+    value: "num_guardrails_triggered",
+    label: "Guardrails Triggered",
+    type: "number",
+  },
+  {
+    value: "num_traces_with_errors",
+    label: "Traces with Errors",
+    type: "number",
+  },
 ];
 
 const TRACE_ID_FIELD = {
@@ -603,8 +624,11 @@ const normalizeFieldType = (rawType, attributeTypes) => {
     t === "json" &&
     Array.isArray(attributeTypes) &&
     attributeTypes.length > 1 &&
-    attributeTypes.every((type) => ["string", "number", "boolean"].includes(type))
-  ) return "string";
+    attributeTypes.every((type) =>
+      ["string", "number", "boolean"].includes(type),
+    )
+  )
+    return "string";
   if (NUMERIC_TYPES.has(t)) return "number";
   if (DATE_TYPES.has(t)) return "date";
   if (BOOLEAN_TYPES.has(t)) return "boolean";
@@ -710,10 +734,16 @@ const isNativeIdField = (id, colType) =>
   ID_ONLY_FIELDS.has(id) && isNativeColumnType(colType);
 
 const getOperatorsForFilter = (filter, property) => {
-  if (isNativeIdField(
-    filter?.field,
-    filter?.apiColType || filter?.fieldCategory || property?.apiColType || property?.category,
-  )) return ID_ONLY_OPS;
+  if (
+    isNativeIdField(
+      filter?.field,
+      filter?.apiColType ||
+        filter?.fieldCategory ||
+        property?.apiColType ||
+        property?.category,
+    )
+  )
+    return ID_ONLY_OPS;
   const ops = getOperators(filter?.fieldType);
   // A property may narrow its own operators — e.g. span type, where the API
   // takes a value list and has nowhere to put an operator, so anything but
@@ -967,9 +997,7 @@ export function filterPropertiesForPicker({
     const aliases = [
       ...(property.searchAliases || []),
       ...(property.dynamicAliases || []),
-    ].some((alias) =>
-      normalizePropertySearchText(alias).includes(query),
-    );
+    ].some((alias) => normalizePropertySearchText(alias).includes(query));
     return name.includes(query) || id.includes(query) || aliases;
   });
   // Exact ids and canonical System labels stay first, but All must retain all
@@ -2837,7 +2865,8 @@ function ValuePicker({
     source: filterValueSource,
   });
 
-  const isIdOnlyField = !hasStaticChoices &&
+  const isIdOnlyField =
+    !hasStaticChoices &&
     isNativeIdField(propertyId, property?.apiColType || propertyCategory);
 
   // Backend search: every non-static cursor-backed vocabulary. A real
@@ -3610,7 +3639,10 @@ function FilterRow({
           : normalizeFieldType(prop.type, prop.attributeTypes);
       // Native identifiers default to exact membership; raw keys keep their type.
       // defaultOperatorForType: optional per-flow { type: op } override.
-      const defaultOp = isNativeIdField(prop.id, prop.apiColType || prop.category)
+      const defaultOp = isNativeIdField(
+        prop.id,
+        prop.apiColType || prop.category,
+      )
         ? "in"
         : defaultOperatorForType?.[nt] || DEFAULT_OP_FOR_TYPE[nt] || "equals";
       let defaultValue;
@@ -4506,8 +4538,11 @@ const TraceFilterPanel = ({
   // below maps that identity back to the raw backend id before applying.
   const queryFilterFields = useMemo(() => {
     return queryPropertyEntries.map(([identity, p]) => {
-      const type = p.type === "json" && normalizeFieldType(p.type, p.attributeTypes) === "string"
-        ? "string" : p.type || "string";
+      const type =
+        p.type === "json" &&
+        normalizeFieldType(p.type, p.attributeTypes) === "string"
+          ? "string"
+          : p.type || "string";
       return {
         value: identity,
         label: p.name,
