@@ -1993,15 +1993,17 @@ def _session_list_outcome(*, complete: bool, seed_is_sampled: bool):
     builder.recommended_filter_classify_batch_size.return_value = 50
     builder.prefers_bounded_filter_page.return_value = True
     builder.filter_candidate_seed_is_sampled.return_value = seed_is_sampled
-    builder.build_page_metrics_query.return_value = ("page metrics", {})
-    builder.build_content_query.return_value = ("page content", {})
-    builder.build_span_attributes_query.return_value = ("page attributes", {})
+    # The train fused the page's three enrichment reads (metrics, content,
+    # span attributes) into one hydration statement, so that is the binding
+    # this helper has to stub; the retired trio is never called.
+    builder.build_page_hydration_query.return_value = ("page hydration", {})
+    builder.expand_page_attribute_rows.return_value = []
     builder.format_sessions.side_effect = lambda rows, columns: [
         dict(zip(columns, row, strict=True)) for row in rows
     ]
 
     def _execute(query, _params, **_kwargs):
-        if query == "page metrics":
+        if query == "page hydration":
             return SimpleNamespace(
                 data=[
                     {
