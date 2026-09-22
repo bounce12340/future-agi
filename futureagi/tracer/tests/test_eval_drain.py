@@ -260,6 +260,12 @@ class TestProgressSerializer:
         assert progress["dispatched"] == 4
         assert progress["completed"] == 2
         assert progress["skipped"] == 2
+        # Nothing is outstanding, and the bar still does not read 100: skipped
+        # rows stay in the denominator, so a drained task carrying any skip
+        # tops out below 100 by design. The alternative -- dropping them from
+        # the total too -- would make an all-skipped task read 100% complete
+        # again, which is the defect this change exists to remove.
+        assert progress["missing"] == 0
         assert progress["percent"] == 50.0
 
     def test_a_draining_task_still_reports_what_is_left(
