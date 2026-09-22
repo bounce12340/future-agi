@@ -78,12 +78,17 @@ def _walk_hops(
     *,
     page_size: int = 2,
     max_hops: int = 24,
+    matching: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Follow one cursor to exhaustion on a route with its own seed token."""
 
     seed_rows = [{"id": row_id, "start_time": END - age} for row_id, age in roots]
     ranks = _ranks(roots)
-    match_rows = [{"id": row_id, "start_time": t} for row_id, t in ranks.items()]
+    match_rows = [
+        {"id": row_id, "start_time": t}
+        for row_id, t in ranks.items()
+        if matching is None or row_id in matching
+    ]
     hops: list[dict[str, Any]] = []
     order: tuple[Any, ...] | None = None
     scan: dict[str, Any] = {}
@@ -195,39 +200,60 @@ def test_a_tie_at_the_boundary_instant_never_stalls_the_walk(shape: str) -> None
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("page_size", [1, 2])
-def test_a_tie_group_wider_than_the_page_is_the_readers_own_limit(
-    page_size: int,
-) -> None:
-    """A tie group the page cannot hold is a limit of the scalar bound itself.
+@pytest.mark.parametrize("page_size", [1, 2, 3, 4])
+def test_an_instant_wider_than_the_page_loses_nothing(page_size: int) -> None:
+    """Four rows in one microsecond, a page that cannot hold them, no loss.
 
-    When more rows share one instant than a page can carry, the page publishes
-    what fits and reports more. The next hop then resumes at the last published
-    ROW, in result order, which on this route is not the order its seeds are
-    keyset on, so the rest of that instant is not re-read. That is the reader's
-    pre-existing pagination contract, not the floor: the identical walk on the
-    reader as it stood before the floor existed drops exactly the same rows.
-    What this pins is that the floor adds no loss of its own and still
-    terminates, which the give-up-the-keyset revision did not.
+    This is the shape that decided where the floor may be published at all. A
+    hop can stop with its keyset INSIDE such an instant, having classified only
+    part of it. A floor that named the whole instant then claimed the unread
+    remainder as published and the next hop dropped it; a floor one microsecond
+    above held the keyset row that nothing would re-read; giving the keyset up
+    to re-read the instant stalled. So no floor is published for a position the
+    bound cannot name, the page keeps every match it classified, and the view
+    resumes at its last published row - which walks down through the instant,
+    one row per hop, losing none of it.
     """
 
     roots = (
         ("above", timedelta(minutes=10)),
-        ("tie-a", timedelta(minutes=80)),
-        ("tie-b", timedelta(minutes=80)),
-        ("tie-c", timedelta(minutes=80)),
-        ("below", timedelta(minutes=200)),
+        ("w4", timedelta(minutes=30)),
+        ("w3", timedelta(minutes=30)),
+        ("w2", timedelta(minutes=30)),
+        ("w1", timedelta(minutes=30)),
+        ("below", timedelta(minutes=50)),
     )
     hops = _walk_hops(roots, page_size=page_size)
     published = [row for hop in hops for row in hop["rows"]]
 
+    assert sorted(published) == sorted({row_id for row_id, _ in roots})
     assert len(published) == len(set(published))
     assert hops[-1]["complete"] is True
-    assert "above" in published
-    # The instant is published as a unit as far as the page reaches into it,
-    # and every row outside it is published.
-    assert len([row for row in published if row.startswith("tie-")]) >= 1
     assert len(hops) < 24
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("page_size", [1, 2, 3])
+def test_an_instant_wider_than_the_page_publishes_no_rejected_row(
+    page_size: int,
+) -> None:
+    """The same instant with non-matching rows in it: none of them leaks."""
+
+    roots = (
+        ("above", timedelta(minutes=10)),
+        ("y2", timedelta(minutes=30)),
+        ("no2", timedelta(minutes=30)),
+        ("y1", timedelta(minutes=30)),
+        ("no1", timedelta(minutes=30)),
+        ("below", timedelta(minutes=50)),
+    )
+    matching = {"above", "y1", "y2", "below"}
+    hops = _walk_hops(roots, page_size=page_size, matching=matching)
+    published = [row for hop in hops for row in hop["rows"]]
+
+    assert sorted(published) == sorted(matching)
+    assert len(published) == len(set(published))
+    assert not [row for row in published if row.startswith("no")]
 
 
 class _RemappingFakeExecutor(_SeedTokenFakeExecutor):

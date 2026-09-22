@@ -1932,7 +1932,17 @@ def read_bounded_filter_page(
         if safe_before_start_time is not None:
             if safe_before_key_is_result_comparable:
                 return safe_before_start_time, safe_before_id
-            return safe_before_start_time, None
+            # A keyset the bound cannot NAME. The page's public boundary is a
+            # single value in result order, and inside one instant that order
+            # cannot separate the rows this keyset has passed from the rows it
+            # has not. Naming the instant claims the unread remainder as
+            # published; naming one microsecond above it holds the keyset row
+            # nothing will re-read; giving the keyset up to re-read the instant
+            # stalls on an instant wider than a hop. So no floor is published
+            # here at all: the page keeps every match it classified and the
+            # view resumes at its last published row, which is what this reader
+            # did before the floor existed and what it still does exactly.
+            return None
         if safe_slice_end is not None:
             return safe_slice_end, None
         return None
@@ -4315,6 +4325,23 @@ def read_bounded_filter_page(
     # while handing out the second, and every row between the two would be
     # published twice.
     published_floor = committed_publication_boundary()
+    if (
+        published_floor is not None
+        and cursor_key is not None
+        and published_floor[0] >= cursor_key[0]
+    ):
+        # A PUBLIC BOUNDARY ONLY EVER DESCENDS. The floor is read off this
+        # page's scan position, and that position can sit ABOVE a row an
+        # earlier hop published: a hop whose keyset the bound could not name
+        # publishes everything it classified, including rows ranked below where
+        # its scan had reached. Handing out the higher value would un-exclude
+        # those rows and publish them a second time, so the boundary this page
+        # was handed stands. Compared on the instant alone: the tokens on
+        # either side can be in different spaces, and on a tie the boundary
+        # already promised is the one to keep. What this page PUBLISHES is
+        # still decided by its own floor; only the promise it passes on is
+        # held back.
+        published_floor = cursor_key
     publishes_a_checkpoint = (
         bounded_continuation and not page_complete and continuation_progressed
     )

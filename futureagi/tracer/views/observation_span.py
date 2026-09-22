@@ -385,7 +385,19 @@ def _span_cursor_order_for_partial_page(
         return _row_order(rows[-1])
     if cursor_state is not None:
         return tuple(cursor_state.order)
-    raise ValueError("partial span page has no continuation checkpoint")
+    # A checkpoint the reader could not name in result order: the pre-floor
+    # expression of the scan position, reached only on a first page with no
+    # rows and a keyset whose token is not the one this list publishes.
+    checkpoint_time = (
+        bounded_page.continuation_before_start_time
+        or bounded_page.continuation_slice_end
+    )
+    if checkpoint_time is None:
+        raise ValueError("partial span page has no continuation checkpoint")
+    token = bounded_page.continuation_before_id
+    if isinstance(token, tuple) and len(token) in {3, 5}:
+        return checkpoint_time, *(str(value) for value in token)
+    return (checkpoint_time, *("\U0010ffff" for _ in range(5)))
 
 
 class AddObservationSpanAnnotationsSerializer(serializers.Serializer):

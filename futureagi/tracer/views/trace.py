@@ -422,7 +422,21 @@ def _trace_list_cursor_order_for_partial_page(
         return _trace_list_cursor_order_for_row(rows[-1], org_scope=org_scope)
     if cursor_state is not None:
         return tuple(cursor_state.order)
-    raise ValueError("partial trace page has no continuation checkpoint")
+    # A checkpoint the reader could not name in result order: the pre-floor
+    # expression of the scan position, reached only on a first page with no
+    # rows and a keyset whose token is not the one this list publishes.
+    checkpoint_time = (
+        bounded_page.continuation_before_start_time
+        or bounded_page.continuation_slice_end
+    )
+    if checkpoint_time is None:
+        raise ValueError("partial trace page has no continuation checkpoint")
+    token = bounded_page.continuation_before_id
+    if org_scope:
+        if isinstance(token, tuple) and len(token) == 2:
+            return checkpoint_time, str(token[0]), str(token[1])
+        return checkpoint_time, "\U0010ffff", "\U0010ffff"
+    return checkpoint_time, str(token) if token is not None else "\U0010ffff"
 
 
 class TraceNavigationReadUnavailable(RuntimeError):

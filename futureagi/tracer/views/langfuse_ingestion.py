@@ -2,7 +2,6 @@ import uuid
 from collections import defaultdict
 
 import structlog
-from drf_yasg.utils import swagger_auto_schema
 from rest_framework.parsers import JSONParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -10,8 +9,8 @@ from rest_framework.views import APIView
 
 from accounts.authentication import APIKeyAuthentication, LangfuseBasicAuthentication
 from integrations.transformers.langfuse_transformer import LangfuseTransformer
-from tfc.utils.api_errors import build_error_envelope
 from tfc.utils.api_contracts import validated_request
+from tfc.utils.api_errors import build_error_envelope
 from tfc.utils.api_serializers import ApiDetailErrorResponseSerializer
 from tracer.models.project import Project
 from tracer.serializers.langfuse_ingestion import (

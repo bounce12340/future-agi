@@ -498,6 +498,18 @@ def _session_list_cursor_order_for_partial_page(*, rows, bounded_page, cursor_st
         )
     if cursor_state is not None:
         return tuple(cursor_state.order)
+    # A checkpoint the reader could not name in result order, on a first page:
+    # fall back to the scan position, which is what this route published before
+    # the floor existed. It is in seed order, so it is an approximation, and it
+    # is reached only when a page has no rows, no incoming cursor and a keyset
+    # whose token is not the one the list publishes.
+    if bounded_page.continuation_before_start_time is not None:
+        return (
+            bounded_page.continuation_before_start_time,
+            str(bounded_page.continuation_before_id or ""),
+        )
+    if bounded_page.continuation_slice_end is not None:
+        return bounded_page.continuation_slice_end, "\U0010ffff" * 8
     raise RuntimeError("session continuation has no stable order boundary")
 
 

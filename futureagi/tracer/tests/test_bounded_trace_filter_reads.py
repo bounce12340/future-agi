@@ -17083,16 +17083,17 @@ class _SeedTokenFakeExecutor(_FakeExecutor):
 
 
 @pytest.mark.unit
-def test_incomparable_keyset_publishes_its_boundary_instant_and_advances() -> None:
-    """An unresolvable instant is published, not held, and the keyset stays.
+def test_a_keyset_the_bound_cannot_name_publishes_what_it_classified() -> None:
+    """A position the bound cannot name publishes no floor at all.
 
-    When the keyset's token cannot be compared against a published row's token,
-    the floor can still name the INSTANT, and that is what it does: every match
-    the hop classified there is published now, so the row the keyset was taken
-    from - whose own seed that keyset excludes - is never stranded. The keyset
-    is kept, because it is the only position that advances inside an instant;
-    giving it up to re-read the instant is what made a dense instant stall the
-    walk for ever.
+    Inside one instant, result order cannot separate the rows a keyset has
+    passed from the rows it has not, and the public boundary is a single value
+    in result order. Naming the instant claims the unread remainder as
+    published; naming one microsecond above it holds the keyset row nothing
+    will re-read; giving the keyset up to re-read the instant stalls on an
+    instant wider than a hop. So this page publishes every match it classified
+    and hands out its last published row, exactly as the reader did before the
+    floor existed, and the floor is left to the positions a bound CAN name.
     """
 
     window_start = END - timedelta(hours=6)
@@ -17152,11 +17153,16 @@ def test_incomparable_keyset_publishes_its_boundary_instant_and_advances() -> No
             break
         floor = page.continuation_published_order_floor
         if floor is not None:
-            # The keyset is kept: an unresolvable instant costs the TOKEN, not
-            # the position, so the next hop can still advance inside it.
-            if page.continuation_before_start_time is not None:
-                assert floor[0] == page.continuation_before_start_time
-                assert floor[1] is None
+            # A floor is published only for a position the bound can name: a
+            # keyset whose token is the one this list publishes, or a slice
+            # boundary. Never for a keyset inside an instant it cannot resolve.
+            assert page.continuation_before_start_time is None or (
+                floor
+                == (
+                    page.continuation_before_start_time,
+                    page.continuation_before_id,
+                )
+            )
             order = (floor[0], "" if floor[1] is None else str(floor[1]))
         elif page.rows:
             order = (page.rows[-1]["start_time"], str(page.rows[-1]["id"]))
