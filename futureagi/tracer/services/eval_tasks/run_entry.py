@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from evaluations.engine.wall_clock import EvalWallClockExceeded, eval_wall_clock_scope
 from tracer.models.custom_eval_config import CustomEvalConfig
 from tracer.models.eval_task import EvalTask
 from tracer.models.observation_span import EvalEntryStatus, EvalLogger, EvalTargetType
@@ -49,33 +50,43 @@ def run_entry(entry: EvalLogger) -> str:
     )
     config_hash = resolved_config_hash(config)
 
-    try:
-        _run_for_target(fresh, config, task_project=task_project)
-    except EvalTelemetryReadError:
-        # CH transport/query pressure is infrastructure, not an eval result.
-        # Bubble it to the activity so its bounded retry policy can retry the
-        # same still-RUNNING entry instead of freezing a transient miss.
-        raise
-    except Exception as e:  # Every failure becomes a terminal state.
-        skipped_reason = getattr(e, "skipped_reason", None)
-        if skipped_reason:
+    with eval_wall_clock_scope() as wall_timeouts:
+        try:
+            _run_for_target(fresh, config, task_project=task_project)
+        except EvalTelemetryReadError:
+            # CH transport/query pressure is infrastructure, not an eval result.
+            # Bubble it to the activity so its bounded retry policy can retry the
+            # same still-RUNNING entry instead of freezing a transient miss.
+            raise
+        except EvalWallClockExceeded as e:
+            return _fail_timed_out(fresh, config_hash, str(e))
+        except Exception as e:  # Every failure becomes a terminal state.
+            skipped_reason = getattr(e, "skipped_reason", None)
+            if skipped_reason:
+                mark_terminal(
+                    fresh,
+                    EvalEntryStatus.SKIPPED,
+                    config_hash=config_hash,
+                    error=False,
+                    skipped_reason=skipped_reason,
+                )
+                return EvalEntryStatus.SKIPPED
+            logger.warning("run_entry failed for %s: %s", fresh.id, e, exc_info=True)
             mark_terminal(
                 fresh,
-                EvalEntryStatus.SKIPPED,
+                EvalEntryStatus.ERRORED,
                 config_hash=config_hash,
-                error=False,
-                skipped_reason=skipped_reason,
+                error=True,
+                error_message=str(e),
             )
-            return EvalEntryStatus.SKIPPED
-        logger.warning("run_entry failed for %s: %s", fresh.id, e, exc_info=True)
-        mark_terminal(
-            fresh,
-            EvalEntryStatus.ERRORED,
-            config_hash=config_hash,
-            error=True,
-            error_message=str(e),
-        )
-        return EvalEntryStatus.ERRORED
+            return EvalEntryStatus.ERRORED
+
+        if wall_timeouts:
+            # The evaluation core catches everything around the model call and
+            # writes a generic "Error during evaluation" onto the entry rather
+            # than re-raising, so a wall-clock timeout has to be read back here
+            # instead of caught. Restating it gives the row the real reason.
+            return _fail_timed_out(fresh, config_hash, wall_timeouts[0])
 
     # The evaluator wrote the result onto the entry; read its error flag to pick
     # the terminal status, then stamp status + hash.
@@ -85,6 +96,25 @@ def run_entry(entry: EvalLogger) -> str:
     if status == EvalEntryStatus.COMPLETED:
         _reseed_eval_clustering(fresh, config.project_id)
     return status
+
+
+def _fail_timed_out(entry: EvalLogger, config_hash: str, message: str) -> str:
+    """Terminalize an entry whose evaluation outlived its wall clock.
+
+    Errored once, with the real reason rather than the engine's generic wrapper,
+    and one attempt spent: the run really happened and really cost something, so
+    a row that keeps timing out must converge on the poison cap instead of being
+    retried without limit by a later requeue.
+    """
+    mark_terminal(
+        entry,
+        EvalEntryStatus.ERRORED,
+        config_hash=config_hash,
+        error=True,
+        error_message=message,
+        count_attempt=True,
+    )
+    return EvalEntryStatus.ERRORED
 
 
 def _reseed_eval_clustering(entry: EvalLogger, project_id) -> None:

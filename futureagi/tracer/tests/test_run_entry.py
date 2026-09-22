@@ -92,9 +92,7 @@ class TestRunEntrySpan:
             raise RuntimeError("engine down")
 
         monkeypatch.setattr("evaluations.engine.run_eval", _boom, raising=False)
-        monkeypatch.setattr(
-            "evaluations.engine.runner.run_eval", _boom, raising=False
-        )
+        monkeypatch.setattr("evaluations.engine.runner.run_eval", _boom, raising=False)
         with patch(
             "tracer.services.eval_tasks.run_entry._reseed_eval_clustering"
         ) as reseed:
@@ -270,3 +268,71 @@ class TestReseedEvalClusteringHook:
         assert run_entry(entry) in _TERMINAL
         entry.refresh_from_db()
         assert entry.status in _TERMINAL
+
+
+@pytest.mark.integration
+@pytest.mark.django_db
+class TestRunEntryWallClock:
+    """An evaluation that outlives its wall clock terminalizes the entry once,
+    with the real reason, and spends an attempt. Both shapes are covered: the
+    evaluation core catches everything around the model call and records a
+    generic error instead of re-raising, so the timeout normally has to be read
+    back rather than caught — but a path that does propagate must land in the
+    same place."""
+
+    def _timed_out_entry(self, task, span, config, propagate):
+        from evaluations.engine.wall_clock import EvalWallClockExceeded, record_timeout
+
+        message = "Evaluation 'Slow Eval' exceeded its 300s wall clock"
+
+        def _fake_run_for_target(entry, cfg, *, task_project):
+            if propagate:
+                raise EvalWallClockExceeded(message)
+            # What the engine really does: swallow it and stamp a generic error.
+            record_timeout(message)
+            EvalLogger.objects.filter(id=entry.id).update(
+                error=True, error_message="Error during evaluation: something"
+            )
+
+        return _span_entry(task, span, config), _fake_run_for_target, message
+
+    @pytest.mark.parametrize("propagate", [False, True])
+    def test_a_timed_out_evaluation_errors_once_with_an_attempt_counted(
+        self,
+        monkeypatch,
+        observation_span,
+        custom_eval_config,
+        eval_task,
+        propagate,
+    ):
+        entry, fake, message = self._timed_out_entry(
+            eval_task, observation_span, custom_eval_config, propagate
+        )
+        monkeypatch.setattr(
+            "tracer.services.eval_tasks.run_entry._run_for_target", fake
+        )
+
+        assert run_entry(entry) == EvalEntryStatus.ERRORED
+
+        entry.refresh_from_db()
+        assert entry.status == EvalEntryStatus.ERRORED
+        assert entry.error is True
+        assert entry.error_message == message
+        assert entry.attempts == 1
+
+    def test_a_normal_run_spends_no_attempt(
+        self,
+        observation_span,
+        custom_eval_config,
+        eval_task,
+        stub_run_eval,
+        stub_cost_log,
+    ):
+        """Only the timeout counts an attempt — an ordinary completion or a
+        converged eval failure must not eat into the reclaim budget."""
+        entry = _span_entry(eval_task, observation_span, custom_eval_config)
+
+        assert run_entry(entry) == EvalEntryStatus.COMPLETED
+
+        entry.refresh_from_db()
+        assert entry.attempts == 0

@@ -193,13 +193,21 @@ DATASET_READ_SETTING_SPECS = {
 # together, because the workflow module cannot be imported at settings-load
 # time. Below that bound the sweep would requeue an entry a worker is still
 # evaluating, and the eval would be paid for twice.
-EVAL_TASK_RECOVERY_SETTING_SPECS = _specs(
-    (
-        ("SWEEP_STALE_RUNNING_SECONDS", 7_200, 600, 86_400),
-        ("SWEEP_MAX_TASKS", 25, 1, 500),
+EVAL_EXECUTION_SETTING_SPECS = {
+    **_specs(
+        (
+            ("SWEEP_STALE_RUNNING_SECONDS", 7_200, 600, 86_400),
+            ("SWEEP_MAX_TASKS", 25, 1, 500),
+        ),
+        prefix="EVAL_TASK_",
     ),
-    prefix="EVAL_TASK_",
-)
+    # Wall clock around one evaluation's execution, for every eval path, not
+    # just the task drain. Nothing else bounds it: the activity heartbeat is
+    # emitted by a timer rather than by progress, so a wedged eval keeps it
+    # beating. 0 disables the bound for a deployment whose evaluations
+    # legitimately run longer.
+    **_specs((("EVAL_RUN_WALL_SECONDS", 300, 0, 43_200),)),
+}
 
 INTERACTIVE_READ_SETTING_SPECS = {
     **_specs(
@@ -511,7 +519,7 @@ RUNTIME_NUMERIC_SETTING_SPECS = {
     **PROPERTY_CATALOG_RUNTIME_SETTING_SPECS,
     **DATASET_READ_SETTING_SPECS,
     **INTERACTIVE_READ_SETTING_SPECS,
-    **EVAL_TASK_RECOVERY_SETTING_SPECS,
+    **EVAL_EXECUTION_SETTING_SPECS,
 }
 
 if len(RUNTIME_NUMERIC_SETTING_SPECS) != sum(
@@ -521,7 +529,7 @@ if len(RUNTIME_NUMERIC_SETTING_SPECS) != sum(
             PROPERTY_CATALOG_RUNTIME_SETTING_SPECS,
             DATASET_READ_SETTING_SPECS,
             INTERACTIVE_READ_SETTING_SPECS,
-            EVAL_TASK_RECOVERY_SETTING_SPECS,
+            EVAL_EXECUTION_SETTING_SPECS,
         ),
     )
 ):

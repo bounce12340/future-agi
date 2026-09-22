@@ -24,6 +24,7 @@ from evaluations.engine.formatting import extract_raw_result, format_eval_value
 from evaluations.engine.instance import create_eval_instance
 from evaluations.engine.params import prepare_run_params
 from evaluations.engine.registry import get_eval_class
+from evaluations.engine.wall_clock import configured_wall_seconds, run_bounded
 
 logger = structlog.get_logger(__name__)
 
@@ -160,9 +161,17 @@ def run_eval(request: EvalRequest) -> EvalResult:
 
     run_params = preprocess_inputs(eval_template.name, run_params)
 
-    # 4. Execute
+    # 4. Execute, under a wall clock. Nothing else bounds the evaluation: the
+    # activity heartbeat is emitted by a timer rather than by progress, so a
+    # wedged eval keeps it beating, and a Temporal timeout cannot kill the
+    # thread anyway.
     start_time = time.time()
-    raw_result = eval_instance.run(**run_params)
+    raw_result = run_bounded(
+        eval_instance.run,
+        run_params,
+        timeout_seconds=configured_wall_seconds(),
+        label=eval_template.name,
+    )
     end_time = time.time()
 
     # 5. Extract and format

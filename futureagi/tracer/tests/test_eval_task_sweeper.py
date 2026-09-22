@@ -333,3 +333,33 @@ def test_the_sweep_is_actually_scheduled_and_its_activity_is_registered():
     assert config.queue == "tasks_s"
     assert 0 < config.interval_seconds <= 600
     assert "tracer.tasks.eval_task_sweeper" in TEMPORAL_ACTIVITY_MODULES
+
+
+def test_sweep_stale_threshold_exceeds_a_live_entrys_longest_run(settings):
+    """The scheduled reap runs beside live workflows, so its threshold must stay
+    above the longest a legitimately running entry can live: the workflow's
+    run-entry start-to-close ceiling times its retry attempts. Below that bound
+    the sweep would requeue an entry a worker is still evaluating, the late
+    result would be fenced out, and the evaluation would be paid for twice. The
+    workflow module cannot be imported at settings-load time, so this test is
+    where the two are pinned together."""
+    from tfc.temporal.eval_tasks.workflows import (
+        _RUN_ENTRY_TIMEOUT,
+        RUN_ENTRY_RETRY_POLICY,
+    )
+
+    longest_run = (
+        _RUN_ENTRY_TIMEOUT.total_seconds() * RUN_ENTRY_RETRY_POLICY.maximum_attempts
+    )
+
+    assert settings.EVAL_TASK_SWEEP_STALE_RUNNING_SECONDS > longest_run
+
+
+def test_the_activity_ceiling_leaves_room_for_the_engines_own_wall(settings):
+    """The engine's wall bounds one evaluation; the activity ceiling has to
+    cover a whole entry — telemetry loads, media, a composite's sub-evals — so
+    it must be the looser of the two, or the activity would abandon runs the
+    wall was still willing to allow."""
+    from tfc.temporal.eval_tasks.workflows import _RUN_ENTRY_TIMEOUT
+
+    assert _RUN_ENTRY_TIMEOUT.total_seconds() > settings.EVAL_RUN_WALL_SECONDS

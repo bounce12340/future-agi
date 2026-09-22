@@ -71,7 +71,12 @@ RUN_ENTRY_RETRY_POLICY = RetryPolicy(
 
 _CONTROL_TIMEOUT = timedelta(minutes=30)
 _RECONCILE_TIMEOUT = timedelta(hours=3)
-_RUN_ENTRY_TIMEOUT = timedelta(hours=12)
+# One entry is one eval config against one row. With the engine's own wall
+# clock bounding each evaluation (EVAL_RUN_WALL_SECONDS), this ceiling only has
+# to cover the telemetry loads, any media the eval pulls, and a composite's
+# sub-evaluations. It was twelve hours, which was the *only* effective bound on
+# a wedged eval and meant one stuck entry held its task's batch for half a day.
+_RUN_ENTRY_TIMEOUT = timedelta(minutes=30)
 _HEARTBEAT = timedelta(minutes=5)
 _CONTINUOUS_RECONCILE_BUDGET_DEFERRAL_PATCH = (
     "continuous-eval-reconcile-budget-deferral-v1"
