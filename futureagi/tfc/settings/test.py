@@ -111,6 +111,29 @@ CH25_EVAL_LOGGER_TABLE = os.environ.get(
     "CH25_EVAL_LOGGER_TABLE", "tracer_eval_logger"
 )
 
+# The per-route list-page acquisition walls are raised for the test process
+# only. They are wall-CLOCK budgets over a whole acquisition, and the
+# integration suites drive hundreds of statements through a single list
+# request; against a containerised ClickHouse each statement costs a few
+# milliseconds, so a five-second wall is reached on a slow machine and the
+# route publishes an empty page where the suite is asserting a filter COUNT.
+# Those suites test the counts, not the wall. The wall's own behaviour --
+# where it stops, what it publishes and the cursor it returns -- is pinned by
+# tracer/tests/test_list_page_wall.py, and part of what that module pins is
+# that a route's wall is DISTINGUISHABLE from the global analytics wall. The
+# value here therefore has to be large enough to stop binding on a slow
+# machine AND still differ from INTERACTIVE_ANALYTICS_DEFAULT_WALL_MS: at
+# 30,000 it equals that wall and four of those cases can no longer observe
+# what they assert. 25,000 is five times the production default and distinct.
+# The production defaults stay at 5,000 ms in
+# tfc/settings/runtime_setting_specs.py; nothing here changes a default or a
+# reviewed bound, and the settings validator still refuses to let
+# USER_LIST_PAGE_WALL_MS exceed the global analytics wall.
+SPAN_LIST_PAGE_WALL_MS = 25_000
+TRACE_LIST_PAGE_WALL_MS = 25_000
+SESSION_LIST_PAGE_WALL_MS = 25_000
+USER_LIST_PAGE_WALL_MS = 25_000
+
 # Test cache configuration
 CACHES = {
     "default": {

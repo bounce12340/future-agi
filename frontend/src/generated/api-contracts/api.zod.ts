@@ -62143,9 +62143,14 @@ export const TracerUsersListResponse = zod.object({
     query_status: zod.enum(["complete", "degraded"]).optional(),
     query_exact: zod.boolean().optional(),
     query_provenance: zod
-      .enum(["span_user_rollup_end_users_candidate", "physical_latest_users"])
+      .enum([
+        "span_user_rollup_end_users_candidate",
+        "physical_latest_users",
+        "matching_activity_walk",
+      ])
       .optional(),
     ordering_exact: zod.boolean().optional(),
+    ordering: zod.enum(["latest_matching_activity"]).optional(),
     approximate_fields: zod.array(zod.enum(["num_sessions"])).optional(),
   }),
 });
