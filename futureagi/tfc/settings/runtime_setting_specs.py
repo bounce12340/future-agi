@@ -364,6 +364,54 @@ INTERACTIVE_READ_SETTING_SPECS = {
             ),
             ("FILTER_VALUE_CURSOR_MAX_QUERIES", 6, 1, 128),
             ("FILTER_VALUE_CURSOR_SCAN_LIMIT", 201, 2, 10_001),
+            # A span-attribute-filtered Users page walks witnessed spans
+            # newest-first in time slices, certifies each slice's users and
+            # stops on its own wall or statement budget with a cursor. The
+            # unfiltered Users page does not read these.
+            ("USER_LIST_PAGE_WALL_MS", 5_000, 100, 60_000),
+            ("USER_LIST_WALK_MAX_STATEMENTS", 24, 1, 256),
+            ("USER_LIST_WALK_INITIAL_SLICE_SECONDS", 60 * 60, 1, 7 * 24 * 60 * 60),
+            # Application reads carry no server deadline, so one dense slice
+            # is bounded only by its width: a one-day slice of a common value
+            # on the largest tenant measured about two seconds at eight
+            # threads. Wider slices trade that against the statements an
+            # empty result needs to prove itself.
+            (
+                "USER_LIST_WALK_MAX_SLICE_SECONDS",
+                24 * 60 * 60,
+                60,
+                366 * 24 * 60 * 60,
+            ),
+            ("USER_LIST_WALK_SLICE_USER_LIMIT", 200, 2, 10_001),
+            # A slice that fails on a read budget is retried at a quarter of
+            # its width down to this floor; below it the failure propagates.
+            ("USER_LIST_WALK_MIN_SLICE_SECONDS", 60, 1, 7 * 24 * 60 * 60),
+            # Users certified per enrichment statement and replayed per
+            # materialisation; the enrichment result is bounded by this times
+            # the requested keys.
+            ("USER_LIST_WALK_CERTIFY_BATCH_SIZE", 25, 1, 1_000),
+            # The rows a walk's tail existence statement may knowingly read.
+            # After an empty slice whose tail does not fit the statement
+            # budget at the slice cap, the walk asks EXPLAIN ESTIMATE how many
+            # rows the blooms leave in the whole tail and issues the one
+            # existence statement only when that count fits here; otherwise
+            # it keeps slicing at the cap. Rows, not bytes: neither the
+            # estimate nor the transport's result carries bytes. Basis: on the
+            # largest tenant an uncosted tail statement read 1.38M rows =
+            # 4.7 GB in 1.66 s (rig run r2b); a million rows there is about
+            # 3.3 GB and 1.2 s at eight threads, a fifth of the page wall, and
+            # a slice of a common value at the one-day cap reads 2.4M.
+            ("USER_LIST_WALK_PROBE_TARGET_READ_ROWS", 1_000_000, 8_192, 50_000_000),
+            # The wall the estimate and the existence statement share, inside
+            # the page wall. The estimate is the existence statement's own
+            # index analysis under the same read settings; the existence
+            # statement repeats it before reading a row, so it is issued only
+            # when the estimate's observed time fits what is left here (at
+            # most half the wall). Basis: the twelve-month text estimate on
+            # the largest tenant at eight threads measured 135-456 ms server
+            # (95 parts, 16k marks; 3.2 s at one thread on a cold index), the
+            # boolean-key estimate 114-117 ms (395 parts, 33k marks).
+            ("USER_LIST_WALK_PROBE_WALL_MS", 1_000, 25, 60_000),
             ("FILTER_VALUE_READ_MAX_THREADS", 2, 1, 16),
             ("FILTER_SELECTOR_QUERY_TIMEOUT_MS", 2_500, 25, 10_000),
             ("FILTER_SELECTOR_MAX_OPT_IN_QUERY_TIMEOUT_MS", 3_000, 25, 30_000),
@@ -998,6 +1046,26 @@ def validate_interactive_read_settings(values: Mapping[str, Numeric]) -> None:
         raise ValueError(
             "filter value cursor segment limits must satisfy minimum <= initial <= maximum"
         )
+    _require_at_most(
+        values["USER_LIST_PAGE_WALL_MS"],
+        values["INTERACTIVE_ANALYTICS_DEFAULT_WALL_MS"],
+        "USER_LIST_PAGE_WALL_MS cannot exceed INTERACTIVE_ANALYTICS_DEFAULT_WALL_MS",
+    )
+    _require_at_most(
+        values["USER_LIST_WALK_INITIAL_SLICE_SECONDS"],
+        values["USER_LIST_WALK_MAX_SLICE_SECONDS"],
+        "USER_LIST_WALK_INITIAL_SLICE_SECONDS cannot exceed USER_LIST_WALK_MAX_SLICE_SECONDS",
+    )
+    _require_at_most(
+        values["USER_LIST_WALK_MIN_SLICE_SECONDS"],
+        values["USER_LIST_WALK_INITIAL_SLICE_SECONDS"],
+        "USER_LIST_WALK_MIN_SLICE_SECONDS cannot exceed USER_LIST_WALK_INITIAL_SLICE_SECONDS",
+    )
+    _require_at_most(
+        values["USER_LIST_WALK_PROBE_WALL_MS"],
+        values["USER_LIST_PAGE_WALL_MS"],
+        "USER_LIST_WALK_PROBE_WALL_MS cannot exceed USER_LIST_PAGE_WALL_MS",
+    )
     _require_at_most(
         values["FILTER_SELECTOR_QUERY_TIMEOUT_MS"],
         values["FILTER_SELECTOR_MAX_OPT_IN_QUERY_TIMEOUT_MS"],
