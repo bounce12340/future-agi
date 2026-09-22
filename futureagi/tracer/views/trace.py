@@ -57,6 +57,7 @@ from tracer.selectors.trace_filter_reads import (
     CURSOR_REQUIRED_MESSAGE,
     PAGE_DEPTH_EXCEEDED_CODE,
     PAGE_DEPTH_EXCEEDED_MESSAGE,
+    bounded_filter_floor_order,
     bounded_numbered_page_depth_exceeded,
     long_filtered_read_requires_cursor,
     numbered_page_depth_exceeded,
@@ -410,22 +411,18 @@ def _trace_list_cursor_order_for_partial_page(
 ) -> tuple[Any, ...]:
     """Return a public boundary for a progressed empty transport page."""
 
+    if bounded_page.has_more and rows:
+        return _trace_list_cursor_order_for_row(rows[-1], org_scope=org_scope)
+    floor = bounded_page.continuation_published_order_floor
+    if floor is not None:
+        return bounded_filter_floor_order(
+            floor, lowest_components=2 if org_scope else 1
+        )
     if rows:
         return _trace_list_cursor_order_for_row(rows[-1], org_scope=org_scope)
     if cursor_state is not None:
         return tuple(cursor_state.order)
-    checkpoint_time = (
-        bounded_page.continuation_before_start_time
-        or bounded_page.continuation_slice_end
-    )
-    if checkpoint_time is None:
-        raise ValueError("partial trace page has no continuation checkpoint")
-    token = bounded_page.continuation_before_id
-    if org_scope:
-        if isinstance(token, tuple) and len(token) == 2:
-            return checkpoint_time, str(token[0]), str(token[1])
-        return checkpoint_time, "\U0010ffff", "\U0010ffff"
-    return checkpoint_time, str(token) if token is not None else "\U0010ffff"
+    raise ValueError("partial trace page has no continuation checkpoint")
 
 
 class TraceNavigationReadUnavailable(RuntimeError):

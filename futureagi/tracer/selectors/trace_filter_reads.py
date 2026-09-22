@@ -271,6 +271,29 @@ class _BudgetExceeded(Exception):
         super().__init__(error_code)
 
 
+def bounded_filter_floor_order(
+    floor: tuple[datetime, Any],
+    *,
+    lowest_components: int,
+) -> tuple[Any, ...]:
+    """Flatten a reader floor into one list view's public order tuple.
+
+    The floor's token is already in the order the view publishes - that is what
+    the reader checks before committing it - so a tuple token flattens straight
+    into the view's components. A ``None`` token means "below every token at
+    that instant", which is spelled as empty components: no real token sorts
+    below one, and a shorter tuple of them still compares low against a longer
+    real one, so the boundary can only admit a row, never hide one.
+    """
+
+    floor_time, floor_token = floor
+    if floor_token is None:
+        return (floor_time, *("" for _ in range(lowest_components)))
+    if isinstance(floor_token, tuple):
+        return (floor_time, *(str(value) for value in floor_token))
+    return (floor_time, str(floor_token))
+
+
 def degraded_bounded_filter_page(error_code: str) -> BoundedFilterPage:
     """Return a sanitized incomplete page without issuing a database read."""
 
@@ -1053,14 +1076,6 @@ def read_bounded_filter_page(
         and not callable(ordered_seed_builder)
     ):
         raise ValueError("unsafe cursor seeds require an ordered seed builder")
-    # A builder that does not spell a seed order token keysets on the very
-    # tuple it publishes, so a scan position and a published row are directly
-    # comparable, ties included. One that does keysets on a physical row -
-    # a matched span, a raw root - whose token says nothing about where the
-    # public row sorts, so only the time component of the two is comparable.
-    seed_and_result_share_order_token = not callable(
-        getattr(builder, "bounded_filter_seed_order_token", None)
-    )
     if request_start >= request_end:
         return BoundedFilterPage(
             rows=[],
@@ -1612,10 +1627,19 @@ def read_bounded_filter_page(
     # remains is not a smaller buffer - it is an INCOMPLETE one, and no
     # position may be committed on the strength of emptying it.
     classifier_flush_interrupted = False
+    # Whether the live keyset's token may be compared against a PUBLISHED row's
+    # order token. It may when the seed row the keyset was taken from sorts the
+    # same way in both orders, which is a property of that row, not of whether
+    # the builder spells a seed token: a route that keysets on a physical span
+    # can still produce a keyset token identical to the row's. A keyset carried
+    # in from a previous hop is always comparable, because a hop that committed
+    # an incomparable one gave it up as a slice before publishing it.
+    before_key_is_result_comparable = True
     safe_slice_end = slice_end
     safe_active_slice_start = active_slice_start
     safe_before_start_time = before_start_time
     safe_before_id = before_id
+    safe_before_key_is_result_comparable = True
     safe_seen_seed_ids: set[Hashable] = set()
     safe_seen_candidate_ids: set[Hashable] = set()
     safe_matched_by_id: dict[Hashable, dict[str, Any]] = {}
@@ -1848,6 +1872,7 @@ def read_bounded_filter_page(
         nonlocal safe_active_slice_start
         nonlocal safe_before_start_time
         nonlocal safe_before_id
+        nonlocal safe_before_key_is_result_comparable
         nonlocal safe_seen_seed_ids
         nonlocal safe_seen_candidate_ids
         nonlocal safe_matched_by_id
@@ -1858,10 +1883,49 @@ def read_bounded_filter_page(
         safe_active_slice_start = active_slice_start
         safe_before_start_time = before_start_time
         safe_before_id = before_id
+        safe_before_key_is_result_comparable = before_key_is_result_comparable
         safe_seen_seed_ids = set(seen_seed_ids)
         safe_seen_candidate_ids = set(seen_candidate_ids)
         safe_matched_by_id = dict(matched_by_id)
         continuation_progressed = True
+
+    def committed_publication_boundary() -> tuple[tuple[datetime, Any] | None, bool]:
+        """The floor this page may publish, read off the COMMITTED position.
+
+        Read it, never cache it. Every caller must see the position as it
+        stands when it asks, because a failed hydration rolls the committed
+        position BACK after the page has already been filtered: a floor
+        remembered from before that rollback would sit below the checkpoint the
+        page hands out, and the next hop would skip every row between the two -
+        the very loss this floor exists to prevent. Below the checkpoint is the
+        one place a floor may never be.
+
+        An in-slice keyset is exclusive, so the row at the keyset itself was
+        consumed and the floor is that keyset - but only when its token can be
+        compared against a published row's token, which is a fact about the row
+        the keyset was taken from. When it cannot, the floor gives up the
+        boundary instant (``+1us``) and the caller must give up the keyset with
+        it: the second element of the return says so. Holding the rows at that
+        instant while resuming below the keyset would strand exactly the row
+        the keyset was taken from, whose own seed the keyset excludes. Resuming
+        at a slice that ends one microsecond above it re-reads that instant and
+        nothing older, and the same floor then keeps the rows it holds out of
+        the next hop's exclusive bound.
+
+        An exhausted slice is half-open: everything at or after its end is
+        consumed, so the whole boundary instant is publishable and the keyset
+        is already empty.
+        """
+
+        if not (bounded_continuation and not page_complete and continuation_progressed):
+            return None, False
+        if safe_before_start_time is not None:
+            if safe_before_key_is_result_comparable:
+                return (safe_before_start_time, safe_before_id), False
+            return (safe_before_start_time + timedelta(microseconds=1), None), True
+        if safe_slice_end is not None:
+            return (safe_slice_end, None), False
+        return None, False
 
     def rollback_unhydrated_page() -> None:
         """Restore the honest scan position from before unpublished matches."""
@@ -2439,6 +2503,7 @@ def read_bounded_filter_page(
         nonlocal candidate_witness_probe_started
         nonlocal before_id
         nonlocal before_start_time
+        nonlocal before_key_is_result_comparable
         nonlocal pre_match_continuation
         nonlocal last_classifier_empty
 
@@ -2769,6 +2834,9 @@ def read_bounded_filter_page(
                 # livelock on a broad-but-not-identical witness result.
                 last_classified_seed = candidate_seed_rows[identity_batch[-1]]
                 before_start_time, before_id = seed_row_key(last_classified_seed)
+                before_key_is_result_comparable = seed_row_key(
+                    last_classified_seed
+                ) == result_row_key(last_classified_seed)
                 checkpoint_continuation()
 
             if stop_on_ordered_prefix and len(matched_by_id) >= prefix_needed:
@@ -3896,6 +3964,10 @@ def read_bounded_filter_page(
                         force=True,
                     )
                 before_start_time, before_id = next_start_time, next_id
+                before_key_is_result_comparable = (
+                    next_start_time,
+                    next_id,
+                ) == result_row_key(seed_rows[-1])
                 if bounded_continuation:
                     checkpoint_continuation()
                 if (
@@ -4147,23 +4219,7 @@ def read_bounded_filter_page(
     # Where seed and result order agree - the span list, every route that
     # keysets on the rows it publishes - every match found is already at or
     # above ``P`` and this filter removes nothing.
-    published_order_floor: tuple[datetime, Any] | None = None
-    if bounded_continuation and not page_complete and continuation_progressed:
-        if safe_before_start_time is not None:
-            # An in-slice keyset is exclusive: the row at the keyset itself was
-            # consumed. Its token is comparable to a result token only when the
-            # builder keysets on its published order; otherwise compare on time
-            # alone and give up the boundary microsecond rather than compare
-            # two different token spaces.
-            published_order_floor = (
-                (safe_before_start_time, safe_before_id)
-                if seed_and_result_share_order_token
-                else (safe_before_start_time + timedelta(microseconds=1), None)
-            )
-        elif safe_slice_end is not None:
-            # An exhausted slice is half-open: everything at or after its end
-            # is consumed, so the whole boundary microsecond is publishable.
-            published_order_floor = (safe_slice_end, None)
+    published_order_floor, _give_up_keyset = committed_publication_boundary()
     if published_order_floor is not None:
         floor_time, floor_token = published_order_floor
         ordered_matches = [
@@ -4241,6 +4297,12 @@ def read_bounded_filter_page(
     error_code = (
         None if page_complete else degraded_error_code or "scan_budget_exceeded"
     )
+    # Read the committed position ONE more time, after every rollback above, so
+    # the floor and the checkpoint published beside it are the same position.
+    published_floor, give_up_keyset = committed_publication_boundary()
+    publishes_a_checkpoint = (
+        bounded_continuation and not page_complete and continuation_progressed
+    )
     return BoundedFilterPage(
         # Raw seeds are not latest-state matches. Even graph callers that opt
         # into incomplete rows may expose only the outer union classifier's
@@ -4259,26 +4321,24 @@ def read_bounded_filter_page(
         deferred_candidate_rows=tuple(deferred_candidate_by_id.values()),
         classification_deferred=defer_classification,
         continuation_slice_start=(
-            safe_active_slice_start
-            if bounded_continuation and not page_complete and continuation_progressed
-            else None
+            safe_active_slice_start if publishes_a_checkpoint else None
         ),
         continuation_slice_end=(
-            safe_slice_end
-            if bounded_continuation and not page_complete and continuation_progressed
-            else None
+            published_floor[0]
+            if give_up_keyset
+            else (safe_slice_end if publishes_a_checkpoint else None)
         ),
         continuation_before_start_time=(
-            safe_before_start_time
-            if bounded_continuation and not page_complete and continuation_progressed
-            else None
+            None
+            if give_up_keyset
+            else (safe_before_start_time if publishes_a_checkpoint else None)
         ),
         continuation_before_id=(
-            safe_before_id
-            if bounded_continuation and not page_complete and continuation_progressed
-            else None
+            None
+            if give_up_keyset
+            else (safe_before_id if publishes_a_checkpoint else None)
         ),
-        continuation_published_order_floor=published_order_floor,
+        continuation_published_order_floor=published_floor,
     )
 
 

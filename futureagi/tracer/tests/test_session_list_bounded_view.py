@@ -1945,6 +1945,14 @@ def test_wall_stopped_session_hops_advance_the_public_bound_to_each_floor():
 
     assert statuses == ["ok", "ok", "ok"]
     assert [payload["table"] for payload in payloads[:2]] == [[], []]
+    # A wall-stopped page reports no more rows on the page it just published
+    # and still hands out a cursor, because its scan carries a checkpoint; the
+    # client keeps hopping on has_more. (query_complete stays true here: that
+    # is the route's pre-existing public_chunk_complete rule, not this page.)
+    for payload in payloads[:2]:
+        assert payload["metadata"]["next_cursor"] is not None
+        assert payload["metadata"]["has_more"] is True
+        assert payload["metadata"]["query_complete"] is True
     assert [row["session_id"] for row in payloads[2]["table"]] == [session_id]
     assert bounded_read.call_count == 3
     first, second, third = bounded_read.call_args_list

@@ -65,6 +65,7 @@ from tracer.selectors.trace_filter_reads import (
     PAGE_DEPTH_EXCEEDED_CODE,
     PAGE_DEPTH_EXCEEDED_MESSAGE,
     BoundedFilterPage,
+    bounded_filter_floor_order,
     bounded_numbered_page_depth_exceeded,
     numbered_page_depth_exceeded,
     read_bounded_filter_page,
@@ -484,8 +485,7 @@ def _session_list_cursor_order_for_partial_page(*, rows, bounded_page, cursor_st
         )
     floor = bounded_page.continuation_published_order_floor
     if floor is not None:
-        floor_time, floor_token = floor
-        return floor_time, "" if floor_token is None else str(floor_token)
+        return bounded_filter_floor_order(floor, lowest_components=1)
     if rows:
         last = rows[-1]
         return (

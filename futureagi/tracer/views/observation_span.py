@@ -71,6 +71,7 @@ from tracer.selectors.trace_filter_reads import (
     CURSOR_REQUIRED_MESSAGE,
     PAGE_DEPTH_EXCEEDED_CODE,
     PAGE_DEPTH_EXCEEDED_MESSAGE,
+    bounded_filter_floor_order,
     bounded_numbered_page_depth_exceeded,
     numbered_page_depth_exceeded,
 )
@@ -362,8 +363,7 @@ def _span_cursor_order_for_partial_page(
 ) -> tuple[Any, ...]:
     """Return the exact row boundary or a progressed empty scan boundary."""
 
-    if rows:
-        row = rows[-1]
+    def _row_order(row):
         if row.get("service_name") is not None:
             return (
                 row.get("start_time"),
@@ -375,18 +375,17 @@ def _span_cursor_order_for_partial_page(
             str(row.get("trace_id", "")),
             str(row.get("project_id", "")),
         )
+
+    if bounded_page.has_more and rows:
+        return _row_order(rows[-1])
+    floor = bounded_page.continuation_published_order_floor
+    if floor is not None:
+        return bounded_filter_floor_order(floor, lowest_components=5)
+    if rows:
+        return _row_order(rows[-1])
     if cursor_state is not None:
         return tuple(cursor_state.order)
-    checkpoint_time = (
-        bounded_page.continuation_before_start_time
-        or bounded_page.continuation_slice_end
-    )
-    if checkpoint_time is None:
-        raise ValueError("partial span page has no continuation checkpoint")
-    token = bounded_page.continuation_before_id
-    if isinstance(token, tuple) and len(token) in {3, 5}:
-        return checkpoint_time, *(str(value) for value in token)
-    return (checkpoint_time, *("\U0010ffff" for _ in range(5)))
+    raise ValueError("partial span page has no continuation checkpoint")
 
 
 class AddObservationSpanAnnotationsSerializer(serializers.Serializer):
