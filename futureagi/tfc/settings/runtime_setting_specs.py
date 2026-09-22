@@ -185,28 +185,47 @@ DATASET_READ_SETTING_SPECS = {
     ),
 }
 
-# Out-of-band recovery for eval tasks whose per-task workflow stopped. The
-# sweep runs beside live workflows, so ``SWEEP_STALE_RUNNING_SECONDS`` must
-# stay above the longest legitimate life of one running entry — the workflow's
-# run-entry start-to-close timeout times its retry attempts, plus backoff.
-# ``test_sweep_stale_threshold_exceeds_a_live_entrys_longest_run`` pins the two
-# together, because the workflow module cannot be imported at settings-load
-# time. Below that bound the sweep would requeue an entry a worker is still
-# evaluating, and the eval would be paid for twice.
+# Out-of-band recovery for eval tasks whose per-task workflow stopped.
+#
+# These two constants mirror ``_RUN_ENTRY_TIMEOUT`` and
+# ``RUN_ENTRY_RETRY_POLICY.maximum_attempts`` in
+# ``tfc.temporal.eval_tasks.workflows``, which cannot be imported at
+# settings-load time. ``test_the_mirrored_run_entry_ceiling_matches_the_workflow``
+# pins them against the real values, so a change there fails a test here
+# rather than silently loosening the bounds below.
+RUN_ENTRY_CEILING_SECONDS = 1_800
+RUN_ENTRY_MAX_ATTEMPTS = 3
+# The longest one entry can legitimately stay ``running``. ``run_entry``
+# re-stamps ``updated_at`` when a run actually begins, so this bounds one
+# execution rather than a claim that may still be sitting in the queue.
+LONGEST_RUNNING_ENTRY_SECONDS = RUN_ENTRY_CEILING_SECONDS * RUN_ENTRY_MAX_ATTEMPTS
+
+# The sweep runs beside live workflows, so ``SWEEP_STALE_RUNNING_SECONDS`` must
+# stay above that bound at every value an operator can configure — not merely
+# at the default. Below it the sweep requeues an entry a worker is still
+# evaluating and spends one of the entry's three reclaims on it.
 EVAL_EXECUTION_SETTING_SPECS = {
     **_specs(
         (
-            ("SWEEP_STALE_RUNNING_SECONDS", 7_200, 600, 86_400),
+            (
+                "SWEEP_STALE_RUNNING_SECONDS",
+                7_200,
+                LONGEST_RUNNING_ENTRY_SECONDS + 1,
+                86_400,
+            ),
             ("SWEEP_MAX_TASKS", 25, 1, 500),
         ),
         prefix="EVAL_TASK_",
     ),
-    # Wall clock around one evaluation's execution, for every eval path, not
-    # just the task drain. Nothing else bounds it: the activity heartbeat is
-    # emitted by a timer rather than by progress, so a wedged eval keeps it
-    # beating. 0 disables the bound for a deployment whose evaluations
-    # legitimately run longer.
-    **_specs((("EVAL_RUN_WALL_SECONDS", 300, 0, 43_200),)),
+    # Wall clock around one evaluation's execution — every caller of
+    # ``evaluations.engine.run_eval``, which is the eval-task drain, the span
+    # eval wrappers and the SDK evaluate path. Nothing else bounds those: the
+    # activity heartbeat is emitted by a timer rather than by progress, so a
+    # wedged eval keeps it beating. It cannot exceed the activity ceiling that
+    # has to contain it, or the activity would abandon runs the wall was still
+    # willing to allow. 0 disables the bound for a deployment whose
+    # evaluations legitimately run longer.
+    **_specs((("EVAL_RUN_WALL_SECONDS", 300, 0, RUN_ENTRY_CEILING_SECONDS),)),
 }
 
 INTERACTIVE_READ_SETTING_SPECS = {
@@ -979,10 +998,33 @@ def validate_interactive_read_settings(values: Mapping[str, Numeric]) -> None:
     )
 
 
+def validate_eval_execution_settings(values: Mapping[str, Numeric]) -> None:
+    """Validate the eval-execution knobs against the workflow's own ceilings.
+
+    The spec bounds already carry these relations, but they carry them as
+    literals a future edit can loosen one at a time. This checks the *resolved*
+    values against the mirrored constants, so loosening a bound alone is not
+    enough to ship a configuration that lets the sweep race a live worker.
+    """
+
+    _require_at_most(
+        values["EVAL_RUN_WALL_SECONDS"],
+        RUN_ENTRY_CEILING_SECONDS,
+        "the evaluation wall cannot exceed the run-entry activity ceiling",
+    )
+    _require_at_least(
+        values["EVAL_TASK_SWEEP_STALE_RUNNING_SECONDS"],
+        LONGEST_RUNNING_ENTRY_SECONDS + 1,
+        "the eval-task sweep's stale threshold must exceed a running entry's "
+        "longest legitimate life",
+    )
+
+
 def validate_runtime_numeric_settings(values: Mapping[str, Numeric]) -> None:
     validate_property_catalog_settings(values)
     validate_dataset_read_settings(values)
     validate_interactive_read_settings(values)
+    validate_eval_execution_settings(values)
     _require_at_most(
         values["PROPERTY_CATALOG_MAX_PAGE_SIZE"],
         values["DASHBOARD_METRICS_CATALOG_MAX_PAGE_SIZE"],
@@ -992,6 +1034,11 @@ def validate_runtime_numeric_settings(values: Mapping[str, Numeric]) -> None:
 
 def _require_at_most(left: Numeric, right: Numeric, message: str) -> None:
     if left > right:
+        raise ValueError(message)
+
+
+def _require_at_least(left: Numeric, right: Numeric, message: str) -> None:
+    if left < right:
         raise ValueError(message)
 
 

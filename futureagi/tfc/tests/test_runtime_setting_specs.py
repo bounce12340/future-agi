@@ -5,11 +5,14 @@ import pytest
 from tfc.settings.runtime_setting_specs import (
     DATASET_READ_SETTING_SPECS,
     INTERACTIVE_READ_SETTING_SPECS,
+    LONGEST_RUNNING_ENTRY_SECONDS,
     PROPERTY_CATALOG_RUNTIME_SETTING_SPECS,
+    RUN_ENTRY_CEILING_SECONDS,
     RUNTIME_NUMERIC_SETTING_SPECS,
     bounded_bulk_worst_case_query_count,
     load_numeric_settings,
     validate_dataset_read_settings,
+    validate_eval_execution_settings,
     validate_interactive_read_settings,
     validate_property_catalog_settings,
     validate_runtime_numeric_settings,
@@ -493,3 +496,48 @@ def test_interactive_default_page_sizes_cannot_exceed_their_maximum(
 
     with pytest.raises(ValueError):
         validate_interactive_read_settings(values)
+
+
+def test_eval_execution_settings_are_validated_as_a_group():
+    """Every other spec group declares a validator; the eval-execution group
+    was added without one, so nothing re-checked its relations against the
+    workflow ceilings they are derived from. The defaults must pass."""
+    values = load_numeric_settings(RUNTIME_NUMERIC_SETTING_SPECS, source={})
+
+    validate_eval_execution_settings(values)
+
+
+def test_an_evaluation_wall_above_the_activity_ceiling_is_rejected():
+    """Known positive: the gate has to fire on a value the spec bounds alone
+    would not catch if someone widened them, so it is called directly with the
+    resolved mapping rather than through parsing."""
+    values = load_numeric_settings(RUNTIME_NUMERIC_SETTING_SPECS, source={})
+    values["EVAL_RUN_WALL_SECONDS"] = RUN_ENTRY_CEILING_SECONDS + 1
+
+    with pytest.raises(ValueError, match="run-entry activity ceiling"):
+        validate_runtime_numeric_settings(values)
+
+
+def test_a_stale_threshold_that_can_race_a_live_worker_is_rejected():
+    """The same, for the sweep's stale threshold: at or below one running
+    entry's longest legitimate life the sweep requeues entries a worker is
+    still evaluating."""
+    values = load_numeric_settings(RUNTIME_NUMERIC_SETTING_SPECS, source={})
+    values["EVAL_TASK_SWEEP_STALE_RUNNING_SECONDS"] = LONGEST_RUNNING_ENTRY_SECONDS
+
+    with pytest.raises(ValueError, match="longest legitimate life"):
+        validate_runtime_numeric_settings(values)
+
+
+def test_the_declared_stale_threshold_range_cannot_race_a_live_worker():
+    """The bound an operator can actually reach. The old minimum was 600 s,
+    nine times below the floor, so a deployment configured anywhere in
+    600-5399 passed parsing and raced live workers while the invariant test
+    -- which read the running value -- still passed on the default."""
+    spec = RUNTIME_NUMERIC_SETTING_SPECS["EVAL_TASK_SWEEP_STALE_RUNNING_SECONDS"]
+
+    assert spec.minimum > LONGEST_RUNNING_ENTRY_SECONDS
+    with pytest.raises(ValueError, match="must be between"):
+        spec.parse(
+            "EVAL_TASK_SWEEP_STALE_RUNNING_SECONDS", LONGEST_RUNNING_ENTRY_SECONDS
+        )
