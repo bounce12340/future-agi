@@ -569,9 +569,23 @@ def _finish_deadline(state: _WalkState) -> ReadDeadline:
     """The analytics wall less what the search already spent.
 
     The users route starts no request-level deadline of its own, so the
-    walk's own start is the earliest moment this can be measured from. That
-    makes the whole page -- search under the page wall, then finish -- add up
-    to the analytics wall rather than to the page wall plus a fresh one.
+    walk's own start is the earliest timestamp this can be measured from
+    without threading a new parameter through the view and the manager. A
+    real request deadline would start EARLIER and so have LESS left by the
+    time materialisation runs; measuring from the walk gives a budget at
+    least as large as that, never smaller. What it is smaller than is the
+    fresh wall it replaces, which is the point: the whole page -- search
+    under the page wall, then finish -- adds up to the analytics wall
+    instead of to the page wall plus a further one.
+
+    In today's settings the difference is latent rather than live. Both
+    enrichment and the candidate replay cap their own statement timeouts at
+    ``USER_LIST_QUERY_TIMEOUT_MS`` / ``USER_LIST_ENRICHMENT_TIMEOUT_MS``
+    (8,000 ms each) and take the smaller of cap and remaining, so the
+    reachable worst case is about the page wall plus two capped statements
+    either way. This binding matters if the page wall is ever raised near
+    the analytics wall, and it is what stops a second full wall existing at
+    all.
     """
 
     spent = state.budget.deadline.elapsed_ms()

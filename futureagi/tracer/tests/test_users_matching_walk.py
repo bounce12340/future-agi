@@ -710,35 +710,62 @@ def test_every_walk_statement_carries_a_server_timeout_including_finish_mode():
 def test_finish_mode_does_not_start_a_second_full_wall_after_the_page_wall():
     """Search plus finish add up to the analytics wall, not past it.
 
-    Restarting the analytics wall at materialisation would let one page spend
-    the page wall and then a whole analytics wall after it, which is more
-    than the global wall the route is supposed to sit inside.
+    This asserts on the DEADLINE the walk builds, not on the timeout a
+    statement ends up carrying, and the difference is the whole point.
+    Enrichment and the candidate replay each cap their statement timeout at
+    8,000 ms and take the smaller of cap and remaining, so a statement
+    receives 8,000 whichever way finish mode is bound. A test that watched
+    the statements could not tell a restarted wall from this one, and would
+    pass against the very thing it exists to forbid.
     """
 
-    world = World()
-    world.user(1, key=minutes_before_end(3), raw=(minutes_before_end(3),))
+    import dataclasses
+    from types import SimpleNamespace
 
-    engine = Engine(world)
-    original = engine.execute_ch_query
-    timeouts: list[float | None] = []
+    def _state(spent_ms: float):
+        budget = walk._WalkBudget(
+            wall_ms=walk.USER_LIST_PAGE_WALL_MS,
+            max_statements=walk.USER_LIST_WALK_MAX_STATEMENTS,
+        )
+        # Rewind the start rather than sleeping: the walk reads elapsed time,
+        # and the deadline is frozen, so this replaces it with an older one.
+        budget.deadline = dataclasses.replace(
+            budget.deadline, started=budget.deadline.started - spent_ms / 1000.0
+        )
+        return SimpleNamespace(budget=budget)
 
-    def slow_then_record(query, params=None, timeout_ms=None, settings=None):
-        import time
+    # Nothing spent: the finish budget is the whole analytics wall.
+    assert (
+        abs(
+            walk._finish_deadline(_state(0)).total_ms
+            - walk.USER_LIST_WALK_FINISH_WALL_MS
+        )
+        <= 50
+    )
 
-        timeouts.append(timeout_ms)
-        if "candidate_users AS" in query:
-            time.sleep(0.15)
-        return original(query, params, timeout_ms, settings)
+    # Spent 1.2 s of search, and the finish budget must be shorter by that.
+    spent = 1_200
+    got = walk._finish_deadline(_state(spent)).total_ms
+    expected = walk.USER_LIST_WALK_FINISH_WALL_MS - spent
+    assert abs(got - expected) <= 100, (
+        f"finish budget {got} should be about {expected}; a wall restarted at "
+        f"materialisation reports the full {walk.USER_LIST_WALK_FINISH_WALL_MS}"
+    )
 
-    engine.execute_ch_query = slow_then_record
-    read, _engine = _page(world, page_size=25, engine=engine)
+    # The whole page is bounded by one analytics wall, not by the page wall
+    # plus another: spending the entire page wall still leaves less than the
+    # analytics wall for the finish.
+    exhausted = walk._finish_deadline(_state(walk.USER_LIST_PAGE_WALL_MS)).total_ms
+    assert (
+        exhausted
+        <= walk.USER_LIST_WALK_FINISH_WALL_MS - walk.USER_LIST_PAGE_WALL_MS + 100
+    )
 
-    assert _names(read) == ["user-1"]
-    finish = max(t for t in timeouts if t is not None)
-    # The search burned real time; the finish budget has to be SHORTER than a
-    # fresh wall by at least what it burned.
-    assert finish < walk.USER_LIST_WALK_FINISH_WALL_MS
-    assert finish > walk.USER_LIST_PAGE_WALL_MS
+    # And it never reaches zero, however long the search ran.
+    assert (
+        walk._finish_deadline(_state(walk.USER_LIST_WALK_FINISH_WALL_MS * 2)).total_ms
+        > 0
+    )
 
 
 def test_a_slice_that_fails_on_a_read_budget_is_retried_narrower_never_wider():
