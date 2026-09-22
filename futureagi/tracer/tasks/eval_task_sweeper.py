@@ -48,7 +48,10 @@ from django.db.models.functions import Cast
 from tfc.temporal.drop_in import temporal_activity
 from tracer.models.eval_task import EvalTask, EvalTaskStatus
 from tracer.models.observation_span import EvalEntryStatus, EvalLogger
-from tracer.services.eval_tasks.reaper import reap_stale_running
+from tracer.services.eval_tasks.reaper import (
+    effective_stale_seconds,
+    reap_stale_running,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -189,7 +192,11 @@ def recover_task(task: EvalTask, *, stale_running_seconds: int) -> dict:
 
     requeued, failed = reap_stale_running(
         task,
-        older_than_seconds=stale_running_seconds,
+        # A validated setting cannot be below the floor, but going through the
+        # same helper as the workflow's reap is what makes "no reap retires a
+        # claim a live run can still own" hold by construction rather than by a
+        # spec bound a later edit could loosen on its own.
+        older_than_seconds=effective_stale_seconds(stale_running_seconds),
         max_attempts=_MAX_ENTRY_ATTEMPTS,
     )
     outcome = {"requeued": requeued, "failed": failed, "restarted": False}

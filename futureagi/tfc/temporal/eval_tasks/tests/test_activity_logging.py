@@ -125,6 +125,7 @@ async def test_reap_logs_what_it_reclaimed(stub):
         lambda task_id, older_than_seconds, max_attempts: {
             "requeued": 4,
             "failed": 1,
+            "older_than_seconds": 5_401,
         },
     )
 
@@ -134,6 +135,12 @@ async def test_reap_logs_what_it_reclaimed(stub):
     line = _event(records, "eval_task_reaped")
     assert line["task_id"] == _TASK_ID
     assert (line["requeued"], line["failed"]) == (4, 1)
+    # The threshold the reap applied, not the one it was asked for: the
+    # workflow always asks for ReapInput's 600 s default and the activity
+    # raises it to the floor, so logging the input would report a window the
+    # reap never used.
+    assert line["older_than_seconds"] == 5_401
+    assert ReapInput(task_id=_TASK_ID).older_than_seconds == 600
 
 
 @pytest.mark.asyncio

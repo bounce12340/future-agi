@@ -180,19 +180,39 @@ def _reap_sync(task_id: str, older_than_seconds: int, max_attempts: int) -> dict
 
     Stale running entries go back to pending with ``attempts`` incremented;
     those already at ``max_attempts`` are marked errored so one poison row can't
-    loop forever. Returns ``{"requeued", "failed"}``. Called once at workflow
-    start to clear leftovers from a previous, crashed execution.
+    loop forever. Called once at workflow start to clear leftovers from a
+    previous, crashed execution.
+
+    The requested threshold is raised to ``MIN_STALE_RUNNING_SECONDS`` when it
+    is shorter. ``ReapInput``'s default is 600 s, which predates the write
+    fence and is inside the window an activity of a since-closed execution can
+    still be running in; a reap there requeues a live run and pays for it
+    twice. Applying the floor here rather than in the workflow keeps it out of
+    the replayed command stream — it is an activity-side decision, so an
+    execution that started before this change picks it up on its next reap.
+
+    Returns ``{"requeued", "failed", "older_than_seconds"}``, the last being the
+    threshold actually applied so the activity logs what it did, not what it
+    was asked for.
     """
     close_old_connections()
     try:
         from tracer.models.eval_task import EvalTask
-        from tracer.services.eval_tasks.reaper import reap_stale_running
+        from tracer.services.eval_tasks.reaper import (
+            effective_stale_seconds,
+            reap_stale_running,
+        )
 
+        stale_seconds = effective_stale_seconds(older_than_seconds)
         task = EvalTask.objects.get(id=task_id)
         requeued, failed = reap_stale_running(
-            task, older_than_seconds=older_than_seconds, max_attempts=max_attempts
+            task, older_than_seconds=stale_seconds, max_attempts=max_attempts
         )
-        return {"requeued": requeued, "failed": failed}
+        return {
+            "requeued": requeued,
+            "failed": failed,
+            "older_than_seconds": stale_seconds,
+        }
     finally:
         close_old_connections()
 
@@ -455,7 +475,7 @@ async def reap_stale_running_activity(input: ReapInput) -> ReapOutput:
         task_id=str(input.task_id),
         requeued=result["requeued"],
         failed=result["failed"],
-        older_than_seconds=input.older_than_seconds,
+        older_than_seconds=result["older_than_seconds"],
     )
     return ReapOutput(requeued=result["requeued"], failed=result["failed"])
 

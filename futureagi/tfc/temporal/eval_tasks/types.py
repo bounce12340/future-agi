@@ -87,6 +87,11 @@ class RunEntryOutput:
 @dataclass
 class ReapInput:
     task_id: str
+    # Left at 600 deliberately: this value is a workflow input, so changing it
+    # would change the payload of a command already recorded in the history of
+    # every open execution. The floor a reap must really honour is applied
+    # activity-side, in ``_reap_sync`` via
+    # ``tracer.services.eval_tasks.reaper.effective_stale_seconds``.
     older_than_seconds: int = 600
     max_attempts: int = 3
 

@@ -247,21 +247,74 @@ class TestFailEntryActivitySync:
 @pytest.mark.django_db(transaction=True)
 class TestReapActivitySync:
     def test_requeues_stale_running(self, eval_task, make_pending_entries):
+        from tracer.services.eval_tasks.reaper import MIN_STALE_RUNNING_SECONDS
+
         entries = make_pending_entries(eval_task, 2, status=EvalEntryStatus.RUNNING)
-        old = timezone.now() - timedelta(seconds=3600)
+        old = timezone.now() - timedelta(seconds=MIN_STALE_RUNNING_SECONDS + 60)
         EvalLogger.objects.filter(id__in=[e.id for e in entries]).update(
             updated_at=old, attempts=0
         )
         from tfc.temporal.eval_tasks.activities import _reap_sync
 
         out = _reap_sync(str(eval_task.id), 600, 3)
-        assert out == {"requeued": 2, "failed": 0}
+        assert out == {
+            "requeued": 2,
+            "failed": 0,
+            "older_than_seconds": MIN_STALE_RUNNING_SECONDS,
+        }
         assert (
             EvalLogger.objects.filter(
                 eval_task_id=str(eval_task.id), status=EvalEntryStatus.PENDING
             ).count()
             == 2
         )
+
+    def test_a_run_the_closed_execution_still_owns_survives_the_start_reap(
+        self, eval_task, make_pending_entries
+    ):
+        """The reap a restarted workflow runs first asks for ``ReapInput``'s
+        own default, 600 s.
+
+        Every restart carries it — Resume, Edit → Save, and the one the
+        scheduled sweep issues — and the sweep only ever restarts a task whose
+        execution has closed, which is precisely when an activity of that
+        execution can still be running on a worker for up to one start-to-close
+        attempt. Requeueing there re-claims an entry whose run is still
+        executing: the evaluation is paid for twice, one of the row's three
+        reclaims is spent, and the first run's result is refused by the fence.
+        """
+        from tfc.temporal.eval_tasks.activities import _reap_sync
+        from tfc.temporal.eval_tasks.types import ReapInput
+        from tracer.services.eval_tasks.reaper import MIN_STALE_RUNNING_SECONDS
+
+        asked = ReapInput(task_id=str(eval_task.id)).older_than_seconds
+        in_flight = make_pending_entries(eval_task, 1, status=EvalEntryStatus.RUNNING)[
+            0
+        ]
+        abandoned = make_pending_entries(eval_task, 1, status=EvalEntryStatus.RUNNING)[
+            0
+        ]
+        EvalLogger.objects.filter(id=in_flight.id).update(
+            updated_at=timezone.now() - timedelta(seconds=1_000), attempts=0
+        )
+        EvalLogger.objects.filter(id=abandoned.id).update(
+            updated_at=timezone.now()
+            - timedelta(seconds=MIN_STALE_RUNNING_SECONDS + 60),
+            attempts=0,
+        )
+
+        out = _reap_sync(str(eval_task.id), asked, 3)
+
+        assert asked == 600
+        in_flight.refresh_from_db()
+        abandoned.refresh_from_db()
+        assert (in_flight.status, in_flight.attempts) == (
+            EvalEntryStatus.RUNNING,
+            0,
+        )
+        assert (out["requeued"], out["failed"]) == (1, 0)
+        assert abandoned.status == EvalEntryStatus.PENDING
+        assert out["older_than_seconds"] == MIN_STALE_RUNNING_SECONDS
 
 
 @pytest.mark.integration
