@@ -412,3 +412,73 @@ def test_the_boundary_never_rises_within_one_instant(
     newer = (instant + timedelta(microseconds=1), floor_token)
     assert _published_order_sort_key(older) < _published_order_sort_key(incoming)
     assert _published_order_sort_key(newer) > _published_order_sort_key(incoming)
+
+
+@pytest.mark.unit
+def test_a_floor_below_the_incoming_boundary_at_one_instant_is_published() -> None:
+    """The reader's own clamp, driven through the reader.
+
+    The page arrives bounded at one instant and stops with a nameable keyset
+    at that SAME instant, at a token below the bound. Its floor is therefore a
+    descent WITHIN the instant and must be published: clamping it away would
+    hand back the bound this hop was given and re-read the rows it just
+    published. A clamp that compares instants alone cannot tell the two apart
+    and returns the incoming bound instead, which is what this asserts against.
+    """
+
+    from tracer.tests.test_bounded_trace_filter_reads import (
+        _WalledFakeExecutor,
+        _WideInitialSliceFakeBuilder,
+    )
+
+    instant = END - timedelta(minutes=30)
+    # Three seeds at one instant, all below the bound this hop is handed, and
+    # one of them ranked an hour earlier so the page cannot prove its prefix
+    # and stops at the wall with its keyset still at the instant.
+    seed_rows = [
+        {"id": "ccc", "start_time": instant},
+        {"id": "bbb", "start_time": instant},
+        {"id": "aaa", "start_time": instant},
+    ]
+    match_rows = [
+        {"id": "ccc", "start_time": instant},
+        {"id": "bbb", "start_time": instant},
+        {"id": "aaa", "start_time": instant - timedelta(hours=1)},
+    ]
+    builder = _WideInitialSliceFakeBuilder(
+        seed_rows,
+        start=_WINDOW_START,
+        end=END,
+        match_rows=match_rows,
+        recommended_batch_size=50,
+        recommended_seed_batch_size=200,
+    )
+    clock = _ManualMonotonic()
+    executor = _WalledFakeExecutor(
+        builder, clock=clock, durations_ms={"seed": 100, "match": 900}
+    )
+    with mock.patch("tracer.selectors.trace_filter_reads.monotonic", new=clock):
+        page = read_bounded_filter_page(
+            builder=builder,
+            analytics=executor,
+            filters=[_time_filter(_WINDOW_START, END)],
+            key_field="id",
+            page_number=0,
+            page_size=2,
+            deadline_ms=2_400,
+            max_seed_attempts=24,
+            max_candidates=200,
+            max_query_count=50,
+            classify_batch_size=50,
+            include_incomplete_rows=True,
+            bounded_continuation=True,
+            # The boundary this hop was handed: same instant, higher token.
+            cursor_start_time=instant,
+            cursor_order_token="mmm",
+        )
+
+    assert page.continuation_before_start_time == instant
+    assert page.continuation_before_id == "aaa"
+    # The floor descends within the instant, so it is what the page publishes.
+    assert page.continuation_published_order_floor == (instant, "aaa")
+    assert [row["id"] for row in page.rows] == ["ccc", "bbb"]
