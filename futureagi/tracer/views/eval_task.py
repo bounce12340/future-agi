@@ -1439,6 +1439,7 @@ def _eval_task_progress_by_id(tasks):
     task.  The root route can return a large page, so serialize that field from
     one grouped query instead of allowing a page-sized N+1 query pattern.
     """
+    from tracer.selectors.eval_tasks.progress import progress_block
 
     historical_ids = [
         str(task.id) for task in tasks if task.run_type == RunType.HISTORICAL
@@ -1456,25 +1457,15 @@ def _eval_task_progress_by_id(tasks):
     for row in rows:
         counts_by_task[str(row["eval_task_id"])][row["status"]] = row["n"]
 
-    progress_by_id = {}
-    for task_id in historical_ids:
-        counts = counts_by_task[task_id]
-        done = (
-            counts.get(EvalEntryStatus.COMPLETED, 0)
-            + counts.get(EvalEntryStatus.ERRORED, 0)
-            + counts.get(EvalEntryStatus.SKIPPED, 0)
-        )
-        remaining = counts.get(EvalEntryStatus.PENDING, 0) + counts.get(
-            EvalEntryStatus.RUNNING, 0
-        )
-        total = done + remaining
-        progress_by_id[task_id] = {
-            "dispatched": total,
-            "completed": done,
-            "missing": remaining,
-            "percent": round(100.0 * done / total, 2) if total else None,
-        }
-    return progress_by_id
+    # Same arithmetic as ``EvalTaskSerializer.get_progress``, from the shared
+    # selector: this route drops the serializer's ``progress`` field and
+    # refills it from here, so a second copy of the formula meant the two
+    # endpoints answered differently about the same task. They did: this one
+    # counted skipped rows as completed, so a task that skipped every row
+    # reported 100 % on the route that renders the task table.
+    return {
+        task_id: progress_block(counts_by_task[task_id]) for task_id in historical_ids
+    }
 
 
 class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):

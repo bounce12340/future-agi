@@ -359,27 +359,15 @@ class EvalTaskSerializer(serializers.ModelSerializer):
     def get_progress(self, obj):
         if obj.run_type != RunType.HISTORICAL:
             return None
-        from tracer.selectors.eval_tasks.progress import count_by_status
+        from tracer.selectors.eval_tasks.progress import (
+            count_by_status,
+            progress_block,
+        )
 
-        counts = count_by_status(obj)
-        # Skipped is neither done nor outstanding. The eval never ran — a mapped
-        # span attribute was absent, so the entry terminalized before any model
-        # call. Counting it as done made a task that skipped every row read
-        # "100% complete" with zero results; counting it as outstanding would
-        # make a finished task look stuck. It gets its own tally and stays in
-        # the total, which is how the task detail endpoint already reports it.
-        done = counts.get("completed", 0) + counts.get("errored", 0)
-        skipped = counts.get("skipped", 0)
-        remaining = counts.get("pending", 0) + counts.get("running", 0)
-        total = done + skipped + remaining
-        percent = round(100.0 * done / total, 2) if total else None
-        return {
-            "dispatched": total,
-            "completed": done,
-            "skipped": skipped,
-            "missing": remaining,
-            "percent": percent,
-        }
+        # The arithmetic lives in the selector because the root list route
+        # answers the same question from its own batched query; see
+        # ``progress_block`` for why skipped is counted apart.
+        return progress_block(count_by_status(obj))
 
     def validate_evals(self, value):
         if not value:
