@@ -225,13 +225,25 @@ def recover_task(task: EvalTask, *, stale_running_seconds: int) -> dict:
 
     requeued, failed = reap_stale_running(
         task,
-        # Through the same helper as the workflow's own reap, carrying the same
-        # evidence: the describe above just answered that no execution owns
-        # this task, so the configured threshold is used exactly rather than
-        # raised to the blind floor. At the shipped default (7,200 s) the two
-        # are the same number; what the flag buys is that an operator who
-        # lowers the setting gets the value they set, and that every reap in
-        # the product decides the floor in one function.
+        # Through the same helper as the workflow's own reap, carrying the
+        # same evidence: the describe above just answered that no execution
+        # owns this task, so the flag takes the branch that returns the
+        # configured threshold exactly instead of the one that raises it to
+        # the blind floor.
+        #
+        # What the flag does not do here is change this number. The other
+        # branch returns ``max(configured, MIN_STALE_RUNNING_SECONDS)``, and
+        # ``SWEEP_STALE_RUNNING_SECONDS`` declares its minimum as
+        # ``LONGEST_RUNNING_ENTRY_SECONDS + 1`` — that same floor — so the two
+        # branches agree at every value an operator can set. It is here to
+        # record the evidence at the one function every reap in the product
+        # decides the floor in, not to lower a threshold: no configurable
+        # value reaches a point where it would.
+        #
+        # It is also not what reclaims the entries this call leaves behind. If
+        # the restart below starts a fresh execution rather than coalescing
+        # onto a live one, that execution's own first reap describes again and
+        # applies ``ReapInput``'s 600 s.
         older_than_seconds=effective_stale_seconds(
             stale_running_seconds, workflow_confirmed_stopped=True
         ),
