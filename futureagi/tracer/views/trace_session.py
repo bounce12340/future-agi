@@ -3525,7 +3525,13 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
             # The selector proves page membership and whether another page
             # exists, but it may stop once that ordered prefix is proved.  Its
             # count is therefore a lower bound, not an exact full-window count.
-            public_chunk_complete = bounded_page.complete or cursor_has_more
+            # A page the reader did not finish is not made complete by the
+            # fact that it can be resumed. Carrying a cursor is what lets the
+            # caller continue; it is not evidence that this chunk is whole.
+            # Rule B makes a wall-stopped page the normal case on this route,
+            # so publishing it as complete would tell every caller that a
+            # short page is the whole answer.
+            public_chunk_complete = bounded_page.complete
             metadata.update(
                 {
                     "total_rows_is_lower_bound": True,
