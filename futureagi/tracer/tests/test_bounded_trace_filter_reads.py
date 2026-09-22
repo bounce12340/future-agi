@@ -17274,3 +17274,152 @@ def test_every_cursor_view_mints_its_partial_boundary_from_the_reader_floor() ->
             page_size=25,
         )
         assert restored.order == (order[0].replace(tzinfo=UTC), *order[1:])
+
+
+def _trace_view_cursor(
+    page: BoundedFilterPage,
+    rows: list[dict[str, Any]],
+    previous_cursor: Any,
+    *,
+    page_size: int,
+    window_start: datetime,
+) -> Any:
+    """Mint the next hop's cursor the way the TRACE view mints it.
+
+    The trace list is the route whose seed order token is a space of its own,
+    so it is the one that exercises the boundary instant. Drive its real
+    helper and the real signed codec: the token shape, the dropped scan fields
+    on a filled page and the floor on a checkpoint page all have to survive
+    the round trip for the next hop to resume where this one stopped.
+    """
+
+    from tracer.services.clickhouse.list_cursor import (
+        decode_list_cursor,
+        encode_list_cursor,
+    )
+    from tracer.views.trace import _trace_list_cursor_order_for_partial_page
+
+    order = _trace_list_cursor_order_for_partial_page(
+        rows=[{"trace_id": row["id"], "start_time": row["start_time"]} for row in rows],
+        bounded_page=page,
+        cursor_state=previous_cursor,
+        org_scope=False,
+    )
+    partial = not page.has_more
+    scope = {"organization_id": "org-a", "project_id": PROJECT_ID}
+    query = {"filters": "differing-token"}
+    token = encode_list_cursor(
+        resource="observe_traces",
+        scope=scope,
+        query=query,
+        page_size=page_size,
+        window_start=window_start,
+        window_end=END,
+        order=order,
+        seen_rows=(previous_cursor.seen_rows if previous_cursor else 0) + len(rows),
+        scan_slice_start=page.continuation_slice_start if partial else None,
+        scan_slice_end=page.continuation_slice_end if partial else None,
+        scan_before_start_time=(
+            page.continuation_before_start_time if partial else None
+        ),
+        scan_before_id=page.continuation_before_id if partial else None,
+    )
+    return decode_list_cursor(
+        token,
+        resource="observe_traces",
+        scope=scope,
+        query=query,
+        page_size=page_size,
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("match_count", [25, 26])
+def test_differing_token_hops_publish_every_match_through_a_real_cursor(
+    match_count: int,
+) -> None:
+    """The route with its own seed token, driven through its own cursor.
+
+    ``match_count`` straddles the page size deliberately. At the page size the
+    hop carries a checkpoint and publishes the floor beside it. One match more
+    and the page is FULL with matches left over: the view resumes at the last
+    published row and drops the scan checkpoint, so the walk re-descends from
+    that rank - more work, but the remainder is re-found rather than held.
+    Two rows share the boundary instant, which is the one the floor cannot
+    resolve in this token space, so the checkpoint has to re-read it.
+    """
+
+    page_size = 25
+    window_start = END - timedelta(hours=6)
+    rows = [
+        {"id": f"t{index:02d}", "start_time": END - timedelta(minutes=10 + index)}
+        for index in range(match_count)
+    ]
+    # Two rows at one instant: one of them will be the last classified seed.
+    rows[-1]["start_time"] = rows[-2]["start_time"]
+
+    published: list[str] = []
+    classified: set[str] = set()
+    cursor: Any = None
+    scan: dict[str, Any] = {}
+    filled_page_seen = False
+    for _ in range(24):
+        builder = _SeedTokenFakeBuilder(
+            rows,
+            start=window_start,
+            end=END,
+            match_rows=rows,
+            recommended_batch_size=50,
+            recommended_seed_batch_size=match_count,
+        )
+        clock = _ManualMonotonic()
+        executor = _SeedTokenFakeExecutor(
+            builder, clock=clock, durations_ms={"seed": 100, "match": 900}
+        )
+        with mock.patch("tracer.selectors.trace_filter_reads.monotonic", new=clock):
+            page = read_bounded_filter_page(
+                builder=builder,
+                analytics=executor,
+                filters=[_time_filter(window_start, END)],
+                key_field="id",
+                page_number=0,
+                page_size=page_size,
+                deadline_ms=2_400,
+                max_seed_attempts=24,
+                max_candidates=200,
+                max_query_count=50,
+                classify_batch_size=50,
+                include_incomplete_rows=True,
+                bounded_continuation=True,
+                cursor_start_time=cursor.order[0] if cursor is not None else None,
+                cursor_order_token=cursor.order[1] if cursor is not None else None,
+                **scan,
+            )
+        classified.update(
+            candidate
+            for query, params in executor.calls
+            if query == "match"
+            for candidate in params["candidate_ids"]
+        )
+        published.extend(row["id"] for row in page.rows)
+        filled_page_seen = filled_page_seen or page.has_more
+        if page.complete and not page.has_more:
+            break
+        cursor = _trace_view_cursor(
+            page,
+            list(page.rows),
+            cursor,
+            page_size=page_size,
+            window_start=window_start,
+        )
+        scan = {
+            "continuation_slice_start": cursor.scan_slice_start,
+            "continuation_slice_end": cursor.scan_slice_end,
+            "continuation_before_start_time": cursor.scan_before_start_time,
+            "continuation_before_id": cursor.scan_before_id,
+        }
+
+    assert classified == {row["id"] for row in rows}
+    assert sorted(published) == sorted(row["id"] for row in rows)
+    assert len(published) == len(set(published))
+    assert filled_page_seen is (match_count > page_size)
