@@ -376,15 +376,25 @@ def _span_cursor_order_for_partial_page(
             str(row.get("project_id", "")),
         )
 
-    if bounded_page.has_more and rows:
+    # There may be NO bounded page here. This route's cursor also serves an
+    # unbounded lane, whose call site passes ``bounded_page=None`` with rows in
+    # hand, so every read of it below is guarded: before the floor existed this
+    # function asked for rows first and reached the page only as a last resort.
+    if bounded_page is not None and bounded_page.has_more and rows:
         return _row_order(rows[-1])
-    floor = bounded_page.continuation_published_order_floor
+    floor = (
+        bounded_page.continuation_published_order_floor
+        if bounded_page is not None
+        else None
+    )
     if floor is not None:
         return bounded_filter_floor_order(floor, lowest_components=5)
     if rows:
         return _row_order(rows[-1])
     if cursor_state is not None:
         return tuple(cursor_state.order)
+    if bounded_page is None:
+        raise ValueError("span cursor page has no row and no checkpoint")
     # A checkpoint the reader could not name in result order: the pre-floor
     # expression of the scan position, reached only on a first page with no
     # rows and a keyset whose token is not the one this list publishes.

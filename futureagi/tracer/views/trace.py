@@ -411,9 +411,16 @@ def _trace_list_cursor_order_for_partial_page(
 ) -> tuple[Any, ...]:
     """Return a public boundary for a progressed empty transport page."""
 
-    if bounded_page.has_more and rows:
+    # Guarded for a missing page exactly as the span list's is: this function
+    # asked for rows before it asked the page anything until the floor was
+    # added, and a caller without a bounded page must not start crashing on it.
+    if bounded_page is not None and bounded_page.has_more and rows:
         return _trace_list_cursor_order_for_row(rows[-1], org_scope=org_scope)
-    floor = bounded_page.continuation_published_order_floor
+    floor = (
+        bounded_page.continuation_published_order_floor
+        if bounded_page is not None
+        else None
+    )
     if floor is not None:
         return bounded_filter_floor_order(
             floor, lowest_components=2 if org_scope else 1
@@ -422,6 +429,8 @@ def _trace_list_cursor_order_for_partial_page(
         return _trace_list_cursor_order_for_row(rows[-1], org_scope=org_scope)
     if cursor_state is not None:
         return tuple(cursor_state.order)
+    if bounded_page is None:
+        raise ValueError("trace cursor page has no row and no checkpoint")
     # A checkpoint the reader could not name in result order: the pre-floor
     # expression of the scan position, reached only on a first page with no
     # rows and a keyset whose token is not the one this list publishes.

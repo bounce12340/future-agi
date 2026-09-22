@@ -481,13 +481,19 @@ def _session_list_cursor_order_for_partial_page(*, rows, bounded_page, cursor_st
     oldest root, and not with the scan checkpoint, which is in seed order.
     """
 
-    if bounded_page.has_more and rows:
+    # Guarded for a missing page as the other two are, though this route's only
+    # call site passes one: the trap is the order of the tests, not the caller.
+    if bounded_page is not None and bounded_page.has_more and rows:
         last = rows[-1]
         return (
             last.get("start_time"),
             str(last.get("session_id") or ""),
         )
-    floor = bounded_page.continuation_published_order_floor
+    floor = (
+        bounded_page.continuation_published_order_floor
+        if bounded_page is not None
+        else None
+    )
     if floor is not None:
         return bounded_filter_floor_order(floor, lowest_components=1)
     if rows:
@@ -498,6 +504,8 @@ def _session_list_cursor_order_for_partial_page(*, rows, bounded_page, cursor_st
         )
     if cursor_state is not None:
         return tuple(cursor_state.order)
+    if bounded_page is None:
+        raise RuntimeError("session continuation has no stable order boundary")
     # A checkpoint the reader could not name in result order, on a first page:
     # fall back to the scan position, which is what this route published before
     # the floor existed. It is in seed order, so it is an approximation, and it
