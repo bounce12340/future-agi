@@ -332,10 +332,7 @@ def test_public_request_checks_do_not_become_owned_metadata_statement_caps(
 ):
     from tracer.services.clickhouse import graph_dispatch as dispatch
     from tracer.services.clickhouse import read_budget
-    from tracer.tests.test_graph_public_source_routing import (
-        RecordingAnalytics,
-        eval_filters,
-    )
+    from tracer.tests.test_graph_public_source_routing import eval_filters
 
     pg, lookups = install()
     pg.clock = 0.0
@@ -376,10 +373,7 @@ def test_public_expiry_skips_or_discards_ownership_without_background_grant(
 ):
     from tracer.services.clickhouse import graph_dispatch as dispatch
     from tracer.services.clickhouse import read_budget
-    from tracer.tests.test_graph_public_source_routing import (
-        RecordingAnalytics,
-        eval_filters,
-    )
+    from tracer.tests.test_graph_public_source_routing import eval_filters
 
     pg, lookups = install(
         outer=outer,
