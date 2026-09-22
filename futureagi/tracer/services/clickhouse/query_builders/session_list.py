@@ -31,10 +31,12 @@ from tracer.services.clickhouse.query_builders.filter_seed_witness import (
     witness_envelope_sql,
 )
 from tracer.services.clickhouse.query_builders.filters import (
+    BooleanMetaFilterShapeError,
     ClickHouseFilterBuilder,
     boolean_meta_presence_condition,
     build_numeric_filter_predicate,
     parse_boolean_meta_filter,
+    resolve_boolean_meta_value,
 )
 from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
     _attribute_plan,
@@ -410,6 +412,15 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         produced a finite session batch, because those sessions imply a finite
         set of tenant/window-scoped root trace IDs.  Keep this parser deliberately
         strict so malformed or newly introduced relational shapes fail closed.
+
+        The *operator* gate is deliberately narrower than the published boolean
+        vocabulary: only a literal ``equals`` is admitted here, because the
+        presence operators have no finite latest-state compiler on this lane.
+        The *value* half is not this builder's to own, so it is resolved by
+        :func:`resolve_boolean_meta_value`, the one rule the list, graph and
+        dashboard compilers already reach.  The operator is passed as the
+        literal this gate just proved, so the shared rule cannot widen what
+        this lane accepts.
         """
 
         values: list[bool] = []
@@ -428,15 +439,10 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             if str(filter_type or "").lower() != "boolean" or filter_op != "equals":
                 raise ValueError("invalid has_eval session filter")
             raw_value = config.get("filter_value", config.get("filterValue", missing))
-            if isinstance(raw_value, bool):
-                value = raw_value
-            elif isinstance(raw_value, str) and raw_value.strip().lower() in {
-                "true",
-                "false",
-            }:
-                value = raw_value.strip().lower() == "true"
-            else:
-                raise ValueError("invalid has_eval session filter")
+            try:
+                value = resolve_boolean_meta_value("has_eval", raw_value, "equals")
+            except BooleanMetaFilterShapeError as exc:
+                raise ValueError("invalid has_eval session filter") from exc
             values.append(value)
         return tuple(values)
 
