@@ -2744,6 +2744,38 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             self.project_ids is not None
         )
 
+    # The binding a raised candidate floor moves. Only the root scan reads it;
+    # the token is what a statement that HAS a root scan renders and a fused
+    # statement does not.
+    _CANDIDATE_ROOT_SCAN_FLOOR_TOKEN = "%(candidate_root_scan_start_us)s"
+
+    def candidate_slice_narrows_root_scan(self) -> bool:
+        """Whether a raised floor changes what the candidate statement reads.
+
+        ``build_candidate_cursor_page_query`` binds the floor into
+        ``candidate_root_scan_start_us`` and the root scan is the only scan
+        that reads it. On the user-detail scalar route there is no root scan
+        to read it: ``_candidate_session_ctes`` fuses root-ness into the
+        all-span replay that the user's own sessions seed and returns before
+        the root CTEs are emitted, so a "slice" of that statement is the
+        unsliced statement byte for byte and reads the same rows. Measured on
+        the high-volume tenant through the view's own entry point at three,
+        six and twelve months: eleven or twelve density probes and one or two
+        "slices" around the unsliced statement, every candidate statement
+        reading the same 7.1-7.4 M rows, 4.3-6.9 s of page wall for a page
+        the unsliced statement alone answered in 1.3-1.8 s warm.
+
+        The question is put to the rendered statement rather than to a copy
+        of the route condition: whichever route the builder takes, a statement
+        whose text carries the floor binding is one the floor narrows, and a
+        statement whose text does not is one it cannot. The render has no
+        side effect the caller can see - the statement binds into its own
+        copy of ``params`` - and is Python only.
+        """
+
+        query, _params = self.build_candidate_cursor_page_query()
+        return self._CANDIDATE_ROOT_SCAN_FLOOR_TOKEN in query
+
     def build_candidate_cursor_page_query(
         self,
         *,
