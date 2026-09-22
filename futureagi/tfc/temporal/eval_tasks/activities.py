@@ -130,8 +130,19 @@ def _fail_entry_sync(entry_id: str) -> dict:
     ``run_entry`` self-converges for eval failures, so an activity reaching this
     path failed at the infra level, not the eval level. Only a still-running
     entry is touched, and only under the claim this read saw, so a late failure
-    can't clobber a result that completed, a Delete & rerun that soft-deleted
-    the entry, or a claim the reaper handed to another worker in the meantime.
+    can't clobber a result that completed or a Delete & rerun that soft-deleted
+    the entry, and cannot race a claim taken between this read and its write.
+
+    The failed run's own claim is not available here -- the activity is handed
+    an entry id, the same reason ``run_entry``'s fence cannot see a claim
+    superseded before it began -- so this is a fence on the current claim, not
+    a check that the row is still the one that failed. What keeps those apart
+    from each other is upstream: the scheduled sweep asks Temporal before it
+    reaps, so no reaper retires the claim of a task whose workflow is still
+    progressing (``tracer.tasks.eval_task_sweeper.recover_task``).
+
+    Returns ``"noop"`` when it wrote nothing, so the caller never records a
+    terminal outcome the entry table did not take.
     """
     close_old_connections()
     try:
@@ -146,7 +157,7 @@ def _fail_entry_sync(entry_id: str) -> dict:
         if entry is None:
             return {"entry_id": str(entry_id), "status": "noop"}
         config = CustomEvalConfig.objects.get(id=entry.custom_eval_config_id)
-        mark_terminal(
+        landed = mark_terminal(
             entry,
             EvalEntryStatus.ERRORED,
             config_hash=resolved_config_hash(config),
@@ -156,6 +167,8 @@ def _fail_entry_sync(entry_id: str) -> dict:
             # ``running_entry_epoch`` scope, so it fences on its own read.
             epoch=entry.updated_at,
         )
+        if not landed:
+            return {"entry_id": str(entry_id), "status": "noop"}
         return {"entry_id": str(entry_id), "status": str(EvalEntryStatus.ERRORED)}
     finally:
         close_old_connections()

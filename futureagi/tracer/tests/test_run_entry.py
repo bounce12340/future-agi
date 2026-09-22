@@ -406,16 +406,59 @@ class TestOneClaimIsOneEvaluation:
                     {"eval_explanation": "stale worker result", "error": False}
                 )
 
+        reseeded = []
         monkeypatch.setattr(
             "tracer.services.eval_tasks.run_entry._run_for_target",
             _reaped_then_reclaimed,
         )
+        monkeypatch.setattr(
+            "tracer.services.eval_tasks.run_entry._reseed_eval_clustering",
+            lambda *a, **k: reseeded.append(1),
+        )
 
-        run_entry(entry)
+        # The refused write is the run's outcome, so it has to be what the run
+        # reports. Returning a terminal status here would tell the workflow --
+        # and the operator reading ``eval_task_entry_run`` -- that this entry
+        # completed, when the row is another claim's and holds no result of
+        # ours; the clustering seed would likewise fire on that row's state.
+        assert run_entry(entry) == "reclaimed"
 
+        assert reseeded == []
         entry.refresh_from_db()
         assert entry.status == EvalEntryStatus.RUNNING
         assert entry.eval_explanation != "stale worker result"
+
+    def test_a_terminalization_refused_mid_run_is_reported_as_a_reclaim(
+        self, observation_span, custom_eval_config, eval_task, monkeypatch
+    ):
+        """Same for the failure branches: an eval that raised under a claim the
+        row no longer carries has produced nothing for this entry, so it cannot
+        report ``errored`` either -- and must not spend one of the entry's three
+        reclaims on a row it does not own."""
+        from tracer.services.eval_tasks.entries import claim_pending_batch
+        from tracer.services.eval_tasks.reaper import reap_stale_running
+
+        entry = self._claimed_entry(
+            eval_task, observation_span, custom_eval_config, age=10_800
+        )
+
+        def _reaped_then_raised(*_a, **_k):
+            assert reap_stale_running(
+                eval_task, older_than_seconds=0, max_attempts=3
+            ) == (1, 0)
+            assert len(claim_pending_batch(eval_task, 1)) == 1
+            raise ValueError("eval blew up")
+
+        monkeypatch.setattr(
+            "tracer.services.eval_tasks.run_entry._run_for_target",
+            _reaped_then_raised,
+        )
+
+        assert run_entry(entry) == "reclaimed"
+
+        entry.refresh_from_db()
+        assert entry.status == EvalEntryStatus.RUNNING
+        assert entry.error_message != "eval blew up"
 
     def test_an_entry_requeued_before_its_run_started_is_not_evaluated(
         self, observation_span, custom_eval_config, eval_task, monkeypatch

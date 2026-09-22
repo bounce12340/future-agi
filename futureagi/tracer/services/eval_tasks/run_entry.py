@@ -32,15 +32,24 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# The run produced nothing for this entry: the row left RUNNING, or the claim
+# the run was writing under is no longer the row's, so every write it made was
+# refused. Distinct from a terminal status because it is not one -- the entry
+# belongs to whoever holds it now, and the drain must not report a verdict, a
+# spent attempt or a clustering seed for a row it does not own.
+RECLAIMED = "reclaimed"
+
 
 def run_entry(entry: EvalLogger) -> str:
     """Run the eval for one entry and record its terminal status; returns it.
 
     No-op (returns ``"deleted"``) if the entry was soft-deleted mid-run — a
-    Delete & rerun landing while it ran, or ``"reclaimed"`` if the claim this
-    activity was scheduled for is no longer the row's. Eval/data failures
-    converge to a terminal state; infrastructure read failures propagate to the
-    activity's bounded retry policy.
+    Delete & rerun landing while it ran, or ``"reclaimed"`` if the row is no
+    longer under the claim this run took: refused before the eval when the row
+    has left RUNNING, and after it when the terminal write is fenced out by a
+    claim taken in the meantime. Eval/data failures converge to a terminal
+    state; infrastructure read failures propagate to the activity's bounded
+    retry policy.
     """
     fresh = EvalLogger.objects.filter(id=entry.id).first()
     if fresh is None:
@@ -66,14 +75,14 @@ def run_entry(entry: EvalLogger) -> str:
     # the claim epoch through ClaimBatchOutput -> RunEntryInput would close it
     # at the fence itself; that is a wire-format change and its own decision.
     if fresh.status != EvalEntryStatus.RUNNING:
-        return "reclaimed"
+        return RECLAIMED
     run_epoch = timezone.now()
     if not EvalLogger.objects.filter(
         id=fresh.id,
         status=EvalEntryStatus.RUNNING,
         updated_at=fresh.updated_at,
     ).update(updated_at=run_epoch):
-        return "reclaimed"
+        return RECLAIMED
     fresh.updated_at = run_epoch
 
     config = CustomEvalConfig.objects.select_related("project").get(
@@ -100,7 +109,7 @@ def run_entry(entry: EvalLogger) -> str:
         except Exception as e:  # Every failure becomes a terminal state.
             skipped_reason = getattr(e, "skipped_reason", None)
             if skipped_reason:
-                mark_terminal(
+                landed = mark_terminal(
                     fresh,
                     EvalEntryStatus.SKIPPED,
                     config_hash=config_hash,
@@ -108,9 +117,9 @@ def run_entry(entry: EvalLogger) -> str:
                     skipped_reason=skipped_reason,
                     epoch=run_epoch,
                 )
-                return EvalEntryStatus.SKIPPED
+                return EvalEntryStatus.SKIPPED if landed else RECLAIMED
             logger.warning("run_entry failed for %s: %s", fresh.id, e, exc_info=True)
-            mark_terminal(
+            landed = mark_terminal(
                 fresh,
                 EvalEntryStatus.ERRORED,
                 config_hash=config_hash,
@@ -118,7 +127,7 @@ def run_entry(entry: EvalLogger) -> str:
                 error_message=str(e),
                 epoch=run_epoch,
             )
-            return EvalEntryStatus.ERRORED
+            return EvalEntryStatus.ERRORED if landed else RECLAIMED
 
         if wall_timeouts:
             # The evaluation core catches everything around the model call and
@@ -136,7 +145,12 @@ def run_entry(entry: EvalLogger) -> str:
     # Explicit rather than scoped: this call is outside ``running_entry_epoch``,
     # and the refresh above has already replaced ``fresh.updated_at`` with
     # whatever the row now carries — which, after a reclaim, is someone else's.
-    mark_terminal(fresh, status, config_hash=config_hash, epoch=run_epoch)
+    if not mark_terminal(fresh, status, config_hash=config_hash, epoch=run_epoch):
+        # The status was read off a row this run no longer owns, and the
+        # refreshed instance carries the re-claimer's state — so it is not this
+        # run's verdict to report, and seeding clustering from it would cluster
+        # another claim's result.
+        return RECLAIMED
     if status == EvalEntryStatus.COMPLETED:
         _reseed_eval_clustering(fresh, config.project_id)
     return status
@@ -150,9 +164,12 @@ def _fail_timed_out(
     Errored once, with the real reason rather than the engine's generic wrapper,
     and one attempt spent: the run really happened and really cost something, so
     a row that keeps timing out must converge on the poison cap instead of being
-    retried without limit by a later requeue.
+    retried without limit by a later requeue. Unless the claim moved while it
+    ran — then the attempt belongs to a row this run no longer owns, and
+    spending one of its three reclaims is exactly the double charge the fence
+    exists to stop.
     """
-    mark_terminal(
+    landed = mark_terminal(
         entry,
         EvalEntryStatus.ERRORED,
         config_hash=config_hash,
@@ -161,7 +178,7 @@ def _fail_timed_out(
         count_attempt=True,
         epoch=epoch,
     )
-    return EvalEntryStatus.ERRORED
+    return EvalEntryStatus.ERRORED if landed else RECLAIMED
 
 
 def _reseed_eval_clustering(entry: EvalLogger, project_id) -> None:

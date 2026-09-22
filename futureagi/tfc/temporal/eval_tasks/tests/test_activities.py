@@ -177,6 +177,74 @@ class TestRunEntryActivitySync:
 
 @pytest.mark.integration
 @pytest.mark.django_db(transaction=True)
+class TestFailEntryActivitySync:
+    """The fail activity is the last write of a run that could not finish.
+
+    It is handed an entry id and nothing else, so the only claim it can fence
+    on is the one its own read saw. That closes exactly one window -- between
+    that read and its write -- and nothing else covered it: deleting the
+    ``epoch=`` argument left every module in this change green.
+    """
+
+    @staticmethod
+    def _running_entry(eval_task, make_pending_entries):
+        [entry] = make_pending_entries(eval_task, 1, status=EvalEntryStatus.RUNNING)
+        return entry
+
+    def test_a_run_that_exhausted_its_retries_is_errored_once(
+        self, monkeypatch, eval_task, make_pending_entries
+    ):
+        import tfc.temporal.eval_tasks.activities as act
+
+        entry = self._running_entry(eval_task, make_pending_entries)
+        monkeypatch.setattr(act, "close_old_connections", lambda: None)
+
+        out = act._fail_entry_sync(str(entry.id))
+
+        entry.refresh_from_db()
+        assert out == {"entry_id": str(entry.id), "status": EvalEntryStatus.ERRORED}
+        assert entry.status == EvalEntryStatus.ERRORED
+        assert entry.error_message == "run_entry activity failed after retries"
+
+    def test_a_claim_that_moved_under_the_read_refuses_the_write_and_says_so(
+        self, monkeypatch, eval_task, make_pending_entries
+    ):
+        """The write is fenced on the stamp the read saw, so a claim that moved
+        in between -- the row re-stamped by a run that started, or retired and
+        re-taken -- keeps its own state instead of being stamped ERRORED under
+        a message describing somebody else's run. The activity has to report
+        that it wrote nothing, or the workflow records a terminal outcome the
+        entry table never took.
+
+        The concurrent re-stamp is driven from ``resolved_config_hash``, which
+        runs between the read and the write on the real path.
+        """
+        import tfc.temporal.eval_tasks.activities as act
+        import tracer.services.eval_tasks.config_hash as config_hash_module
+
+        entry = self._running_entry(eval_task, make_pending_entries)
+        monkeypatch.setattr(act, "close_old_connections", lambda: None)
+        moved_to = timezone.now() + timedelta(seconds=1)
+        real_hash = config_hash_module.resolved_config_hash
+
+        def _restamp_then_hash(config):
+            EvalLogger.objects.filter(id=entry.id).update(updated_at=moved_to)
+            return real_hash(config)
+
+        monkeypatch.setattr(
+            config_hash_module, "resolved_config_hash", _restamp_then_hash
+        )
+
+        out = act._fail_entry_sync(str(entry.id))
+
+        entry.refresh_from_db()
+        assert out == {"entry_id": str(entry.id), "status": "noop"}
+        assert entry.status == EvalEntryStatus.RUNNING
+        assert entry.error_message != "run_entry activity failed after retries"
+
+
+@pytest.mark.integration
+@pytest.mark.django_db(transaction=True)
 class TestReapActivitySync:
     def test_requeues_stale_running(self, eval_task, make_pending_entries):
         entries = make_pending_entries(eval_task, 2, status=EvalEntryStatus.RUNNING)
