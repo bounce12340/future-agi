@@ -369,6 +369,26 @@ class TestSweepActivity:
         assert result["restarted"] == 0
         assert temporal["started"] == []
 
+    def test_the_sweep_can_be_turned_off_without_a_deploy_of_its_own(
+        self, make_task, make_entry, temporal, settings
+    ):
+        """A Temporal pause is the immediate lever but not a durable one:
+        ``register_temporal_schedules`` runs on every backend container start
+        and rebuilds each schedule's state from config, so the pause is undone
+        by the next deploy, restart or scale-up. The setting is the rollback
+        that survives one, and it has to report itself — an operator must be
+        able to tell a disabled sweep from a fleet with nothing stranded."""
+        task = make_task()
+        make_entry(task)
+
+        settings.EVAL_TASK_SWEEP_MAX_TASKS = 0
+        result = sweeper.sweep_stranded_eval_tasks._original_func()
+
+        assert result["disabled"] is True
+        assert result["candidates"] == 0
+        assert temporal["described"] == []
+        assert temporal["started"] == []
+
     def test_one_tasks_failure_does_not_cost_the_others_their_recovery(
         self, make_task, make_entry, temporal, monkeypatch
     ):

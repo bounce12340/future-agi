@@ -25,6 +25,11 @@ Per tick, bounded and idempotent:
 evaluation calls on work their owner stopped on purpose. ``failed`` is out of
 scope for the same reason and is opt-in through
 ``EVAL_TASK_SWEEP_RECOVER_FAILED``; the Resume button recovers one explicitly.
+
+``EVAL_TASK_SWEEP_MAX_TASKS=0`` disables the sweep. That is the rollback that
+survives a restart: pausing the schedule in Temporal takes effect at once but
+is undone by the next backend container start, which re-registers every
+schedule with its state rebuilt from config.
 """
 
 from __future__ import annotations
@@ -186,9 +191,25 @@ def sweep_stranded_eval_tasks():
     ``max_retries=0``: the next tick recovers a sweep-level failure, and one
     task's failure (a Temporal describe against an unreachable service, say)
     must not cost the others their recovery.
+
+    ``EVAL_TASK_SWEEP_MAX_TASKS=0`` turns the sweep off. It reports that as its
+    own event rather than as an empty tick, because "disabled" and "nothing is
+    stranded" are the two readings an operator has to tell apart, and this job
+    only ever speaks in counts.
     """
+    limit = int(settings.EVAL_TASK_SWEEP_MAX_TASKS)
+    if limit <= 0:
+        logger.info("eval_task_sweep_disabled")
+        return {
+            "candidates": 0,
+            "restarted": 0,
+            "entries_requeued": 0,
+            "entries_poisoned": 0,
+            "errors": 0,
+            "disabled": True,
+        }
     stale_running_seconds = int(settings.EVAL_TASK_SWEEP_STALE_RUNNING_SECONDS)
-    tasks = find_stranded_tasks()
+    tasks = find_stranded_tasks(limit=limit)
     restarted = requeued = poisoned = errors = 0
     for task in tasks:
         try:
@@ -206,6 +227,7 @@ def sweep_stranded_eval_tasks():
         "entries_requeued": requeued,
         "entries_poisoned": poisoned,
         "errors": errors,
+        "disabled": False,
     }
     logger.info("eval_task_sweep_completed", **result)
     return result
