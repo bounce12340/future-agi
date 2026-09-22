@@ -232,6 +232,18 @@ class BoundedFilterPage:
     continuation_slice_start: datetime | None = None
     continuation_before_start_time: datetime | None = None
     continuation_before_id: Any = None
+    # The public order boundary this page PROVES, in result-order space: every
+    # match at or above it is published here, and nothing the walk has still to
+    # find can reach it. The scan checkpoint above is in SEED order, which for
+    # a route whose rank can lag its seed (a session ranked by its oldest live
+    # root, a trace whose canonical root is older than a tombstoned newer one)
+    # is a different axis - so a caller that mints its exclusive cursor bound
+    # from the checkpoint, or from the last row of a page it never proved,
+    # claims a prefix that does not exist. A caller publishes this, verbatim,
+    # as the boundary of a checkpoint-carrying page. ``None`` on a complete
+    # page and on any page with no committed checkpoint. The second element is
+    # the order token, or ``None`` for "below every token at that time".
+    continuation_published_order_floor: tuple[datetime, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -1041,6 +1053,14 @@ def read_bounded_filter_page(
         and not callable(ordered_seed_builder)
     ):
         raise ValueError("unsafe cursor seeds require an ordered seed builder")
+    # A builder that does not spell a seed order token keysets on the very
+    # tuple it publishes, so a scan position and a published row are directly
+    # comparable, ties included. One that does keysets on a physical row -
+    # a matched span, a raw root - whose token says nothing about where the
+    # public row sorts, so only the time component of the two is comparable.
+    seed_and_result_share_order_token = not callable(
+        getattr(builder, "bounded_filter_seed_order_token", None)
+    )
     if request_start >= request_end:
         return BoundedFilterPage(
             rows=[],
@@ -4097,6 +4117,65 @@ def read_bounded_filter_page(
         rollback_unhydrated_page()
 
     ordered_matches = sorted(matched_by_id.values(), key=result_row_key, reverse=True)
+
+    # THE PUBLICATION FLOOR, and the reason a checkpoint-carrying page is
+    # ordered as well as exact.
+    #
+    # The walk descends in SEED order and publishes in RESULT order, and on
+    # several routes those are different axes: a session is DISCOVERED by any
+    # of its roots and RANKED by its oldest one, and a trace whose newest raw
+    # root was tombstoned is ranked by an older canonical root. The seed key is
+    # an upper bound on the rank, never the rank itself. So after the scan has
+    # committed position ``P``, what the walk knows is this: every row whose
+    # seed key is above ``P`` has been classified, and every row it has still
+    # to find ranks at or below ``P``, because a row is reachable by its own
+    # rank. Only the matches ranked at or above ``P`` are therefore in their
+    # final position; one ranked below it can still be outranked by a row this
+    # hop never saw.
+    #
+    # A complete page proves its whole prefix and needs none of this. An
+    # unfinished one publishes the ordered part and holds the rest, which is
+    # not loss: a held row's rank IS one of its own seeds, below ``P``, so the
+    # descent still reaches it and publishes it in its true position. Nothing
+    # is published twice, because "published" is now exactly "ranked at or
+    # above ``P``" - the claim a continuation's exclusive bound already makes
+    # and, before this floor existed, made falsely. The previous behaviour
+    # published the out-of-order row, minted the bound from it, and then
+    # discarded every later match that outranked it while advancing the
+    # checkpoint past its seeds, so those rows left the list for good.
+    #
+    # Where seed and result order agree - the span list, every route that
+    # keysets on the rows it publishes - every match found is already at or
+    # above ``P`` and this filter removes nothing.
+    published_order_floor: tuple[datetime, Any] | None = None
+    if bounded_continuation and not page_complete and continuation_progressed:
+        if safe_before_start_time is not None:
+            # An in-slice keyset is exclusive: the row at the keyset itself was
+            # consumed. Its token is comparable to a result token only when the
+            # builder keysets on its published order; otherwise compare on time
+            # alone and give up the boundary microsecond rather than compare
+            # two different token spaces.
+            published_order_floor = (
+                (safe_before_start_time, safe_before_id)
+                if seed_and_result_share_order_token
+                else (safe_before_start_time + timedelta(microseconds=1), None)
+            )
+        elif safe_slice_end is not None:
+            # An exhausted slice is half-open: everything at or after its end
+            # is consumed, so the whole boundary microsecond is publishable.
+            published_order_floor = (safe_slice_end, None)
+    if published_order_floor is not None:
+        floor_time, floor_token = published_order_floor
+        ordered_matches = [
+            row
+            for row in ordered_matches
+            if (
+                result_row_key(row) >= (floor_time, floor_token)
+                if floor_token is not None
+                else result_row_key(row)[0] >= floor_time
+            )
+        ]
+
     offset = page_number * page_size
     has_more = len(ordered_matches) > offset + page_size
     page_rows = (
@@ -4199,6 +4278,7 @@ def read_bounded_filter_page(
             if bounded_continuation and not page_complete and continuation_progressed
             else None
         ),
+        continuation_published_order_floor=published_order_floor,
     )
 
 

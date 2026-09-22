@@ -80,7 +80,19 @@ def _bounded_page(
     continuation_slice_end: datetime | None = None,
     continuation_before_start_time: datetime | None = None,
     continuation_before_id: str | None = None,
+    continuation_published_order_floor: tuple | None = None,
 ) -> BoundedFilterPage:
+    if continuation_published_order_floor is None and (
+        not complete and continuation_slice_end is not None
+    ):
+        # The selector commits a publication floor with every checkpoint it
+        # commits, and the session builder keysets on the order it publishes,
+        # so a checkpoint without a floor is not a reachable page.
+        continuation_published_order_floor = (
+            (continuation_before_start_time, continuation_before_id)
+            if continuation_before_start_time is not None
+            else (continuation_slice_end, None)
+        )
     return BoundedFilterPage(
         rows=list(rows or []),
         has_more=has_more,
@@ -96,6 +108,7 @@ def _bounded_page(
         continuation_slice_end=continuation_slice_end,
         continuation_before_start_time=continuation_before_start_time,
         continuation_before_id=continuation_before_id,
+        continuation_published_order_floor=continuation_published_order_floor,
     )
 
 
@@ -405,20 +418,41 @@ def test_session_partial_page_cursor_uses_canonical_order_not_stale_rollup():
     raw_session_id = str(uuid.uuid4())
     canonical_session_id = str(uuid.uuid4())
 
+    rows = [
+        {
+            "session_id": canonical_session_id,
+            "start_time": exact_start,
+            "_seed_order_start": seed_start,
+            "_seed_order_id": raw_session_id,
+        }
+    ]
+
+    # A page that filled its prefix and left matches over resumes at its last
+    # published row, in the classified order, never at the raw seed rollup.
     order = _session_list_cursor_order_for_partial_page(
-        rows=[
-            {
-                "session_id": canonical_session_id,
-                "start_time": exact_start,
-                "_seed_order_start": seed_start,
-                "_seed_order_id": raw_session_id,
-            }
-        ],
-        bounded_page=SimpleNamespace(),
+        rows=rows,
+        bounded_page=SimpleNamespace(
+            has_more=True,
+            continuation_published_order_floor=None,
+        ),
         cursor_state=None,
     )
 
     assert order == (exact_start, canonical_session_id)
+
+    # A page stopped at its wall resumes at the boundary the selector proves,
+    # which is the only value that makes the next hop's exclusive bound true.
+    floor_start = datetime(2026, 8, 20, 6, 0)
+    checkpoint_order = _session_list_cursor_order_for_partial_page(
+        rows=rows,
+        bounded_page=SimpleNamespace(
+            has_more=False,
+            continuation_published_order_floor=(floor_start, raw_session_id),
+        ),
+        cursor_state=None,
+    )
+
+    assert checkpoint_order == (floor_start, raw_session_id)
 
 
 @pytest.mark.unit
@@ -1780,3 +1814,145 @@ def test_string_page_public_dispatch_and_old_order_token(org, cursor, kind, pref
                 view, request, validated_data={**data, "cursor": token}, **kwargs
             )
         analytics.execute_ch_query.assert_not_called()
+
+
+@pytest.mark.unit
+def test_wall_stopped_session_hops_advance_the_public_bound_to_each_floor():
+    """Each wall-stopped hop hands out the boundary its own scan proved.
+
+    A hop that publishes nothing used to re-hand the bound it was given, and a
+    hop that published one row handed out that row's rank. Neither is a fact
+    about the scan: on this route a session is ranked by its oldest root and
+    discovered by any of them, so the published rank sits arbitrarily far below
+    the position the walk reached. The next hop then classified sessions that
+    outranked the bound, dropped every one of them as "already published", and
+    advanced its checkpoint past their seeds - so they left the list for good.
+    The bound has to descend with the floor instead.
+    """
+
+    from tracer.views.trace_session import TraceSessionView
+
+    view, request = _view_and_request()
+    request.query_params = {"cursor_mode": "true", "allow_sampled": "false"}
+    project_id = str(uuid.uuid4())
+    session_id = str(uuid.uuid4())
+    window_start = datetime(2025, 8, 1, tzinfo=UTC)
+    window_end = datetime(2026, 8, 1, tzinfo=UTC)
+    first_floor = window_end - timedelta(days=9)
+    second_floor_time = window_end - timedelta(days=11)
+    second_floor_id = str(uuid.uuid4())
+    session_start = window_start + timedelta(days=2)
+
+    builder = mock.MagicMock()
+    builder.supports_candidate_first_page.return_value = True
+    builder.supports_candidate_cursor_page.return_value = False
+    builder.supports_bounded_filter_scan.return_value = True
+    builder.filter_seed_witness_slack_hours.return_value = None
+    builder.recommended_filter_classify_batch_size.return_value = 50
+    builder.parse_time_range.return_value = (window_start, window_end)
+    builder.build_page_hydration_query.return_value = ("page hydration", {})
+    builder.expand_page_attribute_rows.return_value = []
+    builder.format_sessions.side_effect = lambda rows, columns: [
+        dict(zip(columns, row, strict=True)) for row in rows
+    ]
+    analytics = mock.MagicMock()
+
+    def _execute(query, _params, **_kwargs):
+        if query == "page hydration":
+            return SimpleNamespace(
+                data=[
+                    {
+                        "session_id": session_id,
+                        "session_start": session_start,
+                        "session_end": session_start,
+                        "duration": 0,
+                        "total_cost": 0,
+                        "total_tokens": 0,
+                        "traces_count": 1,
+                        "first_message": "first",
+                        "last_message": "last",
+                    }
+                ]
+            )
+        raise AssertionError(f"unexpected ClickHouse query: {query}")
+
+    analytics.execute_ch_query.side_effect = _execute
+    view._fetch_session_names = mock.MagicMock(return_value={})
+    view._fetch_end_user_info = mock.MagicMock(return_value={})
+    pages = [
+        # An exhausted slice: the whole boundary microsecond is published.
+        _bounded_page(
+            complete=False,
+            error_code="deadline_exceeded",
+            continuation_slice_end=first_floor,
+        ),
+        # An in-slice keyset: the row at the keyset itself was consumed.
+        _bounded_page(
+            complete=False,
+            error_code="deadline_exceeded",
+            continuation_slice_end=window_end - timedelta(days=10),
+            continuation_before_start_time=second_floor_time,
+            continuation_before_id=second_floor_id,
+        ),
+        _bounded_page(
+            rows=[{"session_id": session_id, "start_time": session_start}],
+            complete=True,
+            total_rows_lower_bound=1,
+        ),
+    ]
+    validated_data = {
+        "filters": [_attribute_filter()],
+        "sort_params": [],
+        "page_number": 0,
+        "page_size": 1,
+        "cursor_mode": True,
+        "allow_sampled": False,
+    }
+
+    statuses = []
+    payloads = []
+    with (
+        mock.patch(
+            "tracer.views.trace_session.SessionListQueryBuilderV2",
+            _builder_class_mock(return_value=builder),
+        ),
+        mock.patch(
+            "tracer.views.trace_session.read_bounded_filter_page",
+            side_effect=pages,
+        ) as bounded_read,
+        mock.patch(
+            "tracer.views.trace_session.AnnotationsLabels.objects.filter",
+            return_value=[],
+        ),
+    ):
+        cursor = None
+        for _ in pages:
+            status, payload = TraceSessionView._list_sessions_clickhouse(
+                view,
+                request,
+                project_id=project_id,
+                project=None,
+                analytics=analytics,
+                validated_data=(
+                    validated_data
+                    if cursor is None
+                    else {**validated_data, "cursor": cursor}
+                ),
+            )
+            statuses.append(status)
+            payloads.append(payload)
+            cursor = payload["metadata"]["next_cursor"]
+
+    assert statuses == ["ok", "ok", "ok"]
+    assert [payload["table"] for payload in payloads[:2]] == [[], []]
+    assert [row["session_id"] for row in payloads[2]["table"]] == [session_id]
+    assert bounded_read.call_count == 3
+    first, second, third = bounded_read.call_args_list
+    assert first.kwargs["cursor_start_time"] is None
+    assert first.kwargs["cursor_order_token"] is None
+    # An exhausted slice bounds the next hop at its end, below every token.
+    assert second.kwargs["cursor_start_time"] == first_floor
+    assert second.kwargs["cursor_order_token"] == ""
+    # A keyset bounds it at the keyset itself, which is inclusive of that row.
+    assert third.kwargs["cursor_start_time"] == second_floor_time
+    assert third.kwargs["cursor_order_token"] == second_floor_id

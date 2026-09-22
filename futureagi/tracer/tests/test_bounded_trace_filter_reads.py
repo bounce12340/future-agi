@@ -16664,3 +16664,220 @@ def test_an_interrupted_flush_leaves_no_position_past_the_chunk_it_lost() -> Non
         (row["id"] in published) or bound is None or (row["start_time"] < bound)
         for row in rows
     )
+
+
+# A route whose classifier ranks a row OLDER than the seed that discovered it.
+# This is the production session shape: a seed row is a session's newest root
+# inside the slice, while the classifier publishes ``min`` over the session's
+# live roots, so a long-lived session is DISCOVERED in a recent slice and
+# RANKED months earlier. Every rank below is one of the id's own seed roots,
+# exactly as ``min(live root start_time)`` always is.
+_RANK_LAG_WINDOW_START = END - timedelta(hours=6)
+_RANK_LAG_SEED_ROOTS: tuple[tuple[str, timedelta], ...] = (
+    ("long-new", timedelta(minutes=10)),
+    ("short-a", timedelta(minutes=70)),
+    ("short-a", timedelta(minutes=75)),
+    ("short-b", timedelta(minutes=80)),
+    ("long-old", timedelta(minutes=85)),
+    ("short-b", timedelta(minutes=95)),
+    ("long-old", timedelta(hours=5)),
+    ("long-new", timedelta(hours=5, minutes=30)),
+)
+
+
+def _rank_lag_seed_rows() -> list[dict[str, Any]]:
+    return [
+        {"id": row_id, "start_time": END - offset}
+        for row_id, offset in _RANK_LAG_SEED_ROOTS
+    ]
+
+
+def _rank_lag_match_rows() -> list[dict[str, Any]]:
+    """One classified row per id, ranked at that id's OLDEST seed root."""
+
+    ranks: dict[str, datetime] = {}
+    for row_id, offset in _RANK_LAG_SEED_ROOTS:
+        rank = END - offset
+        if row_id not in ranks or rank < ranks[row_id]:
+            ranks[row_id] = rank
+    return [{"id": row_id, "start_time": rank} for row_id, rank in ranks.items()]
+
+
+class _WalledFakeExecutor(_FakeExecutor):
+    """Charge each statement to a manual clock, like a page wall does."""
+
+    def __init__(
+        self,
+        builder: _FakeBuilder,
+        *,
+        clock: _ManualMonotonic,
+        durations_ms: dict[str, int],
+    ):
+        super().__init__(builder)
+        self.clock = clock
+        self.durations_ms = durations_ms
+
+    def execute_ch_query(self, query, params, *, timeout_ms, settings):
+        self.clock.advance_ms(self.durations_ms.get(query, 50))
+        return super().execute_ch_query(
+            query,
+            params,
+            timeout_ms=timeout_ms,
+            settings=settings,
+        )
+
+
+def _partial_page_cursor_order(
+    page: BoundedFilterPage,
+    rows: list[dict[str, Any]],
+    previous_order: tuple[Any, ...] | None,
+) -> tuple[Any, ...]:
+    """Mirror a list view's public boundary for a wall-stopped page.
+
+    A page that filled to ``page_size`` with matches left over resumes at its
+    last published row and drops its scan checkpoint, exactly as the views do.
+    A checkpoint-carrying page instead publishes the boundary the selector
+    proves: everything at or above it is already published.
+    """
+
+    if page.has_more and rows:
+        return rows[-1]["start_time"], str(rows[-1]["id"])
+    floor = getattr(page, "continuation_published_order_floor", None)
+    if floor is not None:
+        floor_time, floor_token = floor
+        return floor_time, "" if floor_token is None else str(floor_token)
+    if rows:
+        return rows[-1]["start_time"], str(rows[-1]["id"])
+    if previous_order is not None:
+        return previous_order
+    raise AssertionError("continuation has no stable order boundary")
+
+
+def _walk_rank_lagging_cursor_hops(
+    *, max_hops: int = 16, page_size: int = 2
+) -> list[dict[str, Any]]:
+    """Follow a wall-stopped cursor to exhaustion and record every hop."""
+
+    seed_rows = _rank_lag_seed_rows()
+    match_rows = _rank_lag_match_rows()
+    hops: list[dict[str, Any]] = []
+    order: tuple[Any, ...] | None = None
+    scan: dict[str, Any] = {}
+    for _ in range(max_hops):
+        builder = _WideInitialSliceFakeBuilder(
+            seed_rows,
+            start=_RANK_LAG_WINDOW_START,
+            end=END,
+            match_rows=match_rows,
+            recommended_seed_batch_size=200,
+        )
+        clock = _ManualMonotonic()
+        executor = _WalledFakeExecutor(
+            builder,
+            clock=clock,
+            durations_ms={"seed": 100, "match": 900},
+        )
+        with mock.patch("tracer.selectors.trace_filter_reads.monotonic", new=clock):
+            page = read_bounded_filter_page(
+                builder=builder,
+                analytics=executor,
+                filters=[_time_filter(_RANK_LAG_WINDOW_START, END)],
+                key_field="id",
+                page_number=0,
+                page_size=page_size,
+                # One seed plus one classifier fits; the next statement is
+                # refused for want of its own envelope. This is the page wall.
+                deadline_ms=2_400,
+                max_seed_attempts=24,
+                max_candidates=200,
+                max_query_count=50,
+                classify_batch_size=50,
+                include_incomplete_rows=True,
+                bounded_continuation=True,
+                cursor_start_time=order[0] if order is not None else None,
+                cursor_order_token=order[1] if order is not None else None,
+                **scan,
+            )
+        classified = [
+            candidate_id
+            for query, params in executor.calls
+            if query == "match"
+            for candidate_id in params["candidate_ids"]
+        ]
+        hops.append(
+            {
+                "rows": list(page.rows),
+                "classified": classified,
+                "complete": page.complete,
+                "has_more": page.has_more,
+                "cursor_in": order,
+                "slice_end": page.continuation_slice_end,
+                "before_start_time": page.continuation_before_start_time,
+                "floor": getattr(page, "continuation_published_order_floor", None),
+            }
+        )
+        if page.complete and not page.has_more:
+            break
+        order = _partial_page_cursor_order(page, list(page.rows), order)
+        if page.has_more or page.continuation_slice_end is None:
+            scan = {}
+        else:
+            scan = {
+                "continuation_slice_start": page.continuation_slice_start,
+                "continuation_slice_end": page.continuation_slice_end,
+                "continuation_before_start_time": (page.continuation_before_start_time),
+                "continuation_before_id": page.continuation_before_id,
+            }
+    return hops
+
+
+@pytest.mark.unit
+def test_wall_stopped_continuation_publishes_every_rank_lagging_match() -> None:
+    """A wall-stopped cursor may not drop a match its classifier accepted.
+
+    The classifier's boundary is the rank the previous page PUBLISHED, so it
+    is a dedup key only while "everything at or above it is published" holds.
+    A page that stops at its wall never proved that, and the walk's scan
+    checkpoint advances in seed order regardless: every later match that
+    outranks the boundary was silently discarded and its seed consumed, so
+    those rows left the list permanently.
+    """
+
+    hops = _walk_rank_lagging_cursor_hops()
+
+    published = [row["id"] for hop in hops for row in hop["rows"]]
+    classified = {row_id for hop in hops for row_id in hop["classified"]}
+    expected = {row["id"] for row in _rank_lag_match_rows()}
+
+    assert classified == expected
+    # Every accepted match reaches the list exactly once.
+    assert sorted(published) == sorted(expected)
+    assert len(published) == len(set(published))
+    # ... and in the list's own order, which is what makes the next hop's
+    # boundary a sound dedup key rather than a ceiling.
+    ranks = {row["id"]: row["start_time"] for row in _rank_lag_match_rows()}
+    assert [ranks[row_id] for row_id in published] == sorted(
+        ranks.values(), reverse=True
+    )
+
+
+@pytest.mark.unit
+def test_wall_stopped_continuation_never_publishes_an_unbounded_rank() -> None:
+    """No hop publishes a row its own checkpoint cannot bound.
+
+    A published row must rank at or above the boundary the page hands out, or
+    the page has claimed a prefix its scan never proved and the next hop's
+    exclusive bound would hide the rows that belong above it.
+    """
+
+    for hop in _walk_rank_lagging_cursor_hops():
+        floor = hop["floor"]
+        if floor is None or hop["has_more"]:
+            continue
+        floor_time, _ = floor
+        assert all(row["start_time"] >= floor_time for row in hop["rows"]), hop
+        if hop["cursor_in"] is not None:
+            assert all(
+                (row["start_time"], str(row["id"])) < tuple(hop["cursor_in"])
+                for row in hop["rows"]
+            ), hop

@@ -465,8 +465,27 @@ def _bounded_session_graph_request(view_method):
 
 
 def _session_list_cursor_order_for_partial_page(*, rows, bounded_page, cursor_state):
-    """Return a stable public order tuple, including checkpoint-only pages."""
+    """Return a stable public order tuple, including checkpoint-only pages.
 
+    The next hop reads this tuple as an exclusive upper bound: everything at or
+    above it is already published. A page that FILLED its prefix and left
+    matches over says so with its last row and drops its scan checkpoint, so
+    the walk re-descends from that rank. A page that stopped at its wall says
+    so with the floor the selector proves - not with its last row, whose rank
+    can sit far below the scan position on a route that ranks a session by its
+    oldest root, and not with the scan checkpoint, which is in seed order.
+    """
+
+    if bounded_page.has_more and rows:
+        last = rows[-1]
+        return (
+            last.get("start_time"),
+            str(last.get("session_id") or ""),
+        )
+    floor = bounded_page.continuation_published_order_floor
+    if floor is not None:
+        floor_time, floor_token = floor
+        return floor_time, "" if floor_token is None else str(floor_token)
     if rows:
         last = rows[-1]
         return (
@@ -475,13 +494,6 @@ def _session_list_cursor_order_for_partial_page(*, rows, bounded_page, cursor_st
         )
     if cursor_state is not None:
         return tuple(cursor_state.order)
-    if bounded_page.continuation_before_start_time is not None:
-        return (
-            bounded_page.continuation_before_start_time,
-            str(bounded_page.continuation_before_id or ""),
-        )
-    if bounded_page.continuation_slice_end is not None:
-        return bounded_page.continuation_slice_end, "\U0010ffff" * 8
     raise RuntimeError("session continuation has no stable order boundary")
 
 
