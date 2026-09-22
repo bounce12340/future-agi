@@ -26288,6 +26288,14 @@ export type UsersResultApiQueryProvenance =
 export const UsersResultApiQueryProvenance = {
   span_user_rollup_end_users_candidate: "span_user_rollup_end_users_candidate",
   physical_latest_users: "physical_latest_users",
+  matching_activity_walk: "matching_activity_walk",
+} as const;
+
+export type UsersResultApiOrdering =
+  (typeof UsersResultApiOrdering)[keyof typeof UsersResultApiOrdering];
+
+export const UsersResultApiOrdering = {
+  latest_matching_activity: "latest_matching_activity",
 } as const;
 
 export type UsersResultApiApproximateFieldsItem =
@@ -26315,6 +26323,7 @@ export interface UsersResultApi {
   query_exact?: boolean;
   query_provenance?: UsersResultApiQueryProvenance;
   ordering_exact?: boolean;
+  ordering?: UsersResultApiOrdering;
   approximate_fields?: UsersResultApiApproximateFieldsItem[];
 }
 
