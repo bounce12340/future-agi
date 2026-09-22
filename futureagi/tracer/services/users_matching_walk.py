@@ -100,7 +100,10 @@ USER_LIST_PAGE_WALL_MS = settings.USER_LIST_PAGE_WALL_MS
 # certified its users should publish them rather than return empty because the
 # search spent the wall. Exempt from the page wall is not the same as exempt
 # from every deadline -- without one these statements carry no server timeout
-# at all -- so they run under the request's own analytics wall instead.
+# at all -- so they run under the analytics wall, measured from the START of
+# the walk rather than restarted at materialisation. Restarting it would let
+# one page spend the page wall AND a whole analytics wall after it; measuring
+# from the walk's start bounds search plus finish together.
 USER_LIST_WALK_FINISH_WALL_MS = settings.INTERACTIVE_ANALYTICS_DEFAULT_WALL_MS
 USER_LIST_WALK_MAX_STATEMENTS = settings.USER_LIST_WALK_MAX_STATEMENTS
 USER_LIST_WALK_INITIAL_SLICE = timedelta(
@@ -562,6 +565,19 @@ def _certify(state: _WalkState, batch: list[_Candidate]) -> bool:
     return True
 
 
+def _finish_deadline(state: _WalkState) -> ReadDeadline:
+    """The analytics wall less what the search already spent.
+
+    The users route starts no request-level deadline of its own, so the
+    walk's own start is the earliest moment this can be measured from. That
+    makes the whole page -- search under the page wall, then finish -- add up
+    to the analytics wall rather than to the page wall plus a fresh one.
+    """
+
+    spent = state.budget.deadline.elapsed_ms()
+    return ReadDeadline.start(max(1.0, USER_LIST_WALK_FINISH_WALL_MS - spent))
+
+
 def _materialise(state: _WalkState, entries: list[_Certified]) -> bool:
     """Whole-window replay plus final membership for publishable users only."""
 
@@ -586,11 +602,12 @@ def _materialise(state: _WalkState, entries: list[_Certified]) -> bool:
             # Finish mode: the PAGE wall does not govern these statements.
             # Passing the walk's own deadline would let the replay spend the
             # last of it and the metrics read that follows raise on the client
-            # clock, dropping a user the page had already certified. A fresh
-            # deadline sized to the request's analytics wall keeps that
-            # property and still gives both statements a server timeout, which
-            # ``deadline=None`` did not.
-            deadline=ReadDeadline.start(USER_LIST_WALK_FINISH_WALL_MS),
+            # clock, dropping a user the page had already certified. The
+            # analytics wall MINUS what the walk has already spent keeps that
+            # property, gives both statements a server timeout that
+            # ``deadline=None`` did not, and bounds search plus finish
+            # together instead of granting a second full wall here.
+            deadline=_finish_deadline(state),
             enrich_rows=True,
             candidate_rows=None,
             skip_attribute_read=True,
