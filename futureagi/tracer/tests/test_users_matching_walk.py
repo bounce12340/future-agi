@@ -616,6 +616,131 @@ def test_wall_exhaustion_stops_between_statements():
     assert _kinds(engine) == ["slice"]
 
 
+def test_an_exhausted_walk_publishes_degraded_and_incomplete_not_complete():
+    """A short page must not look like a finished one.
+
+    The seeded lane on this same endpoint publishes ``degraded`` and
+    ``query_complete`` false when its wall stopped it, so a caller can tell
+    an exhausted read from an empty answer. The walk owes the same contract:
+    without it, an exhausted page arrives as ``complete`` with no rows and
+    ``has_more`` true, which reads as "no matches" to anything that trusts
+    the status.
+    """
+
+    world = World()
+    for ordinal, minutes in enumerate((3, 7, 11), start=1):
+        world.user(
+            ordinal, key=minutes_before_end(minutes), raw=(minutes_before_end(minutes),)
+        )
+
+    # Exhausted by the statement budget.
+    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 1):
+        read, _engine = _page(world, page_size=25)
+    assert read.payload["table"] == []
+    assert read.has_more is True
+    assert read.payload["query_complete"] is False
+    assert read.payload["query_status"] == "degraded"
+
+    # Exhausted by the wall, on the same page shape.
+    with patch.object(walk, "USER_LIST_PAGE_WALL_MS", 60):
+        engine = Engine(world)
+        original = engine.execute_ch_query
+
+        def slow(query, params=None, timeout_ms=None, settings=None):
+            import time
+
+            time.sleep(0.08)
+            return original(query, params, timeout_ms, settings)
+
+        engine.execute_ch_query = slow
+        read, _engine = _page(world, page_size=25, engine=engine)
+    assert read.has_more is True
+    assert read.payload["query_complete"] is False
+    assert read.payload["query_status"] == "degraded"
+
+    # A walk that finished is still complete; the contract only changes for
+    # the page that was cut short.
+    finished, _engine = _page(world, page_size=25)
+    assert _names(finished) == ["user-1", "user-2", "user-3"]
+    assert finished.has_more is False
+    assert finished.payload["query_complete"] is True
+    assert finished.payload["query_status"] == "complete"
+
+
+def test_every_walk_statement_carries_a_server_timeout_including_finish_mode():
+    """Exempt from the page wall is not exempt from every deadline.
+
+    Application reads on this stack carry no server deadline of their own, so
+    a statement issued with ``timeout_ms=None`` runs unbounded. The walk's
+    finish-mode statements -- the whole-window replay and the enrichment that
+    follows it -- are deliberately not governed by the page wall, which is
+    what lets a page publish users it has already certified. They still have
+    to carry a deadline; theirs comes from the request's analytics wall.
+    """
+
+    world = World()
+    for ordinal, minutes in enumerate((3, 7), start=1):
+        world.user(
+            ordinal, key=minutes_before_end(minutes), raw=(minutes_before_end(minutes),)
+        )
+
+    engine = Engine(world)
+    original = engine.execute_ch_query
+    timeouts: list[float | None] = []
+
+    def recording(query, params=None, timeout_ms=None, settings=None):
+        timeouts.append(timeout_ms)
+        return original(query, params, timeout_ms, settings)
+
+    engine.execute_ch_query = recording
+    read, _engine = _page(world, page_size=25, engine=engine)
+
+    assert _names(read) == ["user-1", "user-2"]
+    assert timeouts, "the walk issued no statement at all"
+    assert all(t is not None for t in timeouts), (
+        f"a walk statement ran with no server deadline: {timeouts}"
+    )
+    # The finish-mode budget is the analytics wall LESS what the search
+    # already spent, so at least one statement is allowed more than the page
+    # wall, and the page as a whole cannot exceed the analytics wall.
+    assert max(timeouts) > walk.USER_LIST_PAGE_WALL_MS
+    assert max(timeouts) <= walk.USER_LIST_WALK_FINISH_WALL_MS
+
+
+def test_finish_mode_does_not_start_a_second_full_wall_after_the_page_wall():
+    """Search plus finish add up to the analytics wall, not past it.
+
+    Restarting the analytics wall at materialisation would let one page spend
+    the page wall and then a whole analytics wall after it, which is more
+    than the global wall the route is supposed to sit inside.
+    """
+
+    world = World()
+    world.user(1, key=minutes_before_end(3), raw=(minutes_before_end(3),))
+
+    engine = Engine(world)
+    original = engine.execute_ch_query
+    timeouts: list[float | None] = []
+
+    def slow_then_record(query, params=None, timeout_ms=None, settings=None):
+        import time
+
+        timeouts.append(timeout_ms)
+        if "candidate_users AS" in query:
+            time.sleep(0.15)
+        return original(query, params, timeout_ms, settings)
+
+    engine.execute_ch_query = slow_then_record
+    read, _engine = _page(world, page_size=25, engine=engine)
+
+    assert _names(read) == ["user-1"]
+    finish = max(t for t in timeouts if t is not None)
+    # The search burned real time; the finish budget has to be SHORTER than a
+    # fresh wall by at least what it burned.
+    assert finish < walk.USER_LIST_WALK_FINISH_WALL_MS
+    assert finish > walk.USER_LIST_PAGE_WALL_MS
+
+
 def test_a_slice_that_fails_on_a_read_budget_is_retried_narrower_never_wider():
     from clickhouse_driver.errors import ServerException
 
@@ -1282,7 +1407,16 @@ def test_wall_spent_during_materialisation_still_publishes_the_certified_user():
     assert _names(read) == ["user-1"]
     assert read.payload["table"][0]["num_sessions"] == 7
     assert _kinds(engine) == ["slice", "remap", "enrich", "replay", "metrics"]
-    assert metric_timeouts == [None]
+    # What this test is about is that the metrics read does NOT inherit the
+    # spent page wall, which would raise on the client clock and drop a user
+    # the page had already committed to. It gets a deadline of its own, from
+    # the request's analytics wall, rather than none at all: a statement with
+    # no timeout runs unbounded on a stack whose reads carry no server
+    # deadline of their own.
+    assert len(metric_timeouts) == 1
+    assert metric_timeouts[0] is not None
+    assert metric_timeouts[0] > walk.USER_LIST_PAGE_WALL_MS
+    assert metric_timeouts[0] <= walk.USER_LIST_WALK_FINISH_WALL_MS
 
 
 def test_walk_limits_are_runtime_settings_not_module_constants():

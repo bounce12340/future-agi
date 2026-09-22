@@ -11,6 +11,7 @@ and ``test_sparse_session_cursor_follows_checkpoint_without_skip_or_duplicate``.
 
 from __future__ import annotations
 
+import pathlib
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -599,3 +600,356 @@ def test_user_refill_programming_error_still_fails_closed():
     reads, exacts = _patched(manager, walk)
     with reads, exacts, pytest.raises(RuntimeError, match="private defect"):
         manager.list_cursor_payload(page_size=25)
+
+
+# --------------------------------------------------------------------------
+# a numbered page is not bound by the wall, driven through a transport that
+# actually spends more than the wall allows
+# --------------------------------------------------------------------------
+_OVERRUN_MS = 400
+_OVERRUN_ROWS = 3
+
+
+def _wall_stopped_page() -> BoundedFilterPage:
+    """What an acquisition really publishes when its budget runs out."""
+
+    return BoundedFilterPage(
+        rows=[],
+        has_more=True,
+        complete=False,
+        status="degraded",
+        error_code=None,
+        total_rows_lower_bound=0,
+        elapsed_ms=float(_OVERRUN_MS),
+        query_count=1,
+        rows_returned=0,
+        result_payload_bytes=0,
+        attempts=(),
+    )
+
+
+def _complete_page(rows: list[dict]) -> BoundedFilterPage:
+    return BoundedFilterPage(
+        rows=list(rows),
+        has_more=False,
+        complete=True,
+        status="complete",
+        error_code=None,
+        total_rows_lower_bound=len(rows),
+        elapsed_ms=float(_OVERRUN_MS),
+        query_count=1,
+        rows_returned=len(rows),
+        result_payload_bytes=0,
+        attempts=(),
+    )
+
+
+def _budget_enforcing_reader(rows: list[dict]):
+    """An acquisition that needs ``_OVERRUN_MS`` and honours its own budget.
+
+    This is the point of the test. The route decides how much time the
+    acquisition may spend; this stands in for the transport that spends it.
+    Handed a budget that covers the work it publishes every row; handed less
+    it publishes what a wall-stopped read publishes, which is no rows, not
+    complete, and more to come. A route that wrongly put a numbered request
+    on the page wall therefore loses rows here rather than merely passing a
+    different number.
+    """
+
+    seen: list[int | None] = []
+
+    def _read(*_args, **kwargs):
+        budget = kwargs["deadline_ms"]
+        seen.append(budget)
+        if budget is not None and budget < _OVERRUN_MS:
+            return _wall_stopped_page()
+        return _complete_page(rows)
+
+    _read.budgets = seen
+    return _read
+
+
+@override_settings(CLICKHOUSE_V2={"QUERY_TYPES_V2_ONLY": "SPAN_LIST"})
+@pytest.mark.parametrize("cursor_mode", [True, False], ids=["cursor", "numbered"])
+def test_span_numbered_page_outlives_the_wall_a_cursor_page_stops_at(cursor_mode):
+    from tracer.views import observation_span as span_view
+    from tracer.views.observation_span import ObservationSpanView
+
+    view, request, organization = _view_and_request(ObservationSpanView)
+    reader = _budget_enforcing_reader([])
+    with (
+        mock.patch.object(span_view, "SPAN_LIST_PAGE_WALL_MS", _OVERRUN_MS // 4),
+        mock.patch("tracer.views.observation_span.CustomEvalConfig") as eval_config,
+        mock.patch(
+            "tracer.views.observation_span.get_annotation_labels_for_project",
+            return_value=[],
+        ),
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+            side_effect=reader,
+        ),
+    ):
+        eval_config.objects.filter.return_value.select_related.return_value = []
+        result = view._list_spans_clickhouse(
+            request,
+            project_id=PROJECT_ID,
+            validated_data={
+                "filters": [
+                    _time_filter(END - timedelta(minutes=30), END),
+                    _attribute_filter("final_status", "Rejected"),
+                ],
+                "page_number": 0,
+                "page_size": 25,
+                "cursor_mode": cursor_mode,
+                "allow_sampled": True,
+            },
+            analytics=mock.MagicMock(),
+            org_project_ids=None,
+            org=organization,
+            read_deadline=_RecordingDeadline(),
+        )
+
+    budget = reader.budgets[0]
+    if cursor_mode:
+        # The wall binds. This acquisition never reached a checkpoint, so the
+        # route fails closed rather than publishing a page it cannot resume.
+        assert budget == _OVERRUN_MS // 4
+        assert result[0] == "error"
+    else:
+        # A numbered page has no cursor to resume from, so it may not be cut
+        # short: it acquires under the request deadline instead, and every
+        # row the transport found survives into the response.
+        assert budget == span_view.SPAN_LIST_CANDIDATE_DEADLINE_MS
+        assert budget > _OVERRUN_MS
+        status_name, payload = result
+        assert status_name == "ok"
+        assert payload["metadata"]["query_complete"] is True
+
+
+@override_settings(CLICKHOUSE_V2={"QUERY_TYPES_V2_ONLY": "TRACE_LIST"})
+@pytest.mark.parametrize("cursor_mode", [True, False], ids=["cursor", "numbered"])
+def test_trace_numbered_page_outlives_the_wall_a_cursor_page_stops_at(cursor_mode):
+    """The trace list carries the identical gate; pin it the same way."""
+
+    from tracer.views import trace as trace_view
+    from tracer.views.trace import TraceView
+
+    view, request, organization = _view_and_request(TraceView)
+    reader = _budget_enforcing_reader([])
+    with (
+        mock.patch.object(trace_view, "TRACE_LIST_PAGE_WALL_MS", _OVERRUN_MS // 4),
+        mock.patch("tracer.views.trace.CustomEvalConfig") as eval_config,
+        mock.patch(
+            "tracer.views.trace.get_annotation_labels_for_project", return_value=[]
+        ),
+        mock.patch(
+            "tracer.views.trace._build_annotation_map_from_scores", return_value={}
+        ),
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+            side_effect=reader,
+        ),
+    ):
+        eval_config.objects.filter.return_value.select_related.return_value = []
+        result = view._list_traces_of_session_clickhouse(
+            request,
+            project_id=PROJECT_ID,
+            validated_data={
+                "filters": [_time_filter()],
+                "page_number": 0,
+                "page_size": 25,
+                "cursor_mode": cursor_mode,
+                "allow_sampled": True,
+            },
+            analytics=mock.MagicMock(),
+            org_project_ids=None,
+            org=organization,
+            read_deadline=_RecordingDeadline(),
+        )
+
+    budget = reader.budgets[0]
+    if cursor_mode:
+        assert budget == _OVERRUN_MS // 4
+        assert result[0] == "error"
+    else:
+        assert budget == trace_view.TRACE_LIST_CANDIDATE_DEADLINE_MS
+        assert budget > _OVERRUN_MS
+        status_name, payload = result
+        assert status_name == "ok"
+        assert payload["metadata"]["query_complete"] is True
+
+
+@pytest.mark.parametrize("cursor_enabled", [True, False], ids=["cursor", "numbered"])
+def test_session_numbered_page_keeps_every_row_the_wall_would_have_cut(cursor_enabled):
+    from tracer.views import trace_session as trace_session_view
+    from tracer.views.trace_session import _read_session_filter_page
+
+    rows = [{"session_id": str(uuid.UUID(int=i + 1))} for i in range(_OVERRUN_ROWS)]
+    builder = mock.MagicMock()
+    builder.filters = [_time_filter()]
+    builder.page_number = 0
+    builder.page_size = 25
+    builder.recommended_filter_classify_batch_size.return_value = 50
+    reader = _budget_enforcing_reader(rows)
+    with (
+        mock.patch.object(
+            trace_session_view, "SESSION_LIST_PAGE_WALL_MS", _OVERRUN_MS // 4
+        ),
+        mock.patch.object(
+            trace_session_view, "read_bounded_filter_page", side_effect=reader
+        ),
+    ):
+        page = _read_session_filter_page(
+            builder,
+            mock.MagicMock(),
+            _RecordingDeadline(),
+            cursor_state=None,
+            cursor_enabled=cursor_enabled,
+        )
+
+    if cursor_enabled:
+        assert reader.budgets[0] == _OVERRUN_MS // 4
+        assert page.complete is False
+        assert page.rows == []
+        assert page.has_more is True
+    else:
+        assert reader.budgets[0] > _OVERRUN_MS
+        assert page.complete is True
+        assert len(page.rows) == _OVERRUN_ROWS
+        assert page.total_rows_lower_bound == _OVERRUN_ROWS
+
+
+# --------------------------------------------------------------------------
+# a CSV export is cursor-capable but it is not a page
+# --------------------------------------------------------------------------
+@override_settings(CLICKHOUSE_V2={"QUERY_TYPES_V2_ONLY": "SPAN_LIST"})
+def test_span_export_fills_its_page_under_the_request_budget_not_the_wall():
+    """Rule B bounds an interactive page; a download is not one.
+
+    The bounded export turns cursor mode on to get the keyset reader, which
+    also selected the five-second page wall over the request budget. A
+    download has no reader to resume it, so the wall only truncated it.
+    """
+
+    from tracer.views import observation_span as span_view
+    from tracer.views.observation_span import ObservationSpanView
+
+    view, request, organization = _view_and_request(ObservationSpanView)
+    reader = _budget_enforcing_reader([])
+    with (
+        mock.patch.object(span_view, "SPAN_LIST_PAGE_WALL_MS", _OVERRUN_MS // 4),
+        mock.patch("tracer.views.observation_span.CustomEvalConfig") as eval_config,
+        mock.patch(
+            "tracer.views.observation_span.get_annotation_labels_for_project",
+            return_value=[],
+        ),
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+            side_effect=reader,
+        ),
+    ):
+        eval_config.objects.filter.return_value.select_related.return_value = []
+        view._list_spans_clickhouse(
+            request,
+            project_id=PROJECT_ID,
+            validated_data={
+                "filters": [
+                    _time_filter(END - timedelta(minutes=30), END),
+                    _attribute_filter("final_status", "Rejected"),
+                ],
+                "page_number": 0,
+                "page_size": 25,
+                "cursor_mode": True,
+                "page_wall": False,
+                "allow_sampled": True,
+            },
+            analytics=mock.MagicMock(),
+            org_project_ids=None,
+            org=organization,
+            read_deadline=_RecordingDeadline(),
+        )
+
+    assert reader.budgets[0] == span_view.SPAN_LIST_CANDIDATE_DEADLINE_MS
+    assert reader.budgets[0] > _OVERRUN_MS
+
+
+def test_session_export_fills_its_page_under_the_request_budget_not_the_wall():
+    """Driven through the view, so the plumbing is under test too.
+
+    Calling the page reader directly would prove only that it honours the
+    parameter; it would not catch the view passing the wrong value, which is
+    where the export's opt-out actually has to travel.
+    """
+
+    from tracer.tests.test_session_positive_witness_page import (
+        PROJECT,
+        builder,
+        leaf,
+    )
+    from tracer.views import trace_session as trace_session_view
+    from tracer.views.trace_session import (
+        SESSION_LIST_QUERY_TIMEOUT_MS,
+        TraceSessionView,
+    )
+
+    view = TraceSessionView.__new__(TraceSessionView)
+    view._gm = SimpleNamespace(
+        success_response=lambda payload: ("ok", payload),
+        custom_error_response=lambda *a, **k: ("error", a, k),
+    )
+    organization = SimpleNamespace(id=uuid.uuid4())
+    request = SimpleNamespace(
+        query_params={},
+        organization=organization,
+        user=SimpleNamespace(organization=organization),
+    )
+    analytics = SimpleNamespace(
+        execute_ch_query=mock.Mock(return_value=SimpleNamespace(data=[]))
+    )
+    rows = [{"session_id": str(uuid.UUID(int=i + 1))} for i in range(_OVERRUN_ROWS)]
+    reader = _budget_enforcing_reader(rows)
+    data = {
+        "filters": builder(leaf("company", ["alpha"], "text", "in")).filters,
+        "sort_params": [],
+        "page_number": 0,
+        "page_size": 25,
+        "cursor_mode": True,
+        # What the bounded export sets, and what this test is really about.
+        "page_wall": False,
+    }
+    with (
+        mock.patch.object(
+            trace_session_view, "SESSION_LIST_PAGE_WALL_MS", _OVERRUN_MS // 4
+        ),
+        mock.patch.object(
+            trace_session_view, "read_bounded_filter_page", side_effect=reader
+        ),
+    ):
+        TraceSessionView._select_session_page(
+            view,
+            request,
+            validated_data=data,
+            project_id=PROJECT,
+            project=None,
+            analytics=analytics,
+            org_project_ids=None,
+        )
+
+    assert reader.budgets, "the export never reached the bounded page reader"
+    # The view builds a real deadline, so the budget is the request timeout
+    # less the millisecond or two already spent -- not the page wall.
+    assert reader.budgets[0] > _OVERRUN_MS
+    assert SESSION_LIST_QUERY_TIMEOUT_MS - reader.budgets[0] < 1_000
+
+
+def test_the_bounded_exports_turn_the_page_wall_off_where_they_are_built():
+    """The opt-out has to be set by the export entry point, not assumed."""
+
+    from tracer.views import observation_span as span_view
+    from tracer.views import trace_session as trace_session_view
+
+    for module in (span_view, trace_session_view):
+        source = pathlib.Path(module.__file__).read_text()
+        export_block = source.split('kwargs.get("bounded_export")', 1)[1][:400]
+        assert "cursor_mode=True" in export_block
+        assert "page_wall=False" in export_block

@@ -96,6 +96,15 @@ USER_LIST_MATCHING_CURSOR_ORDER = "matching_activity_users_v1"
 USER_LIST_MATCHING_ORDERING = "latest_matching_activity"
 USER_LIST_MATCHING_PROVENANCE = "matching_activity_walk"
 USER_LIST_PAGE_WALL_MS = settings.USER_LIST_PAGE_WALL_MS
+# Finish mode is exempt from the PAGE wall by design: a page that has already
+# certified its users should publish them rather than return empty because the
+# search spent the wall. Exempt from the page wall is not the same as exempt
+# from every deadline -- without one these statements carry no server timeout
+# at all -- so they run under the analytics wall, measured from the START of
+# the walk rather than restarted at materialisation. Restarting it would let
+# one page spend the page wall AND a whole analytics wall after it; measuring
+# from the walk's start bounds search plus finish together.
+USER_LIST_WALK_FINISH_WALL_MS = settings.INTERACTIVE_ANALYTICS_DEFAULT_WALL_MS
 USER_LIST_WALK_MAX_STATEMENTS = settings.USER_LIST_WALK_MAX_STATEMENTS
 USER_LIST_WALK_INITIAL_SLICE = timedelta(
     seconds=settings.USER_LIST_WALK_INITIAL_SLICE_SECONDS
@@ -556,6 +565,19 @@ def _certify(state: _WalkState, batch: list[_Candidate]) -> bool:
     return True
 
 
+def _finish_deadline(state: _WalkState) -> ReadDeadline:
+    """The analytics wall less what the search already spent.
+
+    The users route starts no request-level deadline of its own, so the
+    walk's own start is the earliest moment this can be measured from. That
+    makes the whole page -- search under the page wall, then finish -- add up
+    to the analytics wall rather than to the page wall plus a fresh one.
+    """
+
+    spent = state.budget.deadline.elapsed_ms()
+    return ReadDeadline.start(max(1.0, USER_LIST_WALK_FINISH_WALL_MS - spent))
+
+
 def _materialise(state: _WalkState, entries: list[_Certified]) -> bool:
     """Whole-window replay plus final membership for publishable users only."""
 
@@ -577,11 +599,15 @@ def _materialise(state: _WalkState, entries: list[_Certified]) -> bool:
             frozen_filters=state.frozen_filters,
             window_start=state.window_start,
             window_end=state.window_end,
-            # Finish mode: the wall does not govern these statements. Passing
-            # the deadline would let the replay spend the last of it and the
-            # metrics read that follows raise on the client clock, dropping a
-            # user the page had already certified.
-            deadline=None,
+            # Finish mode: the PAGE wall does not govern these statements.
+            # Passing the walk's own deadline would let the replay spend the
+            # last of it and the metrics read that follows raise on the client
+            # clock, dropping a user the page had already certified. The
+            # analytics wall MINUS what the walk has already spent keeps that
+            # property, gives both statements a server timeout that
+            # ``deadline=None`` did not, and bounds search plus finish
+            # together instead of granting a second full wall here.
+            deadline=_finish_deadline(state),
             enrich_rows=True,
             candidate_rows=None,
             skip_attribute_read=True,
@@ -811,14 +837,20 @@ def walk_matching_activity_page(
     qualified_exact = not manager._unqualified_attribute_fallback_used
     seen_rows = seen_before + len(state.published)
     lower_bound = seen_rows + (1 if has_more and unseen_row_proven else 0)
+    # A page the wall or the statement budget cut short is published as
+    # degraded and incomplete, never as a complete page that happens to be
+    # short: a caller must be able to tell an exhausted walk from an empty
+    # answer. This is the seeded lane's contract on the same endpoint
+    # (``UsersListManager._cursor_payload``), and the walk owes the same one.
+    exhausted = state.budget.exhausted_by is not None
     payload = {
         "table": list(state.published),
         "total_count": lower_bound,
         "total_pages": (lower_bound + page_size - 1) // page_size,
         "count_is_lower_bound": has_more,
         "has_more": has_more,
-        "query_complete": True,
-        "query_status": "complete",
+        "query_complete": not exhausted,
+        "query_status": "degraded" if exhausted else "complete",
         "query_exact": qualified_exact,
         "query_provenance": USER_LIST_MATCHING_PROVENANCE,
         "ordering_exact": qualified_exact,

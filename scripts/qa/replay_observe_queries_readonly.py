@@ -419,6 +419,7 @@ _USERS_REMAP_SHA = "090df268267944b22e713077c59d4836e4046fadb60bfbb78116f3a43af4
 # ``UsersSourcePinTests`` fails the moment these drift from the tree again.
 _USERS_SOURCE_PINS = {
     "tracer.services.users_list_manager": "76ee7470c6cb0bfd600e293d76396465e56a0283e5fd1ba91610f105e87acfda",
+    "tracer.services.users_matching_walk": "bd5d1ad717ad09b4d93ae1a4ed0f942dc27a10ca7984fe9b108e96898f41575b",
     "tracer.services.clickhouse.query_builders.user_list": "5c56a3a7125a937416366e66b9c76b1cb267d2dc5373073abd08d4d5f21ebcfb",
     "tracer.services.clickhouse.v2.query_builders.user_list": "d5024fe5a46b7cbdf2621d04dfd02027c17816f7250f84120c920a0dd3c9908e",
     "tracer.services.clickhouse.v2.id_remap_sql": "56903f382c0f8dc40099e5ebfda45a8ab853c0b8f7ec16b5712f9c11092fe24a",
