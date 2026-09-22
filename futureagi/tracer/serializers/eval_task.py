@@ -362,17 +362,21 @@ class EvalTaskSerializer(serializers.ModelSerializer):
         from tracer.selectors.eval_tasks.progress import count_by_status
 
         counts = count_by_status(obj)
-        done = (
-            counts.get("completed", 0)
-            + counts.get("errored", 0)
-            + counts.get("skipped", 0)
-        )
+        # Skipped is neither done nor outstanding. The eval never ran — a mapped
+        # span attribute was absent, so the entry terminalized before any model
+        # call. Counting it as done made a task that skipped every row read
+        # "100% complete" with zero results; counting it as outstanding would
+        # make a finished task look stuck. It gets its own tally and stays in
+        # the total, which is how the task detail endpoint already reports it.
+        done = counts.get("completed", 0) + counts.get("errored", 0)
+        skipped = counts.get("skipped", 0)
         remaining = counts.get("pending", 0) + counts.get("running", 0)
-        total = done + remaining
+        total = done + skipped + remaining
         percent = round(100.0 * done / total, 2) if total else None
         return {
             "dispatched": total,
             "completed": done,
+            "skipped": skipped,
             "missing": remaining,
             "percent": percent,
         }

@@ -217,3 +217,60 @@ class TestProgressReads:
         assert has_undrained_work(task) is False
         _entries(task, custom_eval_config, 1, status=EvalEntryStatus.PENDING)
         assert has_undrained_work(task) is True
+
+
+@pytest.mark.integration
+@pytest.mark.django_db
+class TestProgressSerializer:
+    """``EvalTaskSerializer.get_progress`` is the historical task's "X of Y
+    complete" bar. It counted a skipped row as done, so a task whose every row
+    was skipped for a missing mapped attribute reported 100% complete with zero
+    results — the single most common way a user is told everything is fine when
+    nothing ran."""
+
+    def _progress(self, task):
+        from tracer.serializers.eval_task import EvalTaskSerializer
+
+        return EvalTaskSerializer().get_progress(task)
+
+    def test_a_task_that_skipped_every_row_does_not_read_as_complete(
+        self, project, custom_eval_config
+    ):
+        task = _task(project, custom_eval_config)
+        _entries(task, custom_eval_config, 5, status=EvalEntryStatus.SKIPPED)
+
+        progress = self._progress(task)
+
+        assert progress["completed"] == 0
+        assert progress["percent"] == 0.0
+        assert progress["skipped"] == 5
+        assert progress["dispatched"] == 5
+        assert progress["missing"] == 0
+
+    def test_skipped_rows_stay_in_the_total_but_out_of_the_percentage(
+        self, project, custom_eval_config
+    ):
+        task = _task(project, custom_eval_config)
+        _entries(task, custom_eval_config, 1, status=EvalEntryStatus.COMPLETED)
+        _entries(task, custom_eval_config, 1, status=EvalEntryStatus.ERRORED)
+        _entries(task, custom_eval_config, 2, status=EvalEntryStatus.SKIPPED)
+
+        progress = self._progress(task)
+
+        assert progress["dispatched"] == 4
+        assert progress["completed"] == 2
+        assert progress["skipped"] == 2
+        assert progress["percent"] == 50.0
+
+    def test_a_draining_task_still_reports_what_is_left(
+        self, project, custom_eval_config
+    ):
+        task = _task(project, custom_eval_config)
+        _entries(task, custom_eval_config, 1, status=EvalEntryStatus.COMPLETED)
+        _entries(task, custom_eval_config, 3, status=EvalEntryStatus.PENDING)
+
+        progress = self._progress(task)
+
+        assert progress["missing"] == 3
+        assert progress["skipped"] == 0
+        assert progress["percent"] == 25.0
