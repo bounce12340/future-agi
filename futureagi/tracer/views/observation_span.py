@@ -1837,6 +1837,9 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
                     page_number=0,
                     page_size=BOUNDED_SPAN_EXPORT_PAGE_SIZE,
                     cursor_mode=True,
+                    # Rule B's wall bounds an interactive page, not a
+                    # download. The users export already opts out this way.
+                    page_wall=False,
                 )
             validated_data["filters"] = bind_request_my_annotations_principal(
                 request,
@@ -2151,9 +2154,12 @@ class ObservationSpanView(BaseModelViewSetMixin, ModelViewSet):
         try:
             # Only a cursor page can stop early and still resume exactly, so
             # only a cursor page runs its acquisition at the page wall.
+            # An export is cursor-capable but it is not a page: it keeps
+            # filling its bounded page under the request budget rather than
+            # stopping at the wall a reader would resume from.
             candidate_deadline_ms = read_deadline.remaining_ms(
                 SPAN_LIST_PAGE_WALL_MS
-                if cursor_enabled
+                if (cursor_enabled and validated_data.get("page_wall", True))
                 else SPAN_LIST_CANDIDATE_DEADLINE_MS
             )
         except ReadDeadlineExceeded:

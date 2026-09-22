@@ -1696,9 +1696,15 @@ def test_sparse_session_cursor_follows_checkpoint_without_skip_or_duplicate(
     assert first_payload["metadata"]["total_rows"] == 0
     assert first_payload["metadata"]["total_rows_is_lower_bound"] is True
     assert first_payload["metadata"]["has_more"] is True
-    assert first_payload["metadata"]["query_complete"] is True
-    assert first_payload["metadata"]["query_status"] == "complete"
-    assert first_payload["metadata"]["query_error_code"] is None
+    # This first page did NOT finish its chunk: it stopped on its deadline and
+    # published the checkpoint it had reached. Carrying a cursor is what makes
+    # it resumable, not what makes it whole, so it is published as degraded
+    # and incomplete with the reason it stopped. The rest of this test is
+    # about the cursor following that checkpoint without skipping or
+    # duplicating a row, which is unchanged.
+    assert first_payload["metadata"]["query_complete"] is False
+    assert first_payload["metadata"]["query_status"] == "degraded"
+    assert first_payload["metadata"]["query_error_code"] == "deadline_exceeded"
     assert first_payload["metadata"]["query_exact"] is False
     assert first_payload["metadata"]["query_provenance"] == (
         "spans_per_session_candidate"
