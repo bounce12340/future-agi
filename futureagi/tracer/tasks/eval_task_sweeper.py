@@ -72,12 +72,19 @@ def find_stranded_tasks(*, limit: int | None = None) -> list[EvalTask]:
     limit = limit if limit is not None else int(settings.EVAL_TASK_SWEEP_MAX_TASKS)
     # ``eval_task_id`` is a CharField, not a relation, so the id set is
     # materialized here rather than left as a subquery against a uuid column.
+    # ``exclude(eval_task_id="")``: the column is a CharField and rows carrying
+    # an empty string exist (``queries/eval_clustering.py`` filters them out by
+    # name). An empty string reaching the ``id__in`` lookup against a UUID
+    # column raises before the per-task error handling below, and this activity
+    # runs with ``max_retries=0`` — one such row anywhere in the fleet would
+    # kill every tick forever.
     stranded_ids = [
         row["eval_task_id"]
         for row in EvalLogger.no_workspace_objects.filter(
             status__in=_UNDRAINED,
             eval_task_id__isnull=False,
         )
+        .exclude(eval_task_id="")
         .values("eval_task_id")
         .annotate(last_touched=Max("updated_at"))
         .order_by("last_touched")[:limit]

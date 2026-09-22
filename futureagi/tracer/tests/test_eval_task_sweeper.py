@@ -169,6 +169,21 @@ class TestFindStrandedTasks:
 
         assert sweeper.find_stranded_tasks() == []
 
+    def test_an_entry_with_a_blank_task_id_cannot_kill_the_tick(
+        self, make_task, make_entry
+    ):
+        """``eval_task_id`` is a CharField, and rows carrying an empty string
+        exist — ``queries/eval_clustering.py`` filters them out by name. An empty
+        string reaching the ``id__in`` lookup against a UUID column raises before
+        the per-task error handling, and the sweep runs with ``max_retries=0``,
+        so one such row would kill every tick forever."""
+        task = make_task()
+        make_entry(task)
+        orphan = make_entry(task)
+        EvalLogger.all_objects.filter(id=orphan.id).update(eval_task_id="")
+
+        assert [str(t.id) for t in sweeper.find_stranded_tasks()] == [str(task.id)]
+
     @pytest.mark.parametrize(
         "status", [EvalTaskStatus.PAUSED, EvalTaskStatus.DELETED, EvalTaskStatus.FAILED]
     )
