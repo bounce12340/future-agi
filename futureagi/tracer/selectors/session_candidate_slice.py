@@ -37,6 +37,15 @@ row, and the row below it was published in its place. Root evidence is safe to
 bound by exactly the inference that fails for membership evidence: a root the
 slice cannot see is a root below T.
 
+WHEN THERE IS NO ROOT SCAN TO BOUND, THE SLICE IS NOT ISSUED. The user-detail
+page with a scalar-attribute filter proves membership and root-ness from one
+all-span replay seeded by the user's own sessions; its builder emits no root
+CTE and its statement never reads the floor. Sliced or not, it is the same
+text over the same rows, so this module asks the builder first
+(``candidate_slice_narrows_root_scan``) and issues that statement once,
+unsliced - which is exact by construction - instead of costing and widening
+a root scan that does not exist.
+
 WHAT THE SLICE MAY BOUND AT THE CEILING IS NARROWER STILL. A continuation also
 caps the root scan at the cursor instant, and a second reviewer found the
 sibling defect there. Some page predicates are a function of the root SET
@@ -117,8 +126,20 @@ from tracer.services.clickhouse.read_budget import ReadDeadline
 # reads the request window for that evidence, so its cost is the unsliced
 # membership scan plus a bounded root scan - never more than the unsliced
 # statement, but the widening loop re-issues it once per attempt, so a page
-# that widens pays that membership scan again. Unmeasured; a shorter attempt
-# budget for those shapes is the obvious follow-up.
+# that widens pays that membership scan again.
+#
+# One shape has no root scan for the floor to bound at all: the user-detail
+# page with a scalar-attribute filter, whose builder fuses root-ness into the
+# all-span replay its user's sessions seed. Measured on the high-volume tenant
+# through the view's entry point at three, six and twelve months, that page
+# issued eleven or twelve density probes and two or three candidate
+# statements - every "slice" byte-identical to the unsliced statement and
+# reading exactly its rows, 7.1-7.4 M per statement - for 4.3-6.9 s of page
+# wall, where the unsliced statement alone took 1.3-1.8 s warm and 1.4-2.8 s
+# as the first statement of a page. ``_slicing_is_available`` now asks the
+# builder whether the floor narrows anything before the first probe
+# (``candidate_slice_narrows_root_scan``) and reads the window whole when it
+# does not.
 #
 # The same reservation applies to a continuation whose page predicate reads the
 # root SET: the probe below costs [floor, cursor] while the statement then
@@ -519,22 +540,30 @@ def _classify_batch_size(builder: Any, candidates: int) -> int:
 
 
 def _slicing_is_available(builder: Any, page_size: int) -> bool:
-    """Whether this request can be both narrowed and verified.
+    """Whether this request can be narrowed, verified, and narrowed to effect.
 
-    Both halves are required. Without the full-state verifier a narrowed scan
+    All three are required. Without the full-state verifier a narrowed scan
     would publish inflated starts, so a builder that cannot run one reads the
-    window whole, exactly as it does today.
+    window whole, exactly as it does today. And a statement the floor does not
+    reach - the builder says so through ``candidate_slice_narrows_root_scan``
+    - would make every probe a cost for a root scan the statement never
+    issues and every slice the unsliced statement under another name, so it
+    reads the window whole too, once. A builder that does not answer the
+    question is taken to narrow, which is every builder this lane had before
+    the question existed.
     """
 
     probe = getattr(builder, "build_candidate_slice_density_probe_query", None)
     estimate = getattr(builder, "candidate_slice_density_estimate", None)
     supports_scan = getattr(builder, "supports_bounded_filter_scan", None)
+    narrows = getattr(builder, "candidate_slice_narrows_root_scan", None)
     return bool(
         callable(probe)
         and callable(estimate)
         and callable(supports_scan)
         and supports_scan()
         and page_size + 1 <= _MAX_VERIFIABLE_CANDIDATES
+        and (not callable(narrows) or narrows())
     )
 
 

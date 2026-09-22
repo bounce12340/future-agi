@@ -98,6 +98,9 @@ USER_LIST_ATTRIBUTE_SEED_TIMEOUT_MS = 1_500
 # first batch runs as before (it has no checkpoint to resume from yet); the
 # hydration after the walk carries no wall; numbered pages never start one and
 # the export opts out (``page_wall=False``) so it still fills its bounded page.
+# The matching-activity walk (``users_matching_walk``) reads the same setting
+# for the wall it owns on the filtered page it serves (a plain-text exact
+# filter, or a number/boolean filter that is the only item on its key).
 USER_LIST_PAGE_WALL_MS = settings.USER_LIST_PAGE_WALL_MS
 
 _USER_LIST_READ_SETTINGS = {
@@ -1952,18 +1955,18 @@ class UsersListManager:
         stops at ``USER_LIST_PAGE_WALL_MS`` and the page is published as it
         stands: exact rows in order, ``has_more`` and the checkpoint, with
         ``query_status`` ``degraded``. ``page_wall=False`` (the export) keeps
-        the walk unbounded.
+        the walk unbounded. A filter the matching-activity walk serves (a
+        plain-text exact filter, or a number/boolean filter that is the only
+        item on its key) never reaches that refill walk:
+        ``walk_matching_activity_page`` serves it and owns its own wall and
+        statement budget (the same ``USER_LIST_PAGE_WALL_MS``), so
+        ``page_wall`` does not apply to it.
         """
 
         if type(page_size) is not int or page_size <= 0:
             raise ValueError("user page size must be a positive integer")
-        # Hydration after the walk carries no wall (``deadline``); the refill
-        # walk after the first batch runs at the page wall.
+        # Hydration after the walk carries no wall (``deadline``).
         deadline = None
-        page_wall_deadline = (
-            ReadDeadline.start(USER_LIST_PAGE_WALL_MS) if page_wall else None
-        )
-        wall_stopped = False
         self._attribute_witness_disabled = False
         self._unqualified_attribute_fallback_used = False
         self._attribute_values_by_user.clear()
@@ -2030,6 +2033,14 @@ class UsersListManager:
             before_first_seen = cursor.order[1]
             before_end_user_id = str(cursor.order[2])
 
+        # Only a seeded page reaches this point: the matching-activity walk
+        # above owns the filtered page it serves and starts its own wall. Here
+        # the refill walk after the first batch runs at the page wall; the
+        # first batch runs unbounded as before.
+        page_wall_deadline = (
+            ReadDeadline.start(USER_LIST_PAGE_WALL_MS) if page_wall else None
+        )
+        wall_stopped = False
         published: list[dict] = []
         checkpoint: tuple[Any, ...] | None = None
         has_more = False
