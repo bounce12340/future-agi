@@ -488,3 +488,64 @@ def test_a_floor_below_the_incoming_boundary_at_one_instant_is_published() -> No
     # The floor descends within the instant, so it is what the page publishes.
     assert page.continuation_published_order_floor == (instant, "aaa")
     assert [row["id"] for row in page.rows] == ["ccc", "bbb"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "helper_name,row,expected",
+    [
+        (
+            "span",
+            {
+                "id": "span-9",
+                "trace_id": "trace-9",
+                "project_id": "project-9",
+                "start_time": END - timedelta(minutes=5),
+            },
+            (END - timedelta(minutes=5), "span-9", "trace-9", "project-9"),
+        ),
+        (
+            "trace",
+            {"trace_id": "trace-9", "start_time": END - timedelta(minutes=5)},
+            (END - timedelta(minutes=5), "trace-9"),
+        ),
+        (
+            "session",
+            {"session_id": "session-9", "start_time": END - timedelta(minutes=5)},
+            (END - timedelta(minutes=5), "session-9"),
+        ),
+    ],
+)
+def test_a_cursor_page_without_a_bounded_page_mints_from_its_last_row(
+    helper_name: str, row: dict[str, Any], expected: tuple[Any, ...]
+) -> None:
+    """A list's cursor also serves lanes that never ran the bounded reader.
+
+    The span list's unbounded cursor lane calls its boundary helper with
+    ``bounded_page=None`` and rows in hand. Before the floor existed these
+    helpers asked for rows first and reached the page only as a last resort, so
+    a missing page was never dereferenced; asking the page for ``has_more``
+    first turned that lane into a 500. Every one of the three helpers is
+    guarded, and with no page they mint the boundary from the last published
+    row, which is what they did before.
+    """
+
+    from tracer.views.observation_span import _span_cursor_order_for_partial_page
+    from tracer.views.trace import _trace_list_cursor_order_for_partial_page
+    from tracer.views.trace_session import (
+        _session_list_cursor_order_for_partial_page,
+    )
+
+    if helper_name == "span":
+        order = _span_cursor_order_for_partial_page(
+            rows=[row], bounded_page=None, cursor_state=None
+        )
+    elif helper_name == "trace":
+        order = _trace_list_cursor_order_for_partial_page(
+            rows=[row], bounded_page=None, cursor_state=None, org_scope=False
+        )
+    else:
+        order = _session_list_cursor_order_for_partial_page(
+            rows=[row], bounded_page=None, cursor_state=None
+        )
+    assert order == expected
