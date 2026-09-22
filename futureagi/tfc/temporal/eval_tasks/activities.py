@@ -99,9 +99,9 @@ def _run_entry_sync(entry_id: str) -> dict:
     Delegates to the ``run_entry`` service, which executes the eval, writes the
     result, and stamps the entry ``completed`` / ``errored`` / ``skipped`` plus
     its config hash. Returns ``"deleted"`` if the entry was soft-deleted mid-run
-    (a Delete & rerun landing while it ran) or ``"reclaimed"`` if the claim this
-    activity was scheduled for is no longer the row's, so the workflow just
-    moves on.
+    (a Delete & rerun landing while it ran) or ``"reclaimed"`` if the row is no
+    longer under the claim the run took -- refused before the eval, or written
+    and fenced out after it -- so the workflow just moves on.
     """
     close_old_connections()
     try:
