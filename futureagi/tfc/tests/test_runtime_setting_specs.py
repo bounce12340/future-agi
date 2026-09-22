@@ -698,3 +698,199 @@ def test_env_example_declares_each_setting_once():
     assert not duplicates, (
         f"{env_example.name} assigns these keys more than once: {duplicates}"
     )
+
+
+# Runtime settings that have no line in ``.env.example`` today. This list is a
+# record of existing debt, not a licence: it is frozen so the gap cannot grow,
+# and the only correct way to change it is to DELETE a name after documenting
+# that setting. It was 130 names when this train started; two of them belonged
+# to the train itself and were documented rather than listed here.
+_UNDOCUMENTED_RUNTIME_SETTINGS = frozenset(
+    (
+        "DASHBOARD_FILTER_VALUE_COMPAT_LOOKBACK_DAYS",
+        "DASHBOARD_FILTER_VALUE_FINITE_MAX",
+        "DASHBOARD_FILTER_VALUE_LEGACY_MAX",
+        "DASHBOARD_FILTER_VALUE_SEARCH_PAGE_SIZE",
+        "DASHBOARD_METRICS_ATTRIBUTE_KEY_LIMIT",
+        "DASHBOARD_METRICS_ATTRIBUTE_WORKERS",
+        "DASHBOARD_ROLLUP_MAX_POINTS",
+        "DASHBOARD_ROLLUP_MAX_QUERIES",
+        "DASHBOARD_ROLLUP_MAX_RESULT_BYTES",
+        "DATASET_INTERACTIVE_MAX_OFFSET_ROWS",
+        "DATASET_INTERACTIVE_MAX_PAGE_SIZE",
+        "DATASET_TABLE_CURSOR_MAX_AGE_SECONDS",
+        "DATASET_TABLE_EXACT_MAX_CELLS",
+        "DATASET_TABLE_EXACT_MAX_CELL_VALUE_BYTES",
+        "DATASET_TABLE_EXACT_MAX_CELL_VARIABLE_BYTES",
+        "DATASET_TABLE_EXACT_MAX_SCHEMA_BYTES",
+        "DATASET_TABLE_EXACT_MAX_SERIALIZED_BYTES",
+        "DATASET_TABLE_SERVER_WALL_SECONDS",
+        "EVAL_LOG_COLUMN_DEADLINE_CHECK_INTERVAL",
+        "EVAL_LOG_MAX_COLUMNS",
+        "EVAL_LOG_MAX_OFFSET",
+        "EVAL_LOG_MAX_SEARCH_COLUMNS",
+        "EVAL_LOG_MAX_SEARCH_LENGTH",
+        "EVAL_LOG_MAX_SORT_COLUMNS",
+        "EVAL_LOG_ROW_DEADLINE_CHECK_INTERVAL",
+        "EVAL_TASK_ERROR_GROUPS_LIMIT",
+        "EVAL_TASK_ERROR_TEXT_MAX_CHARS",
+        "EVAL_TASK_LIST_COMPATIBILITY_FILTER_UNITS",
+        "EVAL_TASK_LIST_COMPATIBILITY_RELATION_LIMIT",
+        "EVAL_TASK_LIST_COMPATIBILITY_SCAN_LIMIT",
+        "EVAL_TASK_LIST_MAX_OFFSET",
+        "EVAL_TASK_ROOT_JSON_PREFLIGHT_UNITS",
+        "EVAL_TASK_USAGE_AGGREGATION_JSON_MAX_CHARS",
+        "EVAL_TASK_USAGE_AGGREGATION_JSON_MAX_UNITS",
+        "EVAL_TASK_USAGE_AGGREGATION_ROW_LIMIT",
+        "EVAL_TASK_USAGE_DETAIL_TEXT_MAX_CHARS",
+        "EVAL_TASK_USAGE_JSON_PREVIEW_MAX_CHARS",
+        "EVAL_TASK_USAGE_MAPPING_ENTRY_LIMIT",
+        "EVAL_TASK_USAGE_MAPPING_JSON_MAX_CHARS",
+        "EVAL_TASK_USAGE_MAPPING_PATH_LIMIT",
+        "EVAL_TASK_USAGE_MAX_CHART_POINTS",
+        "EVAL_TASK_USAGE_OMITTED_FIELDS_LIMIT",
+        "EVAL_TASK_WARNING_GROUPS_LIMIT",
+        "EVAL_TASK_WARNING_KEY_LIMIT",
+        "EVAL_TASK_WARNING_KEY_MAX_CHARS",
+        "EVAL_TASK_WARNING_LOG_SCAN_LIMIT",
+        "EVAL_TASK_WARNING_MESSAGE_MAX_CHARS",
+        "FILTER_SELECTOR_MAX_BUILDER_QUERY_TIMEOUT_MS",
+        "FILTER_SELECTOR_MAX_NUMBERED_PAGE_WORK_ROWS",
+        "FILTER_SELECTOR_MAX_OPT_IN_QUERY_TIMEOUT_MS",
+        "FILTER_SELECTOR_NUMERIC_LONG_TEXT_SEED_WITNESS_SLACK_HOURS",
+        "FILTER_SELECTOR_POPULATION_MAX_THREADS",
+        "FILTER_SELECTOR_TEXT_SEED_TARGET_READ_ROWS",
+        "FILTER_SELECTOR_TEXT_SEED_WITNESS_SLACK_HOURS",
+        "FILTER_VALUE_CURSOR_INITIAL_SEGMENT_SECONDS",
+        "FILTER_VALUE_CURSOR_MAX_SEGMENT_SECONDS",
+        "FILTER_VALUE_CURSOR_MIN_SEGMENT_SECONDS",
+        "FILTER_VALUE_CURSOR_SCAN_LIMIT",
+        "FILTER_VALUE_READ_MAX_THREADS",
+        "GRAPH_SPAN_METRIC_BATCH_SIZE",
+        "GRAPH_TRACE_DECORATION_CANDIDATE_LIMIT",
+        "INTERACTIVE_READ_DEFAULT_MAX_RESPONSE_UNITS",
+        "OBSERVABILITY_LIST_MAX_BLOCK_SIZE",
+        "OBSERVABILITY_LIST_MAX_RESULT_ROWS",
+        "OBSERVABILITY_NAVIGATION_CANDIDATE_LIMIT",
+        "OBSERVABILITY_NAVIGATION_MAX_QUERIES",
+        "OBSERVABILITY_NAVIGATION_SCAN_PAGE_SIZE",
+        "PROMPT_METRICS_MAX_CHOICE_UTF8_BYTES",
+        "PROMPT_METRICS_MAX_EVAL_COLUMNS",
+        "PROMPT_METRICS_MAX_OFFSET",
+        "PROMPT_METRICS_MAX_TOTAL_CHOICE_UTF8_BYTES",
+        "PROMPT_METRICS_SPAN_PAGE_DB_PAYLOAD_BYTES",
+        "PROPERTY_CATALOG_AUTHORITATIVE_VALUE_BATCH_MAX_BYTES",
+        "PROPERTY_CATALOG_AUTHORITATIVE_VALUE_BATCH_MAX_ROWS",
+        "PROPERTY_CATALOG_CANONICAL_SPAN_MAX_GROUPS",
+        "PROPERTY_CATALOG_CANONICAL_SPAN_MAX_GROUP_BYTES",
+        "PROPERTY_CATALOG_CANONICAL_SPAN_MAX_THREADS",
+        "PROPERTY_CATALOG_CANONICAL_SPAN_MAX_WINDOWS",
+        "PROPERTY_CATALOG_CANONICAL_SPAN_PAGE_ROWS",
+        "PROPERTY_CATALOG_CANONICAL_SPAN_QUERY_TIMEOUT_MS",
+        "PROPERTY_CATALOG_CANONICAL_SPAN_SCAN_WINDOW_HOURS",
+        "PROPERTY_CATALOG_CURSOR_MAX_AGE_SECONDS",
+        "PROPERTY_CATALOG_DEV_CANONICAL_SPAN_PAGE_ROWS",
+        "PROPERTY_CATALOG_DEV_INITIAL_BACKFILL_MAX_WALL_MS",
+        "PROPERTY_CATALOG_DEV_SCHEDULED_RECONCILE_MAX_WALL_MS",
+        "PROPERTY_CATALOG_FULL_REPAIR_INTERVAL_SECONDS",
+        "PROPERTY_CATALOG_INITIAL_BACKFILL_CANONICAL_SPAN_PAGE_ROWS",
+        "PROPERTY_CATALOG_INITIAL_BACKFILL_CANONICAL_SPAN_QUERY_TIMEOUT_MS",
+        "PROPERTY_CATALOG_INITIAL_BACKFILL_LEASE_HEADROOM_MS",
+        "PROPERTY_CATALOG_LINEAGE_ANCHOR_MAX_AGE_SECONDS",
+        "PROPERTY_CATALOG_MAX_LINEAGE_REVISIONS",
+        "PROPERTY_CATALOG_MAX_NONTERMINAL_RESERVATIONS",
+        "PROPERTY_CATALOG_QUERY_WALL_MS",
+        "PROPERTY_CATALOG_READ_EXTERNAL_GROUP_BY_BYTES",
+        "PROPERTY_CATALOG_READ_EXTERNAL_SORT_BYTES",
+        "PROPERTY_CATALOG_READ_MAX_BYTES",
+        "PROPERTY_CATALOG_READ_MAX_CONCURRENT_QUERIES_PER_USER",
+        "PROPERTY_CATALOG_READ_MAX_MEMORY_BYTES",
+        "PROPERTY_CATALOG_READ_MAX_RESULT_BYTES",
+        "PROPERTY_CATALOG_READ_MAX_THREADS",
+        "PROPERTY_CATALOG_READ_POOL_SIZE",
+        "PROPERTY_CATALOG_READ_TRANSPORT_TIMEOUT_SECONDS",
+        "PROPERTY_CATALOG_RECONCILE_ACTIVITY_TIME_LIMIT_SECONDS",
+        "PROPERTY_CATALOG_RECONCILE_DEFAULT_ENVELOPE_ROWS",
+        "PROPERTY_CATALOG_RECONCILE_DEFAULT_MAX_ENVELOPE_BYTES",
+        "PROPERTY_CATALOG_RECONCILE_MAX_ENVELOPE_BYTES",
+        "PROPERTY_CATALOG_RECONCILE_MAX_ENVELOPE_ROWS",
+        "PROPERTY_CATALOG_RECONCILE_MAX_WORKSPACES",
+        "PROPERTY_CATALOG_SOURCE_MAX_PAGE_BYTES",
+        "PROPERTY_CATALOG_SOURCE_MAX_TOTAL_BYTES",
+        "SESSION_LIST_FILTER_MAX_CANDIDATES",
+        "SESSION_LIST_FILTER_MAX_QUERIES",
+        "SESSION_LIST_FILTER_MAX_SEED_ATTEMPTS",
+        "SESSION_LIST_FILTER_SEED_WITNESS_SLACK_HOURS",
+        "SESSION_LIST_MAX_RESULT_BYTES",
+        "SESSION_LIST_READ_MAX_THREADS",
+        "SIMULATION_PREVIEW_CURSOR_MAX_AGE_SECONDS",
+        "SMART_FILTER_GROUNDED_VALUE_LIMIT",
+        "SMART_FILTER_PROJECT_SCOPE_LIMIT",
+        "SMART_FILTER_REQUEST_WALL_MS",
+        "SMART_FILTER_SEARCH_MAX_BYTES",
+        "SMART_FILTER_VALUE_LIMIT",
+        "SMART_FILTER_VALUE_READ_WALL_MS",
+        "TRACE_LIST_ANNOTATION_SCORE_SPAN_LIMIT",
+        "TRACE_LIST_ENRICHMENT_CHUNK_SIZE",
+        "TRACE_LIST_ENRICHMENT_MAX_WORKERS",
+        "VOICE_CONTENT_MAX_QUERY_ATTEMPTS",
+        "VOICE_FILTER_TEXT_SEED_WITNESS_SLACK_HOURS",
+    )
+)
+
+
+def _env_example_assignments():
+    env_example = Path(__file__).resolve().parents[2] / ".env.example"
+    return {
+        line.split("=", 1)[0].strip()
+        for line in env_example.read_text().splitlines()
+        if "=" in line and not line.lstrip().startswith("#")
+    }
+
+
+def test_every_new_runtime_setting_is_documented_in_env_example():
+    """An operator cannot tune a bound they cannot see.
+
+    Every bound in this file is meant to be operator-tunable, which means it
+    needs a line in ``.env.example``. Most already have one; the rest are
+    named in ``_UNDOCUMENTED_RUNTIME_SETTINGS`` as existing debt. What this
+    guard exists for is the NEXT setting: one added without a line fails
+    here, because it is in the specs, absent from the example, and not on the
+    frozen list.
+    """
+
+    documented = _env_example_assignments()
+    undocumented = {
+        name for name in RUNTIME_NUMERIC_SETTING_SPECS if name not in documented
+    }
+    assert undocumented, "the reader found nothing at all; check the parser"
+
+    new_and_undocumented = sorted(undocumented - _UNDOCUMENTED_RUNTIME_SETTINGS)
+    assert not new_and_undocumented, (
+        "these runtime settings have no line in .env.example and are not on "
+        "the frozen debt list, so an operator has no way to see or tune "
+        f"them: {new_and_undocumented}"
+    )
+
+
+def test_the_undocumented_list_does_not_name_a_setting_that_is_documented():
+    """The debt list must shrink honestly, never drift.
+
+    A name that has since been documented has to leave the list, otherwise
+    the list stops being a record of what is missing and starts hiding the
+    fact that the gap closed.
+    """
+
+    documented = _env_example_assignments()
+    stale = sorted(_UNDOCUMENTED_RUNTIME_SETTINGS & documented)
+    assert not stale, (
+        f"these are documented in .env.example and must be removed from "
+        f"_UNDOCUMENTED_RUNTIME_SETTINGS: {stale}"
+    )
+
+    unknown = sorted(
+        _UNDOCUMENTED_RUNTIME_SETTINGS - set(RUNTIME_NUMERIC_SETTING_SPECS)
+    )
+    assert not unknown, (
+        f"these are on the debt list but are no longer settings at all: {unknown}"
+    )
