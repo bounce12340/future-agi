@@ -635,7 +635,8 @@ def test_string_page_policy_and_finite_single_replay(cls, org, filters, preferre
     # replay is split, and it keeps its own smaller batch.
     assert subject.recommended_filter_cursor_seed_batch_size() == 200
     assert subject.recommended_filter_classify_batch_size() == 50
-    assert subject.recommended_filter_max_slice_width() is None
+    # An exhausted slice may double until it covers the whole request window.
+    assert subject.recommended_filter_max_slice_width() == timedelta(days=7)
     sql, params = subject.build_filter_match_query_from_seed_rows(
         [{"session_id": USER}]
     )
@@ -686,7 +687,9 @@ def test_string_page_initial_width_preserves_minimum_and_maximum(minutes, expect
     assert subject.recommended_filter_initial_slice_width() == (
         timedelta(minutes=expected) if expected else None
     )
-    assert subject.recommended_filter_max_slice_width() is None
+    assert subject.recommended_filter_max_slice_width() == (
+        timedelta(minutes=minutes) if minutes >= 5 else None
+    )
 
 
 @pytest.mark.parametrize(
