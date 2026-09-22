@@ -15,7 +15,7 @@ def test_ensure_active_start_coalesces_with_an_active_workflow(monkeypatch):
     monkeypatch.setattr(
         client,
         "_select",
-        lambda _task, _queue: (workflow_class, workflow_input),
+        lambda _task, _queue, **_kwargs: (workflow_class, workflow_input),
     )
 
     def _start(**kwargs):
@@ -41,7 +41,7 @@ def test_committed_rerun_replaces_an_old_or_closing_workflow(monkeypatch):
     monkeypatch.setattr(
         client,
         "_select",
-        lambda _task, _queue: (SimpleNamespace(run=object()), object()),
+        lambda _task, _queue, **_kwargs: (SimpleNamespace(run=object()), object()),
     )
 
     def _start(**kwargs):
@@ -102,7 +102,7 @@ async def test_async_committed_rerun_replaces_an_active_workflow(monkeypatch):
     monkeypatch.setattr(
         client,
         "_select",
-        lambda _task, _queue: (workflow_class, workflow_input),
+        lambda _task, _queue, **_kwargs: (workflow_class, workflow_input),
     )
 
     async def _start(**kwargs):
@@ -119,3 +119,73 @@ async def test_async_committed_rerun_replaces_an_active_workflow(monkeypatch):
     assert captured["cancel_existing"] is False
     assert captured["id_reuse_policy"] == WorkflowIDReusePolicy.ALLOW_DUPLICATE
     assert captured["id_conflict_policy"] == WorkflowIDConflictPolicy.TERMINATE_EXISTING
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("described", "expected"),
+    [
+        ("absent", True),
+        ("closed", True),
+        ("progressing", False),
+    ],
+)
+def test_the_start_carries_what_the_describe_said_into_the_reap(
+    monkeypatch, described, expected
+):
+    """The first thing a fresh execution does is reap, and the reap applies a
+    ninety-minute floor unless something can show it is not racing a live
+    dispatcher. Nothing inside the workflow can show that — a describe taken
+    from within finds the execution asking — so the starter takes it, in the
+    moment between the old execution ending and the new one beginning, and
+    carries the answer in the workflow input."""
+    from tfc.temporal.eval_tasks import client
+    from tfc.temporal.eval_tasks.types import EvalTaskWorkflowInput
+    from tracer.models.eval_task import RunType
+
+    monkeypatch.setattr(
+        client, "describe_eval_task_workflow_sync", lambda _task_id: described
+    )
+    captured = {}
+
+    def _start(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(id=kwargs["workflow_id"])
+
+    monkeypatch.setattr(client, "start_workflow_sync", _start)
+
+    client.start_eval_task_workflow_sync(
+        SimpleNamespace(id="task-id", run_type=RunType.HISTORICAL),
+        replace_existing=True,
+    )
+
+    workflow_input = captured["workflow_input"]
+    assert isinstance(workflow_input, EvalTaskWorkflowInput)
+    assert workflow_input.workflow_confirmed_stopped is expected
+
+
+@pytest.mark.unit
+def test_a_describe_that_cannot_answer_leaves_the_floor_in_place(monkeypatch):
+    """No answer is not a negative answer. An unreachable Temporal must not
+    read as "nothing is draining" — that is the one reading that lets a reap
+    retire a claim a live execution still owns."""
+    from tfc.temporal.eval_tasks import client
+    from tracer.models.eval_task import RunType
+
+    def _unreachable(_task_id):
+        raise RuntimeError("temporal unreachable")
+
+    monkeypatch.setattr(client, "describe_eval_task_workflow_sync", _unreachable)
+    captured = {}
+
+    def _start(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(id=kwargs["workflow_id"])
+
+    monkeypatch.setattr(client, "start_workflow_sync", _start)
+
+    client.start_eval_task_workflow_sync(
+        SimpleNamespace(id="task-id", run_type=RunType.HISTORICAL)
+    )
+
+    assert captured["workflow_input"].workflow_confirmed_stopped is False

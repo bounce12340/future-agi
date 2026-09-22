@@ -18,7 +18,7 @@ def _workflow_id(task_id: str) -> str:
     return f"eval-task-{task_id}"
 
 
-def _select(task, task_queue):
+def _select(task, task_queue, *, workflow_confirmed_stopped: bool = False):
     """Return (workflow_class, workflow_input) for the task's run_type."""
     from tfc.temporal.eval_tasks.types import (
         ContinuousDrainState,
@@ -32,10 +32,14 @@ def _select(task, task_queue):
 
     if task.run_type == RunType.CONTINUOUS:
         return ContinuousEvalTaskWorkflow, ContinuousDrainState(
-            task_id=str(task.id), task_queue=task_queue
+            task_id=str(task.id),
+            task_queue=task_queue,
+            workflow_confirmed_stopped=workflow_confirmed_stopped,
         )
     return HistoricalEvalTaskWorkflow, EvalTaskWorkflowInput(
-        task_id=str(task.id), task_queue=task_queue
+        task_id=str(task.id),
+        task_queue=task_queue,
+        workflow_confirmed_stopped=workflow_confirmed_stopped,
     )
 
 
@@ -50,8 +54,16 @@ def start_eval_task_workflow_sync(
     New-task/legacy callers coalesce with an already-active workflow. A rerun
     or resume passes ``replace_existing=True`` after its PENDING state commits,
     so a stale or closing execution cannot absorb the start and strand the row.
+
+    Every start describes the task's workflow id first and carries the answer
+    into the workflow input, because the first thing a fresh run does is reap:
+    see ``_describe_says_nothing_is_draining``.
     """
-    workflow_class, workflow_input = _select(task, task_queue)
+    workflow_class, workflow_input = _select(
+        task,
+        task_queue,
+        workflow_confirmed_stopped=_describe_says_nothing_is_draining(task.id),
+    )
     conflict_policy = (
         WorkflowIDConflictPolicy.TERMINATE_EXISTING
         if replace_existing
@@ -112,6 +124,39 @@ def describe_eval_task_workflow_sync(task_id) -> str:
     )
 
 
+def _describe_says_nothing_is_draining(task_id) -> bool:
+    """Whether the server just said no execution owns this task's workflow id.
+
+    This is the evidence the first act of the run it precedes needs. A fresh
+    execution reaps before it claims, asking for ``ReapInput``'s 600 s, and
+    ``effective_stale_seconds`` raises that to ninety minutes unless something
+    can show the reap is not racing a live dispatcher. Nothing inside the
+    workflow can show it — a describe taken from within would find the
+    execution asking. It has to be taken here, in the moment between the old
+    execution ending and the new one starting, which is where Resume, Edit →
+    Save and the sweep's restart all pass.
+
+    False on any failure, including an unreachable Temporal: no answer is not
+    a negative answer, and the floor is the safe reading of silence. The start
+    that follows surfaces the outage on its own.
+    """
+    try:
+        return describe_eval_task_workflow_sync(task_id) in (WF_ABSENT, WF_CLOSED)
+    except Exception:
+        return False
+
+
+async def _describe_says_nothing_is_draining_async(task_id) -> bool:
+    """``_describe_says_nothing_is_draining`` for the async starter."""
+    try:
+        return (await describe_eval_task_workflow_async(task_id)) in (
+            WF_ABSENT,
+            WF_CLOSED,
+        )
+    except Exception:
+        return False
+
+
 def signal_pause_eval_task_workflow(task_id) -> bool:
     """Tell the running workflow to stop launching new evals at once. Best-effort
     — the paused DB status the caller already wrote is the durable source of
@@ -125,7 +170,13 @@ async def start_eval_task_workflow_async(
     *,
     replace_existing: bool = False,
 ) -> str:
-    workflow_class, workflow_input = _select(task, task_queue)
+    workflow_class, workflow_input = _select(
+        task,
+        task_queue,
+        workflow_confirmed_stopped=await _describe_says_nothing_is_draining_async(
+            task.id
+        ),
+    )
     conflict_policy = (
         WorkflowIDConflictPolicy.TERMINATE_EXISTING
         if replace_existing

@@ -269,19 +269,17 @@ class TestReapActivitySync:
             == 2
         )
 
-    def test_a_run_the_closed_execution_still_owns_survives_the_start_reap(
+    def test_a_reap_that_cannot_see_the_workflow_waits_out_the_run(
         self, eval_task, make_pending_entries
     ):
-        """The reap a restarted workflow runs first asks for ``ReapInput``'s
-        own default, 600 s.
+        """A reap with no evidence about the workflow applies the floor.
 
-        Every restart carries it — Resume, Edit → Save, and the one the
-        scheduled sweep issues — and the sweep only ever restarts a task whose
-        execution has closed, which is precisely when an activity of that
-        execution can still be running on a worker for up to one start-to-close
-        attempt. Requeueing there re-claims an entry whose run is still
-        executing: the evaluation is paid for twice, one of the row's three
-        reclaims is spent, and the first run's result is refused by the fence.
+        ``ReapInput``'s own default is 600 s, well inside the window an
+        activity of a since-closed execution can still be running on a worker.
+        Requeueing there re-claims an entry whose run is still executing: the
+        evaluation is paid for twice, one of the row's three reclaims is spent,
+        and the first run's result is refused by the fence. This is the branch
+        a starter whose describe could not answer lands in.
         """
         from tfc.temporal.eval_tasks.activities import _reap_sync
         from tfc.temporal.eval_tasks.types import ReapInput
@@ -315,6 +313,49 @@ class TestReapActivitySync:
         assert (out["requeued"], out["failed"]) == (1, 0)
         assert abandoned.status == EvalEntryStatus.PENDING
         assert out["older_than_seconds"] == MIN_STALE_RUNNING_SECONDS
+
+    def test_a_restart_that_knows_the_workflow_is_dead_reclaims_at_once(
+        self, eval_task, make_pending_entries
+    ):
+        """The other branch, and the one Resume depends on.
+
+        The starter described the task's workflow id in the moment before this
+        execution began and the server said nothing owned it, so no dispatcher
+        can take the entries this reap requeues, and ``ReapInput``'s 600 s is
+        honoured as asked. Without this the same entry waits ninety minutes: a
+        Resume inside that window reclaims nothing, claims nothing, refuses to
+        finalize and drives the task straight back to FAILED in seconds.
+
+        What the describe does not rule out is an abandoned evaluation thread
+        from the dead execution. Its write is refused by the claim-epoch fence,
+        so the row stays correct; the residue is a duplicated evaluation spend,
+        which closes with the run-entry thread-leak follow-up.
+        """
+        from tfc.temporal.eval_tasks.activities import _reap_sync
+        from tfc.temporal.eval_tasks.types import ReapInput
+        from tracer.services.eval_tasks.reaper import MIN_STALE_RUNNING_SECONDS
+
+        asked = ReapInput(task_id=str(eval_task.id)).older_than_seconds
+        stranded = make_pending_entries(eval_task, 1, status=EvalEntryStatus.RUNNING)[0]
+        fresh = make_pending_entries(eval_task, 1, status=EvalEntryStatus.RUNNING)[0]
+        EvalLogger.objects.filter(id=stranded.id).update(
+            updated_at=timezone.now() - timedelta(seconds=asked + 60), attempts=0
+        )
+        EvalLogger.objects.filter(id=fresh.id).update(
+            updated_at=timezone.now() - timedelta(seconds=30), attempts=0
+        )
+
+        out = _reap_sync(str(eval_task.id), asked, 3, True)
+
+        stranded.refresh_from_db()
+        fresh.refresh_from_db()
+        assert asked == 600
+        assert out["older_than_seconds"] == asked < MIN_STALE_RUNNING_SECONDS
+        assert (out["requeued"], out["failed"]) == (1, 0)
+        assert stranded.status == EvalEntryStatus.PENDING
+        # Still inside the requested threshold: the waiver lowers the floor, it
+        # does not make the reap indiscriminate.
+        assert fresh.status == EvalEntryStatus.RUNNING
 
 
 @pytest.mark.integration
@@ -468,3 +509,43 @@ class TestFinalizeActivitySync:
 
         with pytest.raises(EvalTask.DoesNotExist):
             _get_task_state_sync(str(uuid.uuid4()))
+
+
+@pytest.mark.asyncio
+async def test_the_reap_activity_carries_the_workflows_evidence_through(monkeypatch):
+    """The flag has to survive the whole hop: workflow input -> ``ReapInput``
+    -> activity wrapper -> ``_reap_sync``. Dropped anywhere in that chain it
+    reads as "unknown", and the ninety-minute floor comes back silently."""
+    import tfc.temporal.eval_tasks.activities as activities
+    from tfc.temporal.eval_tasks.types import ReapInput
+
+    seen = {}
+
+    class NoopHeartbeater:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    def fake_sync_to_async(function, **_kwargs):
+        async def invoke(*args, **kwargs):
+            return function(*args, **kwargs)
+
+        return invoke
+
+    def capture(task_id, older_than_seconds, max_attempts, confirmed):
+        seen.update(asked=older_than_seconds, confirmed=confirmed)
+        return {"requeued": 0, "failed": 0, "older_than_seconds": older_than_seconds}
+
+    monkeypatch.setattr(activities, "Heartbeater", NoopHeartbeater)
+    monkeypatch.setattr(activities, "otel_sync_to_async", fake_sync_to_async)
+    monkeypatch.setattr(activities, "_reap_sync", capture)
+
+    await activities.reap_stale_running_activity(
+        ReapInput(task_id="task-id", workflow_confirmed_stopped=True)
+    )
+    assert seen == {"asked": 600, "confirmed": True}
+
+    await activities.reap_stale_running_activity(ReapInput(task_id="task-id"))
+    assert seen == {"asked": 600, "confirmed": False}

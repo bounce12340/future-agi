@@ -122,7 +122,7 @@ async def test_reap_logs_what_it_reclaimed(stub):
     stub.setattr(
         activities,
         "_reap_sync",
-        lambda task_id, older_than_seconds, max_attempts: {
+        lambda task_id, older_than_seconds, max_attempts, confirmed: {
             "requeued": 4,
             "failed": 1,
             "older_than_seconds": 5_401,
@@ -137,8 +137,9 @@ async def test_reap_logs_what_it_reclaimed(stub):
     assert (line["requeued"], line["failed"]) == (4, 1)
     # The threshold the reap applied, not the one it was asked for: the
     # workflow always asks for ReapInput's 600 s default and the activity
-    # raises it to the floor, so logging the input would report a window the
-    # reap never used.
+    # either honours it or raises it to the floor, depending on what the
+    # starter's describe established, so logging the input would report a
+    # window the reap may never have used.
     assert line["older_than_seconds"] == 5_401
     assert ReapInput(task_id=_TASK_ID).older_than_seconds == 600
 

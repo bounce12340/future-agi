@@ -174,7 +174,12 @@ def _fail_entry_sync(entry_id: str) -> dict:
         close_old_connections()
 
 
-def _reap_sync(task_id: str, older_than_seconds: int, max_attempts: int) -> dict:
+def _reap_sync(
+    task_id: str,
+    older_than_seconds: int,
+    max_attempts: int,
+    workflow_confirmed_stopped: bool = False,
+) -> dict:
     """Reclaim entries stuck running past ``older_than_seconds`` (e.g. a worker
     crashed mid-eval).
 
@@ -183,13 +188,15 @@ def _reap_sync(task_id: str, older_than_seconds: int, max_attempts: int) -> dict
     loop forever. Called once at workflow start to clear leftovers from a
     previous, crashed execution.
 
-    The requested threshold is raised to ``MIN_STALE_RUNNING_SECONDS`` when it
-    is shorter. ``ReapInput``'s default is 600 s, which predates the write
-    fence and is inside the window an activity of a since-closed execution can
-    still be running in; a reap there requeues a live run and pays for it
-    twice. Applying the floor here rather than in the workflow keeps it out of
-    the replayed command stream — it is an activity-side decision, so an
-    execution that started before this change picks it up on its next reap.
+    The requested threshold is raised to ``MIN_STALE_RUNNING_SECONDS`` unless
+    the starter's describe established that nothing was draining the task,
+    which ``workflow_confirmed_stopped`` carries. Blind, ``ReapInput``'s 600 s
+    default is inside the window an activity of a since-closed execution can
+    still be running in, and reaping there requeues a live run and pays for it
+    twice; with the describe behind it, 600 s is what Resume and Edit → Save
+    need in order to reclaim anything at all. The decision itself lives in
+    ``effective_stale_seconds``, and applying it here rather than in the
+    workflow keeps the threshold out of the replayed command stream.
 
     Returns ``{"requeued", "failed", "older_than_seconds"}``, the last being the
     threshold actually applied so the activity logs what it did, not what it
@@ -203,7 +210,10 @@ def _reap_sync(task_id: str, older_than_seconds: int, max_attempts: int) -> dict
             reap_stale_running,
         )
 
-        stale_seconds = effective_stale_seconds(older_than_seconds)
+        stale_seconds = effective_stale_seconds(
+            older_than_seconds,
+            workflow_confirmed_stopped=workflow_confirmed_stopped,
+        )
         task = EvalTask.objects.get(id=task_id)
         requeued, failed = reap_stale_running(
             task, older_than_seconds=stale_seconds, max_attempts=max_attempts
@@ -468,7 +478,10 @@ async def fail_eval_entry_activity(input: RunEntryInput) -> RunEntryOutput:
 async def reap_stale_running_activity(input: ReapInput) -> ReapOutput:
     async with Heartbeater():
         result = await otel_sync_to_async(_reap_sync, thread_sensitive=False)(
-            input.task_id, input.older_than_seconds, input.max_attempts
+            input.task_id,
+            input.older_than_seconds,
+            input.max_attempts,
+            input.workflow_confirmed_stopped,
         )
     logger.info(
         "eval_task_reaped",

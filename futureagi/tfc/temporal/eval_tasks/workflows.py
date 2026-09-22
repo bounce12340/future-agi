@@ -214,10 +214,21 @@ async def _reconcile_continuous(task_id: str) -> bool:
     return True
 
 
-async def _reap(task_id: str) -> None:
+async def _reap(task_id: str, *, workflow_confirmed_stopped: bool = False) -> None:
+    """Reclaim entries a previous execution abandoned in ``running``.
+
+    ``workflow_confirmed_stopped`` is passed through from this execution's own
+    input: the starter described the task's workflow id in the moment before
+    this run began and the server said nothing owned it. Without it the reap
+    applies a ninety-minute floor, which is what made Resume and Edit → Save
+    no-ops inside ninety minutes of a crash. See
+    ``tracer.services.eval_tasks.reaper.effective_stale_seconds``.
+    """
     await workflow.execute_activity(
         "reap_stale_running_activity",
-        ReapInput(task_id=task_id),
+        ReapInput(
+            task_id=task_id, workflow_confirmed_stopped=workflow_confirmed_stopped
+        ),
         start_to_close_timeout=_CONTROL_TIMEOUT,
         heartbeat_timeout=_HEARTBEAT,
         retry_policy=CONTROL_RETRY_POLICY,
@@ -380,8 +391,14 @@ class HistoricalEvalTaskWorkflow(_ObservableEvalWorkflow):
             # continue-as-new are already running).
             await _mark_running(input.task_id)
             await _reconcile(input.task_id)
-            # Reclaim entries left RUNNING by a crashed prior execution.
-            await _reap(input.task_id)
+            # Reclaim entries left RUNNING by a crashed prior execution. Only
+            # on a genuine first start: a continue-as-new hop takes the
+            # ``already_reconciled`` branch, which is also why its input need
+            # not carry the describe forward.
+            await _reap(
+                input.task_id,
+                workflow_confirmed_stopped=input.workflow_confirmed_stopped,
+            )
 
         self._phase = PHASE_DRAINING
         processed = input.processed
@@ -472,7 +489,10 @@ class ContinuousEvalTaskWorkflow(_ObservableEvalWorkflow):
         reconciled = await _reconcile_continuous(state.task_id)
         reaped = False
         if reconciled:
-            await _reap(state.task_id)
+            await _reap(
+                state.task_id,
+                workflow_confirmed_stopped=state.workflow_confirmed_stopped,
+            )
             reaped = True
 
         while True:
@@ -506,7 +526,10 @@ class ContinuousEvalTaskWorkflow(_ObservableEvalWorkflow):
                 # A restarted workflow may have entries stranded RUNNING. If
                 # initial CH pressure delayed the first proof, reap immediately
                 # after eventual success and before the first claim.
-                await _reap(state.task_id)
+                await _reap(
+                    state.task_id,
+                    workflow_confirmed_stopped=state.workflow_confirmed_stopped,
+                )
                 reaped = True
 
             batch = await _claim(state.task_id, state.batch_size)
@@ -530,6 +553,10 @@ class ContinuousEvalTaskWorkflow(_ObservableEvalWorkflow):
                 state.batches, state.continue_as_new_after_batches
             ):
                 # Reset the per-run batch counter; keep lifetime ``processed``.
+                # ``workflow_confirmed_stopped`` is deliberately not carried:
+                # the next hop reaps again, and by then the execution draining
+                # this task is this one, so the describe taken before the
+                # original start no longer says anything about a live claim.
                 workflow.continue_as_new(
                     ContinuousDrainState(
                         task_id=state.task_id,

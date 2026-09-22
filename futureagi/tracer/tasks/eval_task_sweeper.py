@@ -2,9 +2,11 @@
 
 An eval task drains through exactly one Temporal workflow, and every start of
 one is user-initiated (create, resume, edit). The reaper that reclaims entries
-abandoned in ``running`` only runs at workflow start — deliberately skipped
-across continue-as-new — so a workflow that stops (failed, terminated, lost
-with its worker) leaves every remaining entry frozen with nothing watching.
+abandoned in ``running`` runs once per execution — at the historical
+workflow's first start, deliberately skipped across its continue-as-new hops,
+and once per hop of the continuous one — so a workflow that stops (failed,
+terminated, lost with its worker) leaves every remaining entry frozen with
+nothing watching.
 ``has_undrained_work`` exists but is only ever read from inside a running
 workflow. This sweep is the missing out-of-band recovery, and the only thing
 that makes a stranded task visible at all.
@@ -223,11 +225,16 @@ def recover_task(task: EvalTask, *, stale_running_seconds: int) -> dict:
 
     requeued, failed = reap_stale_running(
         task,
-        # A validated setting cannot be below the floor, but going through the
-        # same helper as the workflow's reap is what makes "no reap retires a
-        # claim a live run can still own" hold by construction rather than by a
-        # spec bound a later edit could loosen on its own.
-        older_than_seconds=effective_stale_seconds(stale_running_seconds),
+        # Through the same helper as the workflow's own reap, carrying the same
+        # evidence: the describe above just answered that no execution owns
+        # this task, so the configured threshold is used exactly rather than
+        # raised to the blind floor. At the shipped default (7,200 s) the two
+        # are the same number; what the flag buys is that an operator who
+        # lowers the setting gets the value they set, and that every reap in
+        # the product decides the floor in one function.
+        older_than_seconds=effective_stale_seconds(
+            stale_running_seconds, workflow_confirmed_stopped=True
+        ),
         max_attempts=_MAX_ENTRY_ATTEMPTS,
     )
     outcome = {
