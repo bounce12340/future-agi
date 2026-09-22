@@ -389,29 +389,35 @@ def test_a_remapped_identity_at_the_boundary_instant_is_the_known_residual() -> 
 def test_the_boundary_never_rises_within_one_instant(
     floor_token: str | None, incoming_token: str, keeps_the_floor: bool
 ) -> None:
-    """The descent clamp compares the whole boundary, token included.
+    """The decision itself, on every shape it can be handed.
 
     Two boundaries at the same instant are ordered by their tokens, and both
     are in the order the list publishes: a floor carries a token only when it
     came from a keyset the bound can name, which is exactly when that token is
     the published one. Comparing on the instant alone would let a floor that
     stopped further INTO an instant than the boundary already promised be
-    handed out, un-excluding the rows published between the two.
+    handed out, un-excluding the rows published between the two. This is the
+    decision's own contract; the reader-level test below is the one that goes
+    red when the comparison is weakened.
     """
 
-    from tracer.selectors.trace_filter_reads import _published_order_sort_key
+    from tracer.selectors.trace_filter_reads import _boundary_to_publish
 
     instant = END - timedelta(minutes=30)
     floor = (instant, floor_token)
     incoming = (instant, incoming_token)
-    descends = _published_order_sort_key(floor) < _published_order_sort_key(incoming)
-    assert descends is keeps_the_floor
+    expected = floor if keeps_the_floor else incoming
+    assert _boundary_to_publish(floor, incoming) == expected
 
-    # And the same rule across instants, which is the ordinary case.
+    # The same decision across instants, which is the ordinary case.
     older = (instant - timedelta(microseconds=1), floor_token)
     newer = (instant + timedelta(microseconds=1), floor_token)
-    assert _published_order_sort_key(older) < _published_order_sort_key(incoming)
-    assert _published_order_sort_key(newer) > _published_order_sort_key(incoming)
+    assert _boundary_to_publish(older, incoming) == older
+    assert _boundary_to_publish(newer, incoming) == incoming
+
+    # With nothing to clamp against, the floor stands as it is.
+    assert _boundary_to_publish(floor, None) == floor
+    assert _boundary_to_publish(None, incoming) is None
 
 
 @pytest.mark.unit
