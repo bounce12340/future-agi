@@ -84,7 +84,9 @@ _EXACT_REPLAY_IDENTITY_COLUMNS = (
     "id",
 )
 # The candidate CTE's name marks a statement that carries the exact replay;
-# ``build_metric_query`` reads it to choose that statement's aggregation.
+# ``build_metric_query`` reads it to choose that statement's aggregation,
+# and ``candidate_estimate_statement`` lifts its body for the cost probe,
+# so the statement and its estimate cannot drift apart on a rename.
 _EXACT_REPLAY_CANDIDATE_CTE = "dashboard_filter_candidate_identities"
 
 # Fat payload columns that no dashboard metric, filter or breakdown expression
@@ -274,6 +276,46 @@ class DashboardQueryBuilderV2(V2RewriteMixin, DashboardQueryBuilder):
                 ),
             )
         )
+
+    @staticmethod
+    def candidate_estimate_statement(sql: str) -> str | None:
+        """Return ``EXPLAIN ESTIMATE`` over this statement's own candidate CTE.
+
+        The identity-discovery CTE is the part-scanning half of an exact
+        filtered read: the replay half only resolves the identities it yields.
+        Estimating it therefore has to read the same text the statement will
+        execute, not a reconstruction of it, so the body is lifted verbatim
+        out of the rendered SQL and the caller reuses the statement's own
+        parameters. ``None`` means this statement embeds no candidate CTE (no
+        exhaustive raw witness), so there is nothing cheap to estimate.
+        """
+
+        marker = f"WITH {_EXACT_REPLAY_CANDIDATE_CTE} AS ("
+        start = sql.find(marker)
+        if start < 0:
+            return None
+        index = start + len(marker)
+        depth = 1
+        quoted = False
+        while index < len(sql):
+            char = sql[index]
+            if quoted:
+                if char == "'":
+                    if sql[index + 1 : index + 2] == "'":
+                        index += 1
+                    else:
+                        quoted = False
+            elif char == "'":
+                quoted = True
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    body = sql[start + len(marker) : index].strip()
+                    return f"EXPLAIN ESTIMATE {body}" if body else None
+            index += 1
+        return None
 
     def _exact_filter_replay_source(
         self,

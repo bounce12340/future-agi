@@ -105,8 +105,12 @@ class QueryResult:
     ``read_rows`` is the server's own native rows-read counter for the
     statement, or ``None`` when the transport cannot report it. It describes
     the work the statement did, never its result: a caller sizing its next read
-    by it must treat ``None`` as "unmeasured", not as zero. Bytes read are
-    logged but not carried here, because nothing decides on them.
+    by it must treat ``None`` as "unmeasured", not as zero.
+
+    ``read_bytes`` is the server's own native bytes-read counter for the
+    statement, or ``None`` when the transport cannot report it. It describes
+    the work the statement did, never its result: a caller learning a read
+    density from it must treat ``None`` as "unmeasured", not as zero.
     """
 
     data: Any  # Can be list, dict, or any serializable structure
@@ -115,6 +119,7 @@ class QueryResult:
     query_time_ms: float
     columns: list[str] | None = None
     read_rows: int | None = None
+    read_bytes: int | None = None
 
     @classmethod
     def from_clickhouse_rows(cls, rows, columns, query_time_ms):
@@ -226,10 +231,10 @@ class AnalyticsQueryService:
         longer a statement deadline. Request/continuation admission and transport
         failure detection are separate from server query execution limits.
 
-        The result carries the statement's own native rows-read progress, which
-        a caller may use to size its next read; the transport leaves it
-        unmeasured when the server reported none. Bytes read reach the log line
-        only - no caller decides on them.
+        The result carries the statement's own native rows-read and
+        bytes-read progress: a caller may size its next read by the rows and
+        learn what this scope costs per row from the bytes. The transport
+        leaves either unmeasured when the server reported none.
         """
         if self.supports_per_query_read_settings:
             settings = application_read_settings(settings)
@@ -274,6 +279,7 @@ class AnalyticsQueryService:
             query_time_ms=round(elapsed, 2),
             columns=col_names,
             read_rows=read_rows,
+            read_bytes=read_bytes,
         )
 
     def get_span_attribute_keys_ch_for_projects(
