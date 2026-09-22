@@ -726,6 +726,59 @@ def test_span_numbered_page_outlives_the_wall_a_cursor_page_stops_at(cursor_mode
         assert payload["metadata"]["query_complete"] is True
 
 
+@override_settings(CLICKHOUSE_V2={"QUERY_TYPES_V2_ONLY": "TRACE_LIST"})
+@pytest.mark.parametrize("cursor_mode", [True, False], ids=["cursor", "numbered"])
+def test_trace_numbered_page_outlives_the_wall_a_cursor_page_stops_at(cursor_mode):
+    """The trace list carries the identical gate; pin it the same way."""
+
+    from tracer.views import trace as trace_view
+    from tracer.views.trace import TraceView
+
+    view, request, organization = _view_and_request(TraceView)
+    reader = _budget_enforcing_reader([])
+    with (
+        mock.patch.object(trace_view, "TRACE_LIST_PAGE_WALL_MS", _OVERRUN_MS // 4),
+        mock.patch("tracer.views.trace.CustomEvalConfig") as eval_config,
+        mock.patch(
+            "tracer.views.trace.get_annotation_labels_for_project", return_value=[]
+        ),
+        mock.patch(
+            "tracer.views.trace._build_annotation_map_from_scores", return_value={}
+        ),
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+            side_effect=reader,
+        ),
+    ):
+        eval_config.objects.filter.return_value.select_related.return_value = []
+        result = view._list_traces_of_session_clickhouse(
+            request,
+            project_id=PROJECT_ID,
+            validated_data={
+                "filters": [_time_filter()],
+                "page_number": 0,
+                "page_size": 25,
+                "cursor_mode": cursor_mode,
+                "allow_sampled": True,
+            },
+            analytics=mock.MagicMock(),
+            org_project_ids=None,
+            org=organization,
+            read_deadline=_RecordingDeadline(),
+        )
+
+    budget = reader.budgets[0]
+    if cursor_mode:
+        assert budget == _OVERRUN_MS // 4
+        assert result[0] == "error"
+    else:
+        assert budget == trace_view.TRACE_LIST_CANDIDATE_DEADLINE_MS
+        assert budget > _OVERRUN_MS
+        status_name, payload = result
+        assert status_name == "ok"
+        assert payload["metadata"]["query_complete"] is True
+
+
 @pytest.mark.parametrize("cursor_enabled", [True, False], ids=["cursor", "numbered"])
 def test_session_numbered_page_keeps_every_row_the_wall_would_have_cut(cursor_enabled):
     from tracer.views import trace_session as trace_session_view
@@ -821,16 +874,49 @@ def test_span_export_fills_its_page_under_the_request_budget_not_the_wall():
 
 
 def test_session_export_fills_its_page_under_the_request_budget_not_the_wall():
-    from tracer.views import trace_session as trace_session_view
-    from tracer.views.trace_session import _read_session_filter_page
+    """Driven through the view, so the plumbing is under test too.
 
+    Calling the page reader directly would prove only that it honours the
+    parameter; it would not catch the view passing the wrong value, which is
+    where the export's opt-out actually has to travel.
+    """
+
+    from tracer.tests.test_session_positive_witness_page import (
+        PROJECT,
+        builder,
+        leaf,
+    )
+    from tracer.views import trace_session as trace_session_view
+    from tracer.views.trace_session import (
+        SESSION_LIST_QUERY_TIMEOUT_MS,
+        TraceSessionView,
+    )
+
+    view = TraceSessionView.__new__(TraceSessionView)
+    view._gm = SimpleNamespace(
+        success_response=lambda payload: ("ok", payload),
+        custom_error_response=lambda *a, **k: ("error", a, k),
+    )
+    organization = SimpleNamespace(id=uuid.uuid4())
+    request = SimpleNamespace(
+        query_params={},
+        organization=organization,
+        user=SimpleNamespace(organization=organization),
+    )
+    analytics = SimpleNamespace(
+        execute_ch_query=mock.Mock(return_value=SimpleNamespace(data=[]))
+    )
     rows = [{"session_id": str(uuid.UUID(int=i + 1))} for i in range(_OVERRUN_ROWS)]
-    builder = mock.MagicMock()
-    builder.filters = [_time_filter()]
-    builder.page_number = 0
-    builder.page_size = 25
-    builder.recommended_filter_classify_batch_size.return_value = 50
     reader = _budget_enforcing_reader(rows)
+    data = {
+        "filters": builder(leaf("company", ["alpha"], "text", "in")).filters,
+        "sort_params": [],
+        "page_number": 0,
+        "page_size": 25,
+        "cursor_mode": True,
+        # What the bounded export sets, and what this test is really about.
+        "page_wall": False,
+    }
     with (
         mock.patch.object(
             trace_session_view, "SESSION_LIST_PAGE_WALL_MS", _OVERRUN_MS // 4
@@ -839,18 +925,21 @@ def test_session_export_fills_its_page_under_the_request_budget_not_the_wall():
             trace_session_view, "read_bounded_filter_page", side_effect=reader
         ),
     ):
-        page = _read_session_filter_page(
-            builder,
-            mock.MagicMock(),
-            _RecordingDeadline(),
-            cursor_state=None,
-            cursor_enabled=True,
-            page_wall=False,
+        TraceSessionView._select_session_page(
+            view,
+            request,
+            validated_data=data,
+            project_id=PROJECT,
+            project=None,
+            analytics=analytics,
+            org_project_ids=None,
         )
 
+    assert reader.budgets, "the export never reached the bounded page reader"
+    # The view builds a real deadline, so the budget is the request timeout
+    # less the millisecond or two already spent -- not the page wall.
     assert reader.budgets[0] > _OVERRUN_MS
-    assert page.complete is True
-    assert len(page.rows) == _OVERRUN_ROWS
+    assert SESSION_LIST_QUERY_TIMEOUT_MS - reader.budgets[0] < 1_000
 
 
 def test_the_bounded_exports_turn_the_page_wall_off_where_they_are_built():
