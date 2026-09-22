@@ -210,12 +210,24 @@ def _data_statements(analytics):
     """The recorded statements that are not the routing gate's cost probe.
 
     The gate issues one ``EXPLAIN ESTIMATE`` before it picks a lane, and the
-    shared fake records it like any other statement. ``graph_cost_project_id``
-    is the parameter the fake itself keys the probe on, so it is the marker to
-    exclude by; a probe that stopped carrying it would be counted again.
+    shared fake records it like any other statement, so the exact counts below
+    have to exclude it.
+
+    A probe is identified by WHAT IT IS -- an ``EXPLAIN`` -- and not by a
+    parameter name it happens to carry. An earlier version excluded on the
+    substring ``graph_cost_project_id``; that is the key the shared fake routes
+    on, but it is incidental to the probe, so a probe whose parameters were
+    renamed would have been counted as a data statement and an ``== 1``
+    assertion could then have passed for the wrong reason. Nothing the product
+    issues to fetch rows is an ``EXPLAIN``, so this test cannot mistake one for
+    the other.
     """
 
-    return [call for call in analytics.calls if "graph_cost_project_id" not in call[0]]
+    return [
+        call
+        for call in analytics.calls
+        if not call[0].lstrip().upper().startswith("EXPLAIN")
+    ]
 
 
 @pytest.mark.parametrize("outer", [False, True])
