@@ -811,14 +811,20 @@ def walk_matching_activity_page(
     qualified_exact = not manager._unqualified_attribute_fallback_used
     seen_rows = seen_before + len(state.published)
     lower_bound = seen_rows + (1 if has_more and unseen_row_proven else 0)
+    # A page the wall or the statement budget cut short is published as
+    # degraded and incomplete, never as a complete page that happens to be
+    # short: a caller must be able to tell an exhausted walk from an empty
+    # answer. This is the seeded lane's contract on the same endpoint
+    # (``UsersListManager._cursor_payload``), and the walk owes the same one.
+    exhausted = state.budget.exhausted_by is not None
     payload = {
         "table": list(state.published),
         "total_count": lower_bound,
         "total_pages": (lower_bound + page_size - 1) // page_size,
         "count_is_lower_bound": has_more,
         "has_more": has_more,
-        "query_complete": True,
-        "query_status": "complete",
+        "query_complete": not exhausted,
+        "query_status": "degraded" if exhausted else "complete",
         "query_exact": qualified_exact,
         "query_provenance": USER_LIST_MATCHING_PROVENANCE,
         "ordering_exact": qualified_exact,

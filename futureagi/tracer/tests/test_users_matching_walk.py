@@ -616,6 +616,57 @@ def test_wall_exhaustion_stops_between_statements():
     assert _kinds(engine) == ["slice"]
 
 
+def test_an_exhausted_walk_publishes_degraded_and_incomplete_not_complete():
+    """A short page must not look like a finished one.
+
+    The seeded lane on this same endpoint publishes ``degraded`` and
+    ``query_complete`` false when its wall stopped it, so a caller can tell
+    an exhausted read from an empty answer. The walk owes the same contract:
+    without it, an exhausted page arrives as ``complete`` with no rows and
+    ``has_more`` true, which reads as "no matches" to anything that trusts
+    the status.
+    """
+
+    world = World()
+    for ordinal, minutes in enumerate((3, 7, 11), start=1):
+        world.user(
+            ordinal, key=minutes_before_end(minutes), raw=(minutes_before_end(minutes),)
+        )
+
+    # Exhausted by the statement budget.
+    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 1):
+        read, _engine = _page(world, page_size=25)
+    assert read.payload["table"] == []
+    assert read.has_more is True
+    assert read.payload["query_complete"] is False
+    assert read.payload["query_status"] == "degraded"
+
+    # Exhausted by the wall, on the same page shape.
+    with patch.object(walk, "USER_LIST_PAGE_WALL_MS", 60):
+        engine = Engine(world)
+        original = engine.execute_ch_query
+
+        def slow(query, params=None, timeout_ms=None, settings=None):
+            import time
+
+            time.sleep(0.08)
+            return original(query, params, timeout_ms, settings)
+
+        engine.execute_ch_query = slow
+        read, _engine = _page(world, page_size=25, engine=engine)
+    assert read.has_more is True
+    assert read.payload["query_complete"] is False
+    assert read.payload["query_status"] == "degraded"
+
+    # A walk that finished is still complete; the contract only changes for
+    # the page that was cut short.
+    finished, _engine = _page(world, page_size=25)
+    assert _names(finished) == ["user-1", "user-2", "user-3"]
+    assert finished.has_more is False
+    assert finished.payload["query_complete"] is True
+    assert finished.payload["query_status"] == "complete"
+
+
 def test_a_slice_that_fails_on_a_read_budget_is_retried_narrower_never_wider():
     from clickhouse_driver.errors import ServerException
 
