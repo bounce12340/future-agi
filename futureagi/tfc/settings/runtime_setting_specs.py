@@ -195,6 +195,22 @@ DATASET_READ_SETTING_SPECS = {
 # rather than silently loosening the bounds below.
 RUN_ENTRY_CEILING_SECONDS = 1_800
 RUN_ENTRY_MAX_ATTEMPTS = 3
+# How long one entry's *evaluations* may take in total, shared by every
+# bounded call the entry makes. A single eval needs no such budget -- the
+# per-evaluation wall already bounds it -- but a composite entry fans out
+# across its children, so N children otherwise cost N walls and nothing holds
+# the entry under the activity ceiling that has to contain it. Exceeding the
+# ceiling is not a slow failure: the attempt times out with its thread still
+# running, the next attempt re-claims and re-runs every child, and after the
+# third the entry is stamped ERRORED -- a composite wide enough to outlive it
+# could never complete, at three times the spend. Bounding the evaluations
+# just below the ceiling turns that into one error carrying the real reason.
+# The margin is for the rest of the activity: the telemetry loads, the
+# mapping resolution and the result write, none of which are evaluations.
+RUN_ENTRY_NON_EVAL_MARGIN_SECONDS = 300
+RUN_ENTRY_EVAL_BUDGET_SECONDS = (
+    RUN_ENTRY_CEILING_SECONDS - RUN_ENTRY_NON_EVAL_MARGIN_SECONDS
+)
 # The longest a run the sweep can still meet may legitimately last. The sweep
 # asks Temporal before it reaps and skips a task whose workflow is progressing,
 # so the only run it can overlap belongs to an execution that has since closed:

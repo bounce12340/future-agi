@@ -4,12 +4,19 @@ Unified eval execution engine.
 run_eval() composes the whole execution of one evaluation: registry → instance
 creation → param preparation → execution → formatting.
 
-It is NOT the only way an evaluation runs. Eleven sites outside this package
-build an instance themselves and call ``eval_instance.run(...)`` directly —
-dataset and prompt-template runs, the playground, external-platform evals and
-the agenthub evaluators — and they compose none of this, including the wall
-clock below. Anything documented as applying to "every eval path" applies to
-run_eval's callers only: the eval-task drain, the span/trace/session eval
+It is NOT the only way an evaluation runs. Sites outside this package build an
+instance themselves and call ``eval_instance.run(...)`` directly — dataset and
+prompt-template runs, the playground, external-platform evals and the agenthub
+evaluators — and they compose none of the rest of this.
+
+The wall clock below is the one piece that is not run_eval's alone.
+``model_hub/views/utils/evals.py``'s ``run_eval_func`` applies it too, because
+that is the path a composite's children take: a composite eval-task entry
+reaches no line of this module, so bounding only run_eval left every composite
+evaluation unbounded while the eval-task activity ceiling was being sized on
+the assumption that they were not. The remaining direct callers are still
+outside it. Anything else documented as applying to "every eval path" applies
+to run_eval's callers only: the eval-task drain, the span/trace/session eval
 wrappers in ``tracer/utils/eval.py`` and the SDK evaluate path.
 
 Callers handle their own:

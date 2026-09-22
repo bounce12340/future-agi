@@ -71,11 +71,19 @@ RUN_ENTRY_RETRY_POLICY = RetryPolicy(
 
 _CONTROL_TIMEOUT = timedelta(minutes=30)
 _RECONCILE_TIMEOUT = timedelta(hours=3)
-# One entry is one eval config against one row. With the engine's own wall
-# clock bounding each evaluation (EVAL_RUN_WALL_SECONDS), this ceiling only has
-# to cover the telemetry loads, any media the eval pulls, and a composite's
-# sub-evaluations. It was twelve hours, which was the *only* effective bound on
-# a wedged eval and meant one stuck entry held its task's batch for half a day.
+# One entry is one eval config against one row. It was twelve hours, which was
+# the *only* effective bound on a wedged eval and meant one stuck entry held
+# its task's batch for half a day.
+#
+# What lets it be half an hour is that the evaluations no longer reach it. Each
+# one is bounded by EVAL_RUN_WALL_SECONDS, and a composite entry -- which is
+# not one evaluation but a fan-out across children, each a separate bounded
+# call -- is bounded as a whole by RUN_ENTRY_EVAL_BUDGET_SECONDS, deliberately
+# set below this ceiling. So this ceiling covers what is left: the telemetry
+# loads, any media the eval pulls, and the result write. Reaching it is a
+# failure mode, not a bound: the attempt times out with its Python thread still
+# running and RUN_ENTRY_RETRY_POLICY re-claims and re-runs the entry twice more
+# before it is stamped ERRORED.
 _RUN_ENTRY_TIMEOUT = timedelta(minutes=30)
 _HEARTBEAT = timedelta(minutes=5)
 _CONTINUOUS_RECONCILE_BUDGET_DEFERRAL_PATCH = (

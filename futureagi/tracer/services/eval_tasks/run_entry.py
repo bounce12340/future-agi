@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 from django.utils import timezone
 
 from evaluations.engine.wall_clock import EvalWallClockExceeded, eval_wall_clock_scope
+from tfc.settings.runtime_setting_specs import RUN_ENTRY_EVAL_BUDGET_SECONDS
 from tracer.models.custom_eval_config import CustomEvalConfig
 from tracer.models.eval_task import EvalTask
 from tracer.models.observation_span import EvalEntryStatus, EvalLogger, EvalTargetType
@@ -96,7 +97,16 @@ def run_entry(entry: EvalLogger) -> str:
     )
     config_hash = resolved_config_hash(config)
 
-    with running_entry_epoch(run_epoch), eval_wall_clock_scope() as wall_timeouts:
+    # One budget for the whole entry, shared by every evaluation it runs. A
+    # single eval never reaches it (the per-evaluation wall is far shorter); a
+    # composite's children do, and without it a wide composite outlives the
+    # activity ceiling and is re-run from scratch twice more before erroring.
+    with (
+        running_entry_epoch(run_epoch),
+        eval_wall_clock_scope(
+            budget_seconds=RUN_ENTRY_EVAL_BUDGET_SECONDS
+        ) as wall_timeouts,
+    ):
         try:
             _run_for_target(fresh, config, task_project=task_project)
         except EvalTelemetryReadError:

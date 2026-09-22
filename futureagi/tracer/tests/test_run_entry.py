@@ -511,3 +511,48 @@ class TestOneClaimIsOneEvaluation:
         run_entry(entry)
 
         assert reaped == [(0, 0)]
+
+
+@pytest.mark.integration
+@pytest.mark.django_db
+class TestOneEntrysEvaluationBudget:
+    """Every evaluation an entry runs shares one deadline.
+
+    A single eval never reaches it — the per-evaluation wall is far shorter.
+    A composite entry does: it is a fan-out across children, each a separate
+    bounded call, so without a shared deadline N children cost N walls. The
+    activity ceiling that has to contain them is fixed, and exceeding it is not
+    a slow failure but a total one: the attempt times out with its thread still
+    running, the next attempt re-claims and re-runs every child, and after the
+    third the entry is stamped ERRORED. A composite wide enough could never
+    complete, at three times the spend.
+    """
+
+    def test_the_run_opens_a_budget_that_fits_inside_the_activity_ceiling(
+        self, observation_span, custom_eval_config, eval_task, monkeypatch
+    ):
+        from evaluations.engine.wall_clock import remaining_budget_seconds
+        from tfc.settings.runtime_setting_specs import (
+            RUN_ENTRY_CEILING_SECONDS,
+            RUN_ENTRY_EVAL_BUDGET_SECONDS,
+        )
+
+        entry = _span_entry(eval_task, observation_span, custom_eval_config)
+        seen = {}
+        monkeypatch.setattr(
+            "tracer.services.eval_tasks.run_entry._run_for_target",
+            lambda *a, **k: seen.update(remaining=remaining_budget_seconds()),
+        )
+
+        run_entry(entry)
+
+        assert seen["remaining"] is not None, (
+            "the entry's evaluations share no deadline: a composite's children "
+            "cost one wall each and nothing holds them under the ceiling"
+        )
+        assert (
+            RUN_ENTRY_EVAL_BUDGET_SECONDS - 30
+            <= seen["remaining"]
+            <= RUN_ENTRY_EVAL_BUDGET_SECONDS
+        )
+        assert RUN_ENTRY_EVAL_BUDGET_SECONDS < RUN_ENTRY_CEILING_SECONDS

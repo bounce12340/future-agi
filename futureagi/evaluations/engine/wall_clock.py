@@ -20,14 +20,25 @@ result write is fenced on the entry still being RUNNING so it cannot land on a
 row that has since been re-claimed. Bounding a thread we cannot kill is the
 best available guarantee; the alternative on the table is twelve hours.
 
-``EVAL_RUN_WALL_SECONDS`` sets the bound. 0 disables it, which is the escape
-hatch for a deployment whose evaluations legitimately run longer.
+``EVAL_RUN_WALL_SECONDS`` sets the per-evaluation bound. 0 disables it, which
+is the escape hatch for a deployment whose evaluations legitimately run longer.
+
+A scope may also carry a **budget**: a deadline shared by every bounded call
+inside it. One eval-task entry is one such scope, and it needs one because a
+composite entry is not one evaluation — it fans out across its children, each
+of which is a separate bounded call. Without a shared deadline N children cost
+N walls, and the activity ceiling that has to contain them is a fixed 30
+minutes, so a composite wide enough to outlive it used to time out, be retried
+from scratch twice more, and end ERRORED having paid for every child three
+times. With the budget the entry errors once, inside the ceiling, carrying the
+real reason.
 """
 
 from __future__ import annotations
 
 import contextvars
 import threading
+import time
 from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -46,6 +57,13 @@ _timeouts: ContextVar[list[str] | None] = ContextVar(
     "eval_wall_clock_timeouts", default=None
 )
 
+# The monotonic instant every bounded call in this scope shares, or None when
+# the scope carries no budget. Set once per scope, never extended: a budget
+# that each call could reset would bound nothing.
+_deadline: ContextVar[float | None] = ContextVar(
+    "eval_wall_clock_deadline", default=None
+)
+
 
 class EvalWallClockExceeded(RuntimeError):
     """One evaluation outlived its wall clock."""
@@ -56,18 +74,35 @@ def configured_wall_seconds() -> int:
 
 
 @contextmanager
-def eval_wall_clock_scope():
+def eval_wall_clock_scope(*, budget_seconds: int | None = None):
     """Collect the wall-clock timeouts that fire inside this block.
 
     Yields the list the timeouts are recorded into, so a caller that cannot see
     the exception can still read that one happened.
+
+    ``budget_seconds`` additionally gives every bounded call in the block one
+    shared deadline, so the block as a whole is bounded however many
+    evaluations it runs. A caller that passes none keeps the per-call bound
+    only, which is what a single evaluation wants.
     """
     record: list[str] = []
     token = _timeouts.set(record)
+    deadline_token = _deadline.set(
+        time.monotonic() + budget_seconds
+        if budget_seconds is not None and budget_seconds > 0
+        else None
+    )
     try:
         yield record
     finally:
+        _deadline.reset(deadline_token)
         _timeouts.reset(token)
+
+
+def remaining_budget_seconds() -> float | None:
+    """Seconds left in the enclosing scope's shared budget, or None if none."""
+    deadline = _deadline.get()
+    return None if deadline is None else deadline - time.monotonic()
 
 
 def record_timeout(message: str) -> None:
@@ -90,7 +125,14 @@ def run_bounded(
     read-source override, the OpenTelemetry span — has the value it would have
     had inline. A non-positive timeout runs the call inline instead, keeping
     the disabled path free of the extra thread entirely.
+
+    An enclosing scope's budget (``eval_wall_clock_scope(budget_seconds=...)``)
+    is applied first and always binds: it is what is left of the deadline the
+    whole block shares, so it caps this call even when the per-evaluation wall
+    is longer or disabled, and a call that starts with none left is refused
+    before it costs anything.
     """
+    timeout_seconds = _within_budget(timeout_seconds, label)
     if timeout_seconds <= 0:
         return func(**kwargs)
 
@@ -113,8 +155,8 @@ def run_bounded(
 
     if worker.is_alive():
         message = (
-            f"Evaluation '{label}' exceeded its {timeout_seconds}s wall clock "
-            "and was abandoned"
+            f"Evaluation '{label}' exceeded its {timeout_seconds:.0f}s wall "
+            "clock and was abandoned"
         )
         record_timeout(message)
         raise EvalWallClockExceeded(message)
@@ -123,11 +165,29 @@ def run_bounded(
     return outcome["value"]
 
 
+def _within_budget(timeout_seconds: float, label: str) -> float:
+    """Clamp a per-call bound to what the enclosing scope's budget allows."""
+    remaining = remaining_budget_seconds()
+    if remaining is None:
+        return timeout_seconds
+    if remaining <= 0:
+        message = (
+            f"Evaluation '{label}' was not started: its entry's evaluation "
+            "budget was already spent"
+        )
+        record_timeout(message)
+        raise EvalWallClockExceeded(message)
+    if timeout_seconds <= 0:
+        return remaining
+    return min(timeout_seconds, remaining)
+
+
 __all__ = [
     "DEFAULT_WALL_SECONDS",
     "EvalWallClockExceeded",
     "configured_wall_seconds",
     "eval_wall_clock_scope",
     "record_timeout",
+    "remaining_budget_seconds",
     "run_bounded",
 ]

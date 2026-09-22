@@ -10,6 +10,7 @@ keeps the engine's ContextVars readable inside the bounded call.
 import threading
 import time
 from contextvars import ContextVar
+from types import SimpleNamespace
 
 import pytest
 
@@ -187,3 +188,112 @@ def test_an_abandoned_run_closes_the_database_connection_it_opened():
 
     assert captured["connected"] is True
     assert captured["wrapper"].connection is None
+
+
+def test_one_scopes_budget_is_shared_by_every_call_inside_it():
+    """A composite entry is not one evaluation.
+
+    It fans out across its children, each of which is a separate bounded call,
+    so the per-evaluation wall alone lets N children cost N walls — and the
+    activity ceiling that has to contain them is fixed. The budget is the
+    deadline they share: the first call is capped by whatever is left of it
+    rather than by its own longer wall, and a call that starts with nothing
+    left is refused before it costs anything.
+    """
+    with eval_wall_clock_scope(budget_seconds=1) as timeouts:
+        with pytest.raises(EvalWallClockExceeded) as first:
+            run_bounded(
+                lambda: time.sleep(20), {}, timeout_seconds=300, label="child-one"
+            )
+        with pytest.raises(EvalWallClockExceeded) as second:
+            run_bounded(lambda: "cheap", {}, timeout_seconds=300, label="child-two")
+
+    # Capped by the budget, not by the 300s wall it asked for.
+    assert "1s wall clock" in str(first.value)
+    assert "budget was already spent" in str(second.value)
+    assert [m.split("'")[1] for m in timeouts] == ["child-one", "child-two"]
+
+
+def test_a_scope_without_a_budget_keeps_the_per_evaluation_wall():
+    """The budget is the drain's; a single evaluation elsewhere keeps its own
+    bound and is not shortened by anything."""
+    with eval_wall_clock_scope() as timeouts:
+        assert (
+            run_bounded(lambda: "fine", {}, timeout_seconds=300, label="single")
+            == "fine"
+        )
+    assert timeouts == []
+
+
+@pytest.mark.django_db(transaction=True)
+def test_run_eval_func_bounds_a_composite_childs_own_run(
+    monkeypatch, organization, workspace
+):
+    """A composite eval-task entry reaches no line of ``run_eval``.
+
+    ``_execute_evaluation`` routes ``template_type == "composite"`` to
+    ``_execute_composite_on_span`` -> ``execute_composite_children_sync`` ->
+    ``_execute_child`` -> ``run_eval_func``, which builds its own instance and
+    calls ``eval_instance.run`` directly. Bounding only ``run_eval`` therefore
+    left every composite evaluation unbounded while the activity ceiling was
+    being sized on the assumption that they were bounded.
+
+    ``run_eval_func`` logs the failure and re-raises, and ``_execute_child``
+    then swallows it into a failed child — which is why the timeout is recorded
+    into the scope as well: the recording is what ``run_entry`` reads back to
+    give the row the real reason rather than the engine's generic wrapper.
+    """
+    from django.conf import settings
+
+    import model_hub.views.utils.evals as evals_module
+    from model_hub.models.evals_metric import EvalTemplate
+    from model_hub.views.utils.evals import run_eval_func
+
+    template = EvalTemplate.objects.create(
+        name="Composite Child Template",
+        description="t",
+        organization=organization,
+        workspace=workspace,
+        config={"eval_type_id": "wall_clock_stub"},
+    )
+    release = threading.Event()
+    started = threading.Event()
+
+    class _NeverReturns:
+        cost = {"total_cost": 0}
+        token_usage = {}
+
+        def run(self, **_kwargs):
+            started.set()
+            release.wait(30)
+            return SimpleNamespace(eval_results=[{}])
+
+    monkeypatch.setattr(evals_module, "log_and_deduct_cost_for_api_request", None)
+    monkeypatch.setattr(
+        "ee.usage.services.metering.check_usage",
+        lambda *_a, **_k: SimpleNamespace(allowed=True),
+    )
+    monkeypatch.setattr(
+        "model_hub.views.utils.evals.EvaluationRunner._create_eval_instance",
+        lambda *_a, **_k: _NeverReturns(),
+    )
+    monkeypatch.setattr(
+        "model_hub.views.utils.evals.EvaluationRunner.map_fields",
+        lambda *_a, **_k: {"input": "hello"},
+    )
+    monkeypatch.setattr(
+        "model_hub.utils.eval_input_validation.validate_eval_inputs",
+        lambda template, run_kwargs, **_kw: (None, run_kwargs),
+    )
+    monkeypatch.setattr(settings, "EVAL_RUN_WALL_SECONDS", 1, raising=False)
+
+    try:
+        with eval_wall_clock_scope() as timeouts:
+            with pytest.raises(EvalWallClockExceeded):
+                run_eval_func({}, {"input": "hello"}, template, organization)
+    finally:
+        release.set()
+
+    assert started.is_set()
+    assert timeouts and "Composite Child Template" in timeouts[0]
+    assert "1s wall clock" in timeouts[0]

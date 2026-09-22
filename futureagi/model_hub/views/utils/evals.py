@@ -371,7 +371,20 @@ def run_eval_func(
 
         partial_input_warning, _run_kwargs = validate_eval_inputs(template, _run_kwargs)
 
-        eval_result = eval_instance.run(**_run_kwargs)
+        # Under the same wall clock as the engine's own run. This path is the
+        # one a composite child takes (``_execute_child`` -> here), so leaving
+        # it unbounded left every composite evaluation outside the bound the
+        # eval-task activity ceiling is sized against -- a wedged child held
+        # its task's whole batch until the ceiling fired, and a wide composite
+        # outlived the ceiling and was re-run from scratch twice more.
+        from evaluations.engine.wall_clock import configured_wall_seconds, run_bounded
+
+        eval_result = run_bounded(
+            eval_instance.run,
+            _run_kwargs,
+            timeout_seconds=configured_wall_seconds(),
+            label=template.name,
+        )
         end_time = time.time()
 
         response = {
