@@ -185,6 +185,22 @@ DATASET_READ_SETTING_SPECS = {
     ),
 }
 
+# Out-of-band recovery for eval tasks whose per-task workflow stopped. The
+# sweep runs beside live workflows, so ``SWEEP_STALE_RUNNING_SECONDS`` must
+# stay above the longest legitimate life of one running entry — the workflow's
+# run-entry start-to-close timeout times its retry attempts, plus backoff.
+# ``test_sweep_stale_threshold_exceeds_a_live_entrys_longest_run`` pins the two
+# together, because the workflow module cannot be imported at settings-load
+# time. Below that bound the sweep would requeue an entry a worker is still
+# evaluating, and the eval would be paid for twice.
+EVAL_TASK_RECOVERY_SETTING_SPECS = _specs(
+    (
+        ("SWEEP_STALE_RUNNING_SECONDS", 7_200, 600, 86_400),
+        ("SWEEP_MAX_TASKS", 25, 1, 500),
+    ),
+    prefix="EVAL_TASK_",
+)
+
 INTERACTIVE_READ_SETTING_SPECS = {
     **_specs(
         (
@@ -495,6 +511,7 @@ RUNTIME_NUMERIC_SETTING_SPECS = {
     **PROPERTY_CATALOG_RUNTIME_SETTING_SPECS,
     **DATASET_READ_SETTING_SPECS,
     **INTERACTIVE_READ_SETTING_SPECS,
+    **EVAL_TASK_RECOVERY_SETTING_SPECS,
 }
 
 if len(RUNTIME_NUMERIC_SETTING_SPECS) != sum(
@@ -504,6 +521,7 @@ if len(RUNTIME_NUMERIC_SETTING_SPECS) != sum(
             PROPERTY_CATALOG_RUNTIME_SETTING_SPECS,
             DATASET_READ_SETTING_SPECS,
             INTERACTIVE_READ_SETTING_SPECS,
+            EVAL_TASK_RECOVERY_SETTING_SPECS,
         ),
     )
 ):

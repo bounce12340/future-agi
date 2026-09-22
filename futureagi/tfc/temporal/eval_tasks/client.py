@@ -70,6 +70,48 @@ def start_eval_task_workflow_sync(
     return handle.id
 
 
+# What a describe of the per-task workflow id told us about the task's drain.
+WF_PROGRESSING = "progressing"
+WF_ABSENT = "absent"
+WF_CLOSED = "closed"
+
+
+async def describe_eval_task_workflow_async(task_id) -> str:
+    """Classify the task's workflow: progressing, closed, or never/no longer there.
+
+    ``WF_PROGRESSING`` means a RUNNING execution owns the task and must be left
+    alone. ``WF_ABSENT`` (NOT_FOUND — retention expired, or one was never
+    started) and ``WF_CLOSED`` (completed / failed / terminated / timed out)
+    both mean nothing is draining the task. Any other RPC failure is the
+    Temporal service being unreachable, not an answer, so it propagates: the
+    caller must skip that task rather than restart it blind.
+    """
+    from temporalio.client import WorkflowExecutionStatus
+    from temporalio.service import RPCError, RPCStatusCode
+
+    from tfc.temporal.common.client import get_client
+
+    client = await get_client()
+    handle = client.get_workflow_handle(_workflow_id(str(task_id)))
+    try:
+        description = await handle.describe()
+    except RPCError as exc:
+        if exc.status == RPCStatusCode.NOT_FOUND:
+            return WF_ABSENT
+        raise
+    if description.status == WorkflowExecutionStatus.RUNNING:
+        return WF_PROGRESSING
+    return WF_CLOSED
+
+
+def describe_eval_task_workflow_sync(task_id) -> str:
+    from tfc.temporal.common.client import _run_async_in_sync_context
+
+    return _run_async_in_sync_context(
+        lambda: describe_eval_task_workflow_async(task_id)
+    )
+
+
 def signal_pause_eval_task_workflow(task_id) -> bool:
     """Tell the running workflow to stop launching new evals at once. Best-effort
     — the paused DB status the caller already wrote is the durable source of
@@ -102,6 +144,11 @@ async def start_eval_task_workflow_async(
 
 
 __all__ = [
+    "WF_ABSENT",
+    "WF_CLOSED",
+    "WF_PROGRESSING",
+    "describe_eval_task_workflow_async",
+    "describe_eval_task_workflow_sync",
     "start_eval_task_workflow_sync",
     "start_eval_task_workflow_async",
     "signal_pause_eval_task_workflow",

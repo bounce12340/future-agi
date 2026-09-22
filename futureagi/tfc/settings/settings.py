@@ -789,6 +789,15 @@ TEMPORAL_TEST_EXECUTION_ENABLED = os.getenv(
     "TEMPORAL_TEST_EXECUTION_ENABLED", "false"
 ).lower() in ("true", "1", "yes")
 
+# Let the eval-task recovery sweep restart FAILED tasks as well as pending and
+# running ones. Default OFF, deliberately: a failed task's undrained entries are
+# re-evaluated when it restarts, and that spends evaluation calls the owner did
+# not ask for. Resuming a failed task stays an explicit choice (the Resume
+# button) unless a deployment opts in here.
+EVAL_TASK_SWEEP_RECOVER_FAILED = os.getenv(
+    "EVAL_TASK_SWEEP_RECOVER_FAILED", "false"
+).lower() in ("true", "1", "yes")
+
 # Hosted simulation runner (plan §9): when enabled, eligible runs are dispatched
 # to the simulation-runner worker which executes the released SDK, instead of the
 # native in-backend simulation path. Default off — no regression.
