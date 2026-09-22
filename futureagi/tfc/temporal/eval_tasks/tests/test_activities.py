@@ -159,7 +159,13 @@ class TestRunEntryActivitySync:
 
         out = _run_entry_sync(str(entry.id))
         assert seen["id"] == str(entry.id)
-        assert out == {"entry_id": str(entry.id), "status": EvalEntryStatus.COMPLETED}
+        # ``task_id`` rides along so the activity wrapper can log which task a
+        # run belonged to without naming the entry in a log line.
+        assert out == {
+            "entry_id": str(entry.id),
+            "task_id": str(eval_task.id),
+            "status": EvalEntryStatus.COMPLETED,
+        }
 
     def test_deleted_when_entry_gone(self, eval_task, make_pending_entries):
         [entry] = make_pending_entries(eval_task, 1)

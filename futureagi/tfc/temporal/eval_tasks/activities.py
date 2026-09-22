@@ -7,6 +7,7 @@ logic and are unit-tested directly; the wrappers add heartbeating and OTel
 context propagation, mirroring ``tfc/temporal/evaluations/activities.py``.
 """
 
+import structlog
 from django.db import close_old_connections
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
@@ -34,6 +35,12 @@ from tfc.temporal.eval_tasks.types import (
     WorkflowLabelsOutput,
 )
 from tracer.services.eval_tasks.ch_guardrails import eval_ch_guardrails
+
+# One structured line per control step, so a task that stops draining is
+# visible on a dashboard instead of only in the entry table. Every field is a
+# count or task-level state: an eval entry's payload is customer data and never
+# goes in a log line.
+logger = structlog.get_logger(__name__)
 
 # =============================================================================
 # Synchronous helpers (the testable core)
@@ -102,8 +109,14 @@ def _run_entry_sync(entry_id: str) -> dict:
         with eval_ch_guardrails():
             entry = EvalLogger.objects.filter(id=entry_id).first()
             if entry is None:
-                return {"entry_id": str(entry_id), "status": "deleted"}
-            return {"entry_id": str(entry_id), "status": str(run_entry(entry))}
+                return {"entry_id": str(entry_id), "task_id": "", "status": "deleted"}
+            return {
+                "entry_id": str(entry_id),
+                # Carried so the activity wrapper can log which task this run
+                # belonged to without ever naming the entry.
+                "task_id": str(entry.eval_task_id or ""),
+                "status": str(run_entry(entry)),
+            }
     finally:
         close_old_connections()
 
@@ -341,6 +354,13 @@ async def reconcile_eval_task_activity(
             result = await otel_sync_to_async(_reconcile_sync, thread_sensitive=False)(
                 input.task_id
             )
+            logger.info(
+                "eval_task_reconciled",
+                task_id=result["task_id"],
+                created=result["created"],
+                requeued=result["requeued"],
+                dropped=result["dropped"],
+            )
     except EvalTaskSelectionRejected as exc:
         # Unsupported filters, row-count overflow, and ambiguous public span
         # identities are deterministic task-contract failures. Retrying cannot
@@ -373,6 +393,12 @@ async def claim_eval_batch_activity(input: ClaimBatchInput) -> ClaimBatchOutput:
         result = await otel_sync_to_async(_claim_batch_sync, thread_sensitive=False)(
             input.task_id, input.n
         )
+    logger.info(
+        "eval_task_batch_claimed",
+        task_id=str(input.task_id),
+        claimed=len(result["entry_ids"]),
+        requested=input.n,
+    )
     return ClaimBatchOutput(entry_ids=result["entry_ids"])
 
 
@@ -382,6 +408,11 @@ async def run_eval_entry_activity(input: RunEntryInput) -> RunEntryOutput:
         result = await otel_sync_to_async(_run_entry_sync, thread_sensitive=False)(
             input.entry_id
         )
+    logger.info(
+        "eval_task_entry_run",
+        task_id=result["task_id"],
+        status=result["status"],
+    )
     return RunEntryOutput(entry_id=result["entry_id"], status=result["status"])
 
 
@@ -400,6 +431,13 @@ async def reap_stale_running_activity(input: ReapInput) -> ReapOutput:
         result = await otel_sync_to_async(_reap_sync, thread_sensitive=False)(
             input.task_id, input.older_than_seconds, input.max_attempts
         )
+    logger.info(
+        "eval_task_reaped",
+        task_id=str(input.task_id),
+        requeued=result["requeued"],
+        failed=result["failed"],
+        older_than_seconds=input.older_than_seconds,
+    )
     return ReapOutput(requeued=result["requeued"], failed=result["failed"])
 
 
@@ -458,6 +496,14 @@ async def finalize_eval_task_activity(input: FinalizeInput) -> FinalizeOutput:
         result = await otel_sync_to_async(_finalize_task_sync, thread_sensitive=False)(
             input.task_id
         )
+    # Logged either way: a drain that ends without finalizing has entries
+    # stranded RUNNING, and that is the line an operator needs to see.
+    logger.info(
+        "eval_task_finalize_attempted",
+        task_id=result["task_id"],
+        finalized=result["finalized"],
+        status=result["status"],
+    )
     return FinalizeOutput(
         task_id=result["task_id"],
         finalized=result["finalized"],
