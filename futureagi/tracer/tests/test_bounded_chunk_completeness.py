@@ -199,9 +199,13 @@ def _read_session_page(bounded: BoundedFilterPage) -> dict[str, Any]:
     builder.recommended_filter_classify_batch_size.return_value = 50
     builder.filter_candidate_seed_is_sampled.return_value = False
     builder.parse_time_range.return_value = (WINDOW_START, WINDOW_END)
-    builder.build_page_metrics_query.return_value = ("page metrics", {})
-    builder.build_content_query.return_value = ("page content", {})
-    builder.build_span_attributes_query.return_value = ("page attributes", {})
+    # The seed-witness slack a cursor carries is an int or None; an unstubbed
+    # MagicMock reaches ``encode_list_cursor`` and is refused outright.
+    builder.filter_seed_witness_slack_hours.return_value = None
+    # The train fused the page's three enrichment reads (metrics, content,
+    # span attributes) into one hydration statement.
+    builder.build_page_hydration_query.return_value = ("page hydration", {})
+    builder.expand_page_attribute_rows.return_value = []
     builder.format_sessions.side_effect = lambda rows, columns: [
         dict(zip(columns, row, strict=True)) for row in rows
     ]
@@ -268,7 +272,21 @@ def test_empty_session_checkpoint_reports_the_degraded_read_it_actually_made() -
     assert isinstance(metadata["next_cursor"], str)
 
 
-def test_session_checkpoint_with_classified_rows_stays_a_complete_chunk() -> None:
+def test_session_checkpoint_with_classified_rows_is_published_unfinished() -> None:
+    """On the session route Rule B decides this case, not #2762.
+
+    #2762 was written against a session route that read
+    ``bounded_page.complete or cursor_has_more``, so a checkpoint that
+    published rows counted as a complete chunk. Rule B removed that: this
+    route now publishes ``bounded_page.complete`` itself, and a wall-stopped
+    page is its normal case, so the page is disclosed as unfinished beside
+    the cursor that resumes it. #2762's own contribution — that a checkpoint
+    which proved NO row is not an answer — is unchanged and is pinned by
+    ``test_empty_session_checkpoint_reports_the_degraded_read_it_actually_made``;
+    on the trace, span and voice routes, where the old form still stood,
+    #2762's ``bounded_chunk_complete`` applies as written.
+    """
+
     session_id = str(uuid.uuid4())
     payload = _read_session_page(
         _checkpointed_page(
@@ -278,9 +296,9 @@ def test_session_checkpoint_with_classified_rows_stays_a_complete_chunk() -> Non
     )
 
     metadata = payload["metadata"]
-    assert metadata["query_complete"] is True
-    assert metadata["query_status"] == "complete"
-    assert metadata["query_error_code"] is None
+    assert metadata["query_complete"] is False
+    assert metadata["query_status"] == "degraded"
+    assert metadata["query_error_code"] == "scan_budget_exceeded"
     assert metadata["has_more"] is True
 
 
