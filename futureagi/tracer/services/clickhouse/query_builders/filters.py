@@ -172,6 +172,52 @@ def boolean_meta_presence_condition(filter_op: str | None) -> str | None:
     return _BOOLEAN_META_PRESENCE_CONDITIONS.get(normalize_filter_op(filter_op) or "")
 
 
+class BooleanMetaFilterShapeError(ValueError):
+    """The shared boolean meta-filter rule rejected a shape.
+
+    Raised by :func:`resolve_boolean_meta_value` so the rule itself owns no
+    public error class.  Each compiler re-raises it as the class its own
+    reader maps to a response: the list and graph compilers as
+    ``UnsupportedFilterShapeError`` (HTTP 400 for the whole read), the
+    dashboard builder as ``InvalidMetricCombinationError`` (a per-widget
+    message, so one nonsensical filter does not fail the whole query).
+    """
+
+
+def resolve_boolean_meta_value(
+    column_id: str,
+    filter_value: Any,
+    operation: str | None,
+) -> bool:
+    """The one value rule behind every boolean meta-filter, in one place.
+
+    Which operators carry a value, how a value coerces to a boolean, and that
+    ``not_equals`` is compiled by negating the requested value rather than by
+    inferring intent from the value alone.
+
+    ``operation`` is already normalised by the caller, because the compilers
+    reach this rule through different alias tables — the list and graph
+    compilers through :func:`normalize_filter_op`, the dashboard through its
+    own payload aliases — and normalising twice here would silently widen
+    each compiler's accepted vocabulary to the other's.
+    """
+
+    if operation not in _BOOLEAN_META_VALUE_OPS:
+        raise BooleanMetaFilterShapeError(
+            f"{column_id} supports only equals, not_equals, is_null and is_not_null"
+        )
+    if isinstance(filter_value, bool):
+        wanted = filter_value
+    elif isinstance(filter_value, str) and filter_value.strip().lower() in {
+        "true",
+        "false",
+    }:
+        wanted = filter_value.strip().lower() == "true"
+    else:
+        raise BooleanMetaFilterShapeError(f"{column_id} requires a boolean value")
+    return wanted if operation == "equals" else not wanted
+
+
 def parse_boolean_meta_filter(
     column_id: str,
     filter_value: Any,
@@ -184,21 +230,12 @@ def parse_boolean_meta_filter(
     first.
     """
 
-    operation = normalize_filter_op(filter_op)
-    if operation not in _BOOLEAN_META_VALUE_OPS:
-        raise _unsupported_filter_shape(
-            f"{column_id} supports only equals, not_equals, is_null and is_not_null"
+    try:
+        return resolve_boolean_meta_value(
+            column_id, filter_value, normalize_filter_op(filter_op)
         )
-    if isinstance(filter_value, bool):
-        wanted = filter_value
-    elif isinstance(filter_value, str) and filter_value.strip().lower() in {
-        "true",
-        "false",
-    }:
-        wanted = filter_value.strip().lower() == "true"
-    else:
-        raise _unsupported_filter_shape(f"{column_id} requires a boolean value")
-    return wanted if operation == "equals" else not wanted
+    except BooleanMetaFilterShapeError as exc:
+        raise _unsupported_filter_shape(str(exc)) from exc
 
 
 def build_literal_text_predicate(

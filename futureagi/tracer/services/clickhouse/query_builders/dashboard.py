@@ -39,8 +39,10 @@ from tracer.services.clickhouse.query_builders.expressions import (
     annotation_numeric_value_expr,
 )
 from tracer.services.clickhouse.query_builders.filters import (
+    BooleanMetaFilterShapeError,
     boolean_meta_presence_condition,
     resolve_annotation_label_output_type,
+    resolve_boolean_meta_value,
     resolve_eval_filter_metadata,
 )
 from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
@@ -906,22 +908,23 @@ class DashboardQueryBuilder:
 
     @classmethod
     def _presence_filter_value(cls, payload: dict, metric_name: str) -> bool:
-        operation = cls._presence_filter_operation(payload)
-        if operation not in {"equals", "not_equals"}:
-            raise InvalidMetricCombinationError(
-                f"{metric_name} supports only equals, not_equals, is_null "
-                "and is_not_null"
+        """Resolve the requested presence through the shared boolean rule.
+
+        The rule lives in :func:`resolve_boolean_meta_value` and is the same
+        one the list, graph and session compilers use; keeping a second copy
+        here is what let the dashboard and the list routes drift apart in the
+        first place. Only the error class differs, because this builder's
+        readers surface the message per widget.
+        """
+
+        try:
+            return resolve_boolean_meta_value(
+                metric_name,
+                payload.get("value"),
+                cls._presence_filter_operation(payload),
             )
-        value = payload.get("value")
-        if isinstance(value, bool):
-            wanted = value
-        elif isinstance(value, str) and value.strip().lower() in {"true", "false"}:
-            wanted = value.strip().lower() == "true"
-        else:
-            raise InvalidMetricCombinationError(
-                f"{metric_name} requires a boolean value"
-            )
-        return wanted if operation == "equals" else not wanted
+        except BooleanMetaFilterShapeError as exc:
+            raise InvalidMetricCombinationError(str(exc)) from exc
 
     def _eval_presence_relation(self) -> str:
         """Return exact project+trace identities with a latest-live eval row."""

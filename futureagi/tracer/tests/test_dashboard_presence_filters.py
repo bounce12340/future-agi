@@ -11,6 +11,12 @@ from tracer.services.clickhouse.query_builders.dashboard import (
     DashboardQueryBuilder,
     InvalidMetricCombinationError,
 )
+from tracer.services.clickhouse.query_builders.filters import (
+    parse_boolean_meta_filter,
+)
+from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
+    UnsupportedFilterShapeError,
+)
 from tracer.services.clickhouse.v2.query_builders.dashboard import (
     DashboardQueryBuilderV2,
 )
@@ -215,3 +221,76 @@ def test_presence_filter_rejects_an_uncompilable_operation(name):
 
     with pytest.raises(InvalidMetricCombinationError, match="supports only equals"):
         DashboardQueryBuilder(config).build_all_queries()
+
+
+# --- one rule, four compilers -------------------------------------------
+# The dashboard builder used to carry its own copy of the boolean value rule
+# (which operators carry a value, how a value coerces, that not_equals
+# negates). The copies were edited in parallel, which is how the dashboard
+# and the list routes drifted apart on these operators in the first place.
+# These tests fail if either side stops going through
+# resolve_boolean_meta_value, which is the only thing that keeps them equal.
+
+
+def _presence_payload(name: str, value, operator: str) -> dict:
+    return {
+        "metric_type": "system_metric",
+        "metric_name": name,
+        "operator": operator,
+        "value": value,
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("name", ["has_eval", "has_annotation"])
+@pytest.mark.parametrize("operator", ["equals", "not_equals"])
+@pytest.mark.parametrize("value", [True, False, "true", "false", "TRUE", " False "])
+def test_the_dashboard_and_the_list_compilers_share_one_boolean_value_rule(
+    name, operator, value
+):
+    assert DashboardQueryBuilder._presence_filter_value(
+        _presence_payload(name, value, operator), name
+    ) == parse_boolean_meta_filter(name, value, operator)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("operator", "value", "fragment"),
+    [
+        ("str_contains", True, "supports only equals"),
+        ("equals", "maybe", "requires a boolean value"),
+        ("equals", 1, "requires a boolean value"),
+        ("equals", None, "requires a boolean value"),
+    ],
+)
+def test_a_rejected_boolean_shape_carries_one_message_and_two_error_classes(
+    operator, value, fragment
+):
+    # Same rule, same message; only the class differs, because the dashboard
+    # surfaces it per widget and the list readers map theirs to HTTP 400.
+    payload = _presence_payload("has_eval", value, operator)
+
+    with pytest.raises(InvalidMetricCombinationError) as dashboard_error:
+        DashboardQueryBuilder._presence_filter_value(payload, "has_eval")
+    with pytest.raises(UnsupportedFilterShapeError) as list_error:
+        parse_boolean_meta_filter("has_eval", value, operator)
+
+    assert fragment in str(dashboard_error.value)
+    assert str(dashboard_error.value) == str(list_error.value)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(("operator", "resolved"), [("is", True), ("is_not", False)])
+def test_sharing_the_rule_does_not_hand_the_dashboard_the_list_aliases(
+    operator, resolved
+):
+    # The two compilers normalise with different alias tables and the shared
+    # rule must not normalise again: the list routes accept these legacy
+    # aliases, the dashboard payload vocabulary does not, and sharing the
+    # value rule must not quietly widen the dashboard's to match.
+    assert parse_boolean_meta_filter("has_eval", True, operator) is resolved
+
+    with pytest.raises(InvalidMetricCombinationError, match="supports only equals"):
+        DashboardQueryBuilder._presence_filter_value(
+            _presence_payload("has_eval", True, operator), "has_eval"
+        )
