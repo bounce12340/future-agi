@@ -16,7 +16,6 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from django.db import transaction
-from django.db.models import F
 from django.utils import timezone
 
 from tracer.models.eval_task import RowType
@@ -368,7 +367,6 @@ def mark_terminal(
     error: bool | None = None,
     error_message: str | None = None,
     skipped_reason: str | None = None,
-    count_attempt: bool = False,
     epoch: datetime | None = None,
 ) -> bool:
     """Record an entry's terminal state (status + the hash that produced it).
@@ -376,9 +374,7 @@ def mark_terminal(
     No-op (returns False) if the entry was soft-deleted mid-run — a Delete &
     rerun landing while it ran. error / error_message / skipped_reason are set
     only when passed, so a result already written by the evaluator isn't
-    clobbered. ``count_attempt`` spends one of the entry's reclaim budget: an
-    attempt was really made and really consumed resources, so a row that keeps
-    timing out has to converge on the same poison cap the reaper enforces.
+    clobbered.
 
     ``epoch`` is the claim the caller owns; it defaults to the running-entry
     epoch in scope (``running_entry_epoch``). A caller outside that scope that
@@ -389,8 +385,6 @@ def mark_terminal(
         "config_hash": config_hash,
         "updated_at": timezone.now(),
     }
-    if count_attempt:
-        fields["attempts"] = F("attempts") + 1
     if error is not None:
         fields["error"] = error
     if error_message is not None:

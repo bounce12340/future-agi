@@ -7,7 +7,6 @@ from tfc.settings.runtime_setting_specs import (
     INTERACTIVE_READ_SETTING_SPECS,
     LONGEST_RUNNING_ENTRY_SECONDS,
     PROPERTY_CATALOG_RUNTIME_SETTING_SPECS,
-    RUN_ENTRY_CEILING_SECONDS,
     RUNTIME_NUMERIC_SETTING_SPECS,
     bounded_bulk_worst_case_query_count,
     load_numeric_settings,
@@ -507,21 +506,12 @@ def test_eval_execution_settings_are_validated_as_a_group():
     validate_eval_execution_settings(values)
 
 
-def test_an_evaluation_wall_above_the_activity_ceiling_is_rejected():
-    """Known positive: the gate has to fire on a value the spec bounds alone
-    would not catch if someone widened them, so it is called directly with the
-    resolved mapping rather than through parsing."""
-    values = load_numeric_settings(RUNTIME_NUMERIC_SETTING_SPECS, source={})
-    values["EVAL_RUN_WALL_SECONDS"] = RUN_ENTRY_CEILING_SECONDS + 1
-
-    with pytest.raises(ValueError, match="run-entry activity ceiling"):
-        validate_runtime_numeric_settings(values)
-
-
 def test_a_stale_threshold_that_can_race_a_live_worker_is_rejected():
-    """The same, for the sweep's stale threshold: at or below one running
+    """Known positive for the sweep's stale threshold: at or below one running
     entry's longest legitimate life the sweep requeues entries a worker is
-    still evaluating."""
+    still evaluating. Called through the whole validator with the resolved
+    mapping, so it fires on a value the spec bounds alone would miss if
+    someone widened them."""
     values = load_numeric_settings(RUNTIME_NUMERIC_SETTING_SPECS, source={})
     values["EVAL_TASK_SWEEP_STALE_RUNNING_SECONDS"] = LONGEST_RUNNING_ENTRY_SECONDS
 

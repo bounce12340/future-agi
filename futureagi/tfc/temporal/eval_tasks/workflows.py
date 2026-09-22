@@ -71,19 +71,25 @@ RUN_ENTRY_RETRY_POLICY = RetryPolicy(
 
 _CONTROL_TIMEOUT = timedelta(minutes=30)
 _RECONCILE_TIMEOUT = timedelta(hours=3)
-# One entry is one eval config against one row. It was twelve hours, which was
-# the *only* effective bound on a wedged eval and meant one stuck entry held
-# its task's batch for half a day.
+# One entry is one eval config against one row, and this start-to-close
+# timeout is the ONLY bound on it. It was twelve hours, so one wedged
+# evaluation held its task's whole batch for half a day with nothing reporting
+# it: the drain gathers a claimed batch before claiming the next, and the
+# five-minute heartbeat cannot help because the Heartbeater is a timer rather
+# than a progress signal and keeps beating for an evaluation that has wedged.
 #
-# What lets it be half an hour is that the evaluations no longer reach it. Each
-# one is bounded by EVAL_RUN_WALL_SECONDS, and a composite entry -- which is
-# not one evaluation but a fan-out across children, each a separate bounded
-# call -- is bounded as a whole by RUN_ENTRY_EVAL_BUDGET_SECONDS, deliberately
-# set below this ceiling. So this ceiling covers what is left: the telemetry
-# loads, any media the eval pulls, and the result write. Reaching it is a
-# failure mode, not a bound: the attempt times out with its Python thread still
-# running and RUN_ENTRY_RETRY_POLICY re-claims and re-runs the entry twice more
-# before it is stamped ERRORED.
+# Be honest about what half an hour buys. A start-to-close timeout does not
+# kill the Python thread underneath: Temporal stops waiting for the attempt,
+# the workflow moves on, and the wedged evaluation keeps running inside the
+# worker's executor until it returns on its own or the process recycles. So
+# this bounds the *task* -- the batch is released, the entry is retried twice
+# more by RUN_ENTRY_RETRY_POLICY and then stamped ERRORED -- and it does not
+# bound the worker's thread pool. That leak is the follow-up; nothing in this
+# change closes it.
+#
+# The ceiling is mirrored, and pinned against this value, as
+# ``tfc.settings.runtime_setting_specs.RUN_ENTRY_CEILING_SECONDS``, which is
+# what the sweep's stale-threshold floor is derived from.
 _RUN_ENTRY_TIMEOUT = timedelta(minutes=30)
 _HEARTBEAT = timedelta(minutes=5)
 _CONTINUOUS_RECONCILE_BUDGET_DEFERRAL_PATCH = (

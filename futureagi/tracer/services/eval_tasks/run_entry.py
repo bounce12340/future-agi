@@ -15,8 +15,6 @@ from typing import TYPE_CHECKING
 
 from django.utils import timezone
 
-from evaluations.engine.wall_clock import EvalWallClockExceeded, eval_wall_clock_scope
-from tfc.settings.runtime_setting_specs import RUN_ENTRY_EVAL_BUDGET_SECONDS
 from tracer.models.custom_eval_config import CustomEvalConfig
 from tracer.models.eval_task import EvalTask
 from tracer.models.observation_span import EvalEntryStatus, EvalLogger, EvalTargetType
@@ -29,7 +27,7 @@ from tracer.services.eval_tasks.entries import (
 )
 
 if TYPE_CHECKING:
-    from datetime import datetime
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -97,16 +95,12 @@ def run_entry(entry: EvalLogger) -> str:
     )
     config_hash = resolved_config_hash(config)
 
-    # One budget for the whole entry, shared by every evaluation it runs. A
-    # single eval never reaches it (the per-evaluation wall is far shorter); a
-    # composite's children do, and without it a wide composite outlives the
-    # activity ceiling and is re-run from scratch twice more before erroring.
-    with (
-        running_entry_epoch(run_epoch),
-        eval_wall_clock_scope(
-            budget_seconds=RUN_ENTRY_EVAL_BUDGET_SECONDS
-        ) as wall_timeouts,
-    ):
+    # Nothing here bounds how long the evaluation itself may take. The only
+    # bound on one entry is the run-entry activity's start-to-close ceiling,
+    # applied by Temporal outside this process; see
+    # ``tfc.temporal.eval_tasks.workflows._RUN_ENTRY_TIMEOUT`` for what that
+    # does and does not stop.
+    with running_entry_epoch(run_epoch):
         try:
             _run_for_target(fresh, config, task_project=task_project)
         except EvalTelemetryReadError:
@@ -114,8 +108,6 @@ def run_entry(entry: EvalLogger) -> str:
             # Bubble it to the activity so its bounded retry policy can retry the
             # same still-RUNNING entry instead of freezing a transient miss.
             raise
-        except EvalWallClockExceeded as e:
-            return _fail_timed_out(fresh, config_hash, str(e), epoch=run_epoch)
         except Exception as e:  # Every failure becomes a terminal state.
             skipped_reason = getattr(e, "skipped_reason", None)
             if skipped_reason:
@@ -139,15 +131,6 @@ def run_entry(entry: EvalLogger) -> str:
             )
             return EvalEntryStatus.ERRORED if landed else RECLAIMED
 
-        if wall_timeouts:
-            # The evaluation core catches everything around the model call and
-            # writes a generic "Error during evaluation" onto the entry rather
-            # than re-raising, so a wall-clock timeout has to be read back here
-            # instead of caught. Restating it gives the row the real reason.
-            return _fail_timed_out(
-                fresh, config_hash, wall_timeouts[0], epoch=run_epoch
-            )
-
     # The evaluator wrote the result onto the entry; read its error flag to pick
     # the terminal status, then stamp status + hash.
     fresh.refresh_from_db()
@@ -164,31 +147,6 @@ def run_entry(entry: EvalLogger) -> str:
     if status == EvalEntryStatus.COMPLETED:
         _reseed_eval_clustering(fresh, config.project_id)
     return status
-
-
-def _fail_timed_out(
-    entry: EvalLogger, config_hash: str, message: str, *, epoch: datetime
-) -> str:
-    """Terminalize an entry whose evaluation outlived its wall clock.
-
-    Errored once, with the real reason rather than the engine's generic wrapper,
-    and one attempt spent: the run really happened and really cost something, so
-    a row that keeps timing out must converge on the poison cap instead of being
-    retried without limit by a later requeue. Unless the claim moved while it
-    ran — then the attempt belongs to a row this run no longer owns, and
-    spending one of its three reclaims is exactly the double charge the fence
-    exists to stop.
-    """
-    landed = mark_terminal(
-        entry,
-        EvalEntryStatus.ERRORED,
-        config_hash=config_hash,
-        error=True,
-        error_message=message,
-        count_attempt=True,
-        epoch=epoch,
-    )
-    return EvalEntryStatus.ERRORED if landed else RECLAIMED
 
 
 def _reseed_eval_clustering(entry: EvalLogger, project_id) -> None:

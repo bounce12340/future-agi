@@ -195,22 +195,6 @@ DATASET_READ_SETTING_SPECS = {
 # rather than silently loosening the bounds below.
 RUN_ENTRY_CEILING_SECONDS = 1_800
 RUN_ENTRY_MAX_ATTEMPTS = 3
-# How long one entry's *evaluations* may take in total, shared by every
-# bounded call the entry makes. A single eval needs no such budget -- the
-# per-evaluation wall already bounds it -- but a composite entry fans out
-# across its children, so N children otherwise cost N walls and nothing holds
-# the entry under the activity ceiling that has to contain it. Exceeding the
-# ceiling is not a slow failure: the attempt times out with its thread still
-# running, the next attempt re-claims and re-runs every child, and after the
-# third the entry is stamped ERRORED -- a composite wide enough to outlive it
-# could never complete, at three times the spend. Bounding the evaluations
-# just below the ceiling turns that into one error carrying the real reason.
-# The margin is for the rest of the activity: the telemetry loads, the
-# mapping resolution and the result write, none of which are evaluations.
-RUN_ENTRY_NON_EVAL_MARGIN_SECONDS = 300
-RUN_ENTRY_EVAL_BUDGET_SECONDS = (
-    RUN_ENTRY_CEILING_SECONDS - RUN_ENTRY_NON_EVAL_MARGIN_SECONDS
-)
 # The longest a run the sweep can still meet may legitimately last. The sweep
 # asks Temporal before it reaps and skips a task whose workflow is progressing,
 # so the only run it can overlap belongs to an execution that has since closed:
@@ -250,15 +234,6 @@ EVAL_EXECUTION_SETTING_SPECS = {
         ),
         prefix="EVAL_TASK_",
     ),
-    # Wall clock around one evaluation's execution — every caller of
-    # ``evaluations.engine.run_eval``, which is the eval-task drain, the span
-    # eval wrappers and the SDK evaluate path. Nothing else bounds those: the
-    # activity heartbeat is emitted by a timer rather than by progress, so a
-    # wedged eval keeps it beating. It cannot exceed the activity ceiling that
-    # has to contain it, or the activity would abandon runs the wall was still
-    # willing to allow. 0 disables the bound for a deployment whose
-    # evaluations legitimately run longer.
-    **_specs((("EVAL_RUN_WALL_SECONDS", 300, 0, RUN_ENTRY_CEILING_SECONDS),)),
 }
 
 INTERACTIVE_READ_SETTING_SPECS = {
@@ -1034,17 +1009,12 @@ def validate_interactive_read_settings(values: Mapping[str, Numeric]) -> None:
 def validate_eval_execution_settings(values: Mapping[str, Numeric]) -> None:
     """Validate the eval-execution knobs against the workflow's own ceilings.
 
-    The spec bounds already carry these relations, but they carry them as
-    literals a future edit can loosen one at a time. This checks the *resolved*
-    values against the mirrored constants, so loosening a bound alone is not
-    enough to ship a configuration that lets the sweep race a live worker.
+    The spec bound already carries this relation, but it carries it as a
+    literal a future edit can loosen. This checks the *resolved* value against
+    the mirrored constants, so loosening the bound alone is not enough to ship
+    a configuration that lets the sweep race a live worker.
     """
 
-    _require_at_most(
-        values["EVAL_RUN_WALL_SECONDS"],
-        RUN_ENTRY_CEILING_SECONDS,
-        "the evaluation wall cannot exceed the run-entry activity ceiling",
-    )
     _require_at_least(
         values["EVAL_TASK_SWEEP_STALE_RUNNING_SECONDS"],
         LONGEST_RUNNING_ENTRY_SECONDS + 1,

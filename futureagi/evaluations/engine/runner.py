@@ -1,23 +1,8 @@
 """
 Unified eval execution engine.
 
-run_eval() composes the whole execution of one evaluation: registry → instance
-creation → param preparation → execution → formatting.
-
-It is NOT the only way an evaluation runs. Sites outside this package build an
-instance themselves and call ``eval_instance.run(...)`` directly — dataset and
-prompt-template runs, the playground, external-platform evals and the agenthub
-evaluators — and they compose none of the rest of this.
-
-The wall clock below is the one piece that is not run_eval's alone.
-``model_hub/views/utils/evals.py``'s ``run_eval_func`` applies it too, because
-that is the path a composite's children take: a composite eval-task entry
-reaches no line of this module, so bounding only run_eval left every composite
-evaluation unbounded while the eval-task activity ceiling was being sized on
-the assumption that they were not. The remaining direct callers are still
-outside it. Anything else documented as applying to "every eval path" applies
-to run_eval's callers only: the eval-task drain, the span/trace/session eval
-wrappers in ``tracer/utils/eval.py`` and the SDK evaluate path.
+run_eval() is THE single function that all eval execution paths call.
+It composes: registry → instance creation → param preparation → execution → formatting.
 
 Callers handle their own:
 - Input resolution (span attributes, dataset cells, transcript data)
@@ -39,7 +24,6 @@ from evaluations.engine.formatting import extract_raw_result, format_eval_value
 from evaluations.engine.instance import create_eval_instance
 from evaluations.engine.params import prepare_run_params
 from evaluations.engine.registry import get_eval_class
-from evaluations.engine.wall_clock import configured_wall_seconds, run_bounded
 
 logger = structlog.get_logger(__name__)
 
@@ -176,18 +160,9 @@ def run_eval(request: EvalRequest) -> EvalResult:
 
     run_params = preprocess_inputs(eval_template.name, run_params)
 
-    # 4. Execute, under a wall clock. Nothing else bounds the evaluation: the
-    # activity heartbeat is emitted by a timer rather than by progress, so a
-    # wedged eval keeps it beating, and a Temporal timeout cannot kill the
-    # thread anyway. The bound reaches this function's callers only — see the
-    # module docstring for the paths that call eval_instance.run directly.
+    # 4. Execute
     start_time = time.time()
-    raw_result = run_bounded(
-        eval_instance.run,
-        run_params,
-        timeout_seconds=configured_wall_seconds(),
-        label=eval_template.name,
-    )
+    raw_result = eval_instance.run(**run_params)
     end_time = time.time()
 
     # 5. Extract and format

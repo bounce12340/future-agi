@@ -594,36 +594,3 @@ def test_sweep_stale_threshold_exceeds_a_live_entrys_longest_run():
 
     assert spec.minimum > longest_run
     assert spec.default > longest_run
-
-
-def test_the_activity_ceiling_leaves_room_for_the_entrys_whole_evaluation_budget():
-    """The engine's wall bounds one evaluation; the activity ceiling has to
-    cover a whole entry — telemetry loads, media, and every child of a
-    composite — so it must be the looser, or the activity would abandon runs
-    the evaluations were still allowed to finish.
-
-    What has to fit under it is the entry's **budget**, not the wall: on the
-    drain every bounded call is clamped to what is left of
-    ``RUN_ENTRY_EVAL_BUDGET_SECONDS``, whatever the wall is set to and however
-    many children a composite has. That is a strict inequality with a named
-    margin, which also settles the case the wall alone could not — at the
-    spec's maximum the wall equals the ceiling, and the activity would abandon
-    a run the wall was still willing to allow.
-
-    The wall bounds are still asserted against the spec's **maximum**: the
-    declared range is what an operator gets to choose from.
-    """
-    from tfc.settings.runtime_setting_specs import (
-        RUN_ENTRY_EVAL_BUDGET_SECONDS,
-        RUN_ENTRY_NON_EVAL_MARGIN_SECONDS,
-        RUNTIME_NUMERIC_SETTING_SPECS,
-    )
-    from tfc.temporal.eval_tasks.workflows import _RUN_ENTRY_TIMEOUT
-
-    spec = RUNTIME_NUMERIC_SETTING_SPECS["EVAL_RUN_WALL_SECONDS"]
-    ceiling = _RUN_ENTRY_TIMEOUT.total_seconds()
-
-    assert RUN_ENTRY_EVAL_BUDGET_SECONDS < ceiling
-    assert ceiling - RUN_ENTRY_EVAL_BUDGET_SECONDS == RUN_ENTRY_NON_EVAL_MARGIN_SECONDS
-    assert ceiling >= spec.maximum
-    assert ceiling > spec.default
