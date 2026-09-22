@@ -1,8 +1,16 @@
 """
 Unified eval execution engine.
 
-run_eval() is THE single function that all eval execution paths call.
-It composes: registry → instance creation → param preparation → execution → formatting.
+run_eval() composes the whole execution of one evaluation: registry → instance
+creation → param preparation → execution → formatting.
+
+It is NOT the only way an evaluation runs. Eleven sites outside this package
+build an instance themselves and call ``eval_instance.run(...)`` directly —
+dataset and prompt-template runs, the playground, external-platform evals and
+the agenthub evaluators — and they compose none of this, including the wall
+clock below. Anything documented as applying to "every eval path" applies to
+run_eval's callers only: the eval-task drain, the span/trace/session eval
+wrappers in ``tracer/utils/eval.py`` and the SDK evaluate path.
 
 Callers handle their own:
 - Input resolution (span attributes, dataset cells, transcript data)
@@ -164,7 +172,8 @@ def run_eval(request: EvalRequest) -> EvalResult:
     # 4. Execute, under a wall clock. Nothing else bounds the evaluation: the
     # activity heartbeat is emitted by a timer rather than by progress, so a
     # wedged eval keeps it beating, and a Temporal timeout cannot kill the
-    # thread anyway.
+    # thread anyway. The bound reaches this function's callers only — see the
+    # module docstring for the paths that call eval_instance.run directly.
     start_time = time.time()
     raw_result = run_bounded(
         eval_instance.run,

@@ -78,8 +78,10 @@ def test_the_bounded_call_sees_the_callers_context_vars():
 
 
 def test_a_timeout_outside_a_scope_is_still_raised():
-    """Every caller of the engine gets the bound, not just the eval-task drain
-    that opens a scope to read the flag back."""
+    """Every caller of ``run_eval`` gets the bound, not just the eval-task
+    drain that opens a scope to read the flag back. Callers that build an
+    instance and run it themselves bypass ``run_eval`` and are not bounded;
+    the engine's module docstring names them."""
     release = threading.Event()
 
     with pytest.raises(EvalWallClockExceeded):
