@@ -57,6 +57,12 @@ _USER_DETAIL_FILTER_TIMEOUT_MS = 9_500
 # The seed's witness subquery sits two levels in; its envelope lines up with
 # the ``PREWHERE`` of that subquery, not with the seed's own block.
 _SEED_WITNESS_ENVELOPE_INDENT = " " * 22
+# The binding a raised candidate slice floor moves. ``_candidate_session_ctes``
+# reads it under the ROOT scan only, ``build_candidate_cursor_page_query``
+# binds a raised floor into it, and ``candidate_slice_narrows_root_scan``
+# asks the rendered statement whether it is referenced at all. One name, so
+# the binder, the predicate and the tests cannot drift apart.
+CANDIDATE_ROOT_SCAN_FLOOR_PARAM = "candidate_root_scan_start_us"
 
 
 class SessionListQueryBuilder(BaseQueryBuilder):
@@ -1755,18 +1761,18 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         # belongs on the page - so the statement withholds it whenever one of
         # those aggregates decides admission.  See
         # ``page_admission_reads_the_root_set``.
-        params.setdefault("candidate_root_scan_start_us", params["start_date_us"])
+        params.setdefault(CANDIDATE_ROOT_SCAN_FLOOR_PARAM, params["start_date_us"])
         params.setdefault("candidate_root_scan_end_us", params["end_date_us"])
         root_span_time_scope = self._physical_time_scope_sql(
             enabled=scope_to_request_window,
-            start_param="candidate_root_scan_start_us",
+            start_param=CANDIDATE_ROOT_SCAN_FLOOR_PARAM,
             end_param="candidate_root_scan_end_us",
         )
         root_latest_time_scope = self._latest_time_scope_sql(
             params,
             enabled=scope_to_request_window,
             param_prefix="session_candidate_time_exclusion",
-            start_param="candidate_root_scan_start_us",
+            start_param=CANDIDATE_ROOT_SCAN_FLOOR_PARAM,
             end_param="candidate_root_scan_end_us",
         )
 
@@ -2744,16 +2750,15 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             self.project_ids is not None
         )
 
-    # The binding a raised candidate floor moves. Only the root scan reads it;
-    # the token is what a statement that HAS a root scan renders and a fused
-    # statement does not.
-    _CANDIDATE_ROOT_SCAN_FLOOR_TOKEN = "%(candidate_root_scan_start_us)s"
+    # How ``CANDIDATE_ROOT_SCAN_FLOOR_PARAM`` renders in a statement's text:
+    # what a statement that HAS a root scan carries and a fused one does not.
+    _CANDIDATE_ROOT_SCAN_FLOOR_TOKEN = f"%({CANDIDATE_ROOT_SCAN_FLOOR_PARAM})s"
 
     def candidate_slice_narrows_root_scan(self) -> bool:
         """Whether a raised floor changes what the candidate statement reads.
 
         ``build_candidate_cursor_page_query`` binds the floor into
-        ``candidate_root_scan_start_us`` and the root scan is the only scan
+        ``CANDIDATE_ROOT_SCAN_FLOOR_PARAM`` and the root scan is the only scan
         that reads it. On the user-detail scalar route there is no root scan
         to read it: ``_candidate_session_ctes`` fuses root-ness into the
         all-span replay that the user's own sessions seed and returns before
@@ -2768,9 +2773,11 @@ class SessionListQueryBuilder(BaseQueryBuilder):
         The question is put to the rendered statement rather than to a copy
         of the route condition: whichever route the builder takes, a statement
         whose text carries the floor binding is one the floor narrows, and a
-        statement whose text does not is one it cannot. The render has no
-        side effect the caller can see - the statement binds into its own
-        copy of ``params`` - and is Python only.
+        statement whose text does not is one it cannot. The render is Python
+        only and binds into its own copy of ``params``; the one builder state
+        it writes is ``start_date`` and ``end_date``, which
+        ``build_candidate_cursor_page_query`` re-parses from the filters on
+        every call and which the page render then sets to the same values.
         """
 
         query, _params = self.build_candidate_cursor_page_query()
@@ -2874,7 +2881,9 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             # its candidates - have to read.
             if not self.start_date <= scan_start_time < self.end_date:
                 raise ValueError("candidate scan floor must stay inside the window")
-            params["candidate_root_scan_start_us"] = _unix_microseconds(scan_start_time)
+            params[CANDIDATE_ROOT_SCAN_FLOOR_PARAM] = _unix_microseconds(
+                scan_start_time
+            )
             if (
                 before_start_time is not None
                 and not self.page_admission_reads_the_root_set()

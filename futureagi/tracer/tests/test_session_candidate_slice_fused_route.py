@@ -24,6 +24,9 @@ from uuid import UUID
 import pytest
 
 from tracer.selectors.session_candidate_slice import read_candidate_slice_page
+from tracer.services.clickhouse.query_builders.session_list import (
+    CANDIDATE_ROOT_SCAN_FLOOR_PARAM,
+)
 from tracer.services.clickhouse.read_budget import ReadDeadline
 from tracer.services.clickhouse.v2.query_builders.session_list import (
     SessionListQueryBuilderV2,
@@ -33,7 +36,8 @@ PROJECT = str(UUID(int=1))
 USER = str(UUID(int=7))
 END = datetime(2026, 9, 12)
 START = END - timedelta(days=92)
-FLOOR_TOKEN = "%(candidate_root_scan_start_us)s"
+FLOOR_TOKEN = f"%({CANDIDATE_ROOT_SCAN_FLOOR_PARAM})s"
+PAGE_SIZE = 25
 
 
 def _window():
@@ -111,7 +115,7 @@ ROOT_SCAN_SHAPES = {
 }
 
 
-def _builder(filters, page_size=25):
+def _builder(filters, page_size=PAGE_SIZE):
     return SessionListQueryBuilderV2(
         project_id=PROJECT,
         filters=filters,
@@ -140,7 +144,7 @@ def test_a_fused_statement_reports_that_the_floor_narrows_nothing(shape):
     )
     # The floor is bound and nothing reads it: same text, same rows.
     assert sliced == unsliced
-    assert "candidate_root_scan_start_us" in params
+    assert CANDIDATE_ROOT_SCAN_FLOOR_PARAM in params
     assert FLOOR_TOKEN not in sliced
     assert "candidate_root_identities" not in sliced
 
@@ -161,21 +165,35 @@ def test_a_statement_with_a_root_scan_reports_that_the_floor_narrows_it(shape):
 
 
 @pytest.mark.unit
-def test_asking_the_builder_leaves_its_bindings_untouched():
+@pytest.mark.parametrize("shape", sorted({**FUSED_SHAPES, **ROOT_SCAN_SHAPES}))
+def test_asking_the_builder_leaves_its_bindings_untouched(shape):
     """The verifier reads the request window out of ``builder.params``.
 
     The answer comes from a render, and a render that bound the floor into
     the builder's own params would make the full-state verifier verify the
-    slice against itself.
+    slice against itself. The render's only write to the builder is the
+    ``start_date``/``end_date`` pair, re-parsed from the filters exactly as
+    the page render re-parses it, on every shape the reader is handed.
     """
 
-    builder = _builder(ROOT_SCAN_SHAPES["default_date_only"])
-    before = dict(builder.params)
+    builder = _builder({**FUSED_SHAPES, **ROOT_SCAN_SHAPES}[shape])
+    before_params = dict(builder.params)
+    before = dict(vars(builder))
 
     builder.candidate_slice_narrows_root_scan()
 
-    assert builder.params == before
-    assert "candidate_root_scan_start_us" not in builder.params
+    assert builder.params == before_params
+    assert CANDIDATE_ROOT_SCAN_FLOOR_PARAM not in builder.params
+    after = dict(vars(builder))
+    changed = {
+        name
+        for name in set(before) | set(after)
+        if before.get(name, object()) != after.get(name, object())
+    }
+    assert changed <= {"start_date", "end_date"}
+    assert (after["start_date"], after["end_date"]) == builder.parse_time_range(
+        builder.filters
+    )
 
 
 # --------------------------------------------------------------------------
@@ -194,8 +212,10 @@ class _Server:
     def __init__(self, rows):
         self.rows = rows
         self.calls: list[tuple[str, dict]] = []
+        self.queries: list[str] = []
 
     def execute_ch_query(self, query, params, *, timeout_ms, settings):
+        self.queries.append(query)
         if query.lstrip().startswith("EXPLAIN ESTIMATE"):
             self.calls.append(("probe", params))
             return SimpleNamespace(
@@ -216,13 +236,14 @@ class _Server:
         return [kind for kind, _params in self.calls]
 
 
-def _read(builder, server):
+def _read(builder, server, **cursor):
     return read_candidate_slice_page(
         builder=builder,
         analytics=server,
         deadline=ReadDeadline.start(30_000),
         read_settings=lambda rows: {"max_result_rows": rows},
         query_timeout_ms=9_000,
+        **cursor,
     )
 
 
@@ -238,13 +259,20 @@ def _rows(count):
 
 @pytest.mark.unit
 @pytest.mark.parametrize("shape", sorted(FUSED_SHAPES))
-@pytest.mark.parametrize("found", [0, 18], ids=["empty", "short_of_a_page"])
+@pytest.mark.parametrize(
+    "found",
+    [0, 18, PAGE_SIZE + 1],
+    ids=["empty", "short_of_a_page", "full_page"],
+)
 def test_a_fused_statement_is_issued_once_unsliced_with_no_probe(shape, found):
     """One statement, the whole window, and the answer is the page.
 
-    Before the repair, both of these pages - the empty one and the one short
-    of ``page_size`` - widened: probes, a slice, more probes, a second slice,
-    and finally the unsliced statement, every candidate statement identical.
+    Before the repair the empty page and the page short of ``page_size``
+    widened: probes, a slice, more probes, a second slice, and finally the
+    unsliced statement, every candidate statement identical. The full page is
+    where exactness is observable: a slice would have had to verify its
+    candidates against full state before publishing, and the unsliced
+    statement's order is the published order with nothing to verify.
     """
 
     server = _Server(rows=_rows(found))
@@ -253,15 +281,46 @@ def test_a_fused_statement_is_issued_once_unsliced_with_no_probe(shape, found):
     assert server.kinds == ["candidate"]
     ((_kind, params),) = server.calls
     # The whole request window, not a raised floor.
-    assert params["candidate_root_scan_start_us"] == params["start_date_us"]
+    assert params[CANDIDATE_ROOT_SCAN_FLOOR_PARAM] == params["start_date_us"]
     assert page.slice_start is None
     assert page.statement_count == 1
     assert [row["session_id"] for row in page.rows] == [
-        row["session_id"] for row in _rows(found)
+        row["session_id"] for row in _rows(found)[:PAGE_SIZE]
     ]
-    assert page.has_more is False
+    assert page.has_more is (found > PAGE_SIZE)
     # ``count() OVER()`` of the unsliced statement is the exact total.
     assert page.remaining_count == found
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("shape", sorted(FUSED_SHAPES))
+def test_a_fused_continuation_is_the_same_single_statement(shape):
+    """A cursor hop on the fused route is one unsliced statement too.
+
+    Nothing was narrowed, so the root-scan ceiling is not pulled down to the
+    cursor instant either: both root bindings stay on the request window and
+    only the keyset clause moves the page.
+    """
+
+    server = _Server(rows=_rows(PAGE_SIZE + 1))
+    page = _read(
+        _builder(FUSED_SHAPES[shape]),
+        server,
+        before_start_time=END - timedelta(hours=40),
+        before_session_id=str(UUID(int=140)),
+    )
+
+    assert server.kinds == ["candidate"]
+    ((_kind, params),) = server.calls
+    assert params[CANDIDATE_ROOT_SCAN_FLOOR_PARAM] == params["start_date_us"]
+    assert params["candidate_root_scan_end_us"] == params["end_date_us"]
+    assert "cursor_before_start_us" in params
+    assert "cursor_before_session_id" in params
+    assert "cursor_before_start_us" in server.queries[0]
+    assert page.slice_start is None
+    assert page.statement_count == 1
+    assert page.has_more is True
+    assert page.remaining_count == PAGE_SIZE + 1
 
 
 @pytest.mark.unit
