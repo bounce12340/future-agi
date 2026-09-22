@@ -96,6 +96,12 @@ USER_LIST_MATCHING_CURSOR_ORDER = "matching_activity_users_v1"
 USER_LIST_MATCHING_ORDERING = "latest_matching_activity"
 USER_LIST_MATCHING_PROVENANCE = "matching_activity_walk"
 USER_LIST_PAGE_WALL_MS = settings.USER_LIST_PAGE_WALL_MS
+# Finish mode is exempt from the PAGE wall by design: a page that has already
+# certified its users should publish them rather than return empty because the
+# search spent the wall. Exempt from the page wall is not the same as exempt
+# from every deadline -- without one these statements carry no server timeout
+# at all -- so they run under the request's own analytics wall instead.
+USER_LIST_WALK_FINISH_WALL_MS = settings.INTERACTIVE_ANALYTICS_DEFAULT_WALL_MS
 USER_LIST_WALK_MAX_STATEMENTS = settings.USER_LIST_WALK_MAX_STATEMENTS
 USER_LIST_WALK_INITIAL_SLICE = timedelta(
     seconds=settings.USER_LIST_WALK_INITIAL_SLICE_SECONDS
@@ -577,11 +583,14 @@ def _materialise(state: _WalkState, entries: list[_Certified]) -> bool:
             frozen_filters=state.frozen_filters,
             window_start=state.window_start,
             window_end=state.window_end,
-            # Finish mode: the wall does not govern these statements. Passing
-            # the deadline would let the replay spend the last of it and the
-            # metrics read that follows raise on the client clock, dropping a
-            # user the page had already certified.
-            deadline=None,
+            # Finish mode: the PAGE wall does not govern these statements.
+            # Passing the walk's own deadline would let the replay spend the
+            # last of it and the metrics read that follows raise on the client
+            # clock, dropping a user the page had already certified. A fresh
+            # deadline sized to the request's analytics wall keeps that
+            # property and still gives both statements a server timeout, which
+            # ``deadline=None`` did not.
+            deadline=ReadDeadline.start(USER_LIST_WALK_FINISH_WALL_MS),
             enrich_rows=True,
             candidate_rows=None,
             skip_attribute_read=True,
