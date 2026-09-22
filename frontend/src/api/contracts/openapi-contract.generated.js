@@ -95701,11 +95701,17 @@ export const OPENAPI_CONTRACT = Object.freeze({
           enum: [
             "span_user_rollup_end_users_candidate",
             "physical_latest_users",
+            "matching_activity_walk",
           ],
         },
         ordering_exact: {
           title: "Ordering exact",
           type: "boolean",
+        },
+        ordering: {
+          title: "Ordering",
+          type: "string",
+          enum: ["latest_matching_activity"],
         },
         approximate_fields: {
           type: "array",
