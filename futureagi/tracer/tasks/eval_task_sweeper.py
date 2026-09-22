@@ -29,7 +29,8 @@ from __future__ import annotations
 
 import structlog
 from django.conf import settings
-from django.db.models import Max
+from django.db.models import Max, Subquery, TextField
+from django.db.models.functions import Cast
 
 from tfc.temporal.drop_in import temporal_activity
 from tracer.models.eval_task import EvalTask, EvalTaskStatus
@@ -65,24 +66,46 @@ def find_stranded_tasks(*, limit: int | None = None) -> list[EvalTask]:
     stranded one. A healthy task selected anyway costs one describe and nothing
     else: its workflow is progressing, so it is left alone.
 
+    The per-tick cap is applied **after** the sweepable-status filter, not
+    before it. A task the sweep refuses to act on — paused, delete-status,
+    finished with leftovers, or an entry pointing at a task row that no longer
+    exists — never drains, so its entries' ``updated_at`` never advances and it
+    sorts oldest on every tick for ever. Costing such a task against the cap
+    would hand it a head slot permanently: fill the cap with them and every
+    tick returns nothing, silently, for as long as they exist. The runbook
+    tells operators not to sweep paused tasks, so paused tasks holding
+    undrained entries are the expected steady state, not an edge case.
+
     ``no_workspace_objects``: this is a system-wide job and must not inherit a
     leaked workspace scope. Both managers exclude soft-deleted rows, so the
-    entries a Delete & rerun wiped cannot read as undrained work.
+    entries a Delete & rerun wiped cannot read as undrained work, and a
+    soft-deleted task cannot be swept.
     """
     limit = limit if limit is not None else int(settings.EVAL_TASK_SWEEP_MAX_TASKS)
-    # ``eval_task_id`` is a CharField, not a relation, so the id set is
-    # materialized here rather than left as a subquery against a uuid column.
-    # ``exclude(eval_task_id="")``: the column is a CharField and rows carrying
-    # an empty string exist (``queries/eval_clustering.py`` filters them out by
-    # name). An empty string reaching the ``id__in`` lookup against a UUID
-    # column raises before the per-task error handling below, and this activity
-    # runs with ``max_retries=0`` — one such row anywhere in the fleet would
-    # kill every tick forever.
+    # ``eval_task_id`` is a CharField holding the task uuid's text form (every
+    # writer stamps ``str(task.id)``), so the sweepable set is cast to text to
+    # join against it. As a subquery rather than a materialized id list: the
+    # candidate read has to be narrowed to sweepable tasks *inside* the query
+    # the cap slices, which is the whole point of the ordering above.
+    sweepable_task_ids = (
+        EvalTask.no_workspace_objects.filter(status__in=sweepable_statuses())
+        .annotate(id_text=Cast("id", output_field=TextField()))
+        .values("id_text")
+        # The model's Meta ordering would otherwise ride along inside the
+        # semi-join, sorting a set nothing reads in order.
+        .order_by()
+    )
+    # ``isnull`` / ``exclude("")`` are redundant beside the semi-join — neither
+    # value can be in a set of rendered uuids — and are kept only to drop those
+    # rows before the join. They are no longer what stops an empty string
+    # reaching a UUID column: nothing compares ``eval_task_id`` to a uuid any
+    # more.
     stranded_ids = [
         row["eval_task_id"]
         for row in EvalLogger.no_workspace_objects.filter(
             status__in=_UNDRAINED,
             eval_task_id__isnull=False,
+            eval_task_id__in=Subquery(sweepable_task_ids),
         )
         .exclude(eval_task_id="")
         .values("eval_task_id")
@@ -91,6 +114,8 @@ def find_stranded_tasks(*, limit: int | None = None) -> list[EvalTask]:
     ]
     if not stranded_ids:
         return []
+    # Re-read as model instances. The status filter is repeated so a task
+    # paused or deleted between the two reads is dropped rather than swept.
     by_id = {
         str(task.id): task
         for task in EvalTask.no_workspace_objects.filter(

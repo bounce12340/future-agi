@@ -217,6 +217,53 @@ class TestFindStrandedTasks:
 
         assert [str(t.id) for t in found] == [str(oldest.id)]
 
+    def test_a_non_sweepable_task_cannot_hold_the_tick_slot(
+        self, make_task, make_entry
+    ):
+        """A paused task never drains, so its entries' ``updated_at`` never
+        advances and it sorts oldest on every tick for ever. If the per-tick cap
+        were applied before the task-status filter it would own a slot
+        permanently and the sweepable task behind it would never be reached."""
+        parked = make_task(status=EvalTaskStatus.PAUSED)
+        make_entry(parked, age_seconds=864_000)
+        sweepable = make_task()
+        make_entry(sweepable, age_seconds=1)
+
+        found = sweeper.find_stranded_tasks(limit=1)
+
+        assert [str(t.id) for t in found] == [str(sweepable.id)]
+
+    def test_entries_whose_task_is_gone_cannot_hold_the_tick_slot(
+        self, make_task, make_entry
+    ):
+        """Same shape with no task row at all: an entry pointing at an id the
+        task table does not carry is never sweepable, so it must not be costed
+        against the cap either."""
+        orphan_host = make_task()
+        orphan = make_entry(orphan_host, age_seconds=864_000)
+        EvalLogger.all_objects.filter(id=orphan.id).update(
+            eval_task_id=str(uuid.uuid4())
+        )
+        sweepable = make_task()
+        make_entry(sweepable, age_seconds=1)
+
+        found = sweeper.find_stranded_tasks(limit=1)
+
+        assert [str(t.id) for t in found] == [str(sweepable.id)]
+
+    def test_non_sweepable_tasks_cannot_fill_the_whole_cap(self, make_task, make_entry):
+        """The starvation is permanent, not a one-slot rounding error: fill the
+        cap with tasks the sweep refuses to act on and every tick returns an
+        empty candidate list, silently, for as long as they exist."""
+        for _ in range(3):
+            make_entry(make_task(status=EvalTaskStatus.PAUSED), age_seconds=864_000)
+        sweepable = make_task()
+        make_entry(sweepable, age_seconds=432_000)
+
+        found = sweeper.find_stranded_tasks(limit=3)
+
+        assert [str(t.id) for t in found] == [str(sweepable.id)]
+
 
 @pytest.mark.django_db
 class TestRecoverTask:
