@@ -366,3 +366,125 @@ def test_a_remapped_identity_at_the_boundary_instant_is_the_known_residual() -> 
     # exclusive bound covers a row no page ever published.
     assert "zz-canon-early" not in published
     assert (instant, "zz-canon-early") >= (floor[0], str(floor[1]))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "floor_token,incoming_token,keeps_the_floor",
+    [
+        # Same instant, floor's token BELOW the boundary already promised: the
+        # floor descends within the instant and is published.
+        ("aaa", "mmm", True),
+        # Same instant, floor's token ABOVE it: clamping on the instant alone
+        # would keep the higher value and re-read every row published between
+        # the two tokens, so the promise already made stands.
+        ("zzz", "mmm", False),
+        # Same instant, same token: nothing moves either way.
+        ("mmm", "mmm", False),
+        # A floor taken from a slice carries no token and sorts below every
+        # token at its instant, so it is published.
+        (None, "mmm", True),
+    ],
+)
+def test_the_boundary_never_rises_within_one_instant(
+    floor_token: str | None, incoming_token: str, keeps_the_floor: bool
+) -> None:
+    """The decision itself, on every shape it can be handed.
+
+    Two boundaries at the same instant are ordered by their tokens, and both
+    are in the order the list publishes: a floor carries a token only when it
+    came from a keyset the bound can name, which is exactly when that token is
+    the published one. Comparing on the instant alone would let a floor that
+    stopped further INTO an instant than the boundary already promised be
+    handed out, un-excluding the rows published between the two. This is the
+    decision's own contract; the reader-level test below is the one that goes
+    red when the comparison is weakened.
+    """
+
+    from tracer.selectors.trace_filter_reads import _boundary_to_publish
+
+    instant = END - timedelta(minutes=30)
+    floor = (instant, floor_token)
+    incoming = (instant, incoming_token)
+    expected = floor if keeps_the_floor else incoming
+    assert _boundary_to_publish(floor, incoming) == expected
+
+    # The same decision across instants, which is the ordinary case.
+    older = (instant - timedelta(microseconds=1), floor_token)
+    newer = (instant + timedelta(microseconds=1), floor_token)
+    assert _boundary_to_publish(older, incoming) == older
+    assert _boundary_to_publish(newer, incoming) == incoming
+
+    # With nothing to clamp against, the floor stands as it is.
+    assert _boundary_to_publish(floor, None) == floor
+    assert _boundary_to_publish(None, incoming) is None
+
+
+@pytest.mark.unit
+def test_a_floor_below_the_incoming_boundary_at_one_instant_is_published() -> None:
+    """The reader's own clamp, driven through the reader.
+
+    The page arrives bounded at one instant and stops with a nameable keyset
+    at that SAME instant, at a token below the bound. Its floor is therefore a
+    descent WITHIN the instant and must be published: clamping it away would
+    hand back the bound this hop was given and re-read the rows it just
+    published. A clamp that compares instants alone cannot tell the two apart
+    and returns the incoming bound instead, which is what this asserts against.
+    """
+
+    from tracer.tests.test_bounded_trace_filter_reads import (
+        _WalledFakeExecutor,
+        _WideInitialSliceFakeBuilder,
+    )
+
+    instant = END - timedelta(minutes=30)
+    # Three seeds at one instant, all below the bound this hop is handed, and
+    # one of them ranked an hour earlier so the page cannot prove its prefix
+    # and stops at the wall with its keyset still at the instant.
+    seed_rows = [
+        {"id": "ccc", "start_time": instant},
+        {"id": "bbb", "start_time": instant},
+        {"id": "aaa", "start_time": instant},
+    ]
+    match_rows = [
+        {"id": "ccc", "start_time": instant},
+        {"id": "bbb", "start_time": instant},
+        {"id": "aaa", "start_time": instant - timedelta(hours=1)},
+    ]
+    builder = _WideInitialSliceFakeBuilder(
+        seed_rows,
+        start=_WINDOW_START,
+        end=END,
+        match_rows=match_rows,
+        recommended_batch_size=50,
+        recommended_seed_batch_size=200,
+    )
+    clock = _ManualMonotonic()
+    executor = _WalledFakeExecutor(
+        builder, clock=clock, durations_ms={"seed": 100, "match": 900}
+    )
+    with mock.patch("tracer.selectors.trace_filter_reads.monotonic", new=clock):
+        page = read_bounded_filter_page(
+            builder=builder,
+            analytics=executor,
+            filters=[_time_filter(_WINDOW_START, END)],
+            key_field="id",
+            page_number=0,
+            page_size=2,
+            deadline_ms=2_400,
+            max_seed_attempts=24,
+            max_candidates=200,
+            max_query_count=50,
+            classify_batch_size=50,
+            include_incomplete_rows=True,
+            bounded_continuation=True,
+            # The boundary this hop was handed: same instant, higher token.
+            cursor_start_time=instant,
+            cursor_order_token="mmm",
+        )
+
+    assert page.continuation_before_start_time == instant
+    assert page.continuation_before_id == "aaa"
+    # The floor descends within the instant, so it is what the page publishes.
+    assert page.continuation_published_order_floor == (instant, "aaa")
+    assert [row["id"] for row in page.rows] == ["ccc", "bbb"]

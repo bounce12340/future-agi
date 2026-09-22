@@ -271,6 +271,73 @@ class _BudgetExceeded(Exception):
         super().__init__(error_code)
 
 
+def _published_order_sort_key(boundary: tuple[Any, ...]) -> tuple[Any, ...]:
+    """Order two public boundaries, instant first and token second.
+
+    Both sides are in the order the list PUBLISHES. A floor carries a token
+    only when it was taken from a keyset the bound can name, which is exactly
+    the case where that token is the published one; a floor taken from a slice
+    carries ``None``, which stands below every token at its instant, and the
+    views spell that same ``None`` as empty components. So the tokens compared
+    here are always in one space, and normalising each side to a tuple of
+    strings makes the comparison total: an absent token sorts below an empty
+    one, which sorts below every real one.
+    """
+
+    instant, token = boundary[0], boundary[1] if len(boundary) > 1 else None
+    if isinstance(instant, datetime):
+        instant = _without_timezone(instant)
+    if token is None:
+        return instant, ()
+    if isinstance(token, tuple):
+        return instant, tuple(str(part) for part in token)
+    return instant, (str(token),)
+
+
+def _boundary_to_publish(
+    published_floor: tuple[Any, ...] | None,
+    cursor_key: tuple[Any, ...] | None,
+) -> tuple[Any, ...] | None:
+    """The boundary a page may pass on: its floor, unless that would RISE.
+
+    A public boundary is an exclusive upper bound on what is still to come, so
+    it may only ever move down. A floor is read off this page's scan position,
+    and that position can sit above a row an earlier hop published - which is
+    what happens on the pages that publish without a floor at all, where the
+    view resumes at a last published row ranked below where the scan had
+    reached. Handing the higher value on would un-exclude that row and publish
+    it twice, so the boundary this page was handed stands.
+
+    Compared as a whole boundary, instant AND token. Within one instant the
+    two can differ, and only the reachable direction is demonstrated: a page
+    can stop with a nameable keyset at the instant it was bounded at, at a
+    token BELOW that bound, and its floor is then a descent within the instant
+    that must be published (pinned through the reader in
+    ``test_boundary_instant_continuations.py``). The opposite direction, a
+    floor sorting above the bound at the same instant, was not produced by any
+    of the four fixtures this branch was reviewed against; the token is in the
+    comparison so the decision is total, not because a walk is known to reach
+    it. Comparing instants alone would decide that case the wrong way.
+
+    The comparison is sound because a floor carries a token only when it came
+    from a keyset the bound can name, which is precisely when that token is
+    the one the list publishes. A slice-form floor carries ``None``, and its
+    own cursor comes back from the view spelled as an empty component, so
+    ``(T, ())`` sorts strictly below ``(T, ("",))`` and the clamp does not fire
+    on a boundary this reader produced itself. That asymmetry is harmless:
+    both mean "below every token at T", and keeping the floor keeps the
+    tighter statement of the two.
+    """
+
+    if published_floor is None or cursor_key is None:
+        return published_floor
+    if _published_order_sort_key(published_floor) >= _published_order_sort_key(
+        cursor_key
+    ):
+        return cursor_key
+    return published_floor
+
+
 def bounded_filter_floor_order(
     floor: tuple[datetime, Any],
     *,
@@ -4325,23 +4392,10 @@ def read_bounded_filter_page(
     # while handing out the second, and every row between the two would be
     # published twice.
     published_floor = committed_publication_boundary()
-    if (
-        published_floor is not None
-        and cursor_key is not None
-        and published_floor[0] >= cursor_key[0]
-    ):
-        # A PUBLIC BOUNDARY ONLY EVER DESCENDS. The floor is read off this
-        # page's scan position, and that position can sit ABOVE a row an
-        # earlier hop published: a hop whose keyset the bound could not name
-        # publishes everything it classified, including rows ranked below where
-        # its scan had reached. Handing out the higher value would un-exclude
-        # those rows and publish them a second time, so the boundary this page
-        # was handed stands. Compared on the instant alone: the tokens on
-        # either side can be in different spaces, and on a tie the boundary
-        # already promised is the one to keep. What this page PUBLISHES is
-        # still decided by its own floor; only the promise it passes on is
-        # held back.
-        published_floor = cursor_key
+    # A public boundary only ever descends; the rule and its reasons live in
+    # ``_boundary_to_publish``. What this page PUBLISHES is still decided by
+    # its own floor above; only the promise it passes on can be held back.
+    published_floor = _boundary_to_publish(published_floor, cursor_key)
     publishes_a_checkpoint = (
         bounded_continuation and not page_complete and continuation_progressed
     )
