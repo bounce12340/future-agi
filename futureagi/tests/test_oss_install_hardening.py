@@ -88,8 +88,9 @@ def test_compose_builds_the_shared_collector_image_with_bounded_resources() -> N
     assert consumer_env["FI_OBSERVED_CATALOG_KAFKA_GROUP"] == (
         "futureagi.observed-attributes.consumer.v1"
     )
-    assert consumer_env["FI_OBSERVED_CATALOG_CH_DATABASE"] == (
-        services["backend"]["environment"]["PROPERTY_CATALOG_DATABASE"]
+    assert (
+        consumer_env["FI_OBSERVED_CATALOG_CH_DATABASE"]
+        == (services["backend"]["environment"]["PROPERTY_CATALOG_DATABASE"])
     )
     collector_volumes = {
         (volume["source"], volume["target"], volume.get("read_only", False))
@@ -336,10 +337,9 @@ fi
 case "$1" in
   inspect)
     case "${last_arg#cid-}" in
-      property-catalog-kafka) printf 'running|0|0|healthy|%s\n' "$started" ;;
-      property-catalog-supervisor)
-        printf 'running|0|0|%s|%s\n' "$FAGI_STUB_SUPERVISOR_HEALTH" "$started" ;;
-      fi-collector|fi-property-catalog-sequencer|fi-property-catalog-consumer)
+      property-catalog-kafka)
+        printf 'running|0|0|%s|%s\n' "$FAGI_STUB_KAFKA_HEALTH" "$started" ;;
+      fi-collector|fi-property-catalog-consumer)
         printf 'running|0|0|none|%s\n' "$started" ;;
       *) printf 'exited|0|0|none|%s\n' "$started" ;;
     esac
@@ -426,7 +426,7 @@ def _installer_sandbox(
         "FAGI_STUB_HEALTH": "ok",
         "FAGI_STUB_MIGRATIONS": "none",
         "FAGI_STUB_CREATE_USER": "ok",
-        "FAGI_STUB_SUPERVISOR_HEALTH": "healthy",
+        "FAGI_STUB_KAFKA_HEALTH": "healthy",
     }
     environment.update(stub_env)
     return script, environment, state
@@ -593,13 +593,13 @@ def test_installer_refuses_to_extend_the_window_for_an_unready_peer_service(
         CI="1",
         FAGI_STUB_HEALTH="ok",
         FAGI_STUB_MIGRATIONS="climbing",
-        FAGI_STUB_SUPERVISOR_HEALTH="starting",
+        FAGI_STUB_KAFKA_HEALTH="starting",
     )
 
     code, stdout, stderr = _run_installer(script, environment, "--skip-user-creation")
 
     assert code == 1
-    assert "still waiting on property-catalog-supervisor to report healthy" in stderr
+    assert "still waiting on property-catalog-kafka to report healthy" in stderr
     assert "backend /health/" not in stderr
     assert "extending the readiness window" not in stdout
     assert _readiness_ticks(state) <= 15
