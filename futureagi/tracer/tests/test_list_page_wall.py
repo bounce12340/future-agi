@@ -11,6 +11,7 @@ and ``test_sparse_session_cursor_follows_checkpoint_without_skip_or_duplicate``.
 
 from __future__ import annotations
 
+import pathlib
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -763,3 +764,103 @@ def test_session_numbered_page_keeps_every_row_the_wall_would_have_cut(cursor_en
         assert page.complete is True
         assert len(page.rows) == _OVERRUN_ROWS
         assert page.total_rows_lower_bound == _OVERRUN_ROWS
+
+
+# --------------------------------------------------------------------------
+# a CSV export is cursor-capable but it is not a page
+# --------------------------------------------------------------------------
+@override_settings(CLICKHOUSE_V2={"QUERY_TYPES_V2_ONLY": "SPAN_LIST"})
+def test_span_export_fills_its_page_under_the_request_budget_not_the_wall():
+    """Rule B bounds an interactive page; a download is not one.
+
+    The bounded export turns cursor mode on to get the keyset reader, which
+    also selected the five-second page wall over the request budget. A
+    download has no reader to resume it, so the wall only truncated it.
+    """
+
+    from tracer.views import observation_span as span_view
+    from tracer.views.observation_span import ObservationSpanView
+
+    view, request, organization = _view_and_request(ObservationSpanView)
+    reader = _budget_enforcing_reader([])
+    with (
+        mock.patch.object(span_view, "SPAN_LIST_PAGE_WALL_MS", _OVERRUN_MS // 4),
+        mock.patch("tracer.views.observation_span.CustomEvalConfig") as eval_config,
+        mock.patch(
+            "tracer.views.observation_span.get_annotation_labels_for_project",
+            return_value=[],
+        ),
+        mock.patch(
+            "tracer.selectors.trace_filter_reads.read_bounded_filter_page",
+            side_effect=reader,
+        ),
+    ):
+        eval_config.objects.filter.return_value.select_related.return_value = []
+        view._list_spans_clickhouse(
+            request,
+            project_id=PROJECT_ID,
+            validated_data={
+                "filters": [
+                    _time_filter(END - timedelta(minutes=30), END),
+                    _attribute_filter("final_status", "Rejected"),
+                ],
+                "page_number": 0,
+                "page_size": 25,
+                "cursor_mode": True,
+                "page_wall": False,
+                "allow_sampled": True,
+            },
+            analytics=mock.MagicMock(),
+            org_project_ids=None,
+            org=organization,
+            read_deadline=_RecordingDeadline(),
+        )
+
+    assert reader.budgets[0] == span_view.SPAN_LIST_CANDIDATE_DEADLINE_MS
+    assert reader.budgets[0] > _OVERRUN_MS
+
+
+def test_session_export_fills_its_page_under_the_request_budget_not_the_wall():
+    from tracer.views import trace_session as trace_session_view
+    from tracer.views.trace_session import _read_session_filter_page
+
+    rows = [{"session_id": str(uuid.UUID(int=i + 1))} for i in range(_OVERRUN_ROWS)]
+    builder = mock.MagicMock()
+    builder.filters = [_time_filter()]
+    builder.page_number = 0
+    builder.page_size = 25
+    builder.recommended_filter_classify_batch_size.return_value = 50
+    reader = _budget_enforcing_reader(rows)
+    with (
+        mock.patch.object(
+            trace_session_view, "SESSION_LIST_PAGE_WALL_MS", _OVERRUN_MS // 4
+        ),
+        mock.patch.object(
+            trace_session_view, "read_bounded_filter_page", side_effect=reader
+        ),
+    ):
+        page = _read_session_filter_page(
+            builder,
+            mock.MagicMock(),
+            _RecordingDeadline(),
+            cursor_state=None,
+            cursor_enabled=True,
+            page_wall=False,
+        )
+
+    assert reader.budgets[0] > _OVERRUN_MS
+    assert page.complete is True
+    assert len(page.rows) == _OVERRUN_ROWS
+
+
+def test_the_bounded_exports_turn_the_page_wall_off_where_they_are_built():
+    """The opt-out has to be set by the export entry point, not assumed."""
+
+    from tracer.views import observation_span as span_view
+    from tracer.views import trace_session as trace_session_view
+
+    for module in (span_view, trace_session_view):
+        source = pathlib.Path(module.__file__).read_text()
+        export_block = source.split('kwargs.get("bounded_export")', 1)[1][:400]
+        assert "cursor_mode=True" in export_block
+        assert "page_wall=False" in export_block

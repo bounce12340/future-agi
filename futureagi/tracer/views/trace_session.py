@@ -256,6 +256,7 @@ def _read_session_filter_page(
     *,
     cursor_state: ListCursor | None = None,
     cursor_enabled: bool = False,
+    page_wall: bool = True,
 ) -> BoundedFilterPage:
     return read_bounded_filter_page(
         builder=builder,
@@ -265,10 +266,13 @@ def _read_session_filter_page(
         page_number=builder.page_number,
         page_size=builder.page_size,
         # Only a cursor page can stop early and still resume exactly, so only
-        # a cursor page runs its acquisition at the page wall.
+        # a cursor page runs its acquisition at the page wall. An export is
+        # cursor-capable but it is not a page: it keeps filling its bounded
+        # page under the request budget rather than stopping at the wall a
+        # reader would resume from.
         deadline_ms=deadline.remaining_ms(
             SESSION_LIST_PAGE_WALL_MS
-            if cursor_enabled
+            if (cursor_enabled and page_wall)
             else SESSION_LIST_QUERY_TIMEOUT_MS
         ),
         max_candidates=SESSION_LIST_FILTER_MAX_CANDIDATES,
@@ -1828,6 +1832,9 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                     page_number=0,
                     page_size=BOUNDED_SESSION_EXPORT_PAGE_SIZE,
                     cursor_mode=True,
+                    # Rule B's wall bounds an interactive page, not a
+                    # download. The users export already opts out this way.
+                    page_wall=False,
                 )
             validated_data["filters"] = bind_request_my_annotations_principal(
                 request,
@@ -3103,6 +3110,7 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                 read_deadline,
                 cursor_state=cursor_state,
                 cursor_enabled=cursor_enabled,
+                page_wall=bool(validated_data.get("page_wall", True)),
             )
             if not bounded_page.complete:
                 if bounded_page.error_code == PAGE_DEPTH_EXCEEDED_CODE:
