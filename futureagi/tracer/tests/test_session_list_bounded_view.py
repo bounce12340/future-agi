@@ -1702,6 +1702,7 @@ def test_sparse_session_cursor_follows_checkpoint_without_skip_or_duplicate(
     # and incomplete with the reason it stopped. The rest of this test is
     # about the cursor following that checkpoint without skipping or
     # duplicating a row, which is unchanged.
+    # A checkpoint that proved no row is an unfinished scan, not an answer.
     assert first_payload["metadata"]["query_complete"] is False
     assert first_payload["metadata"]["query_status"] == "degraded"
     assert first_payload["metadata"]["query_error_code"] == "deadline_exceeded"
