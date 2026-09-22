@@ -17083,16 +17083,16 @@ class _SeedTokenFakeExecutor(_FakeExecutor):
 
 
 @pytest.mark.unit
-def test_incomparable_keyset_gives_up_its_boundary_instant_and_re_reads_it() -> None:
-    """Giving up the boundary instant means giving up the keyset with it.
+def test_incomparable_keyset_publishes_its_boundary_instant_and_advances() -> None:
+    """An unresolvable instant is published, not held, and the keyset stays.
 
     When the keyset's token cannot be compared against a published row's token,
-    the floor cannot resolve ties at the keyset's own instant, so it holds
-    every match there. Resuming below the keyset would then strand exactly the
-    row the keyset was taken from, whose own seed that keyset excludes: it is
-    held, never re-read, and the walk goes on to report the page complete
-    without it. The checkpoint becomes a slice ending one microsecond above the
-    instant instead, which re-reads that instant and nothing older.
+    the floor can still name the INSTANT, and that is what it does: every match
+    the hop classified there is published now, so the row the keyset was taken
+    from - whose own seed that keyset excludes - is never stranded. The keyset
+    is kept, because it is the only position that advances inside an instant;
+    giving it up to re-read the instant is what made a dense instant stall the
+    walk for ever.
     """
 
     window_start = END - timedelta(hours=6)
@@ -17111,8 +17111,8 @@ def test_incomparable_keyset_gives_up_its_boundary_instant_and_re_reads_it() -> 
             start=window_start,
             end=END,
             match_rows=rows,
-            recommended_batch_size=2,
-            recommended_seed_batch_size=2,
+            recommended_batch_size=3,
+            recommended_seed_batch_size=3,
         )
         clock = _ManualMonotonic()
         executor = _SeedTokenFakeExecutor(
@@ -17125,7 +17125,11 @@ def test_incomparable_keyset_gives_up_its_boundary_instant_and_re_reads_it() -> 
                 filters=[_time_filter(window_start, END)],
                 key_field="id",
                 page_number=0,
-                page_size=2,
+                # Room for the whole boundary instant: a tie group wider than
+                # the page falls to the reader's pre-existing has_more
+                # contract, which ``test_boundary_instant_continuations.py``
+                # covers on its own.
+                page_size=3,
                 deadline_ms=2_400,
                 max_seed_attempts=24,
                 max_candidates=200,
@@ -17148,9 +17152,11 @@ def test_incomparable_keyset_gives_up_its_boundary_instant_and_re_reads_it() -> 
             break
         floor = page.continuation_published_order_floor
         if floor is not None:
-            # A checkpoint that gave up its keyset publishes no keyset either.
-            if page.continuation_before_start_time is None:
-                assert page.continuation_slice_end == floor[0]
+            # The keyset is kept: an unresolvable instant costs the TOKEN, not
+            # the position, so the next hop can still advance inside it.
+            if page.continuation_before_start_time is not None:
+                assert floor[0] == page.continuation_before_start_time
+                assert floor[1] is None
             order = (floor[0], "" if floor[1] is None else str(floor[1]))
         elif page.rows:
             order = (page.rows[-1]["start_time"], str(page.rows[-1]["id"]))

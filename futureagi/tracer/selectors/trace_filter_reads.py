@@ -1889,43 +1889,53 @@ def read_bounded_filter_page(
         safe_matched_by_id = dict(matched_by_id)
         continuation_progressed = True
 
-    def committed_publication_boundary() -> tuple[tuple[datetime, Any] | None, bool]:
+    def committed_publication_boundary() -> tuple[datetime, Any] | None:
         """The floor this page may publish, read off the COMMITTED position.
 
         Read it, never cache it. Every caller must see the position as it
         stands when it asks, because a failed hydration rolls the committed
         position BACK after the page has already been filtered: a floor
         remembered from before that rollback would sit below the checkpoint the
-        page hands out, and the next hop would skip every row between the two -
-        the very loss this floor exists to prevent. Below the checkpoint is the
-        one place a floor may never be.
+        page hands out, and the next hop, resuming at the checkpoint but
+        bounded by the floor, would classify the rows in between and discard
+        every one of them as already published.
 
-        An in-slice keyset is exclusive, so the row at the keyset itself was
-        consumed and the floor is that keyset - but only when its token can be
-        compared against a published row's token, which is a fact about the row
-        the keyset was taken from. When it cannot, the floor gives up the
-        boundary instant (``+1us``) and the caller must give up the keyset with
-        it: the second element of the return says so. Holding the rows at that
-        instant while resuming below the keyset would strand exactly the row
-        the keyset was taken from, whose own seed the keyset excludes. Resuming
-        at a slice that ends one microsecond above it re-reads that instant and
-        nothing older, and the same floor then keeps the rows it holds out of
-        the next hop's exclusive bound.
+        THE INSTANT IS THE UNIT this bound can speak in. A keyset is exclusive,
+        so the row at the keyset was consumed and the floor is that keyset -
+        when its token can be compared against a published row's token, which
+        is a fact about the row the keyset was taken from, not about which
+        methods the builder spells. When it cannot, the bound can still say
+        WHICH INSTANT, and that is enough: the floor is the whole instant, so
+        every match the hop classified there is published now and the next hop
+        drops everything ranked at or above it.
+
+        What must NOT happen is holding those rows while the scan resumes below
+        them. The keyset is the only position that advances INSIDE an instant,
+        so a hop that gives it up to re-read the instant re-reads its own input
+        for ever whenever that instant holds more rows than one hop can
+        classify - an empty list that never fills.
 
         An exhausted slice is half-open: everything at or after its end is
-        consumed, so the whole boundary instant is publishable and the keyset
-        is already empty.
+        consumed, so the whole boundary instant is publishable and there is no
+        keyset to speak of.
+
+        What this gives up, deliberately: at an instant the keyset stopped
+        inside, a row the hop has NOT yet seen can rank in that same instant,
+        and the next hop drops it along with the ones that were published. That
+        costs a row only when two entities' ranks collide within one microsecond
+        AND the keyset lands between them, and it is what buys a bound that
+        always advances.
         """
 
         if not (bounded_continuation and not page_complete and continuation_progressed):
-            return None, False
+            return None
         if safe_before_start_time is not None:
             if safe_before_key_is_result_comparable:
-                return (safe_before_start_time, safe_before_id), False
-            return (safe_before_start_time + timedelta(microseconds=1), None), True
+                return safe_before_start_time, safe_before_id
+            return safe_before_start_time, None
         if safe_slice_end is not None:
-            return (safe_slice_end, None), False
-        return None, False
+            return safe_slice_end, None
+        return None
 
     def rollback_unhydrated_page() -> None:
         """Restore the honest scan position from before unpublished matches."""
@@ -4219,7 +4229,7 @@ def read_bounded_filter_page(
     # Where seed and result order agree - the span list, every route that
     # keysets on the rows it publishes - every match found is already at or
     # above ``P`` and this filter removes nothing.
-    published_order_floor, _give_up_keyset = committed_publication_boundary()
+    published_order_floor = committed_publication_boundary()
     if published_order_floor is not None:
         floor_time, floor_token = published_order_floor
         ordered_matches = [
@@ -4299,7 +4309,12 @@ def read_bounded_filter_page(
     )
     # Read the committed position ONE more time, after every rollback above, so
     # the floor and the checkpoint published beside it are the same position.
-    published_floor, give_up_keyset = committed_publication_boundary()
+    # Both rollback sites between the two reads (classification drift, and the
+    # hydration budget) must leave page_rows empty and has_more false: a
+    # rollback that kept its rows would publish them against the first floor
+    # while handing out the second, and every row between the two would be
+    # published twice.
+    published_floor = committed_publication_boundary()
     publishes_a_checkpoint = (
         bounded_continuation and not page_complete and continuation_progressed
     )
@@ -4323,21 +4338,11 @@ def read_bounded_filter_page(
         continuation_slice_start=(
             safe_active_slice_start if publishes_a_checkpoint else None
         ),
-        continuation_slice_end=(
-            published_floor[0]
-            if give_up_keyset
-            else (safe_slice_end if publishes_a_checkpoint else None)
-        ),
+        continuation_slice_end=(safe_slice_end if publishes_a_checkpoint else None),
         continuation_before_start_time=(
-            None
-            if give_up_keyset
-            else (safe_before_start_time if publishes_a_checkpoint else None)
+            safe_before_start_time if publishes_a_checkpoint else None
         ),
-        continuation_before_id=(
-            None
-            if give_up_keyset
-            else (safe_before_id if publishes_a_checkpoint else None)
-        ),
+        continuation_before_id=(safe_before_id if publishes_a_checkpoint else None),
         continuation_published_order_floor=published_floor,
     )
 
