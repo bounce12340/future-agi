@@ -27,6 +27,21 @@ from tracer.models.project import Project
 from tracer.models.trace import Trace
 from tracer.tasks import eval_task_sweeper as sweeper
 
+_UNDRAINED = (EvalEntryStatus.PENDING, EvalEntryStatus.RUNNING)
+
+
+@pytest.fixture(autouse=True)
+def only_this_modules_entries(db):
+    """Start every test from an empty undrained set.
+
+    The sweep is a system-wide job: it reads every task in the database, so any
+    entry another module left behind changes its answer. ``--reuse-db`` is in
+    this repo's pytest addopts and a ``transaction=True`` test commits its rows,
+    so leftovers survive between sessions. The delete runs inside the test's own
+    transaction and rolls back with it, leaving nothing changed for anyone else.
+    """
+    EvalLogger.all_objects.filter(status__in=_UNDRAINED).delete()
+
 
 @pytest.fixture
 def sweep_project(db, organization, workspace):
