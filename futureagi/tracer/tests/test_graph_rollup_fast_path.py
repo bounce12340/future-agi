@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 from datetime import datetime
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+from clickhouse_connect.driver.exceptions import (
+    DatabaseError as ClickHouseConnectDatabaseError,
+)
 from clickhouse_driver.errors import ErrorCodes, NetworkError, ServerException
 from django.conf import settings as django_settings
 
 from tracer.services.clickhouse import exact_graph_reads, graph_dispatch
+from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
 from tracer.services.clickhouse.session_graph import fetch_session_graph_ch
 
 PROJECT_ID = "22222222-2222-4222-8222-222222222222"
@@ -512,6 +517,91 @@ def test_seed_probe_failure_degrades_to_the_unseeded_graph(monkeypatch, code):
     assert response["query_complete"] is True
     assert response["query_status"] == "complete"
     assert response["query_count"] == 2
+
+
+def _seed_probe_graph_filters() -> list[dict]:
+    return [
+        _date_filter("2026-07-01T00:00:00Z", "2026-08-01T00:00:00Z"),
+        _span_attribute_filter("account_id", filter_type="text", value="acct-1"),
+    ]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "probe_error",
+    [
+        ServerException("probe diagnostic", code=ErrorCodes.TYPE_MISMATCH),
+        NetworkError("probe transport"),
+        ReadDeadlineExceeded("read deadline exceeded"),
+        ClickHouseConnectDatabaseError("Code: 53. probe diagnostic"),
+    ],
+    ids=lambda exc: type(exc).__name__,
+)
+def test_seed_probe_failure_is_logged_with_its_traceback(monkeypatch, probe_error):
+    """An absorbed probe failure still degrades, but never silently."""
+    monkeypatch.setattr(
+        graph_dispatch.settings,
+        "DASHBOARD_TRACE_REPLICA_SHARD_CLUSTER",
+        "",
+    )
+    warning_calls = []
+    monkeypatch.setattr(
+        graph_dispatch,
+        "logger",
+        SimpleNamespace(
+            warning=lambda *args, **kwargs: warning_calls.append((args, kwargs))
+        ),
+    )
+    analytics = mock.Mock()
+    analytics.execute_ch_query.side_effect = [
+        probe_error,
+        _empty_graph_query_result(),
+    ]
+
+    response = graph_dispatch._fetch_direct_raw_system_metric_graph(
+        analytics=analytics,
+        project_id=PROJECT_ID,
+        filters=_seed_probe_graph_filters(),
+        interval="day",
+        metric_id="latency",
+        observe_type="trace",
+        timeout_ms=30_000,
+    )
+
+    assert analytics.execute_ch_query.call_count == 2
+    assert "trace_id IN (" not in analytics.execute_ch_query.call_args_list[1].args[0]
+    assert response["query_status"] == "complete"
+    assert len(warning_calls) == 1
+    assert warning_calls[0][1]["exc_info"] is True
+    assert warning_calls[0][1]["error_type"] == type(probe_error).__name__
+    assert warning_calls[0][1]["probe_index"] == 1
+
+
+@pytest.mark.unit
+def test_seed_probe_defect_is_not_absorbed_as_an_unanswered_probe(monkeypatch):
+    """A failure no ClickHouse probe can raise is a defect and propagates."""
+    monkeypatch.setattr(
+        graph_dispatch.settings,
+        "DASHBOARD_TRACE_REPLICA_SHARD_CLUSTER",
+        "",
+    )
+    analytics = mock.Mock()
+    analytics.execute_ch_query.side_effect = [
+        RuntimeError("probe defect"),
+        _empty_graph_query_result(),
+    ]
+
+    with pytest.raises(RuntimeError, match="probe defect"):
+        graph_dispatch._fetch_direct_raw_system_metric_graph(
+            analytics=analytics,
+            project_id=PROJECT_ID,
+            filters=_seed_probe_graph_filters(),
+            interval="day",
+            metric_id="latency",
+            observe_type="trace",
+            timeout_ms=30_000,
+        )
+    assert analytics.execute_ch_query.call_count == 1
 
 
 @pytest.mark.unit

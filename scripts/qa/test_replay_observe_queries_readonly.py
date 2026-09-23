@@ -4,7 +4,7 @@ import unittest
 import hashlib
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -383,8 +383,8 @@ class UsersOriginShaDerivationTests(unittest.TestCase):
 
     ORGANIZATION = str(UUID(int=11))
     PROJECT = str(UUID(int=12))
-    WINDOW_START = datetime(2026, 9, 3, 0, 0, tzinfo=timezone.utc)
-    WINDOW_END = datetime(2026, 9, 3, 4, 0, tzinfo=timezone.utc)
+    WINDOW_START = datetime(2026, 9, 3, 0, 0, tzinfo=UTC)
+    WINDOW_END = datetime(2026, 9, 3, 4, 0, tzinfo=UTC)
     # Nine letters ``k`` push the legacy ASCII bloom enumeration past its 256
     # variant ceiling, so the hint declines and the page is a shape of its own.
     HINT_DECLINED_VALUE = "k" * 9
