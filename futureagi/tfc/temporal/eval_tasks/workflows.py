@@ -106,8 +106,14 @@ _CONTINUOUS_RECONCILE_BUDGET_DEFERRAL_PATCH = (
 # same duplicate-spend residual ``effective_stale_seconds`` describes. One
 # wait is ``ReapInput``'s threshold, so a restart confirmed stopped reclaims
 # after one; without that evidence the reap applies the blind floor
-# (``MIN_STALE_RUNNING_SECONDS``, 5,401 s), which ten waits pass. Twelve consecutive waits that reclaim nothing mean the rows
-# cannot be reclaimed at all, and the drain fails as it always did.
+# (``MIN_STALE_RUNNING_SECONDS``, 5,401 s), which ten waits pass. Twelve
+# consecutive waits that reclaim nothing mean the rows cannot be reclaimed at
+# all, and the drain fails as it always did. The cap is a literal rather than
+# derived from ``_RUN_ENTRY_TIMEOUT``: it decides between sleeping and raising,
+# so a new value needs its own patch marker, and a timeout change must not
+# become a workflow change. The guard is a test that fails if the floor ever
+# outgrows the waits, in ``tracer/tests/test_eval_task_sweeper.py``:
+# ``test_thresholds_are_derived_and_the_wait_cap_clears_the_blind_floor``.
 _FINALIZE_WAIT = timedelta(seconds=ReapInput.older_than_seconds)
 _MAX_IDLE_FINALIZE_WAITS = 12
 _HISTORICAL_FINALIZE_WAIT_PATCH = "historical-eval-finalize-wait-v1"

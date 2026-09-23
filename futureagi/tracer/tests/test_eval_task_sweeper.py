@@ -760,3 +760,51 @@ def test_sweep_stale_threshold_exceeds_a_live_entrys_longest_run():
 
     assert spec.minimum > longest_run
     assert spec.default > longest_run
+
+
+def test_thresholds_are_derived_and_the_wait_cap_clears_the_blind_floor():
+    """A historical drain that cannot finalize waits ``_FINALIZE_WAIT`` and reaps
+    again, and fails the task after ``_MAX_IDLE_FINALIZE_WAITS`` waits that
+    reclaim nothing. A restart that could not confirm the old execution stopped
+    reaps at the blind floor, so its claims only become reclaimable once they
+    are older than ``MIN_STALE_RUNNING_SECONDS``. If the waits run out first,
+    the drain fails a task it would have recovered, and FAILED is outside the
+    sweep's default scope — the stranding round 6 closed, back with no signal.
+
+    The floor is derived from the run-entry ceiling, so raising that ceiling
+    (to 40 minutes the floor is 7,201 s, past twelve waits of 600 s) has to fail
+    here. The cap stays a literal on purpose: it decides between sleeping and
+    raising, so changing it while executions sit in the wait is a
+    non-determinism error, and deriving it from the ceiling would turn a
+    timeout change into a workflow change. A change to the cap needs its own
+    ``workflow.patched`` marker; this test is the guard on the ceiling.
+    """
+    from tfc.temporal.eval_tasks.types import ReapInput
+    from tfc.temporal.eval_tasks.workflows import (
+        _FINALIZE_WAIT,
+        _MAX_IDLE_FINALIZE_WAITS,
+        _RUN_ENTRY_TIMEOUT,
+        RUN_ENTRY_RETRY_POLICY,
+    )
+    from tracer.services.eval_tasks.reaper import (
+        MIN_STALE_RUNNING_SECONDS,
+        effective_stale_seconds,
+    )
+
+    blind = effective_stale_seconds(
+        ReapInput.older_than_seconds, workflow_confirmed_stopped=False
+    )
+    confirmed = effective_stale_seconds(
+        ReapInput.older_than_seconds, workflow_confirmed_stopped=True
+    )
+    # Recomputed from the workflow's own ceiling, not the settings mirror, so
+    # moving ``_RUN_ENTRY_TIMEOUT`` alone cannot slip past this.
+    longest_run = (
+        _RUN_ENTRY_TIMEOUT.total_seconds() * RUN_ENTRY_RETRY_POLICY.maximum_attempts
+    )
+    longest_wait = _MAX_IDLE_FINALIZE_WAITS * _FINALIZE_WAIT.total_seconds()
+
+    assert blind == MIN_STALE_RUNNING_SECONDS > longest_run
+    assert longest_wait > blind
+    # A confirmed-stopped restart reclaims after a single wait.
+    assert _FINALIZE_WAIT.total_seconds() >= confirmed
