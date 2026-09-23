@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 import threading
 import uuid
@@ -10,9 +9,12 @@ from datetime import UTC, datetime, timedelta
 from time import monotonic, sleep
 
 import pytest
-from clickhouse_driver import Client
 
-from conftest import _require_safe_ch25_test_target
+from conftest import (
+    _ch_test_native_client,
+    _ch_test_owned_database,
+    _open_ch_test_native_client,
+)
 from tracer.services.clickhouse import exact_graph_reads
 from tracer.services.clickhouse.query_builders import TimeSeriesQueryBuilder
 from tracer.services.clickhouse.query_builders.user_list import UserListQueryBuilder
@@ -28,66 +30,19 @@ from tracer.services.clickhouse.v2.query_builders.user_time_series import (
 
 pytestmark = pytest.mark.integration
 
-CH_HOST = os.environ.get("CH25_HOST", "127.0.0.1")
-CH_NATIVE_PORT = int(
-    os.environ.get("CH25_NATIVE_PORT") or os.environ.get("CH25_TCP_PORT") or "19000"
-)
-CH_USER = os.environ.get("CH25_USER") or os.environ.get("CH_USERNAME") or "default"
-CH_PASSWORD = os.environ.get("CH25_PASSWORD") or os.environ.get("CH_PASSWORD") or ""
-
-
-def _ch_client(*, database: str) -> Client:
-    return Client(
-        host=CH_HOST,
-        port=CH_NATIVE_PORT,
-        user=CH_USER,
-        password=CH_PASSWORD,
-        database=database,
-        connect_timeout=3,
-    )
-
 
 @pytest.fixture(scope="module")
 def ch_database():
     """Create one unique test-owned database and remove it after the module."""
 
-    database = f"test_user_graph_{uuid.uuid4().hex}"
-    _require_safe_ch25_test_target(host=CH_HOST, database=database)
-    admin = _ch_client(database="default")
-    created = False
-    try:
-        try:
-            admin.execute("SELECT 1")
-        except Exception as exc:
-            pytest.skip(
-                f"CH25 is not reachable on {CH_HOST}:{CH_NATIVE_PORT} ({exc!r})"
-            )
-        admin.execute(f"CREATE DATABASE {database}")
-        created = True
+    with _ch_test_owned_database("test_user_graph_") as database:
         yield database
-    finally:
-        try:
-            if created:
-                # The exact target is an unguessable database created above;
-                # no shared schema object is touched during cleanup.
-                admin.execute(f"DROP DATABASE IF EXISTS {database} SYNC")
-        finally:
-            admin.disconnect()
 
 
 @pytest.fixture(scope="module")
 def ch_client(ch_database):
-    client = _ch_client(database=ch_database)
-    try:
-        try:
-            client.execute("SELECT 1")
-        except Exception as exc:
-            pytest.skip(
-                f"CH25 is not reachable on {CH_HOST}:{CH_NATIVE_PORT} ({exc!r})"
-            )
+    with _ch_test_native_client(database=ch_database) as client:
         yield client
-    finally:
-        client.disconnect()
 
 
 @pytest.fixture()
@@ -871,7 +826,7 @@ def test_one_statement_pins_parts_across_concurrent_insert_and_merge(
         ORDER BY id
         """
     )
-    reader = _ch_client(database=ch_database)
+    reader = _open_ch_test_native_client(database=ch_database)
     query_id = f"exact_statement_snapshot_{uuid.uuid4().hex}"
     outcome: dict[str, object] = {}
 
