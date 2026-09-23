@@ -155,9 +155,7 @@ def test_span_and_trace_rollups_share_one_deadline(monkeypatch):
     # so a payload carrying it stays inexact even though the token series is
     # now the base table's own number.
     assert result["query_exact"] is False
-    exactness = {
-        metric["name"]: metric["query_exact"] for metric in result["metrics"]
-    }
+    exactness = {metric["name"]: metric["query_exact"] for metric in result["metrics"]}
     assert exactness == {"tokens": True, "trace_count": False}
 
 
