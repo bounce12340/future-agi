@@ -7,15 +7,20 @@ import RunningStatusRenderer from "./RunningStatusRenderer";
 
 const axiosPostMock = vi.hoisted(() => vi.fn());
 
-vi.mock("src/utils/axios", () => ({
-  default: { post: axiosPostMock },
-  endpoints: {
-    project: {
-      pauseEvalTask: (taskId) => `/tasks/${taskId}/pause`,
-      resumeEvalTask: (taskId) => `/tasks/${taskId}/resume`,
+vi.mock("src/utils/axios", async () => {
+  const actual = await vi.importActual("src/utils/axios");
+  return {
+    default: { post: axiosPostMock },
+    endpoints: {
+      project: {
+        pauseEvalTask: (taskId) => `/tasks/${taskId}/pause`,
+        // The real mapping, so the click below is checked against the URL the
+        // backend serves rather than a stand-in.
+        resumeEvalTask: actual.endpoints.project.resumeEvalTask,
+      },
     },
-  },
-}));
+  };
+});
 
 vi.mock("src/components/snackbar", () => ({
   enqueueSnackbar: vi.fn(),
@@ -63,7 +68,7 @@ describe("RunningStatusRenderer resume action", () => {
 
       await waitFor(() =>
         expect(axiosPostMock).toHaveBeenCalledWith(
-          `/tasks/${data.id}/resume`,
+          `/tracer/eval-task/unpause_eval_task/?eval_task_id=${data.id}`,
           {},
         ),
       );

@@ -12,23 +12,27 @@ const axiosPostMock = vi.hoisted(() => vi.fn());
 const confirmDialogMock = vi.hoisted(() => vi.fn());
 const useAuthContextMock = vi.hoisted(() => vi.fn(() => ({ role: "Admin" })));
 
-vi.mock("src/utils/axios", () => ({
-  default: {
-    patch: axiosPatchMock,
-    post: axiosPostMock,
-  },
-  endpoints: {
-    project: {
-      updateEvalTask: (id) => `/tracer/eval-task/${id}/`,
-      patchEvalTask: () => "/tracer/eval-task/update_eval_task/",
-      pauseEvalTask: (id) =>
-        `/tracer/eval-task/pause_eval_task/?eval_task_id=${id}`,
-      resumeEvalTask: (id) =>
-        `/tracer/eval-task/unpause_eval_task/?eval_task_id=${id}`,
-      createEvalTask: () => "/tracer/eval-task/",
+vi.mock("src/utils/axios", async () => {
+  const actual = await vi.importActual("src/utils/axios");
+  return {
+    default: {
+      patch: axiosPatchMock,
+      post: axiosPostMock,
     },
-  },
-}));
+    endpoints: {
+      project: {
+        updateEvalTask: (id) => `/tracer/eval-task/${id}/`,
+        patchEvalTask: () => "/tracer/eval-task/update_eval_task/",
+        pauseEvalTask: (id) =>
+          `/tracer/eval-task/pause_eval_task/?eval_task_id=${id}`,
+        // The real mapping, so the Resume assertions check the URL the backend
+        // serves rather than a copy of it.
+        resumeEvalTask: actual.endpoints.project.resumeEvalTask,
+        createEvalTask: () => "/tracer/eval-task/",
+      },
+    },
+  };
+});
 
 vi.mock("src/auth/hooks", () => ({
   useAuthContext: useAuthContextMock,

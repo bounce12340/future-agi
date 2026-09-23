@@ -8,21 +8,26 @@ import TaskListView from "./TaskListView";
 const axiosGetMock = vi.hoisted(() => vi.fn());
 const axiosPostMock = vi.hoisted(() => vi.fn());
 
-vi.mock("src/utils/axios", () => ({
-  default: {
-    get: axiosGetMock,
-    post: axiosPostMock,
-  },
-  endpoints: {
-    project: {
-      getEvalTaskList: () => "/project-tasks",
-      getEvalTasksWithProjectName: () => "/workspace-tasks",
-      markEvalsDeleted: () => "/delete-tasks",
-      pauseEvalTask: (taskId) => `/tasks/${taskId}/pause`,
-      resumeEvalTask: (taskId) => `/tasks/${taskId}/resume`,
+vi.mock("src/utils/axios", async () => {
+  const actual = await vi.importActual("src/utils/axios");
+  return {
+    default: {
+      get: axiosGetMock,
+      post: axiosPostMock,
     },
-  },
-}));
+    endpoints: {
+      project: {
+        getEvalTaskList: () => "/project-tasks",
+        getEvalTasksWithProjectName: () => "/workspace-tasks",
+        markEvalsDeleted: () => "/delete-tasks",
+        pauseEvalTask: (taskId) => `/tasks/${taskId}/pause`,
+        // The real mapping, so each click below is checked against the URL
+        // the backend serves rather than a stand-in.
+        resumeEvalTask: actual.endpoints.project.resumeEvalTask,
+      },
+    },
+  };
+});
 
 vi.mock("src/auth/hooks", () => ({
   useAuthContext: () => ({ role: "admin" }),
@@ -127,7 +132,7 @@ describe("TaskListView resume action", () => {
 
     await waitFor(() =>
       expect(axiosPostMock).toHaveBeenCalledWith(
-        "/tasks/task-failed/resume",
+        "/tracer/eval-task/unpause_eval_task/?eval_task_id=task-failed",
         {},
       ),
     );
@@ -143,7 +148,7 @@ describe("TaskListView resume action", () => {
 
     await waitFor(() =>
       expect(axiosPostMock).toHaveBeenCalledWith(
-        "/tasks/task-paused/resume",
+        "/tracer/eval-task/unpause_eval_task/?eval_task_id=task-paused",
         {},
       ),
     );
