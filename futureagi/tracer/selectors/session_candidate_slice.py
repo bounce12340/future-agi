@@ -186,9 +186,17 @@ class _QueryExecutor(Protocol):
 class CandidateSliceBuilder(Protocol):
     """The Session-list builder methods this lane issues its statements from.
 
-    ``SessionListQueryBuilderV2`` is the one implementation. The density pair
-    and ``supports_bounded_filter_scan`` are still looked up defensively in
-    ``_slicing_is_available``: a builder that cannot answer them is read whole.
+    ``SessionListQueryBuilderV2`` is the one implementation. Some members are
+    still looked up defensively with ``getattr``:
+
+    * the density pair and ``supports_bounded_filter_scan``, in
+      ``_slicing_is_available``: a builder that cannot answer them is read
+      whole;
+    * ``candidate_slice_narrows_root_scan() -> bool``, also in
+      ``_slicing_is_available``, is optional and so not declared below: a
+      builder that does not answer it is taken to narrow;
+    * ``recommended_filter_classify_batch_size``, in ``_classify_batch_size``:
+      without it the candidates are classified in one batch.
     """
 
     page_size: int
