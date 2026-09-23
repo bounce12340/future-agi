@@ -5,6 +5,7 @@ task's ``run_type`` and starts it under the per-task id ``eval-task-{id}`` so at
 most one workflow runs per task. Wired into the views at cutover (PR 9).
 """
 
+import structlog
 from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 
 from tfc.temporal.common.client import (
@@ -12,6 +13,8 @@ from tfc.temporal.common.client import (
     start_workflow_async,
     start_workflow_sync,
 )
+
+logger = structlog.get_logger(__name__)
 
 
 def _workflow_id(task_id: str) -> str:
@@ -137,12 +140,16 @@ def _describe_says_nothing_is_draining(task_id) -> bool:
     Save and the sweep's restart all pass.
 
     False on any failure, including an unreachable Temporal: no answer is not
-    a negative answer, and the floor is the safe reading of silence. The start
-    that follows surfaces the outage on its own.
+    a negative answer, and the floor is the safe reading of silence. That
+    choice changes what the run reclaims — ninety minutes instead of ten — and
+    the start that follows can still succeed (a describe-only failure, or a
+    transient that cleared), so the failure is logged with its traceback here
+    rather than left to the start to surface.
     """
     try:
         return describe_eval_task_workflow_sync(task_id) in (WF_ABSENT, WF_CLOSED)
-    except Exception:
+    except Exception as exc:
+        _log_describe_fallback(task_id, exc)
         return False
 
 
@@ -153,8 +160,21 @@ async def _describe_says_nothing_is_draining_async(task_id) -> bool:
             WF_ABSENT,
             WF_CLOSED,
         )
-    except Exception:
+    except Exception as exc:
+        _log_describe_fallback(task_id, exc)
         return False
+
+
+def _log_describe_fallback(task_id, exc: Exception) -> None:
+    """Record why a start fell back to the blind reap floor, traceback
+    included."""
+    logger.warning(
+        "eval_task_start_describe_failed",
+        task_id=str(task_id),
+        fallback="blind_reap_floor",
+        error_type=type(exc).__name__,
+        exc_info=exc,
+    )
 
 
 def signal_pause_eval_task_workflow(task_id) -> bool:

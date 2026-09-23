@@ -189,3 +189,52 @@ def test_a_describe_that_cannot_answer_leaves_the_floor_in_place(monkeypatch):
     )
 
     assert captured["workflow_input"].workflow_confirmed_stopped is False
+
+
+@pytest.mark.unit
+def test_a_describe_fallback_is_logged_with_its_cause(monkeypatch):
+    """The fallback is conservative but not silent: it changes what the run
+    reclaims, and the start after it can still succeed, so the event has to
+    carry the failure itself — its type and traceback."""
+    import structlog
+
+    from tfc.temporal.eval_tasks import client
+
+    failure = RuntimeError("temporal unreachable")
+
+    def _unreachable(_task_id):
+        raise failure
+
+    monkeypatch.setattr(client, "describe_eval_task_workflow_sync", _unreachable)
+
+    with structlog.testing.capture_logs() as records:
+        assert client._describe_says_nothing_is_draining("task-id") is False
+
+    [line] = [r for r in records if r["event"] == "eval_task_start_describe_failed"]
+    assert line["log_level"] == "warning"
+    assert line["task_id"] == "task-id"
+    assert line["error_type"] == "RuntimeError"
+    assert line["exc_info"] is failure
+    assert failure.__traceback__ is not None
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_the_async_describe_fallback_is_logged_with_its_cause(monkeypatch):
+    import structlog
+
+    from tfc.temporal.eval_tasks import client
+
+    failure = RuntimeError("temporal unreachable")
+
+    async def _unreachable(_task_id):
+        raise failure
+
+    monkeypatch.setattr(client, "describe_eval_task_workflow_async", _unreachable)
+
+    with structlog.testing.capture_logs() as records:
+        assert await client._describe_says_nothing_is_draining_async("t") is False
+
+    [line] = [r for r in records if r["event"] == "eval_task_start_describe_failed"]
+    assert line["exc_info"] is failure
+    assert line["error_type"] == "RuntimeError"
