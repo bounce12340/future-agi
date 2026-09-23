@@ -98,8 +98,10 @@ def test_ai_unpause_preserves_filters_and_replaces_closing_workflow(monkeypatch)
     queryset = SimpleNamespace(get=lambda **_kwargs: task)
 
     monkeypatch.setattr(
-        "tracer.models.eval_task.EvalTask.objects.select_for_update",
-        lambda: queryset,
+        "tracer.selectors.eval_tasks.scope.eval_tasks_in_scope",
+        lambda _queryset, **_scope: SimpleNamespace(
+            select_for_update=lambda **_lock: queryset
+        ),
     )
     monkeypatch.setattr(
         "tracer.models.eval_task.EvalTaskLogger.objects.get", lambda **_kwargs: logger
@@ -142,8 +144,12 @@ def _unpause_through_the_tool(monkeypatch, status):
     )
     starts = []
     monkeypatch.setattr(
-        "tracer.models.eval_task.EvalTask.objects.select_for_update",
-        lambda: SimpleNamespace(get=lambda **_kwargs: task),
+        "tracer.selectors.eval_tasks.scope.eval_tasks_in_scope",
+        lambda _queryset, **_scope: SimpleNamespace(
+            select_for_update=lambda **_lock: SimpleNamespace(
+                get=lambda **_kwargs: task
+            )
+        ),
     )
     monkeypatch.setattr(
         "tracer.models.eval_task.EvalTaskLogger.objects.get",

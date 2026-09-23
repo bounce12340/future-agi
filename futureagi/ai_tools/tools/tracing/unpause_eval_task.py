@@ -38,12 +38,21 @@ class UnpauseEvalTaskTool(BaseTool):
             EvalTaskLogger,
             EvalTaskStatus,
         )
+        from tracer.selectors.eval_tasks.scope import eval_tasks_in_scope
 
         with transaction.atomic():
             try:
-                eval_task = EvalTask.objects.select_for_update().get(
-                    id=params.eval_task_id,
-                    project__organization=context.organization,
+                # The unpause endpoint's scope, not the organization alone: a
+                # task in another workspace, or in a deleted project, is not
+                # this caller's to resume — and a resume spends evaluations.
+                eval_task = (
+                    eval_tasks_in_scope(
+                        EvalTask.objects,
+                        organization=context.organization,
+                        workspace=context.workspace,
+                    )
+                    .select_for_update(of=("self",))
+                    .get(id=params.eval_task_id)
                 )
             except EvalTask.DoesNotExist:
                 return ToolResult.not_found("EvalTask", str(params.eval_task_id))
