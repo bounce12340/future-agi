@@ -238,3 +238,63 @@ async def test_the_async_describe_fallback_is_logged_with_its_cause(monkeypatch)
     [line] = [r for r in records if r["event"] == "eval_task_start_describe_failed"]
     assert line["exc_info"] is failure
     assert line["error_type"] == "RuntimeError"
+
+
+@pytest.mark.unit
+def test_a_start_handed_the_describes_answer_does_not_describe_again(monkeypatch):
+    """The sweep's restart is gated on a describe it has just taken. Asking
+    again costs a second RPC, and a second one that failed would put the run
+    on the blind floor after the sweep had admitted it on 600 s. Recorded
+    rather than raised: the helper absorbs any exception from the describe."""
+    from tfc.temporal.eval_tasks import client
+    from tracer.models.eval_task import RunType
+
+    described = []
+    monkeypatch.setattr(
+        client,
+        "describe_eval_task_workflow_sync",
+        lambda task_id: described.append(task_id) or client.WF_PROGRESSING,
+    )
+    captured = {}
+
+    def _start(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(id=kwargs["workflow_id"])
+
+    monkeypatch.setattr(client, "start_workflow_sync", _start)
+
+    client.start_eval_task_workflow_sync(
+        SimpleNamespace(id="task-id", run_type=RunType.HISTORICAL),
+        workflow_confirmed_stopped=True,
+    )
+
+    assert described == []
+    assert captured["workflow_input"].workflow_confirmed_stopped is True
+    assert captured["id_conflict_policy"] == WorkflowIDConflictPolicy.USE_EXISTING
+
+
+@pytest.mark.unit
+def test_a_replacing_start_cannot_be_handed_an_answer(monkeypatch):
+    """A replacing start terminates whatever owns the id, so whether that was
+    a live drain is what its own describe, taken just before, has to say. An
+    answer taken earlier can predate a start that the terminate then kills."""
+    from tfc.temporal.eval_tasks import client
+
+    described = []
+    started = []
+    monkeypatch.setattr(
+        client,
+        "describe_eval_task_workflow_sync",
+        lambda task_id: described.append(task_id) or client.WF_CLOSED,
+    )
+    monkeypatch.setattr(client, "start_workflow_sync", started.append)
+
+    with pytest.raises(ValueError, match="coalescing starts only"):
+        client.start_eval_task_workflow_sync(
+            SimpleNamespace(id="task-id"),
+            replace_existing=True,
+            workflow_confirmed_stopped=True,
+        )
+
+    assert described == []
+    assert started == []

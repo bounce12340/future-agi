@@ -217,7 +217,8 @@ LONGEST_RUNNING_ENTRY_SECONDS = RUN_ENTRY_CEILING_SECONDS * RUN_ENTRY_MAX_ATTEMP
 # reap never requeues an entry whose run is still in flight from a closed
 # execution. It does not bound the recovery as a whole. The workflow the sweep
 # then restarts reaps first at ``ReapInput``'s 600 s, on the evidence of the
-# same describe (``RESTART_REAP_SECONDS`` in
+# same describe, which the sweep hands to the starter rather than letting it
+# describe again (``RESTART_REAP_SECONDS`` in
 # ``tracer.services.eval_tasks.recovery``), so a claim older than ten minutes
 # is reclaimed as soon as that run starts, whatever this is set to — and a run
 # of the closed execution can still be in flight under it. What keeps the row

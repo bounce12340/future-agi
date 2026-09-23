@@ -27,9 +27,9 @@ logger = structlog.get_logger(__name__)
 _MAX_ENTRY_ATTEMPTS = ReapInput.max_attempts
 
 # What the first reap of a workflow this sweep starts applies. The sweep has
-# just been told nothing owns the task, and the starter describes again and
-# carries that into the run, so the run reaps with ``ReapInput``'s own
-# threshold rather than the blind floor.
+# just been told nothing owns the task and hands that answer to the starter,
+# which carries it into the run rather than describing again, so the run reaps
+# with ``ReapInput``'s own threshold rather than the blind floor.
 RESTART_REAP_SECONDS = effective_stale_seconds(
     ReapInput.older_than_seconds, workflow_confirmed_stopped=True
 )
@@ -79,13 +79,14 @@ def recover_task(task: EvalTask, *, stale_running_seconds: int) -> dict:
     no retries — and ``EVAL_TASK_SWEEP_STALE_RUNNING_SECONDS`` is floored to
     exceed it, so *this* reap never requeues that run's entry. The floor is not
     the guarantee, though: the workflow restarted below reaps first at
-    ``RESTART_REAP_SECONDS`` (600 s) on the same describe's evidence, so a claim
-    older than that is reclaimed as soon as it starts, whatever the setting
-    says. What makes that safe is the fence — the in-flight run's writes are
-    fenced on the claim stamp it took, not merely on ``RUNNING``, so a requeue
-    and a re-claim refuse them — and what it costs is one evaluation paid for
-    twice (``effective_stale_seconds``). Raising the setting does not remove
-    that cost.
+    ``RESTART_REAP_SECONDS`` (600 s) on the evidence of the same describe —
+    handed to the starter, which does not describe again — so a claim older
+    than that is reclaimed as soon as it starts, whatever the setting says.
+    What makes that safe is the fence — the in-flight run's writes are fenced
+    on the claim stamp it took, not merely on ``RUNNING``, so a requeue and a
+    re-claim refuse them — and what it costs is one evaluation paid for twice
+    (``effective_stale_seconds``). Raising the setting does not remove that
+    cost.
 
     **Deferral.** A workflow that stopped a few minutes ago leaves claims
     younger than both this reap and the ``RESTART_REAP_SECONDS`` the restarted
@@ -101,7 +102,10 @@ def recover_task(task: EvalTask, *, stale_running_seconds: int) -> dict:
     in between — the exact failure this whole change exists to prevent. For the
     same reason ``restarted`` counts starts *issued*: one that coalesced onto an
     execution started in the gap is counted too, because the server resolves
-    that and does not report which way it went.
+    that and does not report which way it went. Coalescing is also what lets
+    the describe's answer travel with the start: a start absorbed by an
+    execution begun in the gap is discarded with its input, so the answer only
+    reaches a run that started with nothing draining.
     """
     from tfc.temporal.eval_tasks.client import (
         WF_PROGRESSING,
@@ -161,7 +165,15 @@ def recover_task(task: EvalTask, *, stale_running_seconds: int) -> dict:
                 return outcome
             task.status = EvalTaskStatus.PENDING
 
-        start_eval_task_workflow_sync(task, replace_existing=False)
+        # The describe above is the evidence the restarted run's first reap
+        # needs, and it has answered: nothing owns the task. Handed over
+        # rather than asked again, so the deferral check's 600 s is the
+        # threshold the run really applies — a second describe that failed
+        # would drop it to the blind floor after this tick had admitted the
+        # restart on 600 s.
+        start_eval_task_workflow_sync(
+            task, replace_existing=False, workflow_confirmed_stopped=True
+        )
     except Exception as exc:
         raise RecoveryInterrupted(outcome, exc) from exc
     outcome["restarted"] = True

@@ -9,12 +9,14 @@ alone, and the threshold that keeps the reap from racing a live worker.
 
 import uuid
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 from django.utils import timezone
 
 from model_hub.models.ai_model import AIModel
 from model_hub.models.evals_metric import EvalTemplate
+from tfc.temporal.eval_tasks import client as eval_task_client
 from tracer.models.custom_eval_config import CustomEvalConfig
 from tracer.models.eval_task import EvalTask, EvalTaskStatus, RowType, RunType
 from tracer.models.observation_span import (
@@ -26,6 +28,10 @@ from tracer.models.observation_span import (
 from tracer.models.project import Project
 from tracer.models.trace import Trace
 from tracer.tasks import eval_task_sweeper as sweeper
+
+# The real starter, bound at import: ``tracer/tests/conftest.py`` replaces it
+# with a stub for every test in this package before the test body runs.
+_REAL_STARTER = eval_task_client.start_eval_task_workflow_sync
 
 _UNDRAINED = (EvalEntryStatus.PENDING, EvalEntryStatus.RUNNING)
 
@@ -127,6 +133,11 @@ def client_progressing():
     from tfc.temporal.eval_tasks import client
 
     return client.WF_PROGRESSING
+
+
+# How the sweep starts a workflow: coalescing, never terminating, and carrying
+# the answer of the describe it was gated on rather than describing again.
+_SWEEP_RESTART = {"replace_existing": False, "workflow_confirmed_stopped": True}
 
 
 @pytest.fixture
@@ -282,7 +293,7 @@ class TestRecoverTask:
         outcome = sweeper.recover_task(task, stale_running_seconds=7_200)
 
         assert outcome["restarted"] is True
-        assert temporal["started"] == [(str(task.id), {"replace_existing": False})]
+        assert temporal["started"] == [(str(task.id), _SWEEP_RESTART)]
 
     def test_a_progressing_workflow_is_never_restarted(
         self, make_task, make_entry, temporal
@@ -384,7 +395,7 @@ class TestSweepActivity:
         assert result["candidates"] == 1
         assert result["restarted"] == 1
         assert result["errors"] == 0
-        assert temporal["started"] == [(str(task.id), {"replace_existing": False})]
+        assert temporal["started"] == [(str(task.id), _SWEEP_RESTART)]
 
     def test_a_healthy_draining_task_is_a_candidate_and_is_reported_as_one(
         self, make_task, make_entry, temporal
@@ -568,7 +579,7 @@ class TestFreshlyAbandonedClaims:
 
         assert not outcome.get("deferred")
         assert outcome["restarted"] is True
-        assert temporal["started"] == [(str(task.id), {"replace_existing": False})]
+        assert temporal["started"] == [(str(task.id), _SWEEP_RESTART)]
 
     @pytest.mark.parametrize("age_seconds", [601, 1_000])
     def test_a_claim_the_restarted_workflow_can_reclaim_restarts_at_once(
@@ -693,6 +704,83 @@ class TestSweepFailureDiagnostics:
         assert line["exc_info"] is failure
 
 
+@pytest.mark.django_db
+class TestTheRestartRunsOnTheSweepsOwnDescribe:
+    """The restarted run's first reap needs to know that nothing owns the task,
+    and the sweep has just asked. Driven through the real starter, with only
+    the Temporal RPCs doubled: the answer is handed over rather than asked for
+    again, so a restart costs one describe, and no second call can fail and
+    drop the run to the blind floor after the deferral check admitted it on
+    ``RESTART_REAP_SECONDS``."""
+
+    def _real_starter(self, monkeypatch, describe):
+        starts = []
+
+        def _start(**kwargs):
+            starts.append(kwargs)
+            return SimpleNamespace(id=kwargs["workflow_id"])
+
+        client = eval_task_client
+        monkeypatch.setattr(client, "start_eval_task_workflow_sync", _REAL_STARTER)
+        monkeypatch.setattr(client, "describe_eval_task_workflow_sync", describe)
+        monkeypatch.setattr(client, "start_workflow_sync", _start)
+        return starts
+
+    def test_a_restart_costs_one_describe(self, make_task, make_entry, monkeypatch):
+        from tfc.temporal.eval_tasks import client
+
+        described = []
+
+        def _describe(task_id):
+            described.append(str(task_id))
+            return client.WF_CLOSED
+
+        starts = self._real_starter(monkeypatch, _describe)
+        task = make_task()
+        make_entry(task, status=EvalEntryStatus.RUNNING, age_seconds=1_000)
+
+        outcome = sweeper.recover_task(task, stale_running_seconds=7_200)
+
+        assert outcome["restarted"] is True
+        assert described == [str(task.id)]
+        [start] = starts
+        assert start["workflow_input"].workflow_confirmed_stopped is True
+
+    def test_the_run_reaps_at_the_threshold_the_deferral_check_admitted(
+        self, make_task, make_entry, monkeypatch
+    ):
+        from tfc.temporal.eval_tasks import client
+        from tfc.temporal.eval_tasks.types import ReapInput
+        from tracer.services.eval_tasks.reaper import effective_stale_seconds
+        from tracer.services.eval_tasks.recovery import RESTART_REAP_SECONDS
+
+        answers = iter([client.WF_CLOSED])
+
+        def _describe(_task_id):
+            # The sweep's describe answers; any later one fails in transit.
+            try:
+                return next(answers)
+            except StopIteration:
+                raise RuntimeError("transient Temporal RPC failure") from None
+
+        starts = self._real_starter(monkeypatch, _describe)
+        task = make_task()
+        # Past the restarted run's 600 s, inside the sweep's own 7,200 s: the
+        # deferral check admits the restart only because the run will reclaim
+        # this claim.
+        make_entry(task, status=EvalEntryStatus.RUNNING, age_seconds=1_000)
+
+        outcome = sweeper.recover_task(task, stale_running_seconds=7_200)
+
+        assert outcome["restarted"] is True
+        [start] = starts
+        carried = start["workflow_input"].workflow_confirmed_stopped
+        first_reap = effective_stale_seconds(
+            ReapInput.older_than_seconds, workflow_confirmed_stopped=carried
+        )
+        assert first_reap == RESTART_REAP_SECONDS
+
+
 def test_the_sweep_is_actually_scheduled_and_its_activity_is_registered():
     """A recovery job nobody runs is the defect it is meant to fix. The schedule
     and the activity registration are separate wires — pin both."""
@@ -741,8 +829,9 @@ def test_sweep_stale_threshold_exceeds_a_live_entrys_longest_run():
     execution dispatches no retries). Below that bound the sweep requeues an
     entry a worker is still evaluating and spends one of its three reclaims.
     This bounds the sweep's own reap only: the workflow it restarts reaps at
-    ``RESTART_REAP_SECONDS`` (600 s) whatever the setting says, and the
-    claim-epoch fence is what keeps that reap's rows correct.
+    ``RESTART_REAP_SECONDS`` (600 s) whatever the setting says, on the answer
+    of the sweep's own describe carried into the start, and the claim-epoch
+    fence is what keeps that reap's rows correct.
 
     Asserted against the spec's **minimum**, not against the live setting. The
     setting resolves from the process environment through ``load_numeric_settings``
