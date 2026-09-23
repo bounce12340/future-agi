@@ -3084,7 +3084,9 @@ class TraceSessionView(BaseModelViewSetMixin, ModelViewSet):
                 )
                 # A narrowed scan cannot see sessions whose every root is below
                 # its floor, so this total is the proven prefix, exactly as on
-                # the bounded filter route. Re-running the legacy full-window
+                # the bounded filter route: rows already published plus the
+                # candidates the reader verified against the whole window, not
+                # the slice's own count. Re-running the legacy full-window
                 # count would reintroduce the timeout this path removes.
                 candidate_total_count = prior_seen_rows + slice_page.remaining_count
                 candidate_total_is_lower_bound = slice_page.slice_start is not None
