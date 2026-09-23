@@ -74,7 +74,8 @@ When the server stops it on a read budget (``is_read_budget_error`` other than
 the request's own wall: memory, row and time limits, cancellation, overload, a
 socket timeout), its head-of-line user is read alone, charged as a second
 enrichment (``_head_statements`` reserves both), and the rest of the request
-certifies one user at a time; the request's wall stops it outright. Only the
+certifies one user at a time; the request's wall (or a transport timeout the
+service reports as one) stops it outright. Only the
 head-of-line user of a request that has decided nothing may have its read
 split in time (``UsersListManager._read_span_attributes``): one user a
 request, up to
@@ -87,9 +88,9 @@ that starts with some of the wall left and outlasts it stops every request at
 that user, having decided no one. Any other user whose read runs out of a read
 budget stops the request (``read_budget``), and so does a batch the page wall
 refuses (``wall``), with the coverage just above the refused batch's first
-candidate: the refused user, unless an already-decided user precedes it, which
-the next request finishes first. Either way the next request decides it as
-its head of line. A refusal by the statement count keeps the boundary it had.
+candidate: the refused user, unless an already-decided user precedes it. The
+next request decides that first candidate first, and the refused user after
+it. A refusal by the statement count keeps the boundary it had.
 A request that has decided something certifies a batch only when the
 statements left also pay one materialisation.
 
@@ -850,8 +851,10 @@ def _certify(state: _WalkState, batch: list[_Candidate]) -> int:
     if not state.progress_owed and state.budget.remaining_statements() < (
         statements + _materialisation_statement_count(manager)
     ):
-        # Off the head of line, only when one materialisation is paid too
-        # (``progress_owed``: defensive, the floor always leaves the head room).
+        # Off the head of line, only when one materialisation is paid too. On
+        # the head path the floor leaves room, unless a stopped slice was
+        # followed by a run of empty slices; there the head still certifies
+        # what it may not publish.
         state.budget.exhausted_by = "statements"
         return 0
     if not state.budget.take(statements, finish=state.progress_owed):
@@ -1448,7 +1451,8 @@ def walk_matching_activity_page(
         # without moving the coverage, it would open the instant then. A
         # request that opens the instant decides a user there, exhausts it,
         # or publishes, so in a fixed world no two requests in a row make no
-        # progress.
+        # progress, except in the known stall (module docstring): a head split
+        # that outlasts the analytics wall repeats the same cursor.
         certified_there = any(
             entry.order_key == next_coverage - _TICK
             for entry in state.certified.values()

@@ -448,7 +448,9 @@ def _follow_on(
     seen_states: set = set()
     coverage = WINDOW_END
     position: tuple = (None, None)
-    stalled = refused = False
+    stalled = False
+    # After a read_budget stop, the refused user's newest witness.
+    refused_at: datetime | None = None
     cursor = None
     finish_wall = walk.USER_LIST_WALK_FINISH_WALL_MS
     enrichment = _enrichments(keys)
@@ -510,11 +512,21 @@ def _follow_on(
                 or _lower_position(order[1:3], position)
             )
             assert progressed or not stalled, f"two hops without progress at {hop}"
-            # A read_budget stop leaves the refused user as the next head of
-            # line, which the next request decides.
-            assert progressed or not refused, f"no progress after read_budget at {hop}"
+            # A read_budget stop leaves the coverage just above the refused
+            # batch: the next request publishes, or moves the coverage down
+            # to the refused user's witness.
+            assert (
+                refused_at is None or _names(read) or order[3] <= refused_at + TICK
+            ), f"no progress past the refused user at {hop}: {order[3]}, {refused_at}"
             stalled = not progressed
-            refused = _exhausted(logs) == ["read_budget"]
+            refused_at = None
+            if _exhausted(logs) == ["read_budget"]:
+                refused_at = max(
+                    moment
+                    for moment, raw_id in world.raw
+                    if world.canonical.get(raw_id) == engine.refused
+                    and moment < coverage
+                )
         coverage, position = order[3], order[1:3]
         cursor = _signed_cursor(read)
         if mutate is not None:
@@ -1301,6 +1313,8 @@ class _MemoryEngine(_CappedEngine):
         self.fail_ms = fail_ms
         self.enrichments: list[tuple[int, timedelta, bool]] = []
         self.split: dict[str, int] = {}
+        # The user whose whole-window read last failed alone.
+        self.refused: str | None = None
 
     def execute_ch_query(
         self,
@@ -1326,6 +1340,8 @@ class _MemoryEngine(_CappedEngine):
             if users == 1 and bucket < WINDOW:
                 (uid,) = params["eu_ids"]
                 self.split[uid] = self.split.get(uid, 0) + 1
+            if users == 1 and bucket >= WINDOW and failed:
+                (self.refused,) = params["eu_ids"]
             if failed:
                 from clickhouse_driver.errors import ErrorCodes, ServerException
 
@@ -1678,13 +1694,16 @@ def test_a_count_refusal_in_a_tie_world_keeps_its_boundary(
     names: list[str] = []
     cursor = None
     requests = statements = opened = 0
+    stops: list[str] = []
     with _shipped_walls(), _scripted_clock(clock):
         for _hop in range(20):
             engine = _CappedEngine(world, clock=clock)
-            read = _keyed_page(
-                page_size=25, cursor=cursor, engine=engine, keys=keys, finish=finish
-            )
+            with capture_logs() as logs:
+                read = _keyed_page(
+                    page_size=25, cursor=cursor, engine=engine, keys=keys, finish=finish
+                )
             names.extend(_names(read))
+            stops.extend(_exhausted(logs))
             requests += 1
             statements += len(engine.calls)
             if not read.has_more:
@@ -1694,6 +1713,7 @@ def test_a_count_refusal_in_a_tie_world_keeps_its_boundary(
             cursor = _signed_cursor(read)
 
     assert names == _expected(world)
+    assert "statements" in stops, stops
     assert requests == 4 and opened <= 2, (requests, opened)
     assert statements <= most_statements, statements
 
@@ -1909,7 +1929,7 @@ def test_a_request_certifies_only_what_it_can_also_publish(
             cursor = _signed_cursor(read)
 
     assert names == _expected(world)
-    # No more than this list cost once the reserve landed.
+    # The cost at 60dcf25ca.
     assert requests <= most_requests and statements <= most_statements, (
         requests,
         statements,
