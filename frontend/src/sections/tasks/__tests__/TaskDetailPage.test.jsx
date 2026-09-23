@@ -271,6 +271,38 @@ describe("TaskDetailPage", () => {
     });
   });
 
+  it("resumes a failed task from the header", async () => {
+    useGetTaskData.mockReturnValue({
+      data: loadedTask({ status: "failed" }),
+      isLoading: false,
+      isError: false,
+    });
+
+    renderTaskDetail("task-1");
+    fireEvent.click(screen.getByRole("button", { name: /resume/i }));
+
+    await waitFor(() => {
+      expect(axiosPostMock).toHaveBeenCalledWith(
+        "/tracer/eval-task/unpause_eval_task/?eval_task_id=task-1",
+        {},
+      );
+    });
+  });
+
+  it("offers no Resume for a completed task", () => {
+    useGetTaskData.mockReturnValue({
+      data: loadedTask({ status: "completed" }),
+      isLoading: false,
+      isError: false,
+    });
+
+    renderTaskDetail("task-1");
+
+    expect(
+      screen.queryByRole("button", { name: /resume/i }),
+    ).not.toBeInTheDocument();
+  });
+
   it("renders the open source button when a trace/span source link is present", () => {
     useGetTaskData.mockReturnValue({
       data: loadedTask({
