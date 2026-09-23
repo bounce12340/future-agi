@@ -224,11 +224,6 @@ class _WalkBudget:
     def remaining_ms(self) -> float:
         return max(self.deadline.total_ms - self.deadline.elapsed_ms(), 0.0)
 
-    def statement_deadline(self) -> ReadDeadline | None:
-        """The wall as a per-statement deadline while it still has room."""
-
-        return self.deadline if self.remaining_ms() >= 25 else None
-
 
 @dataclass
 class _WalkState:
@@ -563,8 +558,7 @@ def _read_slice(
                 state.budget.remaining_statements() >= 1 + _head_statements(manager)
             )
             if width > USER_LIST_WALK_MIN_SLICE and room:
-                narrower = max(USER_LIST_WALK_MIN_SLICE, width / 4)
-                slice_start = max(state.window_start, slice_end - narrower)
+                slice_start = _narrower_start(state, slice_end, width)
             elif owed:
                 escape = True
             else:
@@ -579,14 +573,13 @@ def _read_slice(
         except Exception as exc:
             if not is_read_budget_error(exc) or width <= USER_LIST_WALK_MIN_SLICE:
                 raise
-            narrower = max(USER_LIST_WALK_MIN_SLICE, width / 4)
+            slice_start = _narrower_start(state, slice_end, width)
             logger.warning(
                 "users_matching_walk_slice_narrowed",
                 error_type=type(exc).__name__,
                 width_seconds=width.total_seconds(),
-                retry_width_seconds=narrower.total_seconds(),
+                retry_width_seconds=(slice_end - slice_start).total_seconds(),
             )
-            slice_start = max(state.window_start, slice_end - narrower)
             continue
         # Kept in the statement's own order: the survivor statement is bound
         # to exactly the ids returned, as returned.
@@ -615,6 +608,15 @@ def _read_slice(
             raw_last=ordered[-1][::-1] if ordered else None,
             tied=bool(ordered) and ordered[0][1] == ordered[-1][1],
         )
+
+
+def _narrower_start(
+    state: _WalkState, slice_end: datetime, width: timedelta
+) -> datetime:
+    """Where a retry a quarter as wide starts: never below the least width,
+    never before the window."""
+
+    return max(state.window_start, slice_end - max(USER_LIST_WALK_MIN_SLICE, width / 4))
 
 
 def _read_survivors(
