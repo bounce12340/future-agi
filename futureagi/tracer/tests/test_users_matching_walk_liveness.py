@@ -1469,8 +1469,11 @@ def test_only_the_head_of_line_decision_of_a_request_splits_in_time():
             # and it was published.
             split = {world.users[uid]["name"]: n for uid, n in memory.split.items()}
             assert split == {_names(read)[0]: _split_statements(TEN_MINUTES) - 1}, split
-            users, bucket, failed = memory.enrichments[-1]
-            assert (users, bucket, failed) == (1, WINDOW, True), memory.enrichments[-1]
+            # The next user was tried once, over the whole window, and ended
+            # the request: its read is neither split nor retried.
+            alone = [f for n, b, f in memory.enrichments if n == 1 and b == WINDOW]
+            assert alone == [True, True], memory.enrichments[-1]
+            assert memory.enrichments[-1] == (1, WINDOW, True)
             assert read.payload["query_status"] == "degraded"
             cursor = _signed_cursor(read)
 
