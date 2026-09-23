@@ -362,8 +362,8 @@ def _statement_budget(manager: Any) -> int:
     A batch whose enrichment runs out of a read budget is charged it again
     for its head-of-line user alone, so one decision at 100 keys is 63.
     The bound stays explicit, the larger of two numbers known before the
-    first statement; outside it are only the time buckets one user's
-    enrichment may split into when it runs out of memory (``_certify``).
+    first statement; outside it are only the time buckets the head-of-line
+    user's enrichment may split into, once per request (``_certify``).
     """
     return max(
         USER_LIST_WALK_MAX_STATEMENTS,
@@ -501,11 +501,12 @@ def _read_slice(
     survivor statement, the instant read and its survivor statement when the
     slice comes back tied at one instant, one batch's enrichment and the
     finish's uncapped replay (``_materialise``) start with no wall at all.
-    That enrichment may split one user's read in time when it runs out of
-    memory (``_certify``): up to 2 x window / ``_USER_LIST_ATTRIBUTE_MIN_BUCKET``
-    statements for each of its enrichment statements (one per accelerated key
-    and per four other keys), with no wall and not counted against the
-    statement budget. On a lane whose ClickHouse profile is read-only
+    That decision may split the head-of-line user's read in time when it
+    runs out of a read budget (``_certify``): up to ``2 ** (ceil(log2(window
+    / _USER_LIST_ATTRIBUTE_MIN_BUCKET)) + 1) - 1`` statements (4,095 over
+    24 h) for each of its enrichment statements (one per accelerated key and
+    per four other keys), with no wall and not counted against the statement
+    budget. On a lane whose ClickHouse profile is read-only
     (``CH*_SERVER_ENFORCED_READONLY``) no setting reaches the server, so the
     slice cap is not sent there either and slices are admitted only.
     """
@@ -818,14 +819,22 @@ def _certify(state: _WalkState, batch: list[_Candidate]) -> int:
     """Attribute enrichment for a batch: membership superset and order key.
 
     Returns how many of ``batch``, from its head, are certified; ``0`` when
-    the budget or the wall refused. A batch's enrichment is not split in
-    time: when it runs out of a read budget (memory, rows), the head-of-line
-    user alone is certified instead, a statement that holds a batch's
-    fraction of the rows, charged as a second enrichment (the failed one
-    may have sent any of its statements; ``_head_statements`` reserves
-    both), and only that one may split its time buckets
-    (``UsersListManager._read_span_attributes``). The rest of the request
-    certifies one user at a time.
+    the budget or the wall refused, or one user's read ran out of a read
+    budget off the head-of-line path. A batch's enrichment is not split in
+    time: when it runs out of a read budget (``is_read_budget_error``:
+    memory, row and time limits, cancellation, overload, a socket timeout),
+    the head-of-line user alone is certified instead, a statement that holds
+    a batch's fraction of the rows, charged as a second enrichment (the
+    failed one may have sent any of its statements; ``_head_statements``
+    reserves both). The rest of the request certifies one user at a time.
+    Only the head-of-line decision of a request that owes progress splits one
+    user's time buckets (``UsersListManager._read_span_attributes``), so at
+    most one user a request: up to ``2 ** (ceil(log2(window /
+    _USER_LIST_ATTRIBUTE_MIN_BUCKET)) + 1) - 1`` statements (4,095 over 24 h)
+    for each enrichment statement, not counted against the statement budget
+    and bounded in time only by ``_admission_deadline`` (no deadline on the
+    head path). Any other user whose read runs out of a read budget stops the
+    request, and the next one decides that user as its head of line.
     """
 
     manager = state.manager
@@ -843,6 +852,7 @@ def _certify(state: _WalkState, batch: list[_Candidate]) -> int:
         for candidate in batch
         for alias in candidate.alias_ids
     }
+    head = len(batch) == 1 and state.progress_owed
     try:
         manager._read_span_attributes(
             rows,
@@ -851,14 +861,18 @@ def _certify(state: _WalkState, batch: list[_Candidate]) -> int:
             end_date=state.window_end,
             candidate_scan_ids=scan_ids,
             candidate_end_user_id_map=alias_map,
-            split_buckets=len(batch) == 1,
+            split_buckets=head,
         )
     except ReadDeadlineExceeded:
         state.budget.exhausted_by = "wall"
         return 0
     except Exception as exc:
-        if len(batch) == 1 or not is_read_budget_error(exc):
+        if head or not is_read_budget_error(exc):
             raise
+        if len(batch) == 1:
+            # Not the head of line: the next request decides this user first.
+            state.budget.exhausted_by = "wall"
+            return 0
         state.certify_singly = True
         logger.info(
             "users_matching_walk_certify_singly",
@@ -924,9 +938,9 @@ def _admission_deadline(state: _WalkState) -> ReadDeadline | None:
     first batch are admitted with no deadline, once per request: its
     survivor statement, the instant read and its survivor statement when the
     slice is tied at one instant, and one batch's enrichment, including the
-    time buckets one user's enrichment may split into when it runs out of
-    memory, up to 2 x window / ``_USER_LIST_ATTRIBUTE_MIN_BUCKET`` statements
-    for each of its enrichment statements (``_certify``).
+    time buckets the head-of-line user's enrichment may split into (up to
+    ``2 ** (ceil(log2(window / _USER_LIST_ATTRIBUTE_MIN_BUCKET)) + 1) - 1``
+    statements for each enrichment statement, ``_certify``).
     """
 
     if not state.progress_owed:

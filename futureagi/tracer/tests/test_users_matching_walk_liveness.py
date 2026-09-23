@@ -19,6 +19,7 @@ follows every cursor to the end.
 from __future__ import annotations
 
 import json
+import math
 import random
 import uuid
 from collections.abc import Callable
@@ -30,6 +31,7 @@ from unittest.mock import patch
 import pytest
 from structlog.testing import capture_logs
 
+from tracer.services import users_list_manager as ulm
 from tracer.services import users_matching_walk as walk
 from tracer.services.clickhouse import read_budget
 from tracer.services.clickhouse.read_budget import ReadDeadline, ReadDeadlineExceeded
@@ -1189,8 +1191,10 @@ class _MemoryEngine(_CappedEngine):
     """An enrichment runs out of memory (code 241) when it holds too much.
 
     It fails when its bucket is wider than ``width``, whatever it carries,
-    or when its users times its bucket's hours exceed ``user_hours``.
-    Records every enrichment as ``(users, bucket width, failed)``.
+    or when its users times its bucket's hours exceed ``user_hours``; a
+    failure costs ``fail_ms``. Records every enrichment as ``(users, bucket
+    width, failed)``, and counts, per user, the statements of that user
+    alone over less than the window (its read split in time).
     """
 
     def __init__(
@@ -1200,12 +1204,15 @@ class _MemoryEngine(_CappedEngine):
         clock: _Clock,
         width: timedelta | None = None,
         user_hours: float | None = None,
+        fail_ms: float = 50.0,
         slice_ms: Callable[[timedelta, bool], float] | None = None,
     ) -> None:
         super().__init__(world, clock=clock, slice_ms=slice_ms)
         self.width = width
         self.user_hours = user_hours
+        self.fail_ms = fail_ms
         self.enrichments: list[tuple[int, timedelta, bool]] = []
+        self.split: dict[str, int] = {}
 
     def execute_ch_query(
         self,
@@ -1224,11 +1231,14 @@ class _MemoryEngine(_CappedEngine):
                 and users * (bucket / timedelta(hours=1)) > self.user_hours
             )
             self.enrichments.append((users, bucket, failed))
+            if users == 1 and bucket < WINDOW:
+                (uid,) = params["eu_ids"]
+                self.split[uid] = self.split.get(uid, 0) + 1
             if failed:
                 from clickhouse_driver.errors import ErrorCodes, ServerException
 
                 self.calls.append(query)
-                self.clock.spend(50.0)
+                self.clock.spend(self.fail_ms)
                 raise ServerException(
                     "Memory limit exceeded", code=ErrorCodes.MEMORY_LIMIT_EXCEEDED
                 )
@@ -1259,6 +1269,17 @@ def _memory_hops(world, *, max_hops, **engine):
 
 
 WINDOW = WINDOW_END - WINDOW_START
+TEN_MINUTES = timedelta(minutes=10)
+
+
+def _split_statements(least: timedelta) -> int:
+    """The statements one enrichment statement over the window sends when every
+    bucket wider than ``least`` runs out of memory: each failed bucket is
+    halved until its halves are no wider than ``least``, so the tree has
+    ``2 ** ceil(log2(window / least))`` leaves and one fewer failed buckets.
+    At the least bucket the manager splits to (1 minute), 4,095 over 24 h.
+    """
+    return 2 ** (math.ceil(math.log2(WINDOW / least)) + 1) - 1
 
 
 def test_a_batch_whose_enrichment_runs_out_of_memory_certifies_its_head_alone():
@@ -1325,13 +1346,49 @@ def test_a_batch_that_runs_out_of_memory_at_many_keys_still_publishes(keys, tied
         assert resumed_in_instant > 0, per_hop
 
 
+def test_only_the_head_of_line_decision_of_a_request_splits_in_time():
+    """One user's read is split in time only while the request owes progress.
+
+    Every enrichment wider than ten minutes runs out of memory, and a failure
+    is cheap, so the page wall would admit several splits. The first batch
+    fails, its head-of-line user alone is split down to buckets that fit and
+    is published; the next user's own enrichment then fails over the whole
+    window and ends the request, degraded, rather than split a second user's
+    read uncounted. The next request decides that user as its head of line.
+    """
+    world, expected = _spread_world(5, 3)
+    clock = _Clock()
+    names: list[str] = []
+    cursor = None
+    with _shipped_walls(), _scripted_clock(clock):
+        for _hop in range(8):
+            memory = _MemoryEngine(
+                world, clock=clock, width=timedelta(minutes=10), fail_ms=5.0
+            )
+            read, _engine = _page(world, page_size=25, cursor=cursor, engine=memory)
+            names.extend(_names(read))
+            if not read.has_more:
+                break
+            # One user split, the head of line, into the buckets that fit,
+            # and it was published.
+            split = {world.users[uid]["name"]: n for uid, n in memory.split.items()}
+            assert split == {_names(read)[0]: _split_statements(TEN_MINUTES) - 1}, split
+            users, bucket, failed = memory.enrichments[-1]
+            assert (users, bucket, failed) == (1, WINDOW, True), memory.enrichments[-1]
+            assert read.payload["query_status"] == "degraded"
+            cursor = _signed_cursor(read)
+
+    assert names == expected
+
+
 @pytest.mark.parametrize("slices", ["cheap", "every_capped_slice_stopped"])
 def test_an_enrichment_that_fails_above_a_bucket_width_still_ends(slices):
     """Every enrichment wider than ten minutes runs out of memory, one user or five.
 
-    Only a single user's enrichment is narrowed in time, down to buckets
-    that fit: its statements are the documented remainder, at most two per
-    bucket of the least width over the window. The list still ends, each
+    Only the head-of-line user's enrichment is narrowed in time, one user a
+    request, down to buckets that fit: the ten-minute tree, inside the
+    remainder the walk documents at the least bucket, and every other
+    statement inside the budget. The list still ends, each
     user once and in order, whether the slices are cheap or every capped
     slice is stopped (the head-of-line path, where that enrichment has no
     deadline).
@@ -1344,16 +1401,17 @@ def test_an_enrichment_that_fails_above_a_bucket_width_still_ends(slices):
     )
 
     assert [name for names, _s, _e in hops for name in names] == expected
+    least = _split_statements(ulm._USER_LIST_ATTRIBUTE_MIN_BUCKET)
+    assert least == 4_095
     for _, statements, enrichments in hops:
         # A batch of more than one user is never narrowed in time.
         assert all(
             bucket == WINDOW for users, bucket, _f in enrichments if users > 1
         ), enrichments
-        bisection_bound = 2 * (WINDOW / timedelta(minutes=1))
-        assert statements <= 43 + bisection_bound, statements
-        assert len(enrichments) <= 1 + 2 * (WINDOW / timedelta(minutes=5)), len(
-            enrichments
-        )
+        narrowed = sum(1 for _u, bucket, _f in enrichments if bucket < WINDOW)
+        assert narrowed in (0, _split_statements(TEN_MINUTES) - 1), narrowed
+        assert narrowed <= least - 1
+        assert statements - narrowed <= walk.USER_LIST_WALK_MAX_STATEMENTS
 
 
 # --------------------------------------------------------------------------
