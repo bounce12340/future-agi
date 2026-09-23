@@ -197,6 +197,22 @@ def _page_replay_read_settings(*, max_result_rows: int) -> dict[str, Any]:
     }
 
 
+def _statement_timeout(
+    deadline: ReadDeadline | None, cap_ms: int | None
+) -> dict[str, Any]:
+    """``timeout_ms`` for one statement under ``deadline``, capped at ``cap_ms``.
+
+    A deadline that is enforced on the server also sends that timeout as the
+    statement's server execution cap; any other deadline only admits it.
+    """
+    if deadline is None:
+        return {"timeout_ms": None}
+    timeout_ms = deadline.remaining_ms(cap_ms)
+    if deadline.enforce_on_server:
+        return {"timeout_ms": timeout_ms, "server_execution_cap_ms": timeout_ms}
+    return {"timeout_ms": timeout_ms}
+
+
 def _log_user_read_failure(event: str, exc: Exception, **context: object) -> None:
     """Log operational reads compactly and programming defects with a stack."""
 
@@ -723,9 +739,7 @@ class UsersListManager:
             result = analytics.execute_ch_query(
                 query,
                 params,
-                timeout_ms=(
-                    deadline.remaining_ms(timeout_cap_ms) if deadline else None
-                ),
+                **_statement_timeout(deadline, timeout_cap_ms),
                 settings=_page_replay_read_settings(
                     max_result_rows=max(1, len(end_user_ids))
                 ),
@@ -1041,11 +1055,7 @@ class UsersListManager:
         eval_result = analytics.execute_ch_query(
             eval_query,
             eval_params,
-            timeout_ms=(
-                deadline.remaining_ms(USER_LIST_ENRICHMENT_TIMEOUT_MS)
-                if deadline
-                else None
-            ),
+            **_statement_timeout(deadline, USER_LIST_ENRICHMENT_TIMEOUT_MS),
             settings=_page_replay_read_settings(
                 max_result_rows=max(1, len(end_user_ids))
             ),
@@ -1092,11 +1102,7 @@ class UsersListManager:
         result = V2AnalyticsQueryService().execute_ch_query(
             query,
             params,
-            timeout_ms=(
-                deadline.remaining_ms(USER_LIST_ENRICHMENT_TIMEOUT_MS)
-                if deadline
-                else None
-            ),
+            **_statement_timeout(deadline, USER_LIST_ENRICHMENT_TIMEOUT_MS),
             settings=_page_replay_read_settings(max_result_rows=max(1, len(rows))),
         )
         return {
@@ -1437,11 +1443,7 @@ class UsersListManager:
             result = V2AnalyticsQueryService().execute_ch_query(
                 query,
                 params,
-                timeout_ms=(
-                    deadline.remaining_ms(USER_LIST_QUERY_TIMEOUT_MS)
-                    if deadline
-                    else None
-                ),
+                **_statement_timeout(deadline, USER_LIST_QUERY_TIMEOUT_MS),
                 settings=_page_replay_read_settings(
                     max_result_rows=max(1, len(candidate_ids))
                 ),
