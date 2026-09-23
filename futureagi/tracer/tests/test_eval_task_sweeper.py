@@ -527,6 +527,172 @@ class TestSweepActivity:
         assert [started[0] for started in temporal["started"]] == [str(second.id)]
 
 
+@pytest.mark.django_db
+class TestFreshlyAbandonedClaims:
+    """A stopped workflow whose only leftovers are claims too young to reclaim.
+
+    The sweep's own reap applies ``EVAL_TASK_SWEEP_STALE_RUNNING_SECONDS``;
+    the workflow it starts reaps with ``ReapInput``'s 600 s. An entry
+    abandoned ``RUNNING`` less than 600 s ago passes neither, so a restart
+    claims nothing, cannot finalize, and used to mark the task FAILED — which
+    the sweep then excluded for good, because failed recovery is opt-in. The
+    sweep now defers such a task, leaving it RUNNING and sweepable, and
+    restarts it on the first tick that finds the claim reclaimable.
+    """
+
+    @pytest.mark.parametrize("age_seconds", [60, 300, 599])
+    def test_a_task_holding_only_fresh_claims_is_deferred_then_recovered(
+        self, make_task, make_entry, temporal, age_seconds
+    ):
+        task = make_task()
+        entry = make_entry(
+            task, status=EvalEntryStatus.RUNNING, age_seconds=age_seconds
+        )
+
+        outcome = sweeper.recover_task(task, stale_running_seconds=7_200)
+
+        task.refresh_from_db()
+        entry.refresh_from_db()
+        assert outcome.get("deferred") is True, outcome
+        assert outcome["restarted"] is False
+        assert temporal["started"] == []
+        assert task.status == EvalTaskStatus.RUNNING
+        assert (entry.status, entry.attempts) == (EvalEntryStatus.RUNNING, 0)
+        assert [t.id for t in sweeper.find_stranded_tasks(limit=10)] == [task.id]
+
+        # A later tick, once the claim is past the restarted workflow's reap.
+        EvalLogger.all_objects.filter(id=entry.id).update(
+            updated_at=timezone.now() - timedelta(seconds=601)
+        )
+        outcome = sweeper.recover_task(task, stale_running_seconds=7_200)
+
+        assert not outcome.get("deferred")
+        assert outcome["restarted"] is True
+        assert temporal["started"] == [(str(task.id), {"replace_existing": False})]
+
+    @pytest.mark.parametrize("age_seconds", [601, 1_000])
+    def test_a_claim_the_restarted_workflow_can_reclaim_restarts_at_once(
+        self, make_task, make_entry, temporal, age_seconds
+    ):
+        task = make_task()
+        make_entry(task, status=EvalEntryStatus.RUNNING, age_seconds=age_seconds)
+
+        outcome = sweeper.recover_task(task, stale_running_seconds=7_200)
+
+        assert not outcome.get("deferred")
+        assert outcome["restarted"] is True
+
+    def test_pending_work_beside_a_fresh_claim_is_restarted(
+        self, make_task, make_entry, temporal
+    ):
+        """Claimable work is reason enough to restart; the workflow itself waits
+        out the fresh claim before it finalizes."""
+        task = make_task()
+        make_entry(task)
+        make_entry(task, status=EvalEntryStatus.RUNNING, age_seconds=60)
+
+        outcome = sweeper.recover_task(task, stale_running_seconds=7_200)
+
+        assert not outcome.get("deferred")
+        assert outcome["restarted"] is True
+
+    def test_a_reap_that_leaves_nothing_undrained_restarts_to_finalize(
+        self, make_task, make_entry, temporal
+    ):
+        """Poisoning the last stale entry leaves no undrained work, so the task
+        drops out of the candidate set; only a restart can finalize it."""
+        task = make_task()
+        entry = make_entry(task, status=EvalEntryStatus.RUNNING, age_seconds=10_000)
+        EvalLogger.all_objects.filter(id=entry.id).update(attempts=3)
+
+        outcome = sweeper.recover_task(task, stale_running_seconds=7_200)
+
+        assert outcome["failed"] == 1
+        assert not outcome.get("deferred")
+        assert outcome["restarted"] is True
+
+    def test_an_opted_in_failed_task_is_not_flipped_while_deferred(
+        self, make_task, make_entry, temporal, settings
+    ):
+        settings.EVAL_TASK_SWEEP_RECOVER_FAILED = True
+        task = make_task(status=EvalTaskStatus.FAILED)
+        make_entry(task, status=EvalEntryStatus.RUNNING, age_seconds=60)
+
+        outcome = sweeper.recover_task(task, stale_running_seconds=7_200)
+
+        task.refresh_from_db()
+        assert outcome.get("deferred") is True, outcome
+        assert task.status == EvalTaskStatus.FAILED
+        assert temporal["started"] == []
+
+    def test_the_tick_reports_deferred_tasks(self, make_task, make_entry, temporal):
+        task = make_task()
+        make_entry(task, status=EvalEntryStatus.RUNNING, age_seconds=60)
+
+        result = sweeper.sweep_stranded_eval_tasks._original_func()
+
+        assert result["candidates"] == 1
+        assert result.get("deferred") == 1, result
+        assert result["restarted"] == 0
+        assert result["errors"] == 0
+
+
+@pytest.mark.django_db
+class TestSweepFailureDiagnostics:
+    """An absorbed per-task failure is logged with its cause and traceback;
+    ``errors`` alone says something failed and never why."""
+
+    def _failure_line(self, records):
+        [line] = [r for r in records if r["event"] == "eval_task_sweep_task_failed"]
+        return line
+
+    def test_a_describe_failure_is_logged_with_its_traceback(
+        self, make_task, make_entry, temporal
+    ):
+        import structlog
+
+        task = make_task()
+        make_entry(task)
+        failure = RuntimeError("temporal unreachable")
+        temporal["verdict"] = failure
+
+        with structlog.testing.capture_logs() as records:
+            result = sweeper.sweep_stranded_eval_tasks._original_func()
+
+        line = self._failure_line(records)
+        assert result["errors"] == 1
+        assert line["log_level"] == "warning"
+        assert line["task_id"] == str(task.id)
+        assert line["error_type"] == "RuntimeError"
+        assert line["exc_info"] is failure
+        assert failure.__traceback__ is not None
+
+    def test_a_restart_failure_is_logged_with_its_cause_not_the_wrapper(
+        self, make_task, make_entry, temporal, monkeypatch
+    ):
+        import structlog
+
+        from tfc.temporal.eval_tasks import client
+
+        task = make_task()
+        make_entry(task)
+        failure = RuntimeError("temporal refused the start")
+
+        def _start_refused(_task, **_kwargs):
+            raise failure
+
+        monkeypatch.setattr(client, "start_eval_task_workflow_sync", _start_refused)
+
+        with structlog.testing.capture_logs() as records:
+            result = sweeper.sweep_stranded_eval_tasks._original_func()
+
+        line = self._failure_line(records)
+        assert result["errors"] == 1
+        assert line["task_id"] == str(task.id)
+        assert line["error_type"] == "RuntimeError"
+        assert line["exc_info"] is failure
+
+
 def test_the_sweep_is_actually_scheduled_and_its_activity_is_registered():
     """A recovery job nobody runs is the defect it is meant to fix. The schedule
     and the activity registration are separate wires — pin both."""

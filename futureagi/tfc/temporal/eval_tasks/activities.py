@@ -139,7 +139,7 @@ def _fail_entry_sync(entry_id: str) -> dict:
     a check that the row is still the one that failed. What keeps those apart
     from each other is upstream: the scheduled sweep asks Temporal before it
     reaps, so no reaper retires the claim of a task whose workflow is still
-    progressing (``tracer.tasks.eval_task_sweeper.recover_task``).
+    progressing (``tracer.services.eval_tasks.recovery.recover_task``).
 
     Returns ``"noop"`` when it wrote nothing, so the caller never records a
     terminal outcome the entry table did not take.
@@ -185,8 +185,9 @@ def _reap_sync(
 
     Stale running entries go back to pending with ``attempts`` incremented;
     those already at ``max_attempts`` are marked errored so one poison row can't
-    loop forever. Called once at workflow start to clear leftovers from a
-    previous, crashed execution.
+    loop forever. Called at workflow start to clear leftovers from a
+    previous, crashed execution, and again while a drain waits for claims
+    too young to reclaim before it can finalize.
 
     The requested threshold is raised to ``MIN_STALE_RUNNING_SECONDS`` unless
     the starter's describe established that nothing was draining the task,

@@ -70,9 +70,10 @@ def run_entry(entry: EvalLogger) -> str:
     # catches only a row that has left RUNNING. Reaching the blind case needs a
     # reaper to requeue an entry whose activity is still queued, which is why
     # the scheduled sweep asks Temporal before it reaps and leaves a progressing
-    # workflow alone (``tracer.tasks.eval_task_sweeper.recover_task``). Carrying
-    # the claim epoch through ClaimBatchOutput -> RunEntryInput would close it
-    # at the fence itself; that is a wire-format change and its own decision.
+    # workflow alone (``tracer.services.eval_tasks.recovery.recover_task``).
+    # Carrying the claim epoch through ClaimBatchOutput -> RunEntryInput would
+    # close it at the fence itself; that is a wire-format change and its own
+    # decision.
     if fresh.status != EvalEntryStatus.RUNNING:
         return RECLAIMED
     run_epoch = timezone.now()

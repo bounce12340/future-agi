@@ -14,11 +14,14 @@ that makes a stranded task visible at all.
 Per tick, bounded and idempotent:
 
 * take tasks in a sweepable status that still have undrained entries, oldest
-  activity first, capped at ``EVAL_TASK_SWEEP_MAX_TASKS``;
+  activity first, capped at ``EVAL_TASK_SWEEP_MAX_TASKS``
+  (``tracer.selectors.eval_tasks.stranded``);
 * ask Temporal whether a workflow is progressing, and leave that task alone if
   one is — a healthy task costs one describe and nothing else;
 * for the rest, reclaim entries stuck ``running`` past
-  ``EVAL_TASK_SWEEP_STALE_RUNNING_SECONDS`` and restart the workflow.
+  ``EVAL_TASK_SWEEP_STALE_RUNNING_SECONDS`` and restart the workflow — unless
+  all that is left are claims too young for the restarted run to reclaim,
+  which are deferred to a later tick (``tracer.services.eval_tasks.recovery``).
 
 Asking before reaping is what makes the reap safe to run on a timer. An entry
 is ``RUNNING`` from the moment its batch is claimed, not from the moment its
@@ -44,236 +47,19 @@ from __future__ import annotations
 
 import structlog
 from django.conf import settings
-from django.db.models import Max, Subquery, TextField
-from django.db.models.functions import Cast
 
 from tfc.temporal.drop_in import temporal_activity
-from tracer.models.eval_task import EvalTask, EvalTaskStatus
-from tracer.models.observation_span import EvalEntryStatus, EvalLogger
-from tracer.services.eval_tasks.reaper import (
-    effective_stale_seconds,
-    reap_stale_running,
+from tracer.selectors.eval_tasks.stranded import (
+    find_stranded_tasks,
+    sweepable_statuses,
+)
+from tracer.services.eval_tasks.recovery import (
+    RecoveryInterrupted,
+    recover_stranded_tasks,
+    recover_task,
 )
 
 logger = structlog.get_logger(__name__)
-
-# Statuses whose undrained work the sweep may re-enter without asking anyone.
-_SWEEPABLE = (EvalTaskStatus.RUNNING, EvalTaskStatus.PENDING)
-
-# Same poison cap the workflow's own reap uses (``ReapInput.max_attempts``), so
-# a row that keeps dying is failed after the same number of reclaims however it
-# was reaped.
-_MAX_ENTRY_ATTEMPTS = 3
-
-_UNDRAINED = (EvalEntryStatus.PENDING, EvalEntryStatus.RUNNING)
-
-
-class RecoveryInterrupted(Exception):
-    """A recovery that had already written rows when it failed.
-
-    The describe is a gate and its failure propagates bare: nothing is written
-    before it answers, so a tick that loses it loses nothing to report. Every
-    later step can have reaped rows already, and those requeues and the
-    attempts they spent are real whether or not the restart that follows them
-    succeeds — so the failure has to carry them out to the tick rather than
-    discard them. ``entries_requeued`` is the line the runbook tells an
-    operator to watch; it must not read 0 for a reap that happened.
-    """
-
-    def __init__(self, outcome: dict, cause: Exception):
-        super().__init__(str(cause))
-        self.outcome = outcome
-        self.cause = cause
-
-
-def sweepable_statuses() -> list[str]:
-    statuses = list(_SWEEPABLE)
-    if getattr(settings, "EVAL_TASK_SWEEP_RECOVER_FAILED", False):
-        statuses.append(EvalTaskStatus.FAILED)
-    return statuses
-
-
-def find_stranded_tasks(*, limit: int | None = None) -> list[EvalTask]:
-    """Tasks in a sweepable status that still hold undrained entries.
-
-    Ordered by the oldest last-touched entry first, so a task frozen for days
-    is always served before tasks that are draining normally — otherwise a busy
-    fleet would spend every tick's budget on healthy tasks and never reach the
-    stranded one. A healthy task selected anyway costs one describe and nothing
-    else: ``recover_task`` asks before it writes, so a progressing workflow's
-    entries are neither reaped nor restarted.
-
-    ``candidates`` therefore counts every task in a sweepable status holding
-    undrained entries — which, on a working fleet, is mostly tasks that are
-    draining normally. It is the sweep's *working set*, not a count of stranded
-    tasks: the describe is what tells the two apart, and it happens per
-    candidate in ``recover_task``. ``candidates - progressing`` is what the
-    tick acted on.
-
-    It also never counts the rest: a paused, delete-status or failed task
-    holding undrained entries, or an entry whose task row is gone, contributes
-    nothing and produces no event. ``candidates: 0`` means nothing sweepable
-    holds undrained work at all, not that nothing is stranded.
-
-    The per-tick cap is applied **after** the sweepable-status filter, not
-    before it. A task the sweep refuses to act on — paused, delete-status,
-    finished with leftovers, or an entry pointing at a task row that no longer
-    exists — never drains, so its entries' ``updated_at`` never advances and it
-    sorts oldest on every tick for ever. Costing such a task against the cap
-    would hand it a head slot permanently: fill the cap with them and every
-    tick returns nothing, silently, for as long as they exist. The runbook
-    tells operators not to sweep paused tasks, so paused tasks holding
-    undrained entries are the expected steady state, not an edge case.
-
-    ``no_workspace_objects``: this is a system-wide job and must not inherit a
-    leaked workspace scope. Both managers exclude soft-deleted rows, so the
-    entries a Delete & rerun wiped cannot read as undrained work, and a
-    soft-deleted task cannot be swept.
-    """
-    limit = limit if limit is not None else int(settings.EVAL_TASK_SWEEP_MAX_TASKS)
-    # ``eval_task_id`` is a CharField holding the task uuid's text form (every
-    # writer stamps ``str(task.id)``), so the sweepable set is cast to text to
-    # join against it. As a subquery rather than a materialized id list: the
-    # candidate read has to be narrowed to sweepable tasks *inside* the query
-    # the cap slices, which is the whole point of the ordering above.
-    sweepable_task_ids = (
-        EvalTask.no_workspace_objects.filter(status__in=sweepable_statuses())
-        .annotate(id_text=Cast("id", output_field=TextField()))
-        .values("id_text")
-        # The model's Meta ordering would otherwise ride along inside the
-        # semi-join, sorting a set nothing reads in order.
-        .order_by()
-    )
-    # ``isnull`` / ``exclude("")`` are redundant beside the semi-join — neither
-    # value can be in a set of rendered uuids — and are kept only to drop those
-    # rows before the join. They are no longer what stops an empty string
-    # reaching a UUID column: nothing compares ``eval_task_id`` to a uuid any
-    # more.
-    stranded_ids = [
-        row["eval_task_id"]
-        for row in EvalLogger.no_workspace_objects.filter(
-            status__in=_UNDRAINED,
-            eval_task_id__isnull=False,
-            eval_task_id__in=Subquery(sweepable_task_ids),
-        )
-        .exclude(eval_task_id="")
-        .values("eval_task_id")
-        .annotate(last_touched=Max("updated_at"))
-        .order_by("last_touched")[:limit]
-    ]
-    if not stranded_ids:
-        return []
-    # Re-read as model instances. The status filter is repeated so a task
-    # paused or deleted between the two reads is dropped rather than swept.
-    by_id = {
-        str(task.id): task
-        for task in EvalTask.no_workspace_objects.filter(
-            id__in=stranded_ids, status__in=sweepable_statuses()
-        )
-    }
-    return [by_id[task_id] for task_id in stranded_ids if task_id in by_id]
-
-
-def recover_task(task: EvalTask, *, stale_running_seconds: int) -> dict:
-    """Ask whether anything is draining the task; if nothing is, reap its stale
-    ``running`` entries and restart it.
-
-    The describe comes first and is a gate, not a hint. An entry is ``RUNNING``
-    from the moment its batch is claimed, so a task that is draining normally
-    holds a tail of claimed-but-unstarted entries whose stamp is as old as the
-    claim — reaping those requeues work a queued activity is about to run, and
-    that activity then takes the re-claim and pays for the evaluation twice. By
-    asking first the sweep only ever retires a claim no execution owns any
-    more, and a healthy task really does cost one describe and nothing else.
-
-    A describe that cannot answer (Temporal unreachable) propagates before
-    anything is written. A failure after it — the status flip, or the start —
-    raises ``RecoveryInterrupted`` carrying the reap already performed, so
-    either way the tick's counts describe what it actually did.
-
-    The reap still reaches what the workflow-start reaper cannot: a workflow
-    that stopped mid-drain leaves entries abandoned in ``running``, and nothing
-    else looks at them until something starts a workflow. The one run that can
-    still be in flight here belongs to an execution that has since closed —
-    bounded by a single activity attempt, because a closed execution dispatches
-    no retries — which is what ``EVAL_TASK_SWEEP_STALE_RUNNING_SECONDS`` is
-    floored to exceed. Its writes are fenced on the claim stamp it took, not
-    merely on ``RUNNING``, so a requeue and a re-claim refuse them.
-
-    The restart coalesces (``replace_existing=False``) rather than terminating:
-    the workflow id is per task, so the Temporal server decides atomically
-    whether a live execution already owns it. A describe is a read taken a
-    moment earlier, so terminating on it would kill a workflow a user started
-    in between — the exact failure this whole change exists to prevent. For the
-    same reason ``restarted`` counts starts *issued*: one that coalesced onto an
-    execution started in the gap is counted too, because the server resolves
-    that and does not report which way it went.
-    """
-    from tfc.temporal.eval_tasks.client import (
-        WF_PROGRESSING,
-        describe_eval_task_workflow_sync,
-        start_eval_task_workflow_sync,
-    )
-
-    if describe_eval_task_workflow_sync(task.id) == WF_PROGRESSING:
-        # Reported, not merely skipped: after the describe moved in front of
-        # the reap, a healthy draining task is a candidate that costs one
-        # describe and nothing else, so without this the tick has no field that
-        # separates the fleet's ordinary working set from the tasks it acted
-        # on.
-        return {"requeued": 0, "failed": 0, "restarted": False, "progressing": True}
-
-    requeued, failed = reap_stale_running(
-        task,
-        # Through the same helper as the workflow's own reap, carrying the
-        # same evidence: the describe above just answered that no execution
-        # owns this task, so the flag takes the branch that returns the
-        # configured threshold exactly instead of the one that raises it to
-        # the blind floor.
-        #
-        # What the flag does not do here is change this number. The other
-        # branch returns ``max(configured, MIN_STALE_RUNNING_SECONDS)``, and
-        # ``SWEEP_STALE_RUNNING_SECONDS`` declares its minimum as
-        # ``LONGEST_RUNNING_ENTRY_SECONDS + 1`` — that same floor — so the two
-        # branches agree at every value an operator can set. It is here to
-        # record the evidence at the one function every reap in the product
-        # decides the floor in, not to lower a threshold: no configurable
-        # value reaches a point where it would.
-        #
-        # It is also not what reclaims the entries this call leaves behind. If
-        # the restart below starts a fresh execution rather than coalescing
-        # onto a live one, that execution's own first reap describes again and
-        # applies ``ReapInput``'s 600 s.
-        older_than_seconds=effective_stale_seconds(
-            stale_running_seconds, workflow_confirmed_stopped=True
-        ),
-        max_attempts=_MAX_ENTRY_ATTEMPTS,
-    )
-    outcome = {
-        "requeued": requeued,
-        "failed": failed,
-        "restarted": False,
-        "progressing": False,
-    }
-
-    try:
-        if task.status == EvalTaskStatus.FAILED:
-            # A failed row makes ``get_eval_task_state_activity`` report the
-            # task inactive, so a restart would exit on its first state check.
-            # Clear it the way Resume does, guarded so a concurrent pause or
-            # delete wins.
-            changed = EvalTask.objects.filter(
-                id=task.id, status=EvalTaskStatus.FAILED
-            ).update(status=EvalTaskStatus.PENDING)
-            if not changed:
-                return outcome
-            task.status = EvalTaskStatus.PENDING
-
-        start_eval_task_workflow_sync(task, replace_existing=False)
-    except Exception as exc:
-        raise RecoveryInterrupted(outcome, exc) from exc
-    outcome["restarted"] = True
-    return outcome
 
 
 @temporal_activity(time_limit=600, queue="tasks_s", max_retries=0)
@@ -291,8 +77,8 @@ def sweep_stranded_eval_tasks():
 
     ``candidates`` is the working set the tick read, healthy tasks included;
     ``progressing`` is how many of them had a live workflow and were left
-    alone. The difference is what the sweep acted on, and it is the only
-    reading of this line that means "something was stranded".
+    alone, and ``deferred`` how many held only claims too young to reclaim yet.
+    ``restarted`` is what the sweep acted on.
     """
     limit = int(settings.EVAL_TASK_SWEEP_MAX_TASKS)
     if limit <= 0:
@@ -301,43 +87,17 @@ def sweep_stranded_eval_tasks():
             "candidates": 0,
             "progressing": 0,
             "restarted": 0,
+            "deferred": 0,
             "entries_requeued": 0,
             "entries_poisoned": 0,
             "errors": 0,
             "disabled": True,
         }
-    stale_running_seconds = int(settings.EVAL_TASK_SWEEP_STALE_RUNNING_SECONDS)
-    tasks = find_stranded_tasks(limit=limit)
-    progressing = restarted = requeued = poisoned = errors = 0
-    for task in tasks:
-        try:
-            outcome = recover_task(task, stale_running_seconds=stale_running_seconds)
-        except RecoveryInterrupted as exc:
-            # The restart is gone, but the reap before it is not: those rows
-            # are pending again and have spent an attempt, and the next tick
-            # recovers them as ordinary stranded work.
-            errors += 1
-            logger.warning(
-                "eval_task_sweep_task_failed", error_type=type(exc.cause).__name__
-            )
-            outcome = exc.outcome
-        except Exception as exc:
-            errors += 1
-            logger.warning("eval_task_sweep_task_failed", error_type=type(exc).__name__)
-            continue
-        progressing += int(outcome["progressing"])
-        restarted += int(outcome["restarted"])
-        requeued += outcome["requeued"]
-        poisoned += outcome["failed"]
-    result = {
-        "candidates": len(tasks),
-        "progressing": progressing,
-        "restarted": restarted,
-        "entries_requeued": requeued,
-        "entries_poisoned": poisoned,
-        "errors": errors,
-        "disabled": False,
-    }
+    result = recover_stranded_tasks(
+        limit=limit,
+        stale_running_seconds=int(settings.EVAL_TASK_SWEEP_STALE_RUNNING_SECONDS),
+    )
+    result["disabled"] = False
     logger.info("eval_task_sweep_completed", **result)
     return result
 

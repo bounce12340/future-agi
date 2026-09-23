@@ -30,7 +30,8 @@ class EvalTaskWorkflowInput:
     # answered that no execution owned the task id. Deliberately NOT carried
     # across continue-as-new: by then this execution is itself the workflow
     # draining the task, so the evidence is stale. The historical workflow
-    # skips the reap on a CAN hop anyway (``already_reconciled``).
+    # skips the first reap on a CAN hop anyway (``already_reconciled``); a
+    # finalize wait's reap on such a hop applies the blind floor.
     workflow_confirmed_stopped: bool = False
 
 
@@ -54,8 +55,9 @@ class ContinuousDrainState:
     batches: int = 0
     continue_as_new_after_batches: int | None = None
     # See ``EvalTaskWorkflowInput.workflow_confirmed_stopped``. The continuous
-    # workflow reaps once per execution, continue-as-new hops included, so
-    # leaving this out of the CAN state is what keeps the floor on those.
+    # workflow reaps once per execution, continue-as-new hops included, and
+    # again after an idle poll that still finds undrained work; leaving this
+    # out of the CAN state is what keeps the floor on those hops.
     workflow_confirmed_stopped: bool = False
 
 

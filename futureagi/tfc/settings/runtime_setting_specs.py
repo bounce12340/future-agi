@@ -209,7 +209,7 @@ RUN_ENTRY_MAX_ATTEMPTS = 3
 # tail can hold a frozen claim stamp for several waves — a span no threshold in
 # this range would cover. The describe-first gate is what makes that safe: a
 # task with a queued tail has a progressing workflow, so the sweep never reaps
-# it. See ``tracer.tasks.eval_task_sweeper.recover_task``.
+# it. See ``tracer.services.eval_tasks.recovery.recover_task``.
 LONGEST_RUNNING_ENTRY_SECONDS = RUN_ENTRY_CEILING_SECONDS * RUN_ENTRY_MAX_ATTEMPTS
 
 # ``SWEEP_STALE_RUNNING_SECONDS`` must stay above that bound at every value an
