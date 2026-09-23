@@ -418,7 +418,7 @@ _USERS_REMAP_SHA = "090df268267944b22e713077c59d4836e4046fadb60bfbb78116f3a43af4
 # ``shasum -a 256 futureagi/<module path>.py``; the offline unit test
 # ``UsersSourcePinTests`` fails the moment these drift from the tree again.
 _USERS_SOURCE_PINS = {
-    "tracer.services.users_list_manager": "9571004976233d758337e844630082772fd018c0d452a368e056726c5baf93aa",
+    "tracer.services.users_list_manager": "39e4a54ab19626afd7d25f8f38e933ea45eac77d11579c377d7c02e9e3100183",
     "tracer.services.users_matching_walk": "76f77d6197550eee262dd47ce9c8b7dcf1083aedd2b44e506997bef8503b9efe",
     "tracer.services.clickhouse.query_builders.user_list": "db6f7566c1a80bf685e18b9f6cf5d6f11f5693702c06ff85948bb8d6b8effcbe",
     "tracer.services.clickhouse.v2.query_builders.user_list": "d5024fe5a46b7cbdf2621d04dfd02027c17816f7250f84120c920a0dd3c9908e",
