@@ -92,7 +92,12 @@ same users again (the checkpoint's comment says when). A user whose key
 is at or above the coverage a request resumed from was decided before it,
 published or rejected by its replay, so it is never pending again however a
 lower row witnesses it, and no cursor's coverage rises above the one it
-resumed from.
+resumed from. That holds for the data as each request saw it. Between
+requests: a user whose newest match moves to a key at or above a cursor's
+coverage is not published by that cursor (a new first page shows it); one
+whose key moves below the coverage is published where it now sorts; and a
+published user whose key moves below the coverage is published again, the
+usual limit of a keyset over changing data.
 """
 
 from __future__ import annotations
@@ -239,8 +244,10 @@ class _WalkState:
     last_id: str | None
     # The coverage this request resumed from. Every user whose key is at or
     # above it was decided by an earlier request, published or rejected by
-    # its replay, however a lower row witnesses it again now; nothing there
-    # is pending, and the cursor never moves back above it.
+    # its replay, as the data stood then; nothing there is pending now,
+    # however a lower row witnesses it, so a user whose key has since moved
+    # into that range is not published by this cursor. The cursor never
+    # moves back above it.
     decided_from: datetime
     certified: dict[str, _Certified] = field(default_factory=dict)
     published: list[dict[str, Any]] = field(default_factory=list)
@@ -354,11 +361,12 @@ def _statement_budget(manager: Any) -> int:
     One decision is what a request needs to decide its first batch: the open
     instant, a slice and its retries a quarter as wide down to the least
     width, and the head-of-line decision (``_head_statements``). The
-    enrichment alone reads every
-    requested attribute key, four ordinary keys a statement, so at the view's
-    100 keys it is 26 statements, more than the configured 24: every
-    certification was refused and the list never moved. The bound stays
-    explicit, the larger of two numbers known before the first statement.
+    enrichment alone reads every requested attribute key, four ordinary keys
+    a statement, so at the view's 100 keys it is 26 statements, more than the
+    configured 24: every certification was refused and the list never moved.
+    The bound stays explicit, the larger of two numbers known before the
+    first statement; outside it are only the time buckets one user's
+    enrichment may split into when it runs out of memory (``_certify``).
     """
     return max(
         USER_LIST_WALK_MAX_STATEMENTS,
@@ -939,10 +947,12 @@ def _finish_deadline(state: _WalkState) -> ReadDeadline:
     least as large as that, never smaller. What it is smaller than is the
     fresh wall it replaces, which is the point: the finish ends by the
     analytics wall measured from the walk's start instead of a further full
-    wall after the page wall. The search before it is bounded by the page
-    wall only at admission (its statements carry no server cap), so one
-    search statement admitted in time may still run past it; a finish that
-    then has less than a statement's floor left is refused, not started.
+    wall after the page wall. The search before it is bounded at admission,
+    by the page wall or, while the request has decided nothing, by the
+    analytics wall (``_admission_deadline``); its slices also carry a server
+    cap (``_slice_cap``), its other statements none, so one of those admitted
+    in time may still run past the wall; a finish that then has less than a
+    statement's floor left is refused, not started.
 
     The deadline is enforced on the server (``enforce_on_server``): each
     finishing statement sends the smaller of its own cap
@@ -1027,14 +1037,17 @@ def _materialise(state: _WalkState, entries: list[_Certified]) -> bool:
         # check. A user whose replay outlasts every cap would otherwise stop
         # every request at the same place, and an exact list can neither skip
         # it nor publish anyone ranked behind it first, so no bounded retry
-        # keeps the list both exact and moving. These statements (the replay
-        # and its metrics, evals and relation reads) are the request's only
-        # unbounded ones: one user, once per request, and, whenever the
-        # budget affords the capped attempt first, only a user whose own
-        # capped replay was stopped. Admitting them against the analytics
-        # wall, as the finish did before the cap existed, would not do: a
-        # replay that spent the wall would refuse the metrics read after it,
-        # and the same user would stall the cursor there instead.
+        # keeps the list both exact and moving. The capped attempt before it
+        # was the user's own replay, stopped; or a batch it led, stopped,
+        # when the budget cannot afford the user's own attempt first; or it
+        # was refused before it started because the search had spent the
+        # analytics wall, and then the user was never tried and is not known
+        # to be heavy. These statements (the replay and its relation, metrics
+        # and evals reads) start with no wall, for one user, once per request
+        # (``_read_slice`` lists the head-of-line slice's). Admitting them
+        # against the analytics wall, as the finish did before the cap
+        # existed, would not do: a replay that spent the wall would refuse the
+        # metrics read after it, and the same user would stall there instead.
         state.uncapped_finish = True
         entries = entries[:1]
         try:
