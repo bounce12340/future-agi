@@ -5061,33 +5061,6 @@ def _users_graph_scheduling_fails(monkeypatch, *, error):
     return calls
 
 
-class _AffordableScanEstimateAnalytics:
-    """Answer only a scan cost estimate, and answer it as affordable.
-
-    The reader is patched in these tests, so no graph statement reaches this
-    object. A dispatcher that costs the scan before reading gets an estimate
-    that keeps the read on the interactive path under test.
-    """
-
-    supports_per_query_read_settings = True
-
-    def execute_ch_query(self, query, params=None, **kwargs):
-        assert "EXPLAIN ESTIMATE" in query, "only a cost estimate may reach this fake"
-        return SimpleNamespace(
-            data=[
-                {
-                    "database": "default",
-                    "table": "spans",
-                    "parts": 1,
-                    "rows": 1_000,
-                    "marks": 1,
-                }
-            ],
-            columns=["database", "table", "parts", "rows", "marks"],
-            query_time_ms=1,
-        )
-
-
 @pytest.mark.unit
 @pytest.mark.parametrize(
     "error",
@@ -5116,7 +5089,7 @@ def test_users_graph_scheduling_transport_failure_is_logged_and_degrades(
     )
 
     response = graph_dispatch.fetch_user_system_metric_graph_ch(
-        analytics=_AffordableScanEstimateAnalytics(),
+        analytics=_AffordableUsersGraphAnalytics(),
         project_id=PROJECT_ID,
         filters=[_date_filter()],
         interval="hour",
@@ -5148,7 +5121,7 @@ def test_users_graph_scheduling_defect_is_not_absorbed(monkeypatch):
 
     with pytest.raises(RuntimeError, match="scheduler defect"):
         graph_dispatch.fetch_user_system_metric_graph_ch(
-            analytics=_AffordableScanEstimateAnalytics(),
+            analytics=_AffordableUsersGraphAnalytics(),
             project_id=PROJECT_ID,
             filters=[_date_filter()],
             interval="hour",
