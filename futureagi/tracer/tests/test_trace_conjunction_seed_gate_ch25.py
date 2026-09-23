@@ -27,6 +27,7 @@ from uuid import uuid4
 import pytest
 from django.test import override_settings
 
+from conftest import _open_ch_test_native_client
 from tracer.services.clickhouse.v2.query_builders.trace_list import (
     TraceListQueryBuilderV2,
 )
@@ -38,26 +39,10 @@ def _local_ch25_client():
     host = os.environ.get("CH25_HOST", "127.0.0.1")
     if host not in {"127.0.0.1", "localhost", "::1"}:
         pytest.skip("conjunction gate proof is restricted to local ClickHouse")
-    try:
-        from clickhouse_driver import Client
-
-        client = Client(
-            host=host,
-            port=int(
-                os.environ.get("CH25_NATIVE_PORT")
-                or os.environ.get("CH25_TCP_PORT")
-                or "19000"
-            ),
-            user=os.environ.get("CH25_USER", "default"),
-            password=os.environ.get("CH25_PASSWORD", ""),
-            database="default",
-            connect_timeout=int(os.environ.get("CH25_CONNECT_TIMEOUT", "2")),
-            send_receive_timeout=int(os.environ.get("CH25_READ_TIMEOUT", "10")),
-        )
-        client.execute("SELECT 1")
-    except Exception as exc:
-        pytest.skip(f"local ClickHouse is unavailable for the gate proof: {exc!r}")
-    return client
+    return _open_ch_test_native_client(
+        connect_timeout=int(os.environ.get("CH25_CONNECT_TIMEOUT", "2")),
+        send_receive_timeout=int(os.environ.get("CH25_READ_TIMEOUT", "10")),
+    )
 
 
 ANCHOR_KEY = "ended_reason"
