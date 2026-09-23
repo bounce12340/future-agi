@@ -1343,7 +1343,10 @@ def walk_matching_activity_page(
             batch = _certified_prefix(state, candidates[start : start + batch_size])
             if batch is None:
                 state.stopped = True
-                boundary = candidates[start].newest_witness
+                if state.budget.exhausted_by == "read_budget":
+                    # Just above the refused user, the next head of line; a
+                    # budget or wall refusal keeps the boundary it had.
+                    boundary = candidates[start].newest_witness
                 break
             start += len(batch)
             remaining = candidates[start:]

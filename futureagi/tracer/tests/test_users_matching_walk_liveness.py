@@ -1605,6 +1605,51 @@ def test_a_user_refused_below_an_empty_slice_is_the_next_requests_head(gap_hours
     assert [len(names) for names in per_hop] == [0, 1, 1, 1], per_hop
 
 
+@pytest.mark.parametrize("gap_hours", [4, 10, 20])
+def test_a_budget_refusal_below_an_empty_slice_ends_without_a_crawl(gap_hours):
+    """The statement budget, not a read, refuses a batch below an empty slice.
+
+    Thirty users sit ``gap_hours`` below the window end, a minute apart, and
+    the page shows 100 attribute keys, so a batch of five costs 27 statements
+    to certify and publish, against a budget of 63. The first request's first
+    slice is empty and the widened slice below it meets the users; after two
+    batches what is left cannot certify and publish a third, and the request
+    stops, its coverage just above the refused batch. (The first batch below
+    an empty slice always fits the floor, so the count only refuses a later
+    one, after the boundary has moved to it.) Each next request starts at
+    that user: every request publishes, none crawls down the gap.
+    """
+    world = World()
+    for n in range(30):
+        moment = WINDOW_END - timedelta(hours=gap_hours, minutes=n)
+        world.user(n + 1, key=moment, raw=(moment,))
+    clock = _Clock()
+    names: list[str] = []
+    per_hop: list[int] = []
+    cursor = None
+    with (
+        _shipped_walls(),
+        _scripted_clock(clock),
+        patch.object(walk, "USER_LIST_WALK_CERTIFY_BATCH_SIZE", 5),
+    ):
+        for hop in range(10):
+            engine = _CappedEngine(world, clock=clock)
+            with capture_logs() as logs:
+                read = _keyed_page(page_size=25, cursor=cursor, engine=engine, keys=100)
+            names.extend(_names(read))
+            per_hop.append(len(_names(read)))
+            if hop == 0:
+                # The first slice is empty: no survivor statement follows it.
+                assert engine.kinds[:2] == ["slice", "slice"], engine.kinds
+            if not read.has_more:
+                break
+            assert _exhausted(logs) == ["statements"], _exhausted(logs)
+            cursor = _signed_cursor(read)
+
+    assert names == [f"user-{n}" for n in range(1, 31)]
+    assert all(per_hop[:-1]), per_hop
+
+
 @pytest.mark.parametrize("slices", ["cheap", "every_capped_slice_stopped"])
 def test_an_enrichment_that_fails_above_a_bucket_width_still_ends(slices):
     """Every enrichment wider than ten minutes runs out of memory, one user or five.
