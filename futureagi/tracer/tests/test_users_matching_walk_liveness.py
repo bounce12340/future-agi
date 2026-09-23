@@ -28,6 +28,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from structlog.testing import capture_logs
 
 from tracer.services import users_matching_walk as walk
 from tracer.services.clickhouse import read_budget
@@ -104,28 +105,53 @@ def _expected(world: World) -> list[str]:
 
 
 def _check_uncapped(
-    replays: list[tuple[tuple[str, ...], bool, bool]], *, proven: bool = True
+    replays: list[tuple[tuple[str, ...], bool, bool]],
+    reasons: list[str],
+    *,
+    replay_info: list[tuple[float, int]] | None = None,
+    finish_wall_ms: float | None = None,
 ) -> None:
-    """At most one replay without a cap, for one user a capped replay stopped.
+    """At most one replay without a cap a request, for one user, and why.
 
-    ``replays`` is one request's ``(ids, capped, stopped)``, in order. The
-    replay just before it was stopped under the cap and led with that user;
-    with ``proven`` (a budget that affords the capped attempt first, and an
-    analytics wall with room for it), it was that user's own. Without, the
-    capped attempt may have been refused before it was sent, when the
-    search had spent the analytics wall.
+    ``replays`` is one request's ``(ids, capped, stopped)``, in order, and
+    ``reasons`` what the walk logged for its uncapped replay:
+    ``own_stopped``, right after that user's own capped replay was stopped;
+    ``batch_stopped``, right after a stopped batch the user led, when the
+    budget could not afford the user's own attempt; ``refused``, when the
+    search had spent the analytics wall and its capped attempt was never
+    sent. With ``replay_info`` (when each replay was sent, and its rows)
+    it also holds that no replay before it returned a row: an uncapped
+    replay comes only while the page has published nothing.
     """
     uncapped = [i for i, (_ids, capped, _stopped) in enumerate(replays) if not capped]
-    assert len(uncapped) <= 1, replays
-    for index in uncapped:
+    assert len(uncapped) == len(reasons) <= 1, (replays, reasons)
+    for index, reason in zip(uncapped, reasons, strict=True):
         (user,) = replays[index][0]
-        if not proven and (index == 0 or not replays[index - 1][2]):
-            continue
-        assert index > 0, replays
-        before, capped, stopped = replays[index - 1]
-        assert capped and stopped and before[0] == user, replays
-        if proven:
-            assert before == (user,), replays
+        if replay_info is not None:
+            assert not any(rows for _at, rows in replay_info[:index]), replay_info
+        if reason == "own_stopped":
+            assert index > 0 and replays[index - 1] == ((user,), True, True), replays
+        elif reason == "batch_stopped":
+            before, capped, stopped = replays[index - 1]
+            assert capped and stopped and len(before) > 1, replays
+            assert before[0] == user, replays
+        else:
+            assert reason == "refused", reason
+            if replay_info is not None:
+                assert replay_info[index][0] >= finish_wall_ms - 25, replay_info
+
+
+def _check_singly(finishing: list[tuple[str, tuple[str, ...], bool, bool]]) -> None:
+    """Once a finishing statement is stopped, every later replay is one user."""
+
+    stops = [
+        i for i, (_kind, _ids, _capped, stopped) in enumerate(finishing) if stopped
+    ]
+    if stops:
+        later = finishing[stops[0] + 1 :]
+        assert all(len(ids) == 1 for kind, ids, _c, _s in later if kind == "replay"), (
+            finishing
+        )
 
 
 class _Clock:
@@ -214,8 +240,18 @@ class _CappedEngine(Engine):
         self.clock = clock
         self.slice_ms = slice_ms
         self.replays: list[tuple[tuple[str, ...], bool, bool]] = []
+        # Per replay: ms into the request when it was sent, rows it returned.
+        self.replay_info: list[tuple[float, int]] = []
         self.finishing: list[tuple[str, tuple[str, ...], bool, bool]] = []
         self.slices: list[tuple[timedelta, float | None, bool]] = []
+        # Per slice: ms into the request when it was sent.
+        self.slice_at: list[float] = []
+        # Every statement fails in the transport: the server is unreachable.
+        self.outage = False
+        self.start = clock.now if clock is not None else 0.0
+
+    def _elapsed_ms(self) -> float:
+        return (self.clock.now - self.start) * 1000.0 if self.clock else 0.0
 
     def execute_ch_query(
         self,
@@ -227,6 +263,9 @@ class _CappedEngine(Engine):
         server_execution_cap_ms=None,
     ):
         kind = _statement_kind(query, params)
+        if self.outage:
+            self.calls.append(query)
+            raise ReadDeadlineExceeded("the server is unreachable")
         if kind in FINISHING:
             ids = tuple((params or {})["candidate_end_user_ids"])
             capped = server_execution_cap_ms is not None
@@ -237,6 +276,7 @@ class _CappedEngine(Engine):
             self.finishing.append((kind, ids, capped, stopped))
             if kind == "replay":
                 self.replays.append((ids, capped, stopped))
+                self.replay_info.append((self._elapsed_ms(), 0))
             if stopped:
                 self.calls.append(query)
                 self.settings.append(settings)
@@ -258,6 +298,8 @@ class _CappedEngine(Engine):
                     [{"end_user_id": uid} for uid in ids] if kind == "relation" else []
                 )
                 return SimpleNamespace(data=data, query_time_ms=1.0)
+        if kind == "slice":
+            self.slice_at.append(self._elapsed_ms())
         result = super().execute_ch_query(
             query,
             params,
@@ -265,8 +307,10 @@ class _CappedEngine(Engine):
             settings,
             server_execution_cap_ms=server_execution_cap_ms,
         )
+        if kind == "replay":
+            self.replay_info[-1] = (self.replay_info[-1][0], len(result.data or ()))
         cost = 1.0
-        if kind_of(query) == "slice":
+        if kind == "slice":
             width = TICK * (params["slice_end_us"] - params["slice_start_us"])
             if self.slice_ms is not None:
                 cost = self.slice_ms(width, bool(result.data))
@@ -308,6 +352,7 @@ def _follow(
     slice_ms: Callable[[timedelta, bool], float] | None = None,
     keys: int = 0,
     finish: int = 1,
+    outage_every: int | None = None,
 ) -> tuple[list[str], int]:
     """Follow the cursor to the end; returns the published names and the hops.
 
@@ -320,7 +365,14 @@ def _follow(
     coverage, or lower the decided position. The walls run on a scripted
     clock (``_CappedEngine``); the page shows ``keys`` attribute columns
     besides the filtered one, and the columns and filters that make
-    ``finish`` finishing statements (``FINISH_SHAPES``).
+    ``finish`` finishing statements (``FINISH_SHAPES``). Every uncapped
+    replay and slice must have the reason the walk logs for it
+    (``_check_uncapped``, ``_check_uncapped_slices``), and once a finishing
+    statement is stopped every later replay carries one user
+    (``_check_singly``). With ``outage_every``, every such hop finds the
+    server unreachable: it must not raise the coverage, and it is left out of
+    the progress and livelock checks. ``mutate(world, published, cursor)``
+    runs between hops.
     """
     with _scripted_clock(_Clock()) as clock:
         return _follow_on(
@@ -334,6 +386,7 @@ def _follow(
             slice_ms=slice_ms,
             keys=keys,
             finish=finish,
+            outage_every=outage_every,
         )
 
 
@@ -349,6 +402,7 @@ def _follow_on(
     slice_ms: Callable[[timedelta, bool], float] | None,
     keys: int,
     finish: int,
+    outage_every: int | None,
 ) -> tuple[list[str], int]:
     budget = walk._statement_budget(_keyed_manager(keys, finish))
     assert budget >= (max_statements or walk.USER_LIST_WALK_MAX_STATEMENTS)
@@ -358,19 +412,42 @@ def _follow_on(
     position: tuple = (None, None)
     stalled = False
     cursor = None
+    finish_wall = walk.USER_LIST_WALK_FINISH_WALL_MS
     for hop in range(1, max_hops + 1):
         engine = _CappedEngine(world, heavy, clock=clock, slice_ms=slice_ms)
-        read = _keyed_page(
-            page_size=page_size, cursor=cursor, engine=engine, keys=keys, finish=finish
-        )
+        engine.outage = outage_every is not None and hop % outage_every == 0
+        with capture_logs() as logs:
+            read = _keyed_page(
+                page_size=page_size,
+                cursor=cursor,
+                engine=engine,
+                keys=keys,
+                finish=finish,
+            )
         names.extend(_names(read))
         assert len(engine.calls) <= budget, (hop, len(engine.calls))
-        _check_uncapped(engine.replays, proven=False)
-        _check_uncapped_slices(engine.slices)
+        if not engine.outage:
+            _check_uncapped(
+                engine.replays,
+                _logged(logs, "users_matching_walk_uncapped_finish"),
+                replay_info=engine.replay_info,
+                finish_wall_ms=finish_wall,
+            )
+            _check_singly(engine.finishing)
+            _check_uncapped_slices(
+                engine.slices,
+                _logged(logs, "users_matching_walk_uncapped_slice"),
+                slice_at=engine.slice_at,
+                finish_wall_ms=finish_wall,
+            )
         if not read.has_more:
             return names, hop
         order = tuple(read.checkpoint_order)
         assert order[3] <= coverage, f"coverage moved up at hop {hop}: {order}"
+        if engine.outage:
+            assert _names(read) == [], hop
+            cursor = _signed_cursor(read)
+            continue
         if mutate is None:
             state = (order, read.seen_rows)
             assert state not in seen_states, f"livelock at hop {hop}: {state}"
@@ -385,7 +462,7 @@ def _follow_on(
         coverage, position = order[3], order[1:3]
         cursor = _signed_cursor(read)
         if mutate is not None:
-            mutate(world, set(names))
+            mutate(world, set(names), order)
     raise AssertionError(f"no end after {max_hops} hops; published {len(names)}")
 
 
@@ -457,12 +534,40 @@ def _keyed_page(*, page_size: int, cursor, engine: Engine, keys: int, finish: in
         return manager.list_cursor_payload(page_size=page_size, cursor=cursor)
 
 
-def _check_uncapped_slices(slices: list[tuple[timedelta, float | None, bool]]):
-    """At most one slice without a cap per request, and no wider than the least."""
+def _check_uncapped_slices(
+    slices: list[tuple[timedelta, float | None, bool]],
+    reasons: list[str],
+    *,
+    slice_at: list[float] | None = None,
+    finish_wall_ms: float | None = None,
+) -> None:
+    """At most one slice without a cap a request, no wider than the least, and why.
 
-    uncapped = [width for width, cap, _stopped in slices if cap is None]
-    assert len(uncapped) <= 1, slices
-    assert all(width <= walk.USER_LIST_WALK_MIN_SLICE for width in uncapped), slices
+    ``reasons`` is what the walk logged: ``narrowest_stopped``, right after
+    a capped slice of the least width was stopped; ``no_budget``, right
+    after a wider one was stopped when the budget could not afford a
+    narrower retry; ``wall_spent``, once the analytics wall had nothing
+    left (``slice_at`` says when each slice was sent).
+    """
+    uncapped = [i for i, (_width, cap, _stopped) in enumerate(slices) if cap is None]
+    assert len(uncapped) == len(reasons) <= 1, (slices, reasons)
+    least = walk.USER_LIST_WALK_MIN_SLICE
+    for index, reason in zip(uncapped, reasons, strict=True):
+        assert slices[index][0] <= least, slices
+        if reason == "wall_spent":
+            if slice_at is not None:
+                assert slice_at[index] >= finish_wall_ms - 25, slice_at
+            continue
+        width, cap, stopped = slices[index - 1]
+        assert index > 0 and cap is not None and stopped, slices
+        if reason == "narrowest_stopped":
+            assert width <= least, slices
+        else:
+            assert reason == "no_budget" and width > least, (reason, slices)
+
+
+def _logged(logs: list[dict], event: str) -> list[str]:
+    return [entry["reason"] for entry in logs if entry["event"] == event]
 
 
 def _lower_position(new: tuple, old: tuple) -> bool:
@@ -535,9 +640,13 @@ def _real_service_hops(world: World, driver: _SlowUserDriver, max_hops: int):
     coverage = WINDOW_END
     for _ in range(max_hops):
         before = len(driver.replays)
-        read = _real_service_page(world, driver, cursor=cursor)
+        with capture_logs() as logs:
+            read = _real_service_page(world, driver, cursor=cursor)
         replays = driver.replays[before:]
-        _check_uncapped(replays)
+        reasons = _logged(logs, "users_matching_walk_uncapped_finish")
+        # The shipped budget always affords a user's own capped attempt.
+        assert set(reasons) <= {"own_stopped", "refused"}, reasons
+        _check_uncapped(replays, reasons)
         hops.append((_names(read), replays))
         if not read.has_more:
             return hops
@@ -843,8 +952,14 @@ def _stopped_slice_hops(world, slice_ms, max_hops):
     with _shipped_walls(), _scripted_clock(clock):
         for _hop in range(max_hops):
             engine = _CappedEngine(world, clock=clock, slice_ms=slice_ms)
-            read, _engine = _page(world, page_size=25, cursor=cursor, engine=engine)
-            _check_uncapped_slices(engine.slices)
+            with capture_logs() as logs:
+                read, _engine = _page(world, page_size=25, cursor=cursor, engine=engine)
+            _check_uncapped_slices(
+                engine.slices,
+                _logged(logs, "users_matching_walk_uncapped_slice"),
+                slice_at=engine.slice_at,
+                finish_wall_ms=walk.USER_LIST_WALK_FINISH_WALL_MS,
+            )
             hops.append((_names(read), engine.slices))
             if not read.has_more:
                 return hops
@@ -1308,17 +1423,20 @@ def test_every_hop_sequence_ends_exact_and_never_raises_the_coverage(seed):
     heavy = frozenset(
         rng.sample(sorted(world.users), min(n_users, rng.choice([0, 0, 0, 1, 2, 3])))
     )
+    # A quarter of the worlds lose the server on every fifth request.
+    outage = random.Random(31 * seed + 7).random() < 0.25
+    bound = _hop_bound(n_users, page_size, len(heavy)) + _slice_hops(world, seed)
     with _limits(seed) as (max_statements, finish), _shipped_walls():
         names, _hops = _follow(
             world,
             page_size=page_size,
-            max_hops=_hop_bound(n_users, page_size, len(heavy))
-            + _slice_hops(world, seed),
+            max_hops=bound + (bound // 4 if outage else 0),
             max_statements=max_statements,
             heavy=heavy,
             slice_ms=_slice_model(seed),
             keys=_key_count(seed),
             finish=finish,
+            outage_every=5 if outage else None,
         )
 
     assert len(names) == len(set(names)), "a user was published twice"
@@ -1328,7 +1446,7 @@ def test_every_hop_sequence_ends_exact_and_never_raises_the_coverage(seed):
 def _stop_matching(rng: random.Random, changed: set[str]):
     """Between hops, an unpublished member may stop matching or be rejected."""
 
-    def mutate(world: World, published: set[str]) -> None:
+    def mutate(world: World, published: set[str], _cursor: tuple) -> None:
         members = [
             uid
             for uid, user in world.users.items()
@@ -1376,3 +1494,86 @@ def test_users_that_stop_matching_between_hops_never_stall_or_repeat(seed):
         uid for uid in before if uid not in changed
     ]
     assert set(names) <= set(before)
+
+
+def _passed(key: datetime, uid: str, cursor: tuple) -> bool:
+    """Whether ``cursor`` has already walked past the position ``(key, uid)``."""
+
+    _marker, last_key, last_id, coverage = cursor[:4]
+    return key >= coverage or (
+        last_key is not None and (key, uid) >= (last_key, last_id)
+    )
+
+
+def _change(rng: random.Random, kind: str, changed: dict[str, bool]):
+    """Between hops, an unpublished user starts matching or its key moves.
+
+    ``start`` makes a non-member a member (a new live match, or no longer
+    rejected); ``up`` and ``down`` move a member's newest live match, its
+    old row staying behind as a witness. Each user changes at most once;
+    ``changed`` records whether the cursor had already passed its new key.
+    """
+
+    def mutate(world: World, published: set[str], cursor: tuple) -> None:
+        if rng.random() < 0.5:
+            return
+        uid = rng.choice(sorted(world.users))
+        user = world.users[uid]
+        if uid in published or uid in changed:
+            return
+        member = user["key"] is not None and user["curated"]
+        if kind == "start":
+            if member:
+                return
+            user["curated"] = True
+            if user["key"] is None:
+                user["key"] = WINDOW_START + TICK * rng.randrange(WINDOW // TICK)
+        elif not member:
+            return
+        elif kind == "up":
+            user["key"] = user["key"] + (WINDOW_END - TICK - user["key"]) * rng.random()
+        else:
+            user["key"] = WINDOW_START + (user["key"] - WINDOW_START) * rng.random()
+        world.raw.append((user["key"], uid))
+        changed[uid] = _passed(user["key"], uid, cursor)
+
+    return mutate
+
+
+@pytest.mark.parametrize("kind", ["start", "up", "down"])
+@pytest.mark.parametrize("seed", range(16))
+def test_users_that_change_between_hops_follow_the_coverage_fence(kind, seed):
+    """A change a cursor has walked past is not published by it; any other is.
+
+    A user whose new key lies at or above the cursor's coverage, or behind
+    its keyset, was decided before the change as the data stood then, so
+    the cursor does not publish it (a new first page would). A user whose new
+    key lies ahead of the cursor is published once, where it now sorts.
+    Unchanged users are all published, once, in order.
+    """
+    rng = random.Random(20_000 + 97 * seed + len(kind))
+    n_users = rng.choice([8, 20, 45])
+    world = _world(rng, n_users)
+    page_size = rng.choice([1, 3, 7, 25])
+    changed: dict[str, bool] = {}
+    with _limits(seed) as (max_statements, finish), _shipped_walls():
+        names, _hops = _follow(
+            world,
+            page_size=page_size,
+            max_hops=_hop_bound(n_users, page_size, 0),
+            max_statements=max_statements,
+            mutate=_change(rng, kind, changed),
+            slice_ms=_slice_model(seed),
+            finish=finish,
+        )
+
+    assert len(names) == len(set(names)), "a user was published twice"
+    members = set(_expected(world))
+    for uid, passed in changed.items():
+        assert (uid in names) == (not passed and uid in members), (uid, passed)
+    # Everything published is in newest-matching-activity order as it stands.
+    positions = {uid: (world.users[uid]["key"], uid) for uid in names}
+    assert names == sorted(names, key=positions.__getitem__, reverse=True)
+    assert [uid for uid in names if uid not in changed] == [
+        uid for uid in _expected(world) if uid not in changed
+    ]

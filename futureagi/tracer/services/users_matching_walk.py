@@ -509,13 +509,15 @@ def _read_slice(
     from tracer.services import users_list_manager as ulm
 
     manager = state.manager
-    escape = False
+    # Why the next read is the head-of-line slice without a cap: the least
+    # width was stopped, or the budget cannot afford a narrower retry.
+    escape: str | None = None
     while True:
         owed = state.progress_owed
         if not state.budget.take(1, finish=owed):
             return None
         deadline = _admission_deadline(state)
-        head = owed and (escape or deadline is None)
+        head = owed and (escape is not None or deadline is None)
         if head:
             if state.slice_uncapped:
                 state.budget.exhausted_by = "wall"
@@ -524,6 +526,7 @@ def _read_slice(
             slice_start = max(state.window_start, slice_end - USER_LIST_WALK_MIN_SLICE)
             logger.info(
                 "users_matching_walk_uncapped_slice",
+                reason=escape or "wall_spent",
                 width_seconds=(slice_end - slice_start).total_seconds(),
             )
         width = slice_end - slice_start
@@ -560,7 +563,11 @@ def _read_slice(
             if width > USER_LIST_WALK_MIN_SLICE and room:
                 slice_start = _narrower_start(state, slice_end, width)
             elif owed:
-                escape = True
+                escape = (
+                    "no_budget"
+                    if width > USER_LIST_WALK_MIN_SLICE
+                    else "narrowest_stopped"
+                )
             else:
                 state.budget.exhausted_by = "wall"
                 return None
@@ -1013,6 +1020,9 @@ def _materialise(state: _WalkState, entries: list[_Certified]) -> bool:
     statements = _materialisation_statement_count(manager)
     if not state.budget.take(statements, finish=True):
         return False
+    finish = _finish_deadline(state)
+    # Refused before it is sent: the search spent the analytics wall.
+    refused = finish.total_ms - finish.elapsed_ms() < 25
     try:
         # Finish mode: the PAGE wall does not govern these statements.
         # Passing the walk's own deadline would let the replay spend the last
@@ -1022,7 +1032,7 @@ def _materialise(state: _WalkState, entries: list[_Certified]) -> bool:
         # ClickHouse as each statement's ``max_execution_time``, and ends the
         # finish by the analytics wall instead of granting a second full wall
         # here.
-        rows = _replay(state, entries, _finish_deadline(state))
+        rows = _replay(state, entries, finish)
     except ReadDeadlineExceeded:
         state.finish_singly = True
         must_decide = not state.published and not state.uncapped_finish
@@ -1051,6 +1061,13 @@ def _materialise(state: _WalkState, entries: list[_Certified]) -> bool:
         # existed, would not do: a replay that spent the wall would refuse the
         # metrics read after it, and the same user would stall there instead.
         state.uncapped_finish = True
+        reason = (
+            "refused"
+            if refused
+            else "own_stopped"
+            if len(entries) == 1
+            else "batch_stopped"
+        )
         entries = entries[:1]
         try:
             rows = _replay(state, entries, None)
@@ -1059,6 +1076,7 @@ def _materialise(state: _WalkState, entries: list[_Certified]) -> bool:
             return False
         logger.info(
             "users_matching_walk_uncapped_finish",
+            reason=reason,
             statements=state.budget.statements,
         )
     by_id = {str(row.get("end_user_id")): row for row in rows if row.get("end_user_id")}
