@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const maxResponseBytes = 32 << 20
+const maxResponseBytes = 512 << 20
 
 var identifier = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 

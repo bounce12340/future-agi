@@ -114,6 +114,35 @@ func TestSourceClientDoesNotAcceptPartialJSON(t *testing.T) {
 	}
 }
 
+func TestSourceClientAcceptsResultAbove32MiBWithBoundedSettings(t *testing.T) {
+	if maxResponseBytes != 512<<20 {
+		t.Fatal("source response limit must be 512 MiB")
+	}
+	value := strings.Repeat("x", 33<<20)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for key, want := range map[string]string{
+			"max_result_bytes": "536870912", "max_memory_usage": "536870912",
+			"max_bytes_to_read": "1073741824", "max_threads": "1",
+			"max_execution_time": "30", "readonly": "1",
+			"result_overflow_mode": "throw", "wait_end_of_query": "1",
+		} {
+			if got := r.URL.Query().Get(key); got != want {
+				t.Errorf("%s: got %q, want %q", key, got, want)
+			}
+		}
+		fmt.Fprintf(w, "{\"value\":\"%s\"}\n", value)
+	}))
+	defer server.Close()
+	reader, err := newSourceReader(server.URL, "source", "readonly", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := reader.selectRows(context.Background(), "SELECT value", nil)
+	if err != nil || len(rows) != 1 || rows[0]["value"] != value {
+		t.Fatalf("complete result above the previous limit was not accepted: %v", err)
+	}
+}
+
 func TestSourceClientRejectsLateExceptionHeaderOnHTTP200(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-ClickHouse-Exception-Code", "159")
