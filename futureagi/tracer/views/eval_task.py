@@ -62,6 +62,10 @@ from tracer.models.eval_task import (
 )
 from tracer.models.observation_span import EvalEntryStatus, EvalLogger, ObservationSpan
 from tracer.models.project import Project
+from tracer.selectors.eval_tasks.scope import (
+    eval_tasks_in_scope,
+    project_workspace_scope_q,
+)
 from tracer.serializers.eval_task import (
     EVAL_TASK_USAGE_MAX_PAGE,
     EditEvalTaskSerializer,
@@ -1667,32 +1671,18 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
         return getattr(user, "organization", None)
 
     def _project_workspace_scope_q(self, organization_id):
-        workspace = getattr(self.request, "workspace", None)
-        if not workspace:
-            return Q()
-        if getattr(workspace, "is_default", False):
-            return (
-                Q(project__workspace=workspace)
-                | Q(
-                    project__workspace__is_default=True,
-                    project__workspace__organization_id=organization_id,
-                )
-                | Q(
-                    project__workspace__isnull=True,
-                    project__organization_id=organization_id,
-                )
-            )
-        return Q(project__workspace=workspace)
+        return project_workspace_scope_q(
+            organization_id, getattr(self.request, "workspace", None)
+        )
 
     def _scope_eval_task_queryset(self, queryset):
-        organization = self._get_request_organization()
-        if organization is None:
-            return queryset.none()
-        organization_id = organization.id
-        return queryset.filter(
-            project__organization_id=organization_id,
-            project__deleted=False,
-        ).filter(self._project_workspace_scope_q(organization_id))
+        # Shared with the AI tool's Resume, so a task id resolves to the same
+        # task, or to none, whichever surface asks.
+        return eval_tasks_in_scope(
+            queryset,
+            organization=self._get_request_organization(),
+            workspace=getattr(self.request, "workspace", None),
+        )
 
     def _scope_project_queryset(self, queryset):
         organization = self._get_request_organization()
