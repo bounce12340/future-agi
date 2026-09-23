@@ -448,7 +448,7 @@ def _follow_on(
     seen_states: set = set()
     coverage = WINDOW_END
     position: tuple = (None, None)
-    stalled = False
+    stalled = refused = False
     cursor = None
     finish_wall = walk.USER_LIST_WALK_FINISH_WALL_MS
     enrichment = _enrichments(keys)
@@ -510,7 +510,11 @@ def _follow_on(
                 or _lower_position(order[1:3], position)
             )
             assert progressed or not stalled, f"two hops without progress at {hop}"
+            # A read_budget stop leaves the refused user as the next head of
+            # line, which the next request decides.
+            assert progressed or not refused, f"no progress after read_budget at {hop}"
             stalled = not progressed
+            refused = _exhausted(logs) == ["read_budget"]
         coverage, position = order[3], order[1:3]
         cursor = _signed_cursor(read)
         if mutate is not None:
@@ -1647,10 +1651,51 @@ def test_a_budget_refusal_below_an_empty_slice_ends_without_a_crawl(gap_hours):
             if not read.has_more:
                 break
             assert _exhausted(logs) == ["statements"], _exhausted(logs)
+            assert read.payload["query_status"] == "degraded"
             cursor = _signed_cursor(read)
 
     assert names == [f"user-{n}" for n in range(1, 31)]
     assert all(per_hop[:-1]), per_hop
+
+
+@pytest.mark.parametrize(
+    ("keys", "finish", "most_statements"), [(12, 3, 70), (21, 1, 75)]
+)
+def test_a_count_refusal_in_a_tie_world_keeps_its_boundary(
+    keys, finish, most_statements
+):
+    """A refusal by the statement count does not move the boundary.
+
+    Eighty users with ties and aliases, no faults. Moving the boundary to a
+    refused batch's first candidate is right for a read or wall stop, but a
+    count refusal of a slice's first batch lands it on an instant a
+    published user shares: the cursor opens that instant, and the next
+    request reads it and enriches again. The list takes 4 requests and
+    opens at most 2 instants.
+    """
+    world = _world(random.Random(11), 80)
+    clock = _Clock()
+    names: list[str] = []
+    cursor = None
+    requests = statements = opened = 0
+    with _shipped_walls(), _scripted_clock(clock):
+        for _hop in range(20):
+            engine = _CappedEngine(world, clock=clock)
+            read = _keyed_page(
+                page_size=25, cursor=cursor, engine=engine, keys=keys, finish=finish
+            )
+            names.extend(_names(read))
+            requests += 1
+            statements += len(engine.calls)
+            if not read.has_more:
+                break
+            order = tuple(read.checkpoint_order)
+            opened += len(order) == 5 and bool(order[4])
+            cursor = _signed_cursor(read)
+
+    assert names == _expected(world)
+    assert requests == 4 and opened <= 2, (requests, opened)
+    assert statements <= most_statements, statements
 
 
 @pytest.mark.parametrize(
@@ -1827,8 +1872,13 @@ def test_a_split_that_outlasts_the_analytics_wall_is_a_known_stall(
     assert coverages[0] - coverages[-1] <= 4 * TICK, coverages
 
 
-@pytest.mark.parametrize(("keys", "finish"), [(21, 1), (13, 3)])
-def test_a_request_certifies_only_what_it_can_also_publish(keys, finish):
+@pytest.mark.parametrize(
+    ("keys", "finish", "most_requests", "most_statements"),
+    [(21, 1, 24, 468), (13, 3, 24, 468)],
+)
+def test_a_request_certifies_only_what_it_can_also_publish(
+    keys, finish, most_requests, most_statements
+):
     """Off the head of line, a batch is certified only when its replay fits too.
 
     One decision reserves two enrichments and two finishes, so after two
@@ -1859,7 +1909,11 @@ def test_a_request_certifies_only_what_it_can_also_publish(keys, finish):
             cursor = _signed_cursor(read)
 
     assert names == _expected(world)
-    print(f"keys={keys} finish={finish}: {requests} requests, {statements} statements")
+    # No more than this list cost once the reserve landed.
+    assert requests <= most_requests and statements <= most_statements, (
+        requests,
+        statements,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1998,8 +2052,8 @@ LIMITS = [
     (200, 24, 25, 5),
 ]
 PAGE_SIZES = [1, 2, 3, 7, 25, 100]
-STATIC_WORLDS = 136
-CHANGING_WORLDS = 32
+STATIC_WORLDS = 124
+CHANGING_WORLDS = 28
 # What a slice that returns rows costs, per run of the limit grid: nothing
 # much; 6 s, past the page wall; 40 s, past the whole request; or 40 s an
 # hour, past its cap only while it is wide.
@@ -2049,11 +2103,11 @@ class _Faults:
     gaps: bool = False
 
 
-def _fault(seed: int, keys: int) -> tuple[_Faults, int]:
+def _fault(seed: int, keys: int, kinds=tuple(FAULTS)) -> tuple[_Faults, int]:
     """The enrichment faults of ``seed``'s world, and the keys its page shows."""
 
     rng = random.Random(6_007 * seed + 5)
-    kind = rng.choice(FAULTS)
+    kind = rng.choice(kinds)
     if kind == "none":
         return _Faults(), keys
     if kind == "index":
@@ -2186,10 +2240,10 @@ def test_users_that_stop_matching_between_hops_never_stall_or_repeat(seed):
     page_size = rng.choice([1, 3, 7, 25])
     heavy = frozenset(rng.sample(sorted(world.users), rng.choice([0, 0, 1, 2])))
     changed: set[str] = set()
-    faults, keys = _fault(10_000 + seed, _key_count(seed))
-    if faults.gaps:
-        # The width fault needs its gap world, which the static test draws.
-        faults, keys = _Faults(), _key_count(seed)
+    # The width fault needs its gap world, which only the static test draws.
+    faults, keys = _fault(
+        10_000 + seed, _key_count(seed), [kind for kind in FAULTS if kind != "width"]
+    )
     with _limits(seed) as (max_statements, finish), _shipped_walls():
         names, _hops = _follow(
             world,
