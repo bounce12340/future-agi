@@ -534,6 +534,9 @@ def _seed_probe_graph_filters() -> list[dict]:
         NetworkError("probe transport"),
         ReadDeadlineExceeded("read deadline exceeded"),
         ClickHouseConnectDatabaseError("Code: 53. probe diagnostic"),
+        # What the native reader raises when the server closes the socket
+        # mid-response: not an OSError, and not wrapped by the driver.
+        EOFError("Unexpected EOF while reading bytes"),
     ],
     ids=lambda exc: type(exc).__name__,
 )
