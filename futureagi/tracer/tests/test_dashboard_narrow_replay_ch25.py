@@ -52,15 +52,50 @@ WINDOW_START = datetime(2026, 9, 10, tzinfo=UTC)
 WINDOW_END = datetime(2026, 9, 11, tzinfo=UTC)
 
 COLUMNS = (
-    "project_id", "observation_type", "service_name", "start_time", "trace_id",
-    "id", "parent_span_id", "name", "end_time", "latency_ms", "org_id",
-    "project_version_id", "end_user_id", "trace_session_id", "prompt_version_id",
-    "prompt_label_id", "custom_eval_config_id", "status", "status_message",
-    "model", "provider", "gen_ai_system", "gen_ai_operation", "operation_name",
-    "prompt_tokens", "completion_tokens", "total_tokens", "cost", "attrs_string",
-    "attrs_number", "attrs_bool", "attributes_extra", "input", "output",
-    "input_gcs_url", "output_gcs_url", "tags", "span_events", "eval_status",
-    "semconv_source", "created_at", "updated_at", "is_deleted", "_version",
+    "project_id",
+    "observation_type",
+    "service_name",
+    "start_time",
+    "trace_id",
+    "id",
+    "parent_span_id",
+    "name",
+    "end_time",
+    "latency_ms",
+    "org_id",
+    "project_version_id",
+    "end_user_id",
+    "trace_session_id",
+    "prompt_version_id",
+    "prompt_label_id",
+    "custom_eval_config_id",
+    "status",
+    "status_message",
+    "model",
+    "provider",
+    "gen_ai_system",
+    "gen_ai_operation",
+    "operation_name",
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "cost",
+    "attrs_string",
+    "attrs_number",
+    "attrs_bool",
+    "attributes_extra",
+    "input",
+    "output",
+    "input_gcs_url",
+    "output_gcs_url",
+    "tags",
+    "span_events",
+    "eval_status",
+    "semconv_source",
+    "created_at",
+    "updated_at",
+    "is_deleted",
+    "_version",
 )
 
 _SPANS_DDL = """
@@ -162,11 +197,50 @@ def _row(
         else attrs
     )
     return (
-        PROJECT, "span", "svc", HOUR.replace(minute=minute), "trace-1", span_id,
-        parent, name, None, latency, None, None, None, None, None, None, None,
-        "OK", "", "m", "p", "", "", "", 0, 0, 0, 0.0, attributes,
-        {"score": 1.0}, {"flag": 1}, "", "", "", None, None, "", "", "", "",
-        HOUR, HOUR, deleted, version,
+        PROJECT,
+        "span",
+        "svc",
+        HOUR.replace(minute=minute),
+        "trace-1",
+        span_id,
+        parent,
+        name,
+        None,
+        latency,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        "OK",
+        "",
+        "m",
+        "p",
+        "",
+        "",
+        "",
+        0,
+        0,
+        0,
+        0.0,
+        attributes,
+        {"score": 1.0},
+        {"flag": 1},
+        "",
+        "",
+        "",
+        None,
+        None,
+        "",
+        "",
+        "",
+        "",
+        HOUR,
+        HOUR,
+        deleted,
+        version,
     )
 
 
@@ -184,7 +258,10 @@ POPULATION = (
     # Root span later re-parented: the root-only metric must drop it.
     ([_row("E", 1, latency=50), _row("E", 2, latency=50, parent="A")], None),
     # Equal-version tie differing only in a column nothing reads.
-    ([_row("F", 7, latency=60, name="left"), _row("F", 7, latency=60, name="right")], 60),
+    (
+        [_row("F", 7, latency=60, name="left"), _row("F", 7, latency=60, name="right")],
+        60,
+    ),
     # Newest version cleared the filtered key entirely.
     ([_row("G", 1, latency=70), _row("G", 2, latency=70, attrs={"other": "x"})], None),
     # Newest version is the one that starts matching.
@@ -284,8 +361,11 @@ def _render(config, table, *, final_twin):
     return sql % escape_params(params, context=DRIVER_CONTEXT)
 
 
-RECIPES = (("scalar", "month", None), ("series", "day", None),
-           ("breakdown", "day", "measurement"))
+RECIPES = (
+    ("scalar", "month", None),
+    ("series", "day", None),
+    ("breakdown", "day", "measurement"),
+)
 
 
 @pytest.mark.parametrize("recipe, granularity, breakdown", RECIPES)
@@ -310,9 +390,7 @@ def test_narrow_replay_matches_final_over_every_churn_shape(
         }
 
 
-def test_version_agreement_is_what_excludes_stale_identities(
-    ch_client, churn_table
-):
+def test_version_agreement_is_what_excludes_stale_identities(ch_client, churn_table):
     """Drop the HAVING and the answer changes — the check is load-bearing."""
 
     config = _config("day", None)

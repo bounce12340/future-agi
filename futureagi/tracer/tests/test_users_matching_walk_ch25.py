@@ -268,7 +268,15 @@ class _LiveExecutor:
         self.tables = tables
         self.statements: list[str] = []
 
-    def execute_ch_query(self, query, params=None, timeout_ms=None, settings=None):
+    def execute_ch_query(
+        self,
+        query,
+        params=None,
+        timeout_ms=None,
+        settings=None,
+        *,
+        server_execution_cap_ms=None,
+    ):
         self.statements.append(query)
         rows, columns = self.client.execute(
             _bind(query, self.tables), params or {}, with_column_types=True
@@ -281,11 +289,11 @@ class _LiveExecutor:
         )
 
 
-def _manager(*, value="gold", window_start=WINDOW_START):
+def _manager(*, value="gold", window_start=WINDOW_START, project=PROJECT):
     return UsersListManager(
         organization_id=ORGANIZATION,
-        allowed_project_ids=[PROJECT],
-        project_id=PROJECT,
+        allowed_project_ids=[project],
+        project_id=project,
         filters=[
             {
                 "column_id": "created_at",
@@ -322,8 +330,9 @@ def _read_page(
     cursor=None,
     value="gold",
     window_start=WINDOW_START,
+    project=PROJECT,
 ):
-    manager = _manager(value=value, window_start=window_start)
+    manager = _manager(value=value, window_start=window_start, project=project)
     executor = _LiveExecutor(ch_client, tables)
     with (
         patch(SERVICE, return_value=executor),
@@ -369,6 +378,79 @@ def test_two_page_cursor_publishes_every_member_once_in_matching_order(
     # witness is stale). C moved, F tombstoned, G uncurated: never published.
     assert pages == [["delta", "alpha"], ["hotel", "echo-old"], ["bravo"]]
     assert read.seen_rows == 5
+
+
+def test_a_tied_instant_pages_by_resolved_id_on_live_clickhouse(
+    ch_client, seeded_tables
+):
+    """Live: the instant statement resolves aliases and pages inside one tie.
+
+    A separate project holds five users and one consolidation group whose
+    span at the instant carries the group's NEW id (sorting above every
+    survivor) while the group resolves to its oldest id (sorting below them
+    all), plus a user whose only row at the instant is a stale version and
+    one user above the instant. Two-id slices make the tie fill a slice, so
+    the instant is decided through the resolved-order statement, across
+    two-row pages and their cursors.
+    """
+    spans, end_users, remap = seeded_tables
+    project = str(uuid.UUID(int=300))
+    instant = WINDOW_START + timedelta(hours=12)
+    tied = [str(uuid.UUID(int=n)) for n in range(302, 307)]
+    survivor, new_id = str(uuid.UUID(int=301)), str(uuid.UUID(int=0x3FF))
+    stale, above = str(uuid.UUID(int=0x3FE)), str(uuid.UUID(int=0x3FD))
+
+    def span(sid, user, tag, version, start):
+        return (
+            uuid.UUID(project), "llm", "svc", start, f"t-{sid}", sid,
+            uuid.UUID(user), start, {"tag": tag}, {}, {}, "{}",
+            1.0, 10, 6, 4, 0, version,
+        )  # fmt: skip
+
+    rows = [span(f"tie-{n}", user, "gold", 1, instant) for n, user in enumerate(tied)]
+    rows += [
+        span("tie-alias", new_id, "gold", 1, instant),
+        span("tie-stale", stale, "gold", 1, instant),
+        span("tie-stale", stale, "silver", 2, instant),
+        span("tie-stale-live", stale, "gold", 1, instant - timedelta(hours=1)),
+        span("tie-above", above, "gold", 1, instant + timedelta(hours=1)),
+    ]
+    ch_client.execute(
+        f"INSERT INTO {spans} (project_id, observation_type, service_name, "
+        "start_time, trace_id, id, end_user_id, end_time, attrs_string, "
+        "attrs_number, attrs_bool, attributes_extra, cost, total_tokens, "
+        "prompt_tokens, completion_tokens, is_deleted, _version) VALUES",
+        rows,
+    )
+    labels = {user: f"tie-{user[-3:]}" for user in [*tied, survivor, stale, above]}
+    ch_client.execute(
+        f"INSERT INTO {end_users} VALUES",
+        [
+            (uuid.UUID(project), uuid.UUID(user), uuid.UUID(ORGANIZATION), label,
+             "string", label, WINDOW_START, 1, 0)
+            for user, label in labels.items()
+        ],
+    )  # fmt: skip
+    ch_client.execute(
+        f"INSERT INTO {remap} VALUES", [(uuid.UUID(survivor), uuid.UUID(new_id), 1)]
+    )
+
+    names, statements, cursor = [], [], None
+    with patch.object(walk, "USER_LIST_WALK_SLICE_USER_LIMIT", 2):
+        while True:
+            read, executor = _read_page(
+                ch_client, seeded_tables, page_size=2, cursor=cursor, project=project
+            )
+            names += [row["user_id"] for row in read.payload["table"]]
+            statements += executor.statements
+            if not read.has_more:
+                break
+            cursor = _cursor(read)
+            assert len(names) < 20
+
+    expected = [above, *sorted(tied, reverse=True), survivor, stale]
+    assert names == [labels[user] for user in expected]
+    assert any("AS instant_end_user_id" in s for s in statements)
 
 
 def test_published_totals_are_whole_window_not_slice(ch_client, seeded_tables):

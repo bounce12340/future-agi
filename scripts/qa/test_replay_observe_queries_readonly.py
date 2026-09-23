@@ -1,10 +1,11 @@
 """Offline guards only. Never connect to a DB or initialize Django in tests."""
 
+import contextlib
 import unittest
 import hashlib
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -383,8 +384,8 @@ class UsersOriginShaDerivationTests(unittest.TestCase):
 
     ORGANIZATION = str(UUID(int=11))
     PROJECT = str(UUID(int=12))
-    WINDOW_START = datetime(2026, 9, 3, 0, 0, tzinfo=timezone.utc)
-    WINDOW_END = datetime(2026, 9, 3, 4, 0, tzinfo=timezone.utc)
+    WINDOW_START = datetime(2026, 9, 3, 0, 0, tzinfo=UTC)
+    WINDOW_END = datetime(2026, 9, 3, 4, 0, tzinfo=UTC)
     # Nine letters ``k`` push the legacy ASCII bloom enumeration past its 256
     # variant ceiling, so the hint declines and the page is a shape of its own.
     HINT_DECLINED_VALUE = "k" * 9
@@ -1720,7 +1721,7 @@ class OutcomeTests(unittest.TestCase):
 
 
 class ExecutorPolicyTests(unittest.TestCase):
-    def run_executor(self, mode, *, failure=None):
+    def run_executor(self, mode, *, failure=None, cap=None, raises=None):
         """Stub adapters at import boundaries: no Django startup or DB sockets."""
         args = SimpleNamespace(
             host="unused.invalid",
@@ -1745,9 +1746,11 @@ class ExecutorPolicyTests(unittest.TestCase):
             }
         )
         result_class = SimpleNamespace(from_clickhouse_rows=Mock(return_value="result"))
+        self.context = Mock(side_effect=lambda **kwargs: contextlib.nullcontext())
         modules = {
             "tracer.services.clickhouse.application_read_policy": SimpleNamespace(
-                application_read_settings=normalize
+                application_read_settings=normalize,
+                application_read_context=self.context,
             ),
             "tracer.services.clickhouse.query_service": SimpleNamespace(
                 QueryResult=result_class
@@ -1783,14 +1786,16 @@ class ExecutorPolicyTests(unittest.TestCase):
                         {"project_id": "project"},
                         timeout_ms=500,
                         settings=supplied,
+                        **({} if cap is None else {"server_execution_cap_ms": cap}),
                     )
 
                 if failure is None:
                     self.assertEqual(call(), "result")
                 else:
-                    with self.assertRaises(type(failure)) as caught:
+                    with self.assertRaises(raises or type(failure)) as caught:
                         call()
-                    self.assertIs(caught.exception, failure)
+                    if raises is None:
+                        self.assertIs(caught.exception, failure)
             finally:
                 reader.close()
         self.assertEqual(supplied, original)
@@ -1833,6 +1838,30 @@ class ExecutorPolicyTests(unittest.TestCase):
         self.assertEqual(
             reader.calls[0]["application_read_settings"], normalize.return_value
         )
+
+    def test_candidate_keeps_a_product_execution_cap_under_the_run_wall(self):
+        """A statement the product asks the server to stop is stopped there too."""
+        from clickhouse_driver.errors import ErrorCodes, ServerException
+
+        reader, driver, normalize = self.run_executor("candidate", cap=8_000)
+        self.context.assert_called_once_with(execution_cap_ms=8_000)
+        normalize.assert_called_once()
+        limits = driver.execute.call_args.kwargs["settings"]
+        self.assertEqual(limits["max_execution_time"], 8.0)
+        self.assertEqual(limits["max_execution_time_leaf"], 60)
+
+        # The product cap's own timeout is the product's deadline, as in the
+        # service; the run wall's is still the driver's error.
+        failure = ServerException("offline", code=ErrorCodes.TIMEOUT_EXCEEDED)
+        reader, driver, normalize = self.run_executor(
+            "candidate", failure=failure, cap=8_000, raises=TimeoutError
+        )
+        self.assertEqual(reader.calls[0]["error_code"], ErrorCodes.TIMEOUT_EXCEEDED)
+        reader, driver, normalize = self.run_executor(
+            "candidate", failure=failure, cap=120_000
+        )
+        limits = driver.execute.call_args.kwargs["settings"]
+        self.assertEqual(limits["max_execution_time"], 60)
 
     def test_reference_errors_propagate_with_mode_and_limits_in_ledger(self):
         from clickhouse_driver.errors import ErrorCodes, ServerException

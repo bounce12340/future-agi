@@ -12,7 +12,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Protocol
 
 from django.conf import settings
 from django.core import signing
@@ -565,7 +565,15 @@ def cursor_page_metadata(
     }
 
 
-def read_filter_seed_witness_slack(builder) -> int | None:
+class WitnessSlackBuilder(Protocol):
+    """The list builders whose filter-seed witness slack a cursor carries."""
+
+    def filter_seed_witness_slack_hours(self) -> int | None: ...
+
+    def pin_filter_seed_witness_slack_hours(self, hours: int | None) -> None: ...
+
+
+def read_filter_seed_witness_slack(builder: WitnessSlackBuilder) -> int | None:
     """The witness slack this read used, for its continuation to carry.
 
     ``None`` for every builder and every request shape that has no witness
@@ -577,7 +585,9 @@ def read_filter_seed_witness_slack(builder) -> int | None:
     return read() if callable(read) else None
 
 
-def pin_filter_seed_witness_slack(builder, cursor_state) -> None:
+def pin_filter_seed_witness_slack(
+    builder: WitnessSlackBuilder, cursor_state: ListCursor | None
+) -> None:
     """Finish a pagination under the slack its first hop was minted with.
 
     The slack decides candidacy, so an operator turning the runtime knob

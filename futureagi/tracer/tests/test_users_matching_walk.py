@@ -17,7 +17,12 @@ from unittest.mock import patch
 import pytest
 
 from tracer.services import users_matching_walk as walk
-from tracer.services.clickhouse.list_cursor import ListCursor
+from tracer.services.clickhouse.list_cursor import (
+    ListCursor,
+    ListCursorError,
+    decode_list_cursor,
+    encode_list_cursor,
+)
 from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
 from tracer.services.clickhouse.v2.query_builders.user_list import (
     UserListQueryBuilderV2,
@@ -105,6 +110,8 @@ class World:
 def kind_of(query: str) -> str:
     if "AS raw_end_user_id" in query:
         return "slice"
+    if "AS instant_end_user_id" in query:
+        return "instant"
     if query.lstrip().startswith("EXPLAIN ESTIMATE"):
         return "estimate"
     if "AS witnessed" in query:
@@ -131,6 +138,7 @@ class Engine:
         self.replayed: list[tuple[str, ...]] = []
         self.remapped: list[tuple[str, ...]] = []
         self.slice_ranges: list[tuple[datetime, datetime]] = []
+        self.instant_ranges: list[tuple[datetime, datetime]] = []
         self.probe_ranges: list[tuple[datetime, datetime]] = []
         self.estimate_ranges: list[tuple[datetime, datetime]] = []
         self.replay_ranges: list[tuple[datetime, datetime]] = []
@@ -143,18 +151,31 @@ class Engine:
         # The client-observed time the scripted server reports for the
         # estimate: what the walk charges the probe's wall.
         self.estimate_ms: float = 1.0
-        # Per statement: the read settings and the timeout the walk sent.
+        # Per statement: the read settings, the timeout the walk sent, and the
+        # server execution cap it asked for (None: admission only).
         self.settings: list[dict | None] = []
         self.timeouts: list[float | None] = []
+        self.caps: list[int | None] = []
 
-    def execute_ch_query(self, query, params=None, timeout_ms=None, settings=None):
+    def execute_ch_query(
+        self,
+        query,
+        params=None,
+        timeout_ms=None,
+        settings=None,
+        *,
+        server_execution_cap_ms=None,
+    ):
         self.calls.append(query)
         self.settings.append(settings)
         self.timeouts.append(timeout_ms)
+        self.caps.append(server_execution_cap_ms)
         params = params or {}
         kind = kind_of(query)
         if kind == "slice":
             return self._slice(params)
+        if kind == "instant":
+            return self._instant(params)
         if kind == "estimate":
             return self._estimate(params)
         if kind == "probe":
@@ -192,6 +213,21 @@ class Engine:
                 {"raw_end_user_id": rid, "raw_newest": moment} for rid, moment in rows
             ],
             query_time_ms=1.0,
+        )
+
+    def _instant(self, params):
+        """Resolved ids witnessed in the instant, through the survivor map."""
+
+        resolved = {
+            self.world.canonical[raw_id]
+            for raw_id in self._witnessed(params, self.instant_ranges)
+        }
+        before = params.get("instant_before_end_user_id")
+        rows = sorted(
+            (uid for uid in resolved if before is None or uid < before), reverse=True
+        )[: params["slice_user_limit"]]
+        return SimpleNamespace(
+            data=[{"instant_end_user_id": uid} for uid in rows], query_time_ms=1.0
         )
 
     def _probe(self, params):
@@ -513,6 +549,260 @@ def test_cursor_resumes_without_skipping_or_repeating_a_user():
     assert read.seen_rows == len(expected)
 
 
+def _signed_cursor(read) -> ListCursor:
+    """The continuation exactly as the Users view hands it to the next request."""
+
+    assert read.has_more and read.checkpoint_order is not None
+    binding = {"resource": "observe_users", "scope": {}, "query": {}, "page_size": 25}
+    token = encode_list_cursor(
+        **binding,
+        window_start=read.window_start,
+        window_end=read.window_end,
+        order=read.checkpoint_order,
+        seen_rows=read.seen_rows,
+    )
+    return decode_list_cursor(token, **binding)
+
+
+def _walk_every_page(world: World, *, max_hops: int, cursor=None, page_size=25):
+    """Follow the cursor to the end; returns the names, per-hop counts, engines."""
+
+    names: list[str] = []
+    counts: list[int] = []
+    engines: list[Engine] = []
+    while True:
+        read, engine = _page(world, page_size=page_size, cursor=cursor)
+        names.extend(_names(read))
+        counts.append(len(read.payload["table"]))
+        engines.append(engine)
+        assert len(counts) <= max_hops, f"no end after {max_hops} hops: {counts}"
+        if not read.has_more:
+            return names, counts, engines
+        cursor = _signed_cursor(read)
+
+
+def _tied_world(size: int) -> tuple[World, list[str]]:
+    world = World()
+    stamp = minutes_before_end(3)
+    for ordinal in range(1, size + 1):
+        world.user(ordinal, key=stamp, raw=(stamp,))
+    # One timestamp: the page's tie order is the resolved id, descending.
+    return world, [f"user-{ordinal}" for ordinal in range(size, 0, -1)]
+
+
+@pytest.mark.parametrize("size", [401, 601])
+def test_a_tied_cohort_larger_than_one_request_publishes_everyone_once_in_order(
+    size,
+):
+    """Hundreds of users share their newest matching instant, at shipped limits.
+
+    No user at a truncated floor is publishable until the whole instant is
+    seen, and one request cannot see 401 or 601 raw ids and certify them. The
+    continuation must resume INSIDE the instant, not start it again: every
+    user exactly once, in order, one full page per request.
+    """
+    assert walk.USER_LIST_WALK_SLICE_USER_LIMIT == 200
+    assert walk.USER_LIST_WALK_MAX_STATEMENTS == 24
+    assert walk.USER_LIST_WALK_CERTIFY_BATCH_SIZE == 25
+    world, expected = _tied_world(size)
+
+    names, counts, engines = _walk_every_page(world, max_hops=-(-size // 25) + 1)
+
+    assert names == expected
+    assert len(set(names)) == size
+    assert all(count == 25 for count in counts[:-1])
+    assert all(engine.calls for engine in engines)
+    # The instant is decided through the resolved-order statement, and no
+    # request re-certifies users an earlier request already published.
+    enriched = [uid for engine in engines for batch in engine.enriched for uid in batch]
+    assert len(enriched) == len(set(enriched)) == size
+
+
+@pytest.mark.parametrize("page_size", [30, 100])
+def test_a_tied_cohort_pages_exactly_when_pages_and_batches_do_not_align(page_size):
+    """A page that ends inside a certified batch leaves certified users behind.
+
+    The cursor resumes at the last published user, not at the end of the
+    batch, so those users are certified again by the next request and
+    published exactly once.
+    """
+    world, expected = _tied_world(601)
+
+    names, counts, _engines = _walk_every_page(
+        world, max_hops=-(-601 // page_size) + 1, page_size=page_size
+    )
+
+    assert names == expected
+    assert all(count == page_size for count in counts[:-1])
+
+
+def test_a_tie_that_outlasts_the_budget_below_one_slice_resumes_in_the_instant():
+    """Fewer tied raw ids than a slice holds, but more certification than a request.
+
+    The slice is not all one instant, so it never opens the instant itself;
+    certification at four statements a batch spends the budget before the
+    tie is decided. The stopped request's cursor opens the instant, so the
+    next one decides it in resolved order instead of starting the slice again.
+    """
+    world, expected = _tied_world(150)
+    world.user(151, key=minutes_before_end(30), raw=(minutes_before_end(30),))
+    expected = [*expected, "user-151"]
+
+    with patch.object(walk, "_enrichment_statement_count", return_value=4):
+        first, _engine = _page(world, page_size=25)
+        assert first.payload["table"] == [] and first.has_more is True
+        assert first.checkpoint_order[4] is True
+        names, _counts, _engines = _walk_every_page(
+            world, max_hops=8, cursor=_signed_cursor(first)
+        )
+
+    assert names == expected
+
+
+def test_a_tied_cohort_progresses_under_a_tiny_budget():
+    """The review's reproducer: six tied users, slices of two, six statements."""
+
+    world, expected = _tied_world(6)
+    with (
+        patch.object(walk, "USER_LIST_WALK_SLICE_USER_LIMIT", 2),
+        patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 6),
+    ):
+        names, counts, _engines = _walk_every_page(world, max_hops=8)
+
+    assert names == expected
+    assert sum(counts[:3]) == 6
+
+
+def test_a_tied_cohort_inside_one_request_keeps_the_raw_slice_path():
+    """199 tied users fit one request: a full first page, no instant statement."""
+
+    world, expected = _tied_world(199)
+
+    read, engine = _page(world, page_size=25)
+    assert _names(read) == expected[:25]
+    assert "instant" not in _kinds(engine)
+    assert len(read.checkpoint_order) == 4
+
+    names, _counts, _engines = _walk_every_page(world, max_hops=9)
+    assert names == expected
+
+
+def test_a_tied_instant_orders_by_resolved_id_when_aliases_carry_the_rows():
+    """Aliases sort above their survivors; the instant still publishes by survivor.
+
+    Every third tied user's row at the instant is carried by an alias whose id
+    sorts above every survivor, so the raw slice meets those users first. A
+    user above the instant and users below it bracket the cohort.
+    """
+    world = World()
+    stamp = minutes_before_end(3)
+    for ordinal in range(1, 451):
+        if ordinal % 3 == 0:
+            # Index 0 lands on the survivor, index 1 (the instant) on the alias.
+            world.user(
+                ordinal,
+                key=stamp,
+                raw=(minutes_before_end(600), stamp),
+                aliases=1,
+            )
+        else:
+            world.user(ordinal, key=stamp, raw=(stamp,))
+    world.user(900, key=minutes_before_end(1), raw=(minutes_before_end(1),))
+    world.user(901, key=minutes_before_end(30), raw=(minutes_before_end(30),))
+    world.user(902, key=minutes_before_end(31), raw=(stamp, minutes_before_end(31)))
+    tied_ids = sorted(
+        (uid for uid, user in world.users.items() if user["key"] == stamp),
+        reverse=True,
+    )
+    expected = [
+        "user-900",
+        *(world.users[uid]["name"] for uid in tied_ids),
+        "user-901",
+        "user-902",
+    ]
+    aliased = [
+        raw_id
+        for moment, raw_id in world.raw
+        if moment == stamp and raw_id not in world.users
+    ]
+    assert aliased and min(aliased) > max(tied_ids)
+
+    names, _counts, engines = _walk_every_page(world, max_hops=21)
+
+    assert names == expected
+    assert any("instant" in _kinds(engine) for engine in engines)
+
+
+def test_stale_witnesses_at_a_tied_instant_publish_at_their_own_key_or_never():
+    """Raw rows at the instant that are stale versions place nobody there.
+
+    Every fifth user's live match is ten minutes older than its stale row at
+    the instant, and every seventh never matches live at all. The first are
+    published below the cohort at their own key; the second never.
+    """
+    world = World()
+    stamp = minutes_before_end(3)
+    older = minutes_before_end(13)
+    at_stamp, below, never = [], [], []
+    for ordinal in range(1, 421):
+        if ordinal % 7 == 0:
+            world.user(ordinal, key=None, raw=(stamp,))
+            never.append(ordinal)
+        elif ordinal % 5 == 0:
+            world.user(ordinal, key=older, raw=(stamp, older))
+            below.append(ordinal)
+        else:
+            world.user(ordinal, key=stamp, raw=(stamp,))
+            at_stamp.append(ordinal)
+    expected = [
+        *(f"user-{n}" for n in reversed(at_stamp)),
+        *(f"user-{n}" for n in reversed(below)),
+    ]
+
+    names, _counts, _engines = _walk_every_page(world, max_hops=20)
+
+    assert names == expected
+    assert not {f"user-{n}" for n in never} & set(names)
+
+
+def test_a_legacy_four_element_cursor_inside_a_tie_still_resumes_exactly():
+    """A cursor issued before the open-instant flag decodes and behaves as before.
+
+    It names only coverage and the last published user, so the request starts
+    with a raw slice from coverage as before; that slice's tie then opens the
+    instant below the last published user, and the walk finishes the cohort.
+    """
+    world, expected = _tied_world(601)
+    first, _engine = _page(world, page_size=25)
+    assert _names(first) == expected[:25]
+    legacy = first.checkpoint_order[:4]
+    assert legacy[1:3] == (
+        world.users[str(uuid.UUID(int=1000 + 577))]["key"],
+        str(uuid.UUID(int=1000 + 577)),
+    )
+
+    cursor = ListCursor(
+        window_start=first.window_start,
+        window_end=first.window_end,
+        order=tuple(legacy),
+        seen_rows=first.seen_rows,
+    )
+    names, _counts, _engines = _walk_every_page(world, max_hops=27, cursor=cursor)
+
+    assert _names(first) + names == expected
+
+
+@pytest.mark.parametrize("flag", [False, None, "true", 1])
+def test_a_five_element_cursor_must_say_the_instant_is_open(flag):
+    world, _expected = _tied_world(3)
+    order = (walk.USER_LIST_MATCHING_CURSOR_ORDER, None, None, WINDOW_END, flag)
+    cursor = ListCursor(
+        window_start=WINDOW_START, window_end=WINDOW_END, order=order, seen_rows=0
+    )
+    with pytest.raises(ListCursorError):
+        _page(world, page_size=25, cursor=cursor)
+
+
 def test_budget_exhaustion_returns_partial_page_and_cursor_without_fallback():
     world = World()
     for ordinal, minutes in enumerate((3, 7, 11), start=1):
@@ -578,11 +868,13 @@ def test_slice_read_exhaustion_returns_partial_page_and_cursor_without_fallback(
     engine = Engine(world)
     original = engine.execute_ch_query
 
-    def wall_spent_in_transport(query, params=None, timeout_ms=None, settings=None):
+    def wall_spent_in_transport(
+        query, params=None, timeout_ms=None, settings=None, **caps
+    ):
         if len(engine.calls) == 1 and kind_of(query) == "slice":
             engine.calls.append(query)
             raise ReadDeadlineExceeded("read deadline exceeded")
-        return original(query, params, timeout_ms, settings)
+        return original(query, params, timeout_ms, settings, **caps)
 
     engine.execute_ch_query = wall_spent_in_transport
     read, engine = _page(world, page_size=25, engine=engine)
@@ -602,11 +894,11 @@ def test_wall_exhaustion_stops_between_statements():
         engine = Engine(world)
         original = engine.execute_ch_query
 
-        def slow(query, params=None, timeout_ms=None, settings=None):
+        def slow(query, params=None, timeout_ms=None, settings=None, **caps):
             import time
 
             time.sleep(0.08)
-            return original(query, params, timeout_ms, settings)
+            return original(query, params, timeout_ms, settings, **caps)
 
         engine.execute_ch_query = slow
         read, engine = _page(world, page_size=25, engine=engine)
@@ -646,11 +938,11 @@ def test_an_exhausted_walk_publishes_degraded_and_incomplete_not_complete():
         engine = Engine(world)
         original = engine.execute_ch_query
 
-        def slow(query, params=None, timeout_ms=None, settings=None):
+        def slow(query, params=None, timeout_ms=None, settings=None, **caps):
             import time
 
             time.sleep(0.08)
-            return original(query, params, timeout_ms, settings)
+            return original(query, params, timeout_ms, settings, **caps)
 
         engine.execute_ch_query = slow
         read, _engine = _page(world, page_size=25, engine=engine)
@@ -667,15 +959,18 @@ def test_an_exhausted_walk_publishes_degraded_and_incomplete_not_complete():
     assert finished.payload["query_status"] == "complete"
 
 
-def test_every_walk_statement_carries_a_server_timeout_including_finish_mode():
+def test_finish_mode_statements_ask_the_server_to_enforce_their_deadline():
     """Exempt from the page wall is not exempt from every deadline.
 
-    Application reads on this stack carry no server deadline of their own, so
-    a statement issued with ``timeout_ms=None`` runs unbounded. The walk's
-    finish-mode statements -- the whole-window replay and the enrichment that
-    follows it -- are deliberately not governed by the page wall, which is
-    what lets a page publish users it has already certified. They still have
-    to carry a deadline; theirs comes from the request's analytics wall.
+    Application reads carry no server time cap, so ``timeout_ms`` alone only
+    decides whether a statement is admitted. The walk's finish-mode
+    statements -- the whole-window replay and the enrichment that follows it
+    -- are deliberately not governed by the page wall, which is what lets a
+    page publish users it has already certified; they ask the service for a
+    server execution cap from the request's analytics wall instead. Search
+    statements keep the application policy: admitted, never capped.
+    (``test_finish_mode_reaches_the_native_driver_as_max_execution_time``
+    follows the cap through the real service and client.)
     """
 
     world = World()
@@ -684,27 +979,114 @@ def test_every_walk_statement_carries_a_server_timeout_including_finish_mode():
             ordinal, key=minutes_before_end(minutes), raw=(minutes_before_end(minutes),)
         )
 
-    engine = Engine(world)
-    original = engine.execute_ch_query
-    timeouts: list[float | None] = []
-
-    def recording(query, params=None, timeout_ms=None, settings=None):
-        timeouts.append(timeout_ms)
-        return original(query, params, timeout_ms, settings)
-
-    engine.execute_ch_query = recording
-    read, _engine = _page(world, page_size=25, engine=engine)
+    read, engine = _page(world, page_size=25)
 
     assert _names(read) == ["user-1", "user-2"]
-    assert timeouts, "the walk issued no statement at all"
-    assert all(t is not None for t in timeouts), (
-        f"a walk statement ran with no server deadline: {timeouts}"
-    )
+    assert engine.timeouts, "the walk issued no statement at all"
+    assert all(t is not None for t in engine.timeouts), engine.timeouts
+    kinds = _kinds(engine)
+    finish = [i for i, kind in enumerate(kinds) if kind in {"replay", "metrics"}]
+    assert finish, kinds
+    for index, kind in enumerate(kinds):
+        if index in finish:
+            assert engine.caps[index] == engine.timeouts[index], kind
+        else:
+            assert engine.caps[index] is None, kind
     # The finish-mode budget is the analytics wall LESS what the search
     # already spent, so at least one statement is allowed more than the page
     # wall, and the page as a whole cannot exceed the analytics wall.
-    assert max(timeouts) > walk.USER_LIST_PAGE_WALL_MS
-    assert max(timeouts) <= walk.USER_LIST_WALK_FINISH_WALL_MS
+    assert max(engine.timeouts) > walk.USER_LIST_PAGE_WALL_MS
+    assert max(engine.timeouts) <= walk.USER_LIST_WALK_FINISH_WALL_MS
+
+
+class _NativeDriver:
+    """A clickhouse-driver stand-in under the REAL service and client.
+
+    It answers each statement from the scripted engine and records the
+    settings the native client actually sent, so the assertion is on what
+    ClickHouse would receive, not on what the walk asked for.
+    """
+
+    def __init__(self, engine: Engine) -> None:
+        self.engine = engine
+        self.sent: list[tuple[str, dict | None]] = []
+        self.fail_kind: str | None = None
+
+    def execute(self, query, params=None, *, with_column_types=False, settings=None):
+        kind = kind_of(query)
+        self.sent.append((kind, settings))
+        if kind == self.fail_kind:
+            from clickhouse_driver.errors import ErrorCodes, ServerException
+
+            raise ServerException(
+                "Timeout exceeded: elapsed 8.0 seconds, maximum: 8",
+                code=ErrorCodes.TIMEOUT_EXCEEDED,
+            )
+        result = self.engine.execute_ch_query(query, params)
+        data = list(result.data or ())
+        columns = list(getattr(result, "columns", None) or (data[0] if data else ()))
+        rows = [tuple(row.get(name) for name in columns) for row in data]
+        return rows, [(name, "String") for name in columns]
+
+
+def _real_service_page(world: World, driver: _NativeDriver, *, cursor=None):
+    from tracer.services.clickhouse.client import ClickHouseClient
+
+    client = ClickHouseClient(host="localhost", port=39999, pool_size=1)
+    manager = _manager()
+    with (
+        patch.object(client, "_get_client", return_value=driver),
+        patch.object(client, "_return_client"),
+        patch(
+            "tracer.services.clickhouse.v2.query_service.get_v2_query_client",
+            return_value=client,
+        ),
+        patch.object(manager, "_read_dimension_candidates", side_effect=_never_seed),
+    ):
+        return manager.list_cursor_payload(page_size=25, cursor=cursor)
+
+
+def test_finish_mode_reaches_the_native_driver_as_max_execution_time():
+    """Through ``V2AnalyticsQueryService`` and ``ClickHouseClient`` unmocked.
+
+    The finish-mode replay arrives at the driver with a real, positive
+    ``max_execution_time`` no larger than its 8,000 ms statement cap; every
+    search statement still arrives with the application policy's 0.
+    """
+
+    world = World()
+    world.user(1, key=minutes_before_end(3), raw=(minutes_before_end(3),))
+    driver = _NativeDriver(Engine(world))
+
+    read = _real_service_page(world, driver)
+
+    assert _names(read) == ["user-1"]
+    sent = dict(driver.sent)
+    replay_cap = sent["replay"]["max_execution_time"]
+    assert 0 < replay_cap <= 8.0
+    assert sent["replay"]["timeout_overflow_mode"] == "throw"
+    assert sent["replay"]["max_rows_to_read"] == 0
+    for kind in ("slice", "remap", "enrich"):
+        assert sent[kind]["max_execution_time"] == 0, kind
+
+
+def test_a_finish_statement_the_server_stops_degrades_the_page_and_carries_the_user():
+    """The server's timeout is the finishing deadline, not a failed request."""
+
+    world = World()
+    world.user(1, key=minutes_before_end(3), raw=(minutes_before_end(3),))
+    driver = _NativeDriver(Engine(world))
+    driver.fail_kind = "replay"
+
+    read = _real_service_page(world, driver)
+
+    assert read.payload["table"] == []
+    assert read.payload["query_status"] == "degraded"
+    assert read.has_more is True
+
+    driver.fail_kind = None
+    resumed = _real_service_page(world, driver, cursor=_signed_cursor(read))
+    assert _names(resumed) == ["user-1"]
 
 
 def test_finish_mode_does_not_start_a_second_full_wall_after_the_page_wall():
@@ -777,12 +1159,12 @@ def test_a_slice_that_fails_on_a_read_budget_is_retried_narrower_never_wider():
     original = engine.execute_ch_query
     widths: list[int] = []
 
-    def flaky(query, params=None, timeout_ms=None, settings=None):
+    def flaky(query, params=None, timeout_ms=None, settings=None, **caps):
         if kind_of(query) == "slice":
             widths.append(params["slice_end_us"] - params["slice_start_us"])
             if len(widths) == 1:
                 raise ServerException("memory", code=241)
-        return original(query, params, timeout_ms, settings)
+        return original(query, params, timeout_ms, settings, **caps)
 
     engine.execute_ch_query = flaky
     read, engine = _page(world, page_size=25, engine=engine)
@@ -907,8 +1289,8 @@ def test_a_probe_the_budget_refuses_or_that_fails_licenses_nothing():
     engine = Engine(world)
     original = engine.execute_ch_query
 
-    def failing_probe(query, params=None, timeout_ms=None, settings=None):
-        result = original(query, params, timeout_ms, settings)
+    def failing_probe(query, params=None, timeout_ms=None, settings=None, **caps):
+        result = original(query, params, timeout_ms, settings, **caps)
         if kind_of(query) == "probe":
             raise ServerException("rows", code=158)
         return result
@@ -925,11 +1307,11 @@ def test_a_probe_the_budget_refuses_or_that_fails_licenses_nothing():
     engine = Engine(world)
     original = engine.execute_ch_query
 
-    def failing_estimate(query, params=None, timeout_ms=None, settings=None):
+    def failing_estimate(query, params=None, timeout_ms=None, settings=None, **caps):
         if kind_of(query) == "estimate":
             engine.calls.append(query)
             raise ServerException("memory", code=241)
-        return original(query, params, timeout_ms, settings)
+        return original(query, params, timeout_ms, settings, **caps)
 
     engine.execute_ch_query = failing_estimate
     with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 4):
@@ -1008,11 +1390,11 @@ def test_a_probe_deadline_raised_in_the_transport_ends_the_probe_not_the_page():
     engine = Engine(world)
     original = engine.execute_ch_query
 
-    def probe_deadline(query, params=None, timeout_ms=None, settings=None):
+    def probe_deadline(query, params=None, timeout_ms=None, settings=None, **caps):
         if kind_of(query) == "estimate":
             engine.calls.append(query)
             raise ReadDeadlineExceeded("probe deadline exceeded")
-        return original(query, params, timeout_ms, settings)
+        return original(query, params, timeout_ms, settings, **caps)
 
     engine.execute_ch_query = probe_deadline
     with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 4):
@@ -1349,12 +1731,12 @@ def test_certified_users_are_materialised_past_the_wall_but_the_search_stops():
     engine = Engine(world)
     original = engine.execute_ch_query
 
-    def slow_enrichment(query, params=None, timeout_ms=None, settings=None):
+    def slow_enrichment(query, params=None, timeout_ms=None, settings=None, **caps):
         import time
 
         if kind_of(query) == "enrich":
             time.sleep(0.08)
-        return original(query, params, timeout_ms, settings)
+        return original(query, params, timeout_ms, settings, **caps)
 
     engine.execute_ch_query = slow_enrichment
     with patch.object(walk, "USER_LIST_PAGE_WALL_MS", 60):
@@ -1377,8 +1759,8 @@ def test_slice_width_grows_without_a_server_time_report():
     engine = Engine(world)
     original = engine.execute_ch_query
 
-    def without_server_time(query, params=None, timeout_ms=None, settings=None):
-        result = original(query, params, timeout_ms, settings)
+    def without_server_time(query, params=None, timeout_ms=None, settings=None, **caps):
+        result = original(query, params, timeout_ms, settings, **caps)
         return SimpleNamespace(data=result.data)
 
     engine.execute_ch_query = without_server_time
@@ -1401,7 +1783,9 @@ def test_wall_spent_during_materialisation_still_publishes_the_certified_user():
     original = engine.execute_ch_query
     metric_timeouts: list[int | None] = []
 
-    def slow_replay_then_metrics(query, params=None, timeout_ms=None, settings=None):
+    def slow_replay_then_metrics(
+        query, params=None, timeout_ms=None, settings=None, **caps
+    ):
         import time
 
         if "session_rows AS" in query:
@@ -1413,7 +1797,7 @@ def test_wall_spent_during_materialisation_still_publishes_the_certified_user():
             )
         if "candidate_users AS" in query:
             time.sleep(0.08)
-        return original(query, params, timeout_ms, settings)
+        return original(query, params, timeout_ms, settings, **caps)
 
     engine.execute_ch_query = slow_replay_then_metrics
     manager = UsersListManager(

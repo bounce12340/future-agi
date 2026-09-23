@@ -60,10 +60,25 @@ certified so far, in order, with a cursor; it never falls back to the
 whole-window statement. A slice that fails on a read budget is retried
 narrower, never wider.
 
-Cursor. ``(marker, last_key, last_id, coverage)``: every user with a matching
-row at or after ``coverage`` is decided; the keyset ``(key, id) < (last_key,
-last_id)`` under ``(key DESC, id DESC)`` rejects a re-discovered published user
-at the enrichment step, before any replay.
+Tied instant. Inside one timestamp the slice's raw id order is not the
+page's resolved id order (an alias may resolve to a survivor on either side of
+it), so no user at a truncated floor is publishable until every raw id at that
+instant has been seen. When a truncated slice returns only rows of its floor's
+instant, or a cursor says an instant is open, the walk decides that instant on
+its own: ``build_matching_activity_instant_query`` returns the RESOLVED users
+witnessed at exactly that instant in descending id order, so each certified
+batch settles a closed id range ``[last returned, before)`` and its members
+publish at once in ``(key, id)`` order. A cohort larger than one request
+resumes inside the instant instead of starting it again.
+
+Cursor. ``(marker, last_key, last_id, coverage[, open_instant])``: every user
+with a matching row at or after ``coverage`` is decided; the keyset ``(key,
+id) < (last_key, last_id)`` under ``(key DESC, id DESC)`` rejects a
+re-discovered published user at the enrichment step, before any replay, and
+inside an instant it names the lowest decided position, published or not.
+``open_instant`` (present only when true; a four-element cursor is read as
+false) tells the next request to decide the instant just below ``coverage``
+first, from ``last_id`` when ``last_key`` is that instant.
 """
 
 from __future__ import annotations
@@ -99,11 +114,12 @@ USER_LIST_PAGE_WALL_MS = settings.USER_LIST_PAGE_WALL_MS
 # Finish mode is exempt from the PAGE wall by design: a page that has already
 # certified its users should publish them rather than return empty because the
 # search spent the wall. Exempt from the page wall is not the same as exempt
-# from every deadline -- without one these statements carry no server timeout
-# at all -- so they run under the analytics wall, measured from the START of
-# the walk rather than restarted at materialisation. Restarting it would let
-# one page spend the page wall AND a whole analytics wall after it; measuring
-# from the walk's start bounds search plus finish together.
+# from every deadline -- application reads carry no server time cap unless the
+# caller asks for one -- so they run under the analytics wall, measured from
+# the START of the walk rather than restarted at materialisation, and ask the
+# server to enforce it. Restarting it would let one page spend the page wall
+# AND a whole analytics wall after it; measuring from the walk's start ends
+# the finish by the analytics wall.
 USER_LIST_WALK_FINISH_WALL_MS = settings.INTERACTIVE_ANALYTICS_DEFAULT_WALL_MS
 USER_LIST_WALK_MAX_STATEMENTS = settings.USER_LIST_WALK_MAX_STATEMENTS
 USER_LIST_WALK_INITIAL_SLICE = timedelta(
@@ -206,6 +222,11 @@ class _WalkState:
     certified: dict[str, _Certified] = field(default_factory=dict)
     published: list[dict[str, Any]] = field(default_factory=list)
     stopped: bool = False
+    # The tied instant being decided, the id below which it was entered, and
+    # the resolved ids it returned (certified), in descending order.
+    instant: datetime | None = None
+    instant_after: str | None = None
+    instant_ids: list[str] = field(default_factory=list)
 
     def keyset_admits(self, key: datetime, end_user_id: str) -> bool:
         if self.last_key is None:
@@ -214,8 +235,14 @@ class _WalkState:
             return key < self.last_key
         return self.last_id is None or end_user_id < self.last_id
 
-    def pending(self, boundary: datetime | None) -> list[_Certified]:
-        """Certified members publishable now, newest first."""
+    def pending(
+        self, boundary: datetime | tuple[datetime, str] | None
+    ) -> list[_Certified]:
+        """Certified members publishable now, newest first.
+
+        A time ``boundary`` leaves undecided users at or below it; a tuple
+        ``(instant, id)`` leaves them strictly below that position.
+        """
 
         rows = [
             entry
@@ -223,11 +250,25 @@ class _WalkState:
             if entry.order_key is not None
             and not entry.published
             and not (entry.materialised and not entry.member)
-            and (boundary is None or entry.order_key > boundary)
+            and _clears(entry, boundary)
             and self.keyset_admits(entry.order_key, entry.end_user_id)
         ]
         rows.sort(key=lambda entry: (entry.order_key, entry.end_user_id), reverse=True)
         return rows
+
+
+def _clears(
+    entry: _Certified, boundary: datetime | tuple[datetime, str] | None
+) -> bool:
+    if boundary is None:
+        return True
+    if isinstance(boundary, tuple):
+        return (entry.order_key, entry.end_user_id) >= boundary
+    return entry.order_key > boundary
+
+
+def _boundary_time(boundary: datetime | tuple[datetime, str] | None) -> datetime | None:
+    return boundary[0] if isinstance(boundary, tuple) else boundary
 
 
 def _utc(value: Any) -> datetime | None:
@@ -270,6 +311,8 @@ class _Slice:
     # The last RAW id returned, in ``(raw_newest DESC, raw_end_user_id DESC)``
     # order: the keyset a truncated slice continues from, and its floor.
     raw_last: tuple[datetime, str] | None
+    # Every returned row shares one instant (a truncated tie).
+    tied: bool = False
 
 
 def _statement_ms(result: Any, started: float) -> float:
@@ -386,35 +429,98 @@ def _read_slice(
                 raw_rows.append((raw_id, newest))
         ordered = sorted(raw_rows, key=lambda item: (item[1], item[0]), reverse=True)
         query_ms = _statement_ms(result, started)
-        remap_rows: list[dict[str, Any]] = []
-        if raw_rows:
-            if not state.budget.take(1):
-                return None
-            remap_query, remap_params = state.builder.build_dimension_survivor_query(
-                [raw_id for raw_id, _newest in raw_rows]
-            )
-            started = time.monotonic()
-            try:
-                remap = ulm.V2AnalyticsQueryService().execute_ch_query(
-                    remap_query,
-                    remap_params,
-                    timeout_ms=state.budget.deadline.remaining_ms(),
-                    settings=ulm._page_read_settings(
-                        max_result_rows=ulm._USER_LIST_ATTR_RESULT_ROWS
-                    ),
-                )
-            except ReadDeadlineExceeded:
-                state.budget.exhausted_by = "wall"
-                return None
-            remap_rows = list(remap.data or ())
-            query_ms += _statement_ms(remap, started)
+        remap = _read_survivors(state, [raw_id for raw_id, _newest in raw_rows])
+        if remap is None:
+            return None
+        remap_rows, remap_ms = remap
         return _Slice(
             candidates=_resolve_raw_witnesses(ordered, remap_rows),
             truncated=len(ordered) >= USER_LIST_WALK_SLICE_USER_LIMIT,
-            query_ms=query_ms,
+            query_ms=query_ms + remap_ms,
             slice_start=slice_start,
             raw_last=ordered[-1][::-1] if ordered else None,
+            tied=bool(ordered) and ordered[0][1] == ordered[-1][1],
         )
+
+
+def _read_survivors(
+    state: _WalkState, ids: list[str]
+) -> tuple[list[dict[str, Any]], float] | None:
+    """The bounded survivor statement over exactly ``ids``; none for no ids."""
+
+    from tracer.services import users_list_manager as ulm
+
+    if not ids:
+        return [], 0.0
+    if not state.budget.take(1):
+        return None
+    query, params = state.builder.build_dimension_survivor_query(ids)
+    started = time.monotonic()
+    try:
+        result = ulm.V2AnalyticsQueryService().execute_ch_query(
+            query,
+            params,
+            timeout_ms=state.budget.deadline.remaining_ms(),
+            settings=ulm._page_read_settings(
+                max_result_rows=ulm._USER_LIST_ATTR_RESULT_ROWS
+            ),
+        )
+    except ReadDeadlineExceeded:
+        state.budget.exhausted_by = "wall"
+        return None
+    return list(result.data or ()), _statement_ms(result, started)
+
+
+def _read_instant(
+    state: _WalkState, instant: datetime, before_id: str | None
+) -> _Slice | None:
+    """Resolved users witnessed at ``instant`` below ``before_id``, id DESC.
+
+    The same bounded survivor statement as a slice then attaches every alias
+    of each returned user, so certification scans all of its identities.
+    """
+    from tracer.services import users_list_manager as ulm
+
+    if not state.budget.take(1):
+        return None
+    query, params = state.builder.build_matching_activity_instant_query(
+        instant=instant,
+        limit=USER_LIST_WALK_SLICE_USER_LIMIT,
+        before_end_user_id=before_id,
+    )
+    started = time.monotonic()
+    try:
+        result = ulm.V2AnalyticsQueryService().execute_ch_query(
+            query,
+            params,
+            timeout_ms=state.budget.deadline.remaining_ms(),
+            settings=ulm._page_replay_read_settings(
+                max_result_rows=USER_LIST_WALK_SLICE_USER_LIMIT
+            ),
+        )
+    except ReadDeadlineExceeded:
+        state.budget.exhausted_by = "wall"
+        return None
+    ids = [
+        str(row.get("instant_end_user_id"))
+        for row in result.data or ()
+        if row.get("instant_end_user_id")
+    ]
+    query_ms = _statement_ms(result, started)
+    remap = _read_survivors(state, ids)
+    if remap is None:
+        return None
+    remap_rows, remap_ms = remap
+    return _Slice(
+        candidates=_resolve_raw_witnesses(
+            [(user_id, instant) for user_id in ids], remap_rows
+        ),
+        truncated=len(ids) >= USER_LIST_WALK_SLICE_USER_LIMIT,
+        query_ms=query_ms + remap_ms,
+        slice_start=instant,
+        raw_last=None,
+        tied=True,
+    )
 
 
 def _probe_wall_spent(state: _WalkState) -> None:
@@ -574,22 +680,28 @@ def _finish_deadline(state: _WalkState) -> ReadDeadline:
     real request deadline would start EARLIER and so have LESS left by the
     time materialisation runs; measuring from the walk gives a budget at
     least as large as that, never smaller. What it is smaller than is the
-    fresh wall it replaces, which is the point: the whole page -- search
-    under the page wall, then finish -- adds up to the analytics wall
-    instead of to the page wall plus a further one.
+    fresh wall it replaces, which is the point: the finish ends by the
+    analytics wall measured from the walk's start instead of a further full
+    wall after the page wall. The search before it is bounded by the page
+    wall only at admission (its statements carry no server cap), so one
+    search statement admitted in time may still run past it; a finish that
+    then has less than a statement's floor left is refused, not started.
 
-    In today's settings the difference is latent rather than live. Both
-    enrichment and the candidate replay cap their own statement timeouts at
-    ``USER_LIST_QUERY_TIMEOUT_MS`` / ``USER_LIST_ENRICHMENT_TIMEOUT_MS``
-    (8,000 ms each) and take the smaller of cap and remaining, so the
-    reachable worst case is about the page wall plus two capped statements
-    either way. This binding matters if the page wall is ever raised near
-    the analytics wall, and it is what stops a second full wall existing at
-    all.
+    The deadline is enforced on the server (``enforce_on_server``): each
+    finishing statement sends the smaller of its own cap
+    (``USER_LIST_QUERY_TIMEOUT_MS`` / ``USER_LIST_ENRICHMENT_TIMEOUT_MS``) and
+    what is left as ``max_execution_time``, so a running replay, metrics,
+    evals or relation statement is stopped there, not only refused admission
+    after it. A statement the server stops raises ``ReadDeadlineExceeded``:
+    the page is published as degraded with its certified users carried in
+    the cursor. On a server profile locked at ``readonly=1`` no query
+    setting reaches ClickHouse and only the profile's limits apply.
     """
 
     spent = state.budget.deadline.elapsed_ms()
-    return ReadDeadline.start(max(1.0, USER_LIST_WALK_FINISH_WALL_MS - spent))
+    return ReadDeadline.start(
+        max(1.0, USER_LIST_WALK_FINISH_WALL_MS - spent), enforce_on_server=True
+    )
 
 
 def _materialise(state: _WalkState, entries: list[_Certified]) -> bool:
@@ -618,9 +730,10 @@ def _materialise(state: _WalkState, entries: list[_Certified]) -> bool:
             # last of it and the metrics read that follows raise on the client
             # clock, dropping a user the page had already certified. The
             # analytics wall MINUS what the walk has already spent keeps that
-            # property, gives both statements a server timeout that
-            # ``deadline=None`` did not, and bounds search plus finish
-            # together instead of granting a second full wall here.
+            # property, reaches ClickHouse as each statement's
+            # ``max_execution_time`` (which ``deadline=None`` never did), and
+            # ends the finish by the analytics wall instead of granting a
+            # second full wall here.
             deadline=_finish_deadline(state),
             enrich_rows=True,
             candidate_rows=None,
@@ -668,6 +781,69 @@ def _publish(state: _WalkState, boundary: datetime | None) -> bool:
     return True
 
 
+def _decide_instant(
+    state: _WalkState, instant: datetime
+) -> tuple[bool, datetime | tuple[datetime, str]]:
+    """Decide the users of one tied instant, publishing in ``(key, id)`` order.
+
+    Enters below ``last_id`` when ``last_key`` is this instant (everything at
+    or above that position is decided). Each certified batch of the instant
+    statement settles every resolved user at the instant from its last id up,
+    so its members publish at once. Returns ``(True, instant - 1us)`` once
+    the instant is exhausted; otherwise ``(False, boundary)`` with what is
+    decided so far, having set ``state.stopped`` if the budget ended it.
+    """
+    state.instant = instant
+    state.instant_after = state.last_id if state.last_key == instant else None
+    state.instant_ids = []
+    after = state.instant_after
+    boundary: datetime | tuple[datetime, str] = instant
+    batch_size = USER_LIST_WALK_CERTIFY_BATCH_SIZE
+    while len(state.published) < state.page_size:
+        read = _read_instant(state, instant, after)
+        if read is None:
+            state.stopped = True
+            return False, boundary
+        for start in range(0, len(read.candidates), batch_size):
+            batch = read.candidates[start : start + batch_size]
+            fresh = [c for c in batch if c.end_user_id not in state.certified]
+            if fresh and not _certify(state, fresh):
+                state.stopped = True
+                return False, boundary
+            state.instant_ids.extend(c.end_user_id for c in batch)
+            boundary = (instant, batch[-1].end_user_id)
+            if not _publish(state, boundary):
+                state.stopped = True
+                return False, boundary
+            if len(state.published) == state.page_size:
+                return False, boundary
+        if not read.truncated:
+            state.instant = None
+            return True, instant - _TICK
+        after = read.candidates[-1].end_user_id
+    return False, boundary
+
+
+def _instant_position(state: _WalkState) -> str | None:
+    """The lowest id of the open instant's decided prefix.
+
+    Every user at the instant with an id at or above it is published, or
+    certified as not placed there (no live match, a key elsewhere, or
+    rejected by the replay), so a cursor may resume strictly below it.
+    """
+    position = state.instant_after
+    for user_id in state.instant_ids:
+        entry = state.certified.get(user_id)
+        if entry is None or not (
+            entry.published
+            or entry.order_key != state.instant
+            or (entry.materialised and not entry.member)
+        ):
+            break
+        position = user_id
+    return position
+
+
 def _slices_needed(width: timedelta) -> int:
     """Slices at the cap that ``width`` of window still needs."""
 
@@ -704,17 +880,26 @@ def walk_matching_activity_page(
         raise ListCursorError(
             "invalid_cursor", "User ordering changed; restart pagination."
         )
+    open_instant = False
     if cursor_order is None:
         last_key, last_id, coverage = None, None, window_end
     else:
-        if len(cursor_order) != 4 or cursor_order[0] != USER_LIST_MATCHING_CURSOR_ORDER:
+        if (
+            len(cursor_order) not in (4, 5)
+            or cursor_order[0] != USER_LIST_MATCHING_CURSOR_ORDER
+        ):
             raise ListCursorError(
                 "invalid_cursor", "User ordering changed; restart pagination."
             )
         last_key = _utc(cursor_order[1])
         last_id = str(cursor_order[2]) if cursor_order[2] is not None else None
         coverage = _utc(cursor_order[3])
-        if coverage is None or (last_key is None) != (last_id is None):
+        open_instant = len(cursor_order) == 5 and cursor_order[4] is True
+        if (
+            coverage is None
+            or (last_key is None) != (last_id is None)
+            or (len(cursor_order) == 5 and not open_instant)
+        ):
             raise ListCursorError(
                 "invalid_cursor", "User ordering changed; restart pagination."
             )
@@ -735,11 +920,27 @@ def walk_matching_activity_page(
     slice_end = min(coverage, window_end)
     width = USER_LIST_WALK_INITIAL_SLICE
     before: tuple[datetime, str] | None = None
-    # Every undecided user's newest matching row lies strictly below this line.
-    boundary: datetime | None = slice_end
+    # Every undecided user's newest matching row lies at or below this line
+    # (a time), or strictly below this position inside a tied instant.
+    boundary: datetime | tuple[datetime, str] | None = slice_end
     exhausted = manager.empty_scope or slice_end <= window_start
     probed = False
+    # An instant to decide before the next slice: the one the cursor left
+    # open, or the floor of a slice that returned nothing else.
+    next_instant = slice_end - _TICK if open_instant else None
     while not exhausted and not state.stopped and len(state.published) < page_size:
+        if next_instant is not None:
+            decided, boundary = _decide_instant(state, next_instant)
+            if not decided:
+                break
+            slice_end, before, next_instant = next_instant, None, None
+            if slice_end <= window_start:
+                exhausted = True
+                boundary = None
+                if not _publish(state, boundary):
+                    state.stopped = True
+                break
+            continue
         read = _read_slice(
             state,
             slice_start=max(window_start, slice_end - width),
@@ -756,6 +957,17 @@ def walk_matching_activity_page(
             # A populated slice re-arms the tail probe: the tail below it is a
             # new question, and one probe per populated region is the bound.
             probed = False
+        if read.truncated and read.tied:
+            # A whole slice of raw ids at one instant: certifying them here
+            # could publish none of them (the tie is undecided until the
+            # instant is exhausted), so decide the instant in resolved order.
+            boundary = floor
+            if not _publish(state, boundary):
+                state.stopped = True
+                break
+            next_instant = floor
+            width = max(USER_LIST_WALK_MIN_SLICE, width / 4)
+            continue
         batch_size = USER_LIST_WALK_CERTIFY_BATCH_SIZE
         for start in range(0, len(candidates), batch_size):
             batch = candidates[start : start + batch_size]
@@ -833,14 +1045,24 @@ def walk_matching_activity_page(
         # and published; a carried member's own newest matching row and every
         # undecided user's rows lie below it.
         keys = [entry.order_key for entry in leftover if entry.order_key is not None]
-        anchors = [*keys, *([boundary] if boundary is not None else [])]
+        boundary_time = _boundary_time(boundary)
+        anchors = [*keys, *([boundary_time] if boundary_time is not None else [])]
         next_coverage = max(anchors) + _TICK if anchors else window_start
+        last_key, last_id = state.last_key, state.last_id
+        position = _instant_position(state) if state.instant is not None else None
+        if position is not None:
+            last_key, last_id = state.instant, position
         checkpoint = (
             USER_LIST_MATCHING_CURSOR_ORDER,
-            state.last_key,
-            state.last_id,
+            last_key,
+            last_id,
             min(next_coverage, window_end),
         )
+        # An instant left undecided, or a walk its budget stopped, resumes by
+        # deciding the instant below ``coverage`` in resolved order: a raw
+        # restart there would rediscover the same tied prefix and stall.
+        if state.instant is not None or state.stopped:
+            checkpoint = (*checkpoint, True)
     if state.stopped:
         logger.info(
             "users_matching_walk_budget_exhausted",
