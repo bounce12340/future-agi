@@ -1863,7 +1863,7 @@ def fetch_user_system_metric_graph_ch(
             # The direct failure is already sanitized. Cache/worker transport
             # availability must not turn it into a raw API exception.
             logger.warning(
-                "user graph exact refresh scheduling degraded",
+                "user_graph_exact_refresh_scheduling_degraded",
                 metric_id=normalized_metric_id,
                 error_type=type(exc).__name__,
                 exc_info=True,
