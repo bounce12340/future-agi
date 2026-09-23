@@ -413,8 +413,11 @@ def _follow_on(
     finish: int,
     outage_every: int | None,
 ) -> tuple[list[str], int]:
-    budget = walk._statement_budget(_keyed_manager(keys, finish))
-    assert budget >= (max_statements or walk.USER_LIST_WALK_MAX_STATEMENTS)
+    budget = max(
+        max_statements or walk.USER_LIST_WALK_MAX_STATEMENTS,
+        _one_decision(keys, finish),
+    )
+    assert walk._statement_budget(_keyed_manager(keys, finish)) == budget
     names: list[str] = []
     seen_states: set = set()
     coverage = WINDOW_END
@@ -514,6 +517,25 @@ def _keyed_manager(keys: int, finish: int = 1):
     )
     assert walk._materialisation_statement_count(manager) == finish
     return manager
+
+
+def _one_decision(keys: int, finish: int = 1) -> int:
+    """The statements one decision takes, restated from its parts.
+
+    Not read from ``walk._statement_budget``, so a budget that grows past
+    what a decision needs is caught: the open instant; the first slice and
+    its retries a quarter as wide down to the least width; the head-of-line
+    slice read without a cap and its survivor statement, then the instant
+    read and its survivor statement; a batch's enrichment, and the
+    head-of-line user's alone after it fails, each one statement for the
+    filtered key and one per four of the ``keys`` others; and a finish of
+    ``finish`` statements with its uncapped retry.
+    """
+    width, retries = walk.USER_LIST_WALK_INITIAL_SLICE, 0
+    while width > walk.USER_LIST_WALK_MIN_SLICE:
+        width, retries = width / 4, retries + 1
+    enrichment = 1 + -(-keys // 4)
+    return 1 + 1 + retries + 2 + 2 + 2 * enrichment + 2 * finish
 
 
 @contextmanager
@@ -1261,6 +1283,48 @@ def test_a_batch_whose_enrichment_runs_out_of_memory_certifies_its_head_alone():
     assert last.payload["query_exact"] is True
 
 
+@pytest.mark.parametrize("tied", [False, True], ids=["spread", "tied"])
+@pytest.mark.parametrize("keys", [40, 44, 100])
+def test_a_batch_that_runs_out_of_memory_at_many_keys_still_publishes(keys, tied):
+    """The head-of-line user's retry is a second enrichment, and it fits.
+
+    Five users over the window do not fit in memory, one does, whatever the
+    page's attribute keys (``_MemoryEngine``). A batch's enrichment is
+    charged in full before it is sent, and the head-of-line user alone is
+    charged again after it fails. With one enrichment reserved, from 44 keys
+    (12 statements) the budget refused that retry and no request published
+    anyone; at 40 keys the retry fitted and the replay after it did not, so
+    a request resuming inside a tie returned the cursor it was given. The
+    tie here is 30 users at one instant, more than a request decides.
+    """
+    world, expected = _tied_world(30) if tied else _spread_world(5, 3)
+    clock = _Clock()
+    names: list[str] = []
+    cursor = None
+    per_hop: list[int] = []
+    failed_batches = 0
+    resumed_in_instant = 0
+    with _shipped_walls(), _scripted_clock(clock):
+        for _hop in range(2 * len(expected) + 2):
+            memory = _MemoryEngine(world, clock=clock, user_hours=30.0)
+            read = _keyed_page(page_size=25, cursor=cursor, engine=memory, keys=keys)
+            per_hop.append(len(_names(read)))
+            names.extend(_names(read))
+            failed_batches += sum(1 for n, _b, f in memory.enrichments if n > 1 and f)
+            if not read.has_more:
+                break
+            order = tuple(read.checkpoint_order)
+            resumed_in_instant += len(order) == 5 and order[4]
+            cursor = _signed_cursor(read)
+
+    # Users are published on every pair of consecutive requests.
+    assert all(a or b for a, b in zip(per_hop, per_hop[1:], strict=False)), per_hop
+    assert names == expected, per_hop
+    assert failed_batches > 0
+    if tied:
+        assert resumed_in_instant > 0, per_hop
+
+
 @pytest.mark.parametrize("slices", ["cheap", "every_capped_slice_stopped"])
 def test_an_enrichment_that_fails_above_a_bucket_width_still_ends(slices):
     """Every enrichment wider than ten minutes runs out of memory, one user or five.
@@ -1303,7 +1367,7 @@ def test_the_views_largest_key_count_still_decides_every_user():
     Certifying a batch reads every key, four ordinary keys a statement: 26
     statements, more than the 24-statement budget, so every certification
     was refused and the list returned empty, degraded pages forever. A
-    request may always spend one batch's decision.
+    request may always spend one batch's decision: 63 statements here.
     """
     from tracer.serializers.trace import UsersQuerySerializer
     from tracer.services.clickhouse.client import ClickHouseClient
@@ -1348,7 +1412,7 @@ def test_the_views_largest_key_count_still_decides_every_user():
     cursor = None
     for _hop in range(6):
         read, statements = page(cursor)
-        assert statements <= 9 + 26 + 2 * 1, statements
+        assert statements <= _one_decision(99) == 63, statements
         names.extend(_names(read))
         if not read.has_more:
             break

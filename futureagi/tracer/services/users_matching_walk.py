@@ -359,6 +359,8 @@ def _statement_budget(manager: Any) -> int:
     enrichment alone reads every requested attribute key, four ordinary keys
     a statement, so at the view's 100 keys it is 26 statements, more than the
     configured 24: every certification was refused and the list never moved.
+    A batch whose enrichment runs out of a read budget is charged it again
+    for its head-of-line user alone, so one decision at 100 keys is 63.
     The bound stays explicit, the larger of two numbers known before the
     first statement; outside it are only the time buckets one user's
     enrichment may split into when it runs out of memory (``_certify``).
@@ -383,11 +385,12 @@ def _head_statements(manager: Any) -> int:
 
     The slice itself and its survivor statement; when it comes back tied at
     one instant, the instant read and its survivor statement; one batch's
-    enrichment; and a finish with its uncapped retry.
+    enrichment and, when that runs out of a read budget, the head-of-line
+    user's own (``_certify``); and a finish with its uncapped retry.
     """
     return (
         4
-        + _enrichment_statement_count(manager)
+        + 2 * _enrichment_statement_count(manager)
         + 2 * _materialisation_statement_count(manager)
     )
 
@@ -818,7 +821,9 @@ def _certify(state: _WalkState, batch: list[_Candidate]) -> int:
     the budget or the wall refused. A batch's enrichment is not split in
     time: when it runs out of a read budget (memory, rows), the head-of-line
     user alone is certified instead, a statement that holds a batch's
-    fraction of the rows, and only that one may split its time buckets
+    fraction of the rows, charged as a second enrichment (the failed one
+    may have sent any of its statements; ``_head_statements`` reserves
+    both), and only that one may split its time buckets
     (``UsersListManager._read_span_attributes``). The rest of the request
     certifies one user at a time.
     """
