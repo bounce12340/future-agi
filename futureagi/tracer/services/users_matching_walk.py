@@ -338,9 +338,8 @@ def _statement_budget(manager: Any) -> int:
 
     One decision is what a request needs to decide its first batch: the open
     instant, a slice and its retries a quarter as wide down to the least
-    width, the head-of-line slice read again without a cap (``_read_slice``),
-    its survivor statement, the batch's enrichment and a finish with its
-    uncapped retry. The enrichment alone reads every
+    width, and the head-of-line decision (``_head_statements``). The
+    enrichment alone reads every
     requested attribute key, four ordinary keys a statement, so at the view's
     100 keys it is 26 statements, more than the configured 24: every
     certification was refused and the list never moved. The bound stays
@@ -364,11 +363,12 @@ def _narrowings() -> int:
 def _head_statements(manager: Any) -> int:
     """What deciding the head-of-line slice's first batch costs, uncapped.
 
-    The slice itself, its survivor statement, one batch's enrichment and a
-    finish with its uncapped retry.
+    The slice itself and its survivor statement; when it comes back tied at
+    one instant, the instant read and its survivor statement; one batch's
+    enrichment; and a finish with its uncapped retry.
     """
     return (
-        2
+        4
         + _enrichment_statement_count(manager)
         + 2 * _materialisation_statement_count(manager)
     )
@@ -470,8 +470,11 @@ def _read_slice(
     decides that slice's first batch with no deadline (``_admission_deadline``):
     an exact list can neither skip that slice nor publish anyone below it
     first, so no bounded retry keeps the list both exact and moving. That
-    slice is the request's only uncapped one; its statements and the
-    finish's uncapped replay (``_materialise``) are its only unbounded ones.
+    slice is the request's only uncapped slice. It, the statements that
+    decide its first batch (its survivor statement; the instant read and its
+    survivor statement when it comes back tied at one instant; one batch's
+    enrichment) and the finish's uncapped replay (``_materialise``) are the
+    request's only unbounded statements.
     Once the request has decided something, a stopped slice it cannot
     narrow, or whose retry the page wall refuses, ends it.
     """
@@ -824,8 +827,10 @@ def _admission_deadline(state: _WalkState) -> ReadDeadline | None:
     mode's budget; admission only, like every search statement) instead of
     the page wall. Once that wall is spent, or the request has read its
     head-of-line slice without a cap (``_read_slice``), the statements that
-    decide that slice's first batch are admitted with no deadline: at most
-    one survivor statement and one batch's enrichment, once per request.
+    decide that slice's first batch are admitted with no deadline: its
+    survivor statement, the instant read and its survivor statement when
+    the slice is tied at one instant, and one batch's enrichment, once per
+    request.
     """
 
     if not state.progress_owed:

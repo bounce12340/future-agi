@@ -336,15 +336,16 @@ def _decision_budget(configured: int) -> int:
 
     One decision: the open instant, a slice and three retries a quarter as
     wide (one hour down to one minute), the head-of-line slice without a
-    cap, its survivors, one batch's enrichment, and a finish with its
-    uncapped retry.
+    cap and its survivors, the instant read and its survivors when that
+    slice is tied at one instant, one batch's enrichment, and a finish with
+    its uncapped retry.
     """
     assert walk.USER_LIST_WALK_INITIAL_SLICE == timedelta(hours=1)
     assert walk.USER_LIST_WALK_MIN_SLICE == timedelta(minutes=1)
     manager = _manager()
     return max(
         configured,
-        7
+        9
         + walk._enrichment_statement_count(manager)
         + 2 * walk._materialisation_statement_count(manager),
     )
@@ -844,7 +845,7 @@ def test_the_views_largest_key_count_still_decides_every_user():
     cursor = None
     for _hop in range(6):
         read, statements = page(cursor)
-        assert statements <= 7 + 26 + 2 * 1, statements
+        assert statements <= 9 + 26 + 2 * 1, statements
         names.extend(_names(read))
         if not read.has_more:
             break
