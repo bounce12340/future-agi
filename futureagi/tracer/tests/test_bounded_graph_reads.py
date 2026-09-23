@@ -5097,6 +5097,7 @@ def test_users_graph_scheduling_transport_failure_is_logged_and_degrades(
     assert response["query_complete"] is False
     assert response["query_error_code"] == "read_budget_exceeded"
     assert len(warning_calls) == 1
+    assert warning_calls[0][0] == ("user_graph_exact_refresh_scheduling_degraded",)
     assert warning_calls[0][1]["exc_info"] is True
     assert warning_calls[0][1]["error_type"] == type(error).__name__
     assert warning_calls[0][1]["metric_id"] == "active_users"
