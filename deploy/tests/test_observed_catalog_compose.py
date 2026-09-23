@@ -57,6 +57,53 @@ def compose(
 
 
 class ComposeContractTests(unittest.TestCase):
+    def test_observed_and_error_feed_topics_remain_separate(self):
+        services = compose(ERROR_FEED_KAFKA_TOPIC="error-feed.custom.v1")["services"]
+        init = services["property-catalog-topic-init"]
+        collector = services["fi-collector"]["environment"]
+        self.assertEqual(
+            collector["FI_ERROR_FEED_KAFKA_TOPIC"],
+            init["environment"]["ERROR_FEED_KAFKA_TOPIC"],
+        )
+        self.assertEqual(
+            collector["FI_OBSERVED_CATALOG_KAFKA_BROKERS"],
+            collector["FI_ERROR_FEED_KAFKA_BROKERS"],
+        )
+        # Execute only shell validation; replace the Kafka CLI with an argv recorder.
+        script = (
+            init["command"][0]
+            .replace("$$", "$")
+            .replace("/opt/kafka/bin/kafka-topics.sh", "printf '%s\\n'")
+        )
+        for override, valid in (
+            ({}, True),
+            ({"ERROR_FEED_KAFKA_TOPIC": "futureagi.observed-attributes.v1"}, False),
+            ({"ERROR_FEED_KAFKA_TOPIC": "bad/topic"}, False),
+            ({"ERROR_FEED_KAFKA_TOPIC": ""}, False),
+            ({"PROPERTY_CATALOG_KAFKA_PARTITIONS": "0"}, False),
+            (
+                {
+                    "OBSERVED_CATALOG_KAFKA_TOPIC": "futureagi.oss.property-catalog.ordered.v1"
+                },
+                False,
+            ),
+        ):
+            with self.subTest(override=override):
+                result = subprocess.run(
+                    ["/bin/sh", "-ec", script],
+                    env={**init["environment"], **override},
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                self.assertEqual(result.returncode, 0 if valid else 64, result.stderr)
+                if valid:
+                    self.assertEqual(result.stdout.splitlines().count("--create"), 2)
+                    self.assertIn("futureagi.observed-attributes.v1\n", result.stdout)
+                    self.assertIn("error-feed.custom.v1\n", result.stdout)
+                else:
+                    self.assertEqual(result.stdout, "")
+
     def test_collector_receives_explicit_tls_configuration(self):
         tls = {
             "PGSSLMODE": "verify-full",

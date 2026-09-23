@@ -5,7 +5,7 @@
 export const API_SURFACE_CONTRACT = Object.freeze({
   generatedFrom: "api_contracts/openapi/swagger.json",
   swaggerVersion: "2.0",
-  endpointCount: 1006,
+  endpointCount: 1037,
   groups: {
     accounts: {
       "/accounts/2fa/recovery-codes/": ["get"],
@@ -852,6 +852,7 @@ export const API_SURFACE_CONTRACT = Object.freeze({
       "/simulate/api/harness-jobs/{id}/": ["get"],
       "/simulate/api/harness-jobs/{id}/adjust/": ["post"],
       "/simulate/api/harness-jobs/{id}/cancel/": ["post"],
+      "/simulate/api/harness-jobs/{id}/conversation/messages/": ["post"],
       "/simulate/api/harness-jobs/{id}/extend/": ["post"],
       "/simulate/api/harness/attempts/{id}/artifacts/manifest/": ["post"],
       "/simulate/api/harness/attempts/{id}/artifacts/{artifact_digest}/": [
@@ -862,6 +863,30 @@ export const API_SURFACE_CONTRACT = Object.freeze({
       "/simulate/api/harness/attempts/{id}/results/": ["post"],
       "/simulate/api/harness/attempts/{id}/scenarios/": ["post"],
       "/simulate/api/harness/attempts/{id}/usage/": ["post"],
+      "/simulate/api/harness/conversations/{id}/adjust/": ["post"],
+      "/simulate/api/harness/conversations/{id}/commands/": ["get"],
+      "/simulate/api/harness/conversations/{id}/events/": ["post"],
+      "/simulate/api/harness/conversations/{id}/rerun/": ["post"],
+      "/simulate/api/harness/conversations/{id}/run-status/": ["get"],
+      "/simulate/api/harness/conversations/{id}/session-store/": ["get"],
+      "/simulate/api/harness/conversations/{id}/session-store/append/": [
+        "post",
+      ],
+      "/simulate/api/harness/conversations/{id}/workspace/": ["put"],
+      "/simulate/api/harness/ingress/{token}/": [
+        "delete",
+        "get",
+        "patch",
+        "post",
+        "put",
+      ],
+      "/simulate/api/harness/ingress/{token}/{target_path}": [
+        "delete",
+        "get",
+        "patch",
+        "post",
+        "put",
+      ],
       "/simulate/api/livekit/call-config/{call_id}/": ["get"],
       "/simulate/api/livekit/call-execution/{call_id}/": ["patch"],
       "/simulate/api/livekit/listener-token/{call_id}/": ["get"],
@@ -1031,6 +1056,42 @@ export const API_SURFACE_CONTRACT = Object.freeze({
       "/tracer/feed/issues/{cluster_id}/trends/": ["get"],
       "/tracer/get-annotation-labels/": ["get"],
       "/tracer/imagine-analysis/": ["get", "post"],
+      "/tracer/internal/error-feed-v2/attempts/{attempt_id}/": ["patch"],
+      "/tracer/internal/error-feed-v2/claims/": ["post"],
+      "/tracer/internal/error-feed-v2/grouping/attempts/{attempt_id}/": [
+        "patch",
+      ],
+      "/tracer/internal/error-feed-v2/grouping/attempts/{attempt_id}/checkpoint/":
+        ["put"],
+      "/tracer/internal/error-feed-v2/grouping/attempts/{attempt_id}/publish/":
+        ["post"],
+      "/tracer/internal/error-feed-v2/grouping/attempts/{attempt_id}/reserve/":
+        ["post"],
+      "/tracer/internal/error-feed-v2/grouping/attempts/{attempt_id}/settle/": [
+        "post",
+      ],
+      "/tracer/internal/error-feed-v2/grouping/claims/": ["post"],
+      "/tracer/internal/error-feed-v2/grouping/feature-attempts/{feature_job_id}/":
+        ["patch"],
+      "/tracer/internal/error-feed-v2/grouping/feature-attempts/{feature_job_id}/complete/":
+        ["post"],
+      "/tracer/internal/error-feed-v2/grouping/feature-claims/": ["post"],
+      "/tracer/internal/error-feed-v2/grouping/outbox/": ["post"],
+      "/tracer/internal/error-feed-v2/grouping/outbox/{event_id}/ack/": [
+        "post",
+      ],
+      "/tracer/internal/error-feed-v2/grouping/severity/attempts/{job_id}/": [
+        "patch",
+      ],
+      "/tracer/internal/error-feed-v2/grouping/severity/attempts/{job_id}/publish/":
+        ["post"],
+      "/tracer/internal/error-feed-v2/grouping/severity/attempts/{job_id}/reserve/":
+        ["post"],
+      "/tracer/internal/error-feed-v2/grouping/severity/attempts/{job_id}/settle/":
+        ["post"],
+      "/tracer/internal/error-feed-v2/grouping/severity/claims/": ["post"],
+      "/tracer/internal/error-feed-v2/notifications/": ["post"],
+      "/tracer/internal/error-feed-v2/reports/": ["post"],
       "/tracer/observability-provider/": ["get", "post"],
       "/tracer/observability-provider/verify_api_key/": ["post"],
       "/tracer/observability-provider/verify_assistant_id/": ["post"],
@@ -2039,6 +2100,7 @@ export const API_SURFACE_PATHS = Object.freeze({
   "/simulate/api/harness-jobs/{id}/": ["get"],
   "/simulate/api/harness-jobs/{id}/adjust/": ["post"],
   "/simulate/api/harness-jobs/{id}/cancel/": ["post"],
+  "/simulate/api/harness-jobs/{id}/conversation/messages/": ["post"],
   "/simulate/api/harness-jobs/{id}/extend/": ["post"],
   "/simulate/api/harness/attempts/{id}/artifacts/manifest/": ["post"],
   "/simulate/api/harness/attempts/{id}/artifacts/{artifact_digest}/": ["put"],
@@ -2047,6 +2109,28 @@ export const API_SURFACE_PATHS = Object.freeze({
   "/simulate/api/harness/attempts/{id}/results/": ["post"],
   "/simulate/api/harness/attempts/{id}/scenarios/": ["post"],
   "/simulate/api/harness/attempts/{id}/usage/": ["post"],
+  "/simulate/api/harness/conversations/{id}/adjust/": ["post"],
+  "/simulate/api/harness/conversations/{id}/commands/": ["get"],
+  "/simulate/api/harness/conversations/{id}/events/": ["post"],
+  "/simulate/api/harness/conversations/{id}/rerun/": ["post"],
+  "/simulate/api/harness/conversations/{id}/run-status/": ["get"],
+  "/simulate/api/harness/conversations/{id}/session-store/": ["get"],
+  "/simulate/api/harness/conversations/{id}/session-store/append/": ["post"],
+  "/simulate/api/harness/conversations/{id}/workspace/": ["put"],
+  "/simulate/api/harness/ingress/{token}/": [
+    "delete",
+    "get",
+    "patch",
+    "post",
+    "put",
+  ],
+  "/simulate/api/harness/ingress/{token}/{target_path}": [
+    "delete",
+    "get",
+    "patch",
+    "post",
+    "put",
+  ],
   "/simulate/api/livekit/call-config/{call_id}/": ["get"],
   "/simulate/api/livekit/call-execution/{call_id}/": ["patch"],
   "/simulate/api/livekit/listener-token/{call_id}/": ["get"],
@@ -2208,6 +2292,41 @@ export const API_SURFACE_PATHS = Object.freeze({
   "/tracer/feed/issues/{cluster_id}/trends/": ["get"],
   "/tracer/get-annotation-labels/": ["get"],
   "/tracer/imagine-analysis/": ["get", "post"],
+  "/tracer/internal/error-feed-v2/attempts/{attempt_id}/": ["patch"],
+  "/tracer/internal/error-feed-v2/claims/": ["post"],
+  "/tracer/internal/error-feed-v2/grouping/attempts/{attempt_id}/": ["patch"],
+  "/tracer/internal/error-feed-v2/grouping/attempts/{attempt_id}/checkpoint/": [
+    "put",
+  ],
+  "/tracer/internal/error-feed-v2/grouping/attempts/{attempt_id}/publish/": [
+    "post",
+  ],
+  "/tracer/internal/error-feed-v2/grouping/attempts/{attempt_id}/reserve/": [
+    "post",
+  ],
+  "/tracer/internal/error-feed-v2/grouping/attempts/{attempt_id}/settle/": [
+    "post",
+  ],
+  "/tracer/internal/error-feed-v2/grouping/claims/": ["post"],
+  "/tracer/internal/error-feed-v2/grouping/feature-attempts/{feature_job_id}/":
+    ["patch"],
+  "/tracer/internal/error-feed-v2/grouping/feature-attempts/{feature_job_id}/complete/":
+    ["post"],
+  "/tracer/internal/error-feed-v2/grouping/feature-claims/": ["post"],
+  "/tracer/internal/error-feed-v2/grouping/outbox/": ["post"],
+  "/tracer/internal/error-feed-v2/grouping/outbox/{event_id}/ack/": ["post"],
+  "/tracer/internal/error-feed-v2/grouping/severity/attempts/{job_id}/": [
+    "patch",
+  ],
+  "/tracer/internal/error-feed-v2/grouping/severity/attempts/{job_id}/publish/":
+    ["post"],
+  "/tracer/internal/error-feed-v2/grouping/severity/attempts/{job_id}/reserve/":
+    ["post"],
+  "/tracer/internal/error-feed-v2/grouping/severity/attempts/{job_id}/settle/":
+    ["post"],
+  "/tracer/internal/error-feed-v2/grouping/severity/claims/": ["post"],
+  "/tracer/internal/error-feed-v2/notifications/": ["post"],
+  "/tracer/internal/error-feed-v2/reports/": ["post"],
   "/tracer/observability-provider/": ["get", "post"],
   "/tracer/observability-provider/verify_api_key/": ["post"],
   "/tracer/observability-provider/verify_assistant_id/": ["post"],

@@ -296,6 +296,7 @@ def _ensure_workflows_registered() -> None:
 
     # Register drop-in TaskRunnerWorkflow for all queues
     try:
+        from simulate.temporal.constants import QUEUE_RUNNER
         from tfc.temporal.drop_in import TaskRunnerWorkflow
 
         register_for_queues(
@@ -307,6 +308,7 @@ def _ensure_workflows_registered() -> None:
                 "exact_aggregation",
                 "trace_ingestion",
                 "agent_compass",
+                QUEUE_RUNNER,
             ],
             workflows=[TaskRunnerWorkflow],
         )
@@ -596,22 +598,31 @@ def _ensure_activities_registered() -> None:
         # the production single-slot admission boundary. Keep only tasks_xl as
         # the explicit compatibility route for deployments not yet running the
         # dedicated worker.
+        from simulate.temporal.constants import QUEUE_RUNNER
         from tfc.temporal.drop_in.decorator import get_temporal_activities
 
         drop_in_activities = get_temporal_activities()
         exact_aggregation_activities = get_temporal_activities(
             queue="exact_aggregation"
         )
+        runner_activities = get_temporal_activities(queue=QUEUE_RUNNER)
+        dedicated_activities = {
+            *exact_aggregation_activities,
+            *runner_activities,
+        }
         generic_drop_in_activities = [
             registered_activity
             for registered_activity in drop_in_activities
-            if registered_activity not in exact_aggregation_activities
+            if registered_activity not in dedicated_activities
+        ]
+        tasks_xl_drop_in_activities = [
+            registered_activity
+            for registered_activity in drop_in_activities
+            if registered_activity not in runner_activities
         ]
         log.info("registering_dropin_activities", count=len(drop_in_activities))
 
-        # Generic queues historically register the complete decorator registry.
-        # The exact reader is the sole exception because concurrent execution is
-        # deliberately bounded at the worker queue.
+        # Keep exact reads and hosted-runner activities on their dedicated queues.
         register_for_queues(
             queues=[
                 "default",
@@ -624,7 +635,7 @@ def _ensure_activities_registered() -> None:
         )
         register_for_queues(
             queues=["tasks_xl"],
-            activities=drop_in_activities,
+            activities=tasks_xl_drop_in_activities,
         )
 
         # Exact graph reads have their own single-slot production worker.  Keep
@@ -633,6 +644,10 @@ def _ensure_activities_registered() -> None:
         register_for_queues(
             queues=["exact_aggregation"],
             activities=exact_aggregation_activities,
+        )
+        register_for_queues(
+            queues=[QUEUE_RUNNER],
+            activities=runner_activities,
         )
     except Exception as e:
         log.exception("could_not_load_dropin_activities", error=str(e))

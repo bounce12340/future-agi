@@ -36,6 +36,7 @@ import (
 	"github.com/future-agi/future-agi/fi-collector/pkg/observedcatalog"
 	"github.com/future-agi/future-agi/fi-collector/pkg/pricing"
 	"github.com/future-agi/future-agi/fi-collector/pkg/server"
+	"github.com/future-agi/future-agi/fi-collector/pkg/traceavailable"
 	"github.com/redis/go-redis/v9"
 	"gopkg.in/yaml.v3"
 )
@@ -140,6 +141,18 @@ func main() {
 			runObservedReplay(ctx, catalog, producer, cfg.Observed.ReplayInterval, log)
 		}()
 	}
+	traceNotifications, err := traceavailable.FromEnv(log)
+	if err != nil {
+		log.Error("Error Feed notification configuration failed", "error", err)
+		os.Exit(1)
+	}
+	if traceNotifications != nil {
+		if cfg.Writer.AsyncInsert {
+			log.Error("Error Feed stored-root notifications require synchronous ClickHouse inserts")
+			os.Exit(1)
+		}
+		opts = append(opts, server.WithTraceNotifier(traceNotifications))
+	}
 	srv := server.New(cfg.Server, writer, authenticator, usageEmitter, metering, opts...)
 
 	// Admin HTTP server — internal only, health check endpoint.
@@ -153,6 +166,13 @@ func main() {
 		"ch_url", cfg.Writer.URL,
 	)
 	runErr := srv.Run(ctx)
+	if traceNotifications != nil {
+		drainCtx, stopDrain := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := traceNotifications.Shutdown(drainCtx); err != nil {
+			log.Warn("Error Feed notification shutdown left a gap", "error", err)
+		}
+		stopDrain()
+	}
 	unexpectedExit := runErr != nil && ctx.Err() == nil
 	if unexpectedExit {
 		log.Error("server exited with error; draining catalog lifecycle", "err", runErr)

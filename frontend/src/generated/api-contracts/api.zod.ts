@@ -34936,11 +34936,13 @@ export const SimulateApiCallExecutionsListResponse = zod.array(
 );
 
 /**
- * Validates the v1.6 request contract and delegates execution to the backend
-selected by ``settings.HARNESS_PROVIDER`` (``daytona`` default, or
-``sandbox``). See ``simulate.services.harness_provider``.
+ * Validates the v1.6 request contract and delegates execution to the public backend selected by
+``settings.HARNESS_PROVIDER`` (``hosted`` or ``sandbox``). The hosted backend independently
+selects its managed sandbox runtime.
  * @summary Provider-neutral control plane for hosted ALK harness jobs.
  */
+
+export const simulateApiHarnessJobsListResponseConversationEventWatermarkMin = 0;
 
 export const simulateApiHarnessJobsListResponseConsumptionTextSimTokensMin = 0;
 
@@ -35021,6 +35023,60 @@ export const SimulateApiHarnessJobsListResponseItem = zod.object({
         .optional(),
     })
     .optional(),
+  conversation: zod
+    .object({
+      conversation_id: zod.string().uuid(),
+      job_id: zod.string().uuid(),
+      state: zod.string().min(1),
+      stage: zod.string().min(1),
+      active_invocation_id: zod.string().min(1),
+      blocking_input: zod.object({}).passthrough(),
+      messages: zod.array(
+        zod.object({
+          message_id: zod.string().uuid(),
+          sequence: zod.number().min(1),
+          role: zod.enum(["user", "assistant", "system"]),
+          kind: zod.enum(["message", "question", "confirmation", "status"]),
+          state: zod.enum([
+            "queued",
+            "delivered",
+            "streaming",
+            "completed",
+            "failed",
+          ]),
+          stage: zod.string(),
+          content: zod.string(),
+          payload: zod.object({}).passthrough(),
+          invocation_id: zod.string().min(1).optional(),
+          function_call_id: zod.string().min(1).optional(),
+          reply_to: zod.string().uuid().optional(),
+          created_at: zod.string().datetime({ offset: true }),
+        }),
+      ),
+      events: zod.array(
+        zod.object({
+          event_id: zod.string().min(1),
+          sequence: zod.number().min(1),
+          kind: zod.string().min(1),
+          message_id: zod.string().uuid().optional(),
+          stage: zod.string(),
+          invocation_id: zod.string().min(1).optional(),
+          function_call_id: zod.string().min(1).optional(),
+          payload: zod.object({}).passthrough(),
+          emitted_at: zod.string().datetime({ offset: true }),
+        }),
+      ),
+      event_watermark: zod
+        .number()
+        .min(simulateApiHarnessJobsListResponseConversationEventWatermarkMin),
+      runtime: zod.object({
+        state: zod.string().min(1),
+        warm_until: zod.string().datetime({ offset: true }),
+        degraded: zod.boolean(),
+        available: zod.boolean(),
+      }),
+    })
+    .optional(),
   consumption: zod
     .object({
       text_sim_tokens: zod
@@ -35044,9 +35100,9 @@ export const SimulateApiHarnessJobsListResponse = zod.array(
 );
 
 /**
- * Validates the v1.6 request contract and delegates execution to the backend
-selected by ``settings.HARNESS_PROVIDER`` (``daytona`` default, or
-``sandbox``). See ``simulate.services.harness_provider``.
+ * Validates the v1.6 request contract and delegates execution to the public backend selected by
+``settings.HARNESS_PROVIDER`` (``hosted`` or ``sandbox``). The hosted backend independently
+selects its managed sandbox runtime.
  * @summary Provider-neutral control plane for hosted ALK harness jobs.
  */
 export const simulateApiHarnessJobsCreateBodySchemaVersionDefault = `futureagi.harness-job.v1`;
@@ -35352,9 +35408,9 @@ export const SimulateApiHarnessJobsCreateBody = zod.object({
 });
 
 /**
- * Validates the v1.6 request contract and delegates execution to the backend
-selected by ``settings.HARNESS_PROVIDER`` (``daytona`` default, or
-``sandbox``). See ``simulate.services.harness_provider``.
+ * Validates the v1.6 request contract and delegates execution to the public backend selected by
+``settings.HARNESS_PROVIDER`` (``hosted`` or ``sandbox``). The hosted backend independently
+selects its managed sandbox runtime.
  * @summary Provider-neutral control plane for hosted ALK harness jobs.
  */
 export const simulateApiHarnessJobsPreflightBodySchemaVersionDefault = `futureagi.harness-job.v1`;
@@ -35681,9 +35737,9 @@ export const SimulateApiHarnessJobsPreflightBody = zod.object({
 });
 
 /**
- * Validates the v1.6 request contract and delegates execution to the backend
-selected by ``settings.HARNESS_PROVIDER`` (``daytona`` default, or
-``sandbox``). See ``simulate.services.harness_provider``.
+ * Validates the v1.6 request contract and delegates execution to the public backend selected by
+``settings.HARNESS_PROVIDER`` (``hosted`` or ``sandbox``). The hosted backend independently
+selects its managed sandbox runtime.
  * @summary Provider-neutral control plane for hosted ALK harness jobs.
  */
 export const SimulateApiHarnessJobsSecretFileUploadBody = zod.object({
@@ -35711,9 +35767,9 @@ export const SimulateApiHarnessJobsSecretValuesBody = zod.object({
 });
 
 /**
- * Validates the v1.6 request contract and delegates execution to the backend
-selected by ``settings.HARNESS_PROVIDER`` (``daytona`` default, or
-``sandbox``). See ``simulate.services.harness_provider``.
+ * Validates the v1.6 request contract and delegates execution to the public backend selected by
+``settings.HARNESS_PROVIDER`` (``hosted`` or ``sandbox``). The hosted backend independently
+selects its managed sandbox runtime.
  * @summary Provider-neutral control plane for hosted ALK harness jobs.
  */
 export const SimulateApiHarnessJobsSourceUploadBody = zod.object({
@@ -35725,14 +35781,16 @@ export const SimulateApiHarnessJobsSourceUploadBody = zod.object({
 });
 
 /**
- * Validates the v1.6 request contract and delegates execution to the backend
-selected by ``settings.HARNESS_PROVIDER`` (``daytona`` default, or
-``sandbox``). See ``simulate.services.harness_provider``.
+ * Validates the v1.6 request contract and delegates execution to the public backend selected by
+``settings.HARNESS_PROVIDER`` (``hosted`` or ``sandbox``). The hosted backend independently
+selects its managed sandbox runtime.
  * @summary Provider-neutral control plane for hosted ALK harness jobs.
  */
 export const SimulateApiHarnessJobsReadParams = zod.object({
   id: zod.string(),
 });
+
+export const simulateApiHarnessJobsReadResponseConversationEventWatermarkMin = 0;
 
 export const simulateApiHarnessJobsReadResponseConsumptionTextSimTokensMin = 0;
 
@@ -35813,6 +35871,60 @@ export const SimulateApiHarnessJobsReadResponse = zod.object({
         .optional(),
     })
     .optional(),
+  conversation: zod
+    .object({
+      conversation_id: zod.string().uuid(),
+      job_id: zod.string().uuid(),
+      state: zod.string().min(1),
+      stage: zod.string().min(1),
+      active_invocation_id: zod.string().min(1),
+      blocking_input: zod.object({}).passthrough(),
+      messages: zod.array(
+        zod.object({
+          message_id: zod.string().uuid(),
+          sequence: zod.number().min(1),
+          role: zod.enum(["user", "assistant", "system"]),
+          kind: zod.enum(["message", "question", "confirmation", "status"]),
+          state: zod.enum([
+            "queued",
+            "delivered",
+            "streaming",
+            "completed",
+            "failed",
+          ]),
+          stage: zod.string(),
+          content: zod.string(),
+          payload: zod.object({}).passthrough(),
+          invocation_id: zod.string().min(1).optional(),
+          function_call_id: zod.string().min(1).optional(),
+          reply_to: zod.string().uuid().optional(),
+          created_at: zod.string().datetime({ offset: true }),
+        }),
+      ),
+      events: zod.array(
+        zod.object({
+          event_id: zod.string().min(1),
+          sequence: zod.number().min(1),
+          kind: zod.string().min(1),
+          message_id: zod.string().uuid().optional(),
+          stage: zod.string(),
+          invocation_id: zod.string().min(1).optional(),
+          function_call_id: zod.string().min(1).optional(),
+          payload: zod.object({}).passthrough(),
+          emitted_at: zod.string().datetime({ offset: true }),
+        }),
+      ),
+      event_watermark: zod
+        .number()
+        .min(simulateApiHarnessJobsReadResponseConversationEventWatermarkMin),
+      runtime: zod.object({
+        state: zod.string().min(1),
+        warm_until: zod.string().datetime({ offset: true }),
+        degraded: zod.boolean(),
+        available: zod.boolean(),
+      }),
+    })
+    .optional(),
   consumption: zod
     .object({
       text_sim_tokens: zod
@@ -35833,9 +35945,9 @@ export const SimulateApiHarnessJobsReadResponse = zod.object({
 });
 
 /**
- * Validates the v1.6 request contract and delegates execution to the backend
-selected by ``settings.HARNESS_PROVIDER`` (``daytona`` default, or
-``sandbox``). See ``simulate.services.harness_provider``.
+ * Validates the v1.6 request contract and delegates execution to the public backend selected by
+``settings.HARNESS_PROVIDER`` (``hosted`` or ``sandbox``). The hosted backend independently
+selects its managed sandbox runtime.
  * @summary Provider-neutral control plane for hosted ALK harness jobs.
  */
 export const SimulateApiHarnessJobsAdjustParams = zod.object({
@@ -35862,9 +35974,9 @@ export const SimulateApiHarnessJobsAdjustBody = zod.object({
 });
 
 /**
- * Validates the v1.6 request contract and delegates execution to the backend
-selected by ``settings.HARNESS_PROVIDER`` (``daytona`` default, or
-``sandbox``). See ``simulate.services.harness_provider``.
+ * Validates the v1.6 request contract and delegates execution to the public backend selected by
+``settings.HARNESS_PROVIDER`` (``hosted`` or ``sandbox``). The hosted backend independently
+selects its managed sandbox runtime.
  * @summary Provider-neutral control plane for hosted ALK harness jobs.
  */
 export const SimulateApiHarnessJobsCancelParams = zod.object({
@@ -35878,6 +35990,8 @@ export const SimulateApiHarnessJobsCancelBody = zod.object({
     .enum(["user_canceled", "ttl_exceeded"])
     .default(simulateApiHarnessJobsCancelBodyReasonDefault),
 });
+
+export const simulateApiHarnessJobsCancelResponseConversationEventWatermarkMin = 0;
 
 export const simulateApiHarnessJobsCancelResponseConsumptionTextSimTokensMin = 0;
 
@@ -35958,6 +36072,60 @@ export const SimulateApiHarnessJobsCancelResponse = zod.object({
         .optional(),
     })
     .optional(),
+  conversation: zod
+    .object({
+      conversation_id: zod.string().uuid(),
+      job_id: zod.string().uuid(),
+      state: zod.string().min(1),
+      stage: zod.string().min(1),
+      active_invocation_id: zod.string().min(1),
+      blocking_input: zod.object({}).passthrough(),
+      messages: zod.array(
+        zod.object({
+          message_id: zod.string().uuid(),
+          sequence: zod.number().min(1),
+          role: zod.enum(["user", "assistant", "system"]),
+          kind: zod.enum(["message", "question", "confirmation", "status"]),
+          state: zod.enum([
+            "queued",
+            "delivered",
+            "streaming",
+            "completed",
+            "failed",
+          ]),
+          stage: zod.string(),
+          content: zod.string(),
+          payload: zod.object({}).passthrough(),
+          invocation_id: zod.string().min(1).optional(),
+          function_call_id: zod.string().min(1).optional(),
+          reply_to: zod.string().uuid().optional(),
+          created_at: zod.string().datetime({ offset: true }),
+        }),
+      ),
+      events: zod.array(
+        zod.object({
+          event_id: zod.string().min(1),
+          sequence: zod.number().min(1),
+          kind: zod.string().min(1),
+          message_id: zod.string().uuid().optional(),
+          stage: zod.string(),
+          invocation_id: zod.string().min(1).optional(),
+          function_call_id: zod.string().min(1).optional(),
+          payload: zod.object({}).passthrough(),
+          emitted_at: zod.string().datetime({ offset: true }),
+        }),
+      ),
+      event_watermark: zod
+        .number()
+        .min(simulateApiHarnessJobsCancelResponseConversationEventWatermarkMin),
+      runtime: zod.object({
+        state: zod.string().min(1),
+        warm_until: zod.string().datetime({ offset: true }),
+        degraded: zod.boolean(),
+        available: zod.boolean(),
+      }),
+    })
+    .optional(),
   consumption: zod
     .object({
       text_sim_tokens: zod
@@ -35978,9 +36146,60 @@ export const SimulateApiHarnessJobsCancelResponse = zod.object({
 });
 
 /**
- * Validates the v1.6 request contract and delegates execution to the backend
-selected by ``settings.HARNESS_PROVIDER`` (``daytona`` default, or
-``sandbox``). See ``simulate.services.harness_provider``.
+ * Validates the v1.6 request contract and delegates execution to the public backend selected by
+``settings.HARNESS_PROVIDER`` (``hosted`` or ``sandbox``). The hosted backend independently
+selects its managed sandbox runtime.
+ * @summary Provider-neutral control plane for hosted ALK harness jobs.
+ */
+export const SimulateApiHarnessJobsConversationConversationMessageParams =
+  zod.object({
+    id: zod.string(),
+  });
+
+export const simulateApiHarnessJobsConversationConversationMessageBodyContentMax = 20000;
+
+export const simulateApiHarnessJobsConversationConversationMessageBodyClientRequestIdRegExp =
+  new RegExp("^[A-Za-z0-9_-]{1,128}$");
+export const simulateApiHarnessJobsConversationConversationMessageBodyKindDefault = `user_message`;
+export const simulateApiHarnessJobsConversationConversationMessageBodyPayloadDefault =
+  {};
+
+export const SimulateApiHarnessJobsConversationConversationMessageBody =
+  zod.object({
+    content: zod
+      .string()
+      .min(1)
+      .max(simulateApiHarnessJobsConversationConversationMessageBodyContentMax),
+    client_request_id: zod
+      .string()
+      .min(1)
+      .regex(
+        simulateApiHarnessJobsConversationConversationMessageBodyClientRequestIdRegExp,
+      ),
+    kind: zod
+      .enum([
+        "user_message",
+        "user_response",
+        "approval",
+        "interrupt",
+        "cancel_operation",
+      ])
+      .default(
+        simulateApiHarnessJobsConversationConversationMessageBodyKindDefault,
+      ),
+    reply_to: zod.string().uuid().optional(),
+    payload: zod
+      .object({})
+      .passthrough()
+      .default(
+        simulateApiHarnessJobsConversationConversationMessageBodyPayloadDefault,
+      ),
+  });
+
+/**
+ * Validates the v1.6 request contract and delegates execution to the public backend selected by
+``settings.HARNESS_PROVIDER`` (``hosted`` or ``sandbox``). The hosted backend independently
+selects its managed sandbox runtime.
  * @summary Provider-neutral control plane for hosted ALK harness jobs.
  */
 export const SimulateApiHarnessJobsExtendParams = zod.object({
@@ -36151,7 +36370,7 @@ export const SimulateApiHarnessAttemptsEventsResponse = zod.object({
 /**
  * The attempt capability authenticates the trusted ALK guest. Customer processes never
 receive that bearer and therefore cannot expose arbitrary sandbox ports themselves.
- * @summary Mint a short-lived, no-header Daytona URL for one guest-selected HTTP port.
+ * @summary Mint a short-lived, no-header URL for one guest-selected HTTP port.
  */
 export const SimulateApiHarnessAttemptsIngressParams = zod.object({
   id: zod.string(),
@@ -36462,6 +36681,327 @@ export const SimulateApiHarnessAttemptsUsageResponse = zod.object({
   current_usage: zod.number().optional(),
   limit: zod.number().optional(),
   upgrade_cta: zod.object({}).passthrough().optional(),
+});
+
+export const SimulateApiHarnessConversationsAdjustParams = zod.object({
+  id: zod.string(),
+});
+
+export const simulateApiHarnessConversationsAdjustBodyInstructionMax = 2000;
+
+export const simulateApiHarnessConversationsAdjustBodyClientRequestIdMax = 128;
+
+export const SimulateApiHarnessConversationsAdjustBody = zod.object({
+  instruction: zod
+    .string()
+    .min(1)
+    .max(simulateApiHarnessConversationsAdjustBodyInstructionMax),
+  client_request_id: zod
+    .string()
+    .min(1)
+    .max(simulateApiHarnessConversationsAdjustBodyClientRequestIdMax)
+    .optional(),
+});
+
+export const SimulateApiHarnessConversationsAdjustResponse = zod.object({
+  adjustment_id: zod.string().uuid(),
+  client_request_id: zod.string().min(1).optional(),
+  instruction: zod.string().min(1),
+  target_stage: zod.string().min(1),
+  scenario_delta: zod.number(),
+  status: zod.string().min(1),
+  created_at: zod.string().datetime({ offset: true }),
+});
+
+export const SimulateApiHarnessConversationsCommandsParams = zod.object({
+  id: zod.string(),
+});
+
+export const simulateApiHarnessConversationsCommandsQueryAfterDefault = 0;
+export const simulateApiHarnessConversationsCommandsQueryAfterMin = 0;
+
+export const SimulateApiHarnessConversationsCommandsQueryParams = zod.object({
+  after: zod
+    .number()
+    .min(simulateApiHarnessConversationsCommandsQueryAfterMin)
+    .default(simulateApiHarnessConversationsCommandsQueryAfterDefault),
+});
+
+export const SimulateApiHarnessConversationsEventsParams = zod.object({
+  id: zod.string(),
+});
+
+export const simulateApiHarnessConversationsEventsBodyAcknowledgedThroughMin = 0;
+
+export const simulateApiHarnessConversationsEventsBodyEventsItemEventIdRegExp =
+  new RegExp("^[A-Za-z0-9_-]{1,128}$");
+
+export const simulateApiHarnessConversationsEventsBodyEventsItemStageMax = 32;
+
+export const simulateApiHarnessConversationsEventsBodyEventsItemInvocationIdMax = 255;
+
+export const simulateApiHarnessConversationsEventsBodyEventsItemFunctionCallIdMax = 255;
+
+export const simulateApiHarnessConversationsEventsBodyEventsItemDigestRegExp =
+  new RegExp("^sha256:[0-9a-f]{64}$");
+
+export const SimulateApiHarnessConversationsEventsBody = zod.object({
+  schema_version: zod.enum(["futureagi.harness-conversation-event.v1"]),
+  acknowledged_through: zod
+    .number()
+    .min(simulateApiHarnessConversationsEventsBodyAcknowledgedThroughMin),
+  events: zod.array(
+    zod.object({
+      schema_version: zod.enum(["futureagi.harness-conversation-event.v1"]),
+      event_id: zod
+        .string()
+        .min(1)
+        .regex(
+          simulateApiHarnessConversationsEventsBodyEventsItemEventIdRegExp,
+        ),
+      conversation_id: zod.string().uuid(),
+      sequence: zod.number().min(1),
+      kind: zod.enum([
+        "turn_started",
+        "assistant_delta",
+        "assistant_message",
+        "stage_changed",
+        "authoring_activity",
+        "tool_started",
+        "tool_result",
+        "question_requested",
+        "confirmation_requested",
+        "turn_interrupted",
+        "turn_completed",
+        "checkpoint_committed",
+        "capability_changed",
+      ]),
+      message_id: zod.string().uuid().optional(),
+      stage: zod
+        .string()
+        .max(simulateApiHarnessConversationsEventsBodyEventsItemStageMax)
+        .optional(),
+      invocation_id: zod
+        .string()
+        .min(1)
+        .max(simulateApiHarnessConversationsEventsBodyEventsItemInvocationIdMax)
+        .optional(),
+      function_call_id: zod
+        .string()
+        .min(1)
+        .max(
+          simulateApiHarnessConversationsEventsBodyEventsItemFunctionCallIdMax,
+        )
+        .optional(),
+      emitted_at: zod.string().datetime({ offset: true }),
+      payload: zod.object({}).passthrough(),
+      digest: zod
+        .string()
+        .min(1)
+        .regex(simulateApiHarnessConversationsEventsBodyEventsItemDigestRegExp),
+    }),
+  ),
+});
+
+export const simulateApiHarnessConversationsEventsResponseAckedThroughSequenceMin = 0;
+
+export const SimulateApiHarnessConversationsEventsResponse = zod.object({
+  acked_through_sequence: zod
+    .number()
+    .min(simulateApiHarnessConversationsEventsResponseAckedThroughSequenceMin),
+});
+
+export const SimulateApiHarnessConversationsRerunParams = zod.object({
+  id: zod.string(),
+});
+
+export const SimulateApiHarnessConversationsRerunBody = zod
+  .object({})
+  .passthrough();
+
+export const SimulateApiHarnessConversationsRunStatusParams = zod.object({
+  id: zod.string(),
+});
+
+export const simulateApiHarnessConversationsRunStatusResponseCompletedScenariosMin = 0;
+
+export const simulateApiHarnessConversationsRunStatusResponseFailedScenariosMin = 0;
+
+export const simulateApiHarnessConversationsRunStatusResponseTotalScenariosMin = 0;
+
+export const SimulateApiHarnessConversationsRunStatusResponse = zod.object({
+  job_id: zod.string().uuid(),
+  state: zod.string().min(1),
+  stage: zod.string().min(1),
+  completed_scenarios: zod
+    .number()
+    .min(simulateApiHarnessConversationsRunStatusResponseCompletedScenariosMin),
+  failed_scenarios: zod
+    .number()
+    .min(simulateApiHarnessConversationsRunStatusResponseFailedScenariosMin),
+  total_scenarios: zod
+    .number()
+    .min(simulateApiHarnessConversationsRunStatusResponseTotalScenariosMin),
+  receipts: zod.object({}).passthrough(),
+});
+
+export const SimulateApiHarnessConversationsSessionStoreParams = zod.object({
+  id: zod.string(),
+});
+
+export const simulateApiHarnessConversationsSessionStoreQueryProjectKeyMax = 255;
+
+export const simulateApiHarnessConversationsSessionStoreQuerySessionIdMax = 255;
+
+export const simulateApiHarnessConversationsSessionStoreQuerySubpathDefault = ``;
+export const simulateApiHarnessConversationsSessionStoreQuerySubpathMax = 512;
+
+export const SimulateApiHarnessConversationsSessionStoreQueryParams =
+  zod.object({
+    project_key: zod
+      .string()
+      .min(1)
+      .max(simulateApiHarnessConversationsSessionStoreQueryProjectKeyMax),
+    session_id: zod
+      .string()
+      .min(1)
+      .max(simulateApiHarnessConversationsSessionStoreQuerySessionIdMax),
+    subpath: zod
+      .string()
+      .max(simulateApiHarnessConversationsSessionStoreQuerySubpathMax)
+      .default(simulateApiHarnessConversationsSessionStoreQuerySubpathDefault),
+  });
+
+export const SimulateApiHarnessConversationsSessionStoreAppendSessionStoreParams =
+  zod.object({
+    id: zod.string(),
+  });
+
+export const simulateApiHarnessConversationsSessionStoreAppendSessionStoreBodyProjectKeyMax = 255;
+
+export const simulateApiHarnessConversationsSessionStoreAppendSessionStoreBodySessionIdMax = 255;
+
+export const simulateApiHarnessConversationsSessionStoreAppendSessionStoreBodySubpathDefault = ``;
+export const simulateApiHarnessConversationsSessionStoreAppendSessionStoreBodySubpathMax = 512;
+
+export const simulateApiHarnessConversationsSessionStoreAppendSessionStoreBodyEntriesMax = 500;
+
+export const SimulateApiHarnessConversationsSessionStoreAppendSessionStoreBody =
+  zod.object({
+    project_key: zod
+      .string()
+      .min(1)
+      .max(
+        simulateApiHarnessConversationsSessionStoreAppendSessionStoreBodyProjectKeyMax,
+      ),
+    session_id: zod
+      .string()
+      .min(1)
+      .max(
+        simulateApiHarnessConversationsSessionStoreAppendSessionStoreBodySessionIdMax,
+      ),
+    subpath: zod
+      .string()
+      .max(
+        simulateApiHarnessConversationsSessionStoreAppendSessionStoreBodySubpathMax,
+      )
+      .default(
+        simulateApiHarnessConversationsSessionStoreAppendSessionStoreBodySubpathDefault,
+      ),
+    entries: zod
+      .array(zod.object({}).passthrough())
+      .min(1)
+      .max(
+        simulateApiHarnessConversationsSessionStoreAppendSessionStoreBodyEntriesMax,
+      ),
+  });
+
+export const simulateApiHarnessConversationsSessionStoreAppendSessionStoreResponseAppendedMin = 0;
+
+export const SimulateApiHarnessConversationsSessionStoreAppendSessionStoreResponse =
+  zod.object({
+    appended: zod
+      .number()
+      .min(
+        simulateApiHarnessConversationsSessionStoreAppendSessionStoreResponseAppendedMin,
+      ),
+  });
+
+export const SimulateApiHarnessConversationsWorkspaceParams = zod.object({
+  id: zod.string(),
+});
+
+export const simulateApiHarnessConversationsWorkspaceResponseDigestRegExp =
+  new RegExp("^sha256:[0-9a-f]{64}$");
+export const simulateApiHarnessConversationsWorkspaceResponseSizeMin = 0;
+
+export const SimulateApiHarnessConversationsWorkspaceResponse = zod.object({
+  digest: zod
+    .string()
+    .min(1)
+    .regex(simulateApiHarnessConversationsWorkspaceResponseDigestRegExp),
+  size: zod
+    .number()
+    .min(simulateApiHarnessConversationsWorkspaceResponseSizeMin),
+});
+
+/**
+ * Relay a signed callback URL to the active sandbox without exposing provider headers.
+ */
+export const SimulateApiHarnessIngressReadParams = zod.object({
+  token: zod.string(),
+  target_path: zod.string(),
+});
+
+/**
+ * Relay a signed callback URL to the active sandbox without exposing provider headers.
+ */
+export const SimulateApiHarnessIngressCreateParams = zod.object({
+  token: zod.string(),
+  target_path: zod.string(),
+});
+
+export const SimulateApiHarnessIngressCreateBody = zod.object({
+  payload: zod.object({}).passthrough().optional(),
+});
+
+export const SimulateApiHarnessIngressCreateResponse = zod.instanceof(File);
+
+/**
+ * Relay a signed callback URL to the active sandbox without exposing provider headers.
+ */
+export const SimulateApiHarnessIngressUpdateParams = zod.object({
+  token: zod.string(),
+  target_path: zod.string(),
+});
+
+export const SimulateApiHarnessIngressUpdateBody = zod.object({
+  payload: zod.object({}).passthrough().optional(),
+});
+
+export const SimulateApiHarnessIngressUpdateResponse = zod.instanceof(File);
+
+/**
+ * Relay a signed callback URL to the active sandbox without exposing provider headers.
+ */
+export const SimulateApiHarnessIngressPartialUpdateParams = zod.object({
+  token: zod.string(),
+  target_path: zod.string(),
+});
+
+export const SimulateApiHarnessIngressPartialUpdateBody = zod.object({
+  payload: zod.object({}).passthrough().optional(),
+});
+
+export const SimulateApiHarnessIngressPartialUpdateResponse =
+  zod.instanceof(File);
+
+/**
+ * Relay a signed callback URL to the active sandbox without exposing provider headers.
+ */
+export const SimulateApiHarnessIngressDeleteParams = zod.object({
+  token: zod.string(),
+  target_path: zod.string(),
 });
 
 /**
@@ -50982,6 +51522,9 @@ export const TracerFeedIssuesListResponse = zod.object({
   result: zod.object({
     data: zod.array(
       zod.object({
+        severity_assessment_status: zod.string().min(1).optional(),
+        severity_source: zod.string().min(1).optional(),
+        severity_reason: zod.string().optional(),
         cluster_id: zod.string().min(1),
         source: zod.string().min(1),
         modality: zod.string().min(1),
@@ -51063,6 +51606,9 @@ export const TracerFeedIssuesReadResponse = zod.object({
   status: zod.boolean().default(tracerFeedIssuesReadResponseStatusDefault),
   result: zod.object({
     row: zod.object({
+      severity_assessment_status: zod.string().min(1).optional(),
+      severity_source: zod.string().min(1).optional(),
+      severity_reason: zod.string().optional(),
       cluster_id: zod.string().min(1),
       source: zod.string().min(1),
       modality: zod.string().min(1),
@@ -51160,6 +51706,9 @@ export const TracerFeedIssuesPartialUpdateResponse = zod.object({
     .default(tracerFeedIssuesPartialUpdateResponseStatusDefault),
   result: zod.object({
     row: zod.object({
+      severity_assessment_status: zod.string().min(1).optional(),
+      severity_source: zod.string().min(1).optional(),
+      severity_reason: zod.string().optional(),
       cluster_id: zod.string().min(1),
       source: zod.string().min(1),
       modality: zod.string().min(1),
@@ -51730,6 +52279,1338 @@ export const TracerImagineAnalysisCreateResponse = zod.object({
       }),
     ),
   }),
+});
+
+export const TracerInternalErrorFeedV2AttemptsPartialUpdateParams = zod.object({
+  attempt_id: zod.string(),
+});
+
+export const tracerInternalErrorFeedV2AttemptsPartialUpdateBodyLeaseTokenMax = 255;
+
+export const tracerInternalErrorFeedV2AttemptsPartialUpdateBodyReasonDefault = ``;
+export const tracerInternalErrorFeedV2AttemptsPartialUpdateBodyReasonMax = 2000;
+
+export const TracerInternalErrorFeedV2AttemptsPartialUpdateBody = zod.object({
+  organization_id: zod.string().uuid(),
+  workspace_id: zod.string().uuid(),
+  project_id: zod.string().uuid(),
+  job_id: zod.string().uuid(),
+  lease_token: zod
+    .string()
+    .min(1)
+    .max(tracerInternalErrorFeedV2AttemptsPartialUpdateBodyLeaseTokenMax),
+  action: zod.enum(["renew", "cancel"]),
+  reason: zod
+    .string()
+    .max(tracerInternalErrorFeedV2AttemptsPartialUpdateBodyReasonMax)
+    .default(tracerInternalErrorFeedV2AttemptsPartialUpdateBodyReasonDefault),
+});
+
+export const TracerInternalErrorFeedV2AttemptsPartialUpdateResponse =
+  zod.object({
+    attempt_id: zod.string().uuid(),
+    status: zod.string().min(1),
+    lease_expires_at: zod.string().datetime({ offset: true }),
+    cancellation_requested: zod.boolean(),
+    job_state: zod.string().min(1),
+  });
+
+export const tracerInternalErrorFeedV2ClaimsCreateBodyWorkerIdMax = 255;
+
+export const tracerInternalErrorFeedV2ClaimsCreateBodyEngineVersionMax = 20;
+
+export const tracerInternalErrorFeedV2ClaimsCreateBodyLimitMax = 50;
+
+export const TracerInternalErrorFeedV2ClaimsCreateBody = zod.object({
+  worker_id: zod
+    .string()
+    .min(1)
+    .max(tracerInternalErrorFeedV2ClaimsCreateBodyWorkerIdMax),
+  engine_version: zod
+    .string()
+    .min(1)
+    .max(tracerInternalErrorFeedV2ClaimsCreateBodyEngineVersionMax),
+  limit: zod
+    .number()
+    .min(1)
+    .max(tracerInternalErrorFeedV2ClaimsCreateBodyLimitMax),
+});
+
+export const tracerInternalErrorFeedV2ClaimsCreateResponseClaimsItemEngineVersionMax = 20;
+
+export const tracerInternalErrorFeedV2ClaimsCreateResponseClaimsItemMemorySnapshotIdMax = 128;
+
+export const tracerInternalErrorFeedV2ClaimsCreateResponseClaimsItemMemoryDigestMax = 71;
+
+export const tracerInternalErrorFeedV2ClaimsCreateResponseClaimsItemMemoryEntriesItemIdMax = 128;
+
+export const tracerInternalErrorFeedV2ClaimsCreateResponseClaimsItemMemoryEntriesItemTextMax = 4000;
+
+export const tracerInternalErrorFeedV2ClaimsCreateResponseClaimsItemMemoryEntriesItemSourceFeedbackIdMax = 128;
+
+export const tracerInternalErrorFeedV2ClaimsCreateResponseClaimsItemLimitsMaxChildrenMin = 0;
+
+export const tracerInternalErrorFeedV2ClaimsCreateResponseClaimsItemLimitsMaxParallelChildrenMin = 0;
+
+export const TracerInternalErrorFeedV2ClaimsCreateResponse = zod.object({
+  claims: zod.array(
+    zod.object({
+      organization_id: zod.string().uuid(),
+      workspace_id: zod.string().uuid(),
+      project_id: zod.string().uuid(),
+      job_id: zod.string().uuid(),
+      trace_id: zod.string().uuid(),
+      generation: zod.number().min(1),
+      attempt_id: zod.string().uuid(),
+      lease_token: zod.string().min(1),
+      lease_expires_at: zod.string().datetime({ offset: true }),
+      read_cutoff: zod.string().datetime({ offset: true }),
+      engine_version: zod
+        .string()
+        .min(1)
+        .max(
+          tracerInternalErrorFeedV2ClaimsCreateResponseClaimsItemEngineVersionMax,
+        ),
+      contract_version: zod.string().min(1),
+      memory: zod.object({
+        snapshot_id: zod
+          .string()
+          .min(1)
+          .max(
+            tracerInternalErrorFeedV2ClaimsCreateResponseClaimsItemMemorySnapshotIdMax,
+          ),
+        digest: zod
+          .string()
+          .min(1)
+          .max(
+            tracerInternalErrorFeedV2ClaimsCreateResponseClaimsItemMemoryDigestMax,
+          ),
+        entries: zod.array(
+          zod.object({
+            id: zod
+              .string()
+              .min(1)
+              .max(
+                tracerInternalErrorFeedV2ClaimsCreateResponseClaimsItemMemoryEntriesItemIdMax,
+              ),
+            text: zod
+              .string()
+              .min(1)
+              .max(
+                tracerInternalErrorFeedV2ClaimsCreateResponseClaimsItemMemoryEntriesItemTextMax,
+              ),
+            source_feedback_id: zod
+              .string()
+              .min(1)
+              .max(
+                tracerInternalErrorFeedV2ClaimsCreateResponseClaimsItemMemoryEntriesItemSourceFeedbackIdMax,
+              )
+              .optional(),
+          }),
+        ),
+      }),
+      limits: zod.object({
+        deadline_seconds: zod.number().min(1),
+        max_model_calls: zod.number().min(1),
+        max_children: zod
+          .number()
+          .min(
+            tracerInternalErrorFeedV2ClaimsCreateResponseClaimsItemLimitsMaxChildrenMin,
+          ),
+        max_parallel_children: zod
+          .number()
+          .min(
+            tracerInternalErrorFeedV2ClaimsCreateResponseClaimsItemLimitsMaxParallelChildrenMin,
+          ),
+        max_input_tokens_total: zod.number().min(1),
+        max_output_tokens_total: zod.number().min(1),
+        max_evidence_bytes: zod.number().min(1),
+        max_tool_result_bytes: zod.number().min(1),
+      }),
+      verification_capabilities: zod.array(zod.string().min(1)),
+      feature_enabled: zod.boolean(),
+    }),
+  ),
+});
+
+export const TracerInternalErrorFeedV2GroupingAttemptsPartialUpdateParams =
+  zod.object({
+    attempt_id: zod.string(),
+  });
+
+export const tracerInternalErrorFeedV2GroupingAttemptsPartialUpdateBodyLeaseTokenMax = 255;
+
+export const TracerInternalErrorFeedV2GroupingAttemptsPartialUpdateBody =
+  zod.object({
+    lease_token: zod
+      .string()
+      .min(1)
+      .max(
+        tracerInternalErrorFeedV2GroupingAttemptsPartialUpdateBodyLeaseTokenMax,
+      ),
+    action: zod.enum(["renew", "cancel"]),
+  });
+
+export const TracerInternalErrorFeedV2GroupingAttemptsPartialUpdateResponse =
+  zod.object({
+    state: zod.string().min(1).optional(),
+    status: zod.string().min(1).optional(),
+    checkpoint_revision: zod.number().optional(),
+    receipt_id: zod.string().uuid().optional(),
+  });
+
+export const TracerInternalErrorFeedV2GroupingAttemptsCheckpointUpdateParams =
+  zod.object({
+    attempt_id: zod.string(),
+  });
+
+export const tracerInternalErrorFeedV2GroupingAttemptsCheckpointUpdateBodyLeaseTokenMax = 255;
+
+export const tracerInternalErrorFeedV2GroupingAttemptsCheckpointUpdateBodyExpectedRevisionMin = 0;
+
+export const TracerInternalErrorFeedV2GroupingAttemptsCheckpointUpdateBody =
+  zod.object({
+    lease_token: zod
+      .string()
+      .min(1)
+      .max(
+        tracerInternalErrorFeedV2GroupingAttemptsCheckpointUpdateBodyLeaseTokenMax,
+      ),
+    expected_revision: zod
+      .number()
+      .min(
+        tracerInternalErrorFeedV2GroupingAttemptsCheckpointUpdateBodyExpectedRevisionMin,
+      ),
+    checkpoint: zod.object({}).passthrough(),
+  });
+
+export const TracerInternalErrorFeedV2GroupingAttemptsCheckpointUpdateResponse =
+  zod.object({
+    state: zod.string().min(1).optional(),
+    status: zod.string().min(1).optional(),
+    checkpoint_revision: zod.number().optional(),
+    receipt_id: zod.string().uuid().optional(),
+  });
+
+export const TracerInternalErrorFeedV2GroupingAttemptsPublishCreateParams =
+  zod.object({
+    attempt_id: zod.string(),
+  });
+
+export const tracerInternalErrorFeedV2GroupingAttemptsPublishCreateBodyLeaseTokenMax = 255;
+
+export const tracerInternalErrorFeedV2GroupingAttemptsPublishCreateBodyIdempotencyKeyMax = 255;
+
+export const tracerInternalErrorFeedV2GroupingAttemptsPublishCreateBodySnapshotDigestRegExp =
+  new RegExp("^sha256:[a-f0-9]{64}$");
+export const tracerInternalErrorFeedV2GroupingAttemptsPublishCreateBodyRegistryRevisionMin = 0;
+
+export const tracerInternalErrorFeedV2GroupingAttemptsPublishCreateBodyCommandsMax = 1000;
+
+export const tracerInternalErrorFeedV2GroupingAttemptsPublishCreateBodyReceiptIdsMax = 100;
+
+export const TracerInternalErrorFeedV2GroupingAttemptsPublishCreateBody =
+  zod.object({
+    lease_token: zod
+      .string()
+      .min(1)
+      .max(
+        tracerInternalErrorFeedV2GroupingAttemptsPublishCreateBodyLeaseTokenMax,
+      ),
+    idempotency_key: zod
+      .string()
+      .min(1)
+      .max(
+        tracerInternalErrorFeedV2GroupingAttemptsPublishCreateBodyIdempotencyKeyMax,
+      ),
+    snapshot_digest: zod
+      .string()
+      .min(1)
+      .regex(
+        tracerInternalErrorFeedV2GroupingAttemptsPublishCreateBodySnapshotDigestRegExp,
+      ),
+    registry_revision: zod
+      .number()
+      .min(
+        tracerInternalErrorFeedV2GroupingAttemptsPublishCreateBodyRegistryRevisionMin,
+      ),
+    commands: zod
+      .array(zod.object({}).passthrough())
+      .max(
+        tracerInternalErrorFeedV2GroupingAttemptsPublishCreateBodyCommandsMax,
+      ),
+    receipt_ids: zod
+      .array(zod.string().uuid())
+      .max(
+        tracerInternalErrorFeedV2GroupingAttemptsPublishCreateBodyReceiptIdsMax,
+      ),
+  });
+
+export const TracerInternalErrorFeedV2GroupingAttemptsPublishCreateResponse =
+  zod.object({
+    state: zod.string().min(1).optional(),
+    status: zod.string().min(1).optional(),
+    checkpoint_revision: zod.number().optional(),
+    receipt_id: zod.string().uuid().optional(),
+  });
+
+export const TracerInternalErrorFeedV2GroupingAttemptsReserveCreateParams =
+  zod.object({
+    attempt_id: zod.string(),
+  });
+
+export const tracerInternalErrorFeedV2GroupingAttemptsReserveCreateBodyLeaseTokenMax = 255;
+
+export const tracerInternalErrorFeedV2GroupingAttemptsReserveCreateBodyRequestKeyMax = 255;
+
+export const tracerInternalErrorFeedV2GroupingAttemptsReserveCreateBodyRequestDigestRegExp =
+  new RegExp("^sha256:[a-f0-9]{64}$");
+
+export const tracerInternalErrorFeedV2GroupingAttemptsReserveCreateBodyRepairIntentPrimaryReceiptIdRegExp =
+  new RegExp("^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$");
+export const tracerInternalErrorFeedV2GroupingAttemptsReserveCreateBodyRepairIntentGroupIndexMin = 0;
+export const tracerInternalErrorFeedV2GroupingAttemptsReserveCreateBodyRepairIntentGroupIndexMax = 99;
+
+export const tracerInternalErrorFeedV2GroupingAttemptsReserveCreateBodyRepairIntentMissingOwnReportIdsItemRegExp =
+  new RegExp("^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$");
+export const tracerInternalErrorFeedV2GroupingAttemptsReserveCreateBodyRepairIntentMissingOwnReportIdsMax = 100;
+
+export const TracerInternalErrorFeedV2GroupingAttemptsReserveCreateBody =
+  zod.object({
+    lease_token: zod
+      .string()
+      .min(1)
+      .max(
+        tracerInternalErrorFeedV2GroupingAttemptsReserveCreateBodyLeaseTokenMax,
+      ),
+    request_key: zod
+      .string()
+      .min(1)
+      .max(
+        tracerInternalErrorFeedV2GroupingAttemptsReserveCreateBodyRequestKeyMax,
+      ),
+    request_digest: zod
+      .string()
+      .min(1)
+      .regex(
+        tracerInternalErrorFeedV2GroupingAttemptsReserveCreateBodyRequestDigestRegExp,
+      ),
+    max_cost_usd: zod.string(),
+    repair_intent: zod
+      .object({
+        primary_receipt_id: zod
+          .string()
+          .min(1)
+          .regex(
+            tracerInternalErrorFeedV2GroupingAttemptsReserveCreateBodyRepairIntentPrimaryReceiptIdRegExp,
+          ),
+        group_index: zod
+          .number()
+          .min(
+            tracerInternalErrorFeedV2GroupingAttemptsReserveCreateBodyRepairIntentGroupIndexMin,
+          )
+          .max(
+            tracerInternalErrorFeedV2GroupingAttemptsReserveCreateBodyRepairIntentGroupIndexMax,
+          ),
+        missing_own_report_ids: zod
+          .array(
+            zod
+              .string()
+              .min(1)
+              .regex(
+                tracerInternalErrorFeedV2GroupingAttemptsReserveCreateBodyRepairIntentMissingOwnReportIdsItemRegExp,
+              ),
+          )
+          .min(1)
+          .max(
+            tracerInternalErrorFeedV2GroupingAttemptsReserveCreateBodyRepairIntentMissingOwnReportIdsMax,
+          ),
+      })
+      .optional(),
+  });
+
+export const TracerInternalErrorFeedV2GroupingAttemptsReserveCreateResponse =
+  zod.object({
+    state: zod.string().min(1).optional(),
+    status: zod.string().min(1).optional(),
+    checkpoint_revision: zod.number().optional(),
+    receipt_id: zod.string().uuid().optional(),
+  });
+
+export const TracerInternalErrorFeedV2GroupingAttemptsSettleCreateParams =
+  zod.object({
+    attempt_id: zod.string(),
+  });
+
+export const tracerInternalErrorFeedV2GroupingAttemptsSettleCreateBodyLeaseTokenMax = 255;
+
+export const tracerInternalErrorFeedV2GroupingAttemptsSettleCreateBodyRequestKeyMax = 255;
+
+export const tracerInternalErrorFeedV2GroupingAttemptsSettleCreateBodyRequestDigestRegExp =
+  new RegExp("^sha256:[a-f0-9]{64}$");
+export const tracerInternalErrorFeedV2GroupingAttemptsSettleCreateBodyModelUsedMax = 255;
+
+export const tracerInternalErrorFeedV2GroupingAttemptsSettleCreateBodyInputTokensMin = 0;
+
+export const tracerInternalErrorFeedV2GroupingAttemptsSettleCreateBodyOutputTokensMin = 0;
+
+export const tracerInternalErrorFeedV2GroupingAttemptsSettleCreateBodyFailureCodeDefault = ``;
+export const tracerInternalErrorFeedV2GroupingAttemptsSettleCreateBodyFailureCodeMax = 100;
+
+export const TracerInternalErrorFeedV2GroupingAttemptsSettleCreateBody =
+  zod.object({
+    lease_token: zod
+      .string()
+      .min(1)
+      .max(
+        tracerInternalErrorFeedV2GroupingAttemptsSettleCreateBodyLeaseTokenMax,
+      ),
+    request_key: zod
+      .string()
+      .min(1)
+      .max(
+        tracerInternalErrorFeedV2GroupingAttemptsSettleCreateBodyRequestKeyMax,
+      ),
+    request_digest: zod
+      .string()
+      .min(1)
+      .regex(
+        tracerInternalErrorFeedV2GroupingAttemptsSettleCreateBodyRequestDigestRegExp,
+      ),
+    status: zod.enum(["settled", "unknown"]),
+    result: zod.object({}).passthrough().optional(),
+    model_used: zod
+      .string()
+      .min(1)
+      .max(
+        tracerInternalErrorFeedV2GroupingAttemptsSettleCreateBodyModelUsedMax,
+      )
+      .optional(),
+    input_tokens: zod
+      .number()
+      .min(
+        tracerInternalErrorFeedV2GroupingAttemptsSettleCreateBodyInputTokensMin,
+      )
+      .optional(),
+    output_tokens: zod
+      .number()
+      .min(
+        tracerInternalErrorFeedV2GroupingAttemptsSettleCreateBodyOutputTokensMin,
+      )
+      .optional(),
+    cost_usd: zod.string().optional(),
+    failure_code: zod
+      .string()
+      .max(
+        tracerInternalErrorFeedV2GroupingAttemptsSettleCreateBodyFailureCodeMax,
+      )
+      .default(
+        tracerInternalErrorFeedV2GroupingAttemptsSettleCreateBodyFailureCodeDefault,
+      ),
+  });
+
+export const TracerInternalErrorFeedV2GroupingAttemptsSettleCreateResponse =
+  zod.object({
+    state: zod.string().min(1).optional(),
+    status: zod.string().min(1).optional(),
+    checkpoint_revision: zod.number().optional(),
+    receipt_id: zod.string().uuid().optional(),
+  });
+
+export const tracerInternalErrorFeedV2GroupingClaimsCreateBodyWorkerIdMax = 255;
+
+export const tracerInternalErrorFeedV2GroupingClaimsCreateBodyLimitMax = 10;
+
+export const TracerInternalErrorFeedV2GroupingClaimsCreateBody = zod.object({
+  worker_id: zod
+    .string()
+    .min(1)
+    .max(tracerInternalErrorFeedV2GroupingClaimsCreateBodyWorkerIdMax),
+  limit: zod
+    .number()
+    .min(1)
+    .max(tracerInternalErrorFeedV2GroupingClaimsCreateBodyLimitMax),
+});
+
+export const TracerInternalErrorFeedV2GroupingClaimsCreateResponse = zod.object(
+  {
+    claims: zod.array(zod.object({}).passthrough()),
+  },
+);
+
+export const TracerInternalErrorFeedV2GroupingFeatureAttemptsPartialUpdateParams =
+  zod.object({
+    feature_job_id: zod.string(),
+  });
+
+export const tracerInternalErrorFeedV2GroupingFeatureAttemptsPartialUpdateBodyLeaseTokenMax = 255;
+
+export const TracerInternalErrorFeedV2GroupingFeatureAttemptsPartialUpdateBody =
+  zod.object({
+    lease_token: zod
+      .string()
+      .min(1)
+      .max(
+        tracerInternalErrorFeedV2GroupingFeatureAttemptsPartialUpdateBodyLeaseTokenMax,
+      ),
+    action: zod.enum(["renew"]),
+  });
+
+export const TracerInternalErrorFeedV2GroupingFeatureAttemptsPartialUpdateResponse =
+  zod.object({
+    state: zod.string().min(1).optional(),
+    status: zod.string().min(1).optional(),
+    checkpoint_revision: zod.number().optional(),
+    receipt_id: zod.string().uuid().optional(),
+  });
+
+export const TracerInternalErrorFeedV2GroupingFeatureAttemptsCompleteCreateParams =
+  zod.object({
+    feature_job_id: zod.string(),
+  });
+
+export const tracerInternalErrorFeedV2GroupingFeatureAttemptsCompleteCreateBodyLeaseTokenMax = 255;
+
+export const tracerInternalErrorFeedV2GroupingFeatureAttemptsCompleteCreateBodyFeaturesMax = 200;
+
+export const tracerInternalErrorFeedV2GroupingFeatureAttemptsCompleteCreateBodyErrorCodeDefault = ``;
+export const tracerInternalErrorFeedV2GroupingFeatureAttemptsCompleteCreateBodyErrorCodeMax = 100;
+
+export const TracerInternalErrorFeedV2GroupingFeatureAttemptsCompleteCreateBody =
+  zod.object({
+    lease_token: zod
+      .string()
+      .min(1)
+      .max(
+        tracerInternalErrorFeedV2GroupingFeatureAttemptsCompleteCreateBodyLeaseTokenMax,
+      ),
+    status: zod.enum(["ready", "failed"]),
+    features: zod
+      .array(zod.object({}).passthrough())
+      .max(
+        tracerInternalErrorFeedV2GroupingFeatureAttemptsCompleteCreateBodyFeaturesMax,
+      ),
+    error_code: zod
+      .string()
+      .max(
+        tracerInternalErrorFeedV2GroupingFeatureAttemptsCompleteCreateBodyErrorCodeMax,
+      )
+      .default(
+        tracerInternalErrorFeedV2GroupingFeatureAttemptsCompleteCreateBodyErrorCodeDefault,
+      ),
+  });
+
+export const TracerInternalErrorFeedV2GroupingFeatureAttemptsCompleteCreateResponse =
+  zod.object({
+    state: zod.string().min(1).optional(),
+    status: zod.string().min(1).optional(),
+    checkpoint_revision: zod.number().optional(),
+    receipt_id: zod.string().uuid().optional(),
+  });
+
+export const tracerInternalErrorFeedV2GroupingFeatureClaimsCreateBodyWorkerIdMax = 255;
+
+export const tracerInternalErrorFeedV2GroupingFeatureClaimsCreateBodyLimitMax = 10;
+
+export const TracerInternalErrorFeedV2GroupingFeatureClaimsCreateBody =
+  zod.object({
+    worker_id: zod
+      .string()
+      .min(1)
+      .max(tracerInternalErrorFeedV2GroupingFeatureClaimsCreateBodyWorkerIdMax),
+    limit: zod
+      .number()
+      .min(1)
+      .max(tracerInternalErrorFeedV2GroupingFeatureClaimsCreateBodyLimitMax),
+  });
+
+export const TracerInternalErrorFeedV2GroupingFeatureClaimsCreateResponse =
+  zod.object({
+    claims: zod.array(zod.object({}).passthrough()),
+  });
+
+export const tracerInternalErrorFeedV2GroupingOutboxCreateBodyLimitMax = 100;
+
+export const TracerInternalErrorFeedV2GroupingOutboxCreateBody = zod.object({
+  limit: zod
+    .number()
+    .min(1)
+    .max(tracerInternalErrorFeedV2GroupingOutboxCreateBodyLimitMax),
+});
+
+export const TracerInternalErrorFeedV2GroupingOutboxCreateResponse = zod.object(
+  {
+    events: zod.array(zod.object({}).passthrough()),
+  },
+);
+
+export const TracerInternalErrorFeedV2GroupingOutboxAckCreateParams =
+  zod.object({
+    event_id: zod.string(),
+  });
+
+export const TracerInternalErrorFeedV2GroupingOutboxAckCreateBody = zod
+  .object({})
+  .passthrough();
+
+export const TracerInternalErrorFeedV2GroupingOutboxAckCreateResponse =
+  zod.object({
+    state: zod.string().min(1).optional(),
+    status: zod.string().min(1).optional(),
+    checkpoint_revision: zod.number().optional(),
+    receipt_id: zod.string().uuid().optional(),
+  });
+
+export const TracerInternalErrorFeedV2GroupingSeverityAttemptsPartialUpdateParams =
+  zod.object({
+    job_id: zod.string(),
+  });
+
+export const tracerInternalErrorFeedV2GroupingSeverityAttemptsPartialUpdateBodyLeaseTokenMax = 255;
+
+export const TracerInternalErrorFeedV2GroupingSeverityAttemptsPartialUpdateBody =
+  zod.object({
+    lease_token: zod
+      .string()
+      .min(1)
+      .max(
+        tracerInternalErrorFeedV2GroupingSeverityAttemptsPartialUpdateBodyLeaseTokenMax,
+      ),
+    action: zod.enum(["renew"]),
+  });
+
+export const TracerInternalErrorFeedV2GroupingSeverityAttemptsPartialUpdateResponse =
+  zod.object({
+    state: zod.string().min(1).optional(),
+    status: zod.string().min(1).optional(),
+    checkpoint_revision: zod.number().optional(),
+    receipt_id: zod.string().uuid().optional(),
+  });
+
+export const TracerInternalErrorFeedV2GroupingSeverityAttemptsPublishCreateParams =
+  zod.object({
+    job_id: zod.string(),
+  });
+
+export const tracerInternalErrorFeedV2GroupingSeverityAttemptsPublishCreateBodyLeaseTokenMax = 255;
+
+export const TracerInternalErrorFeedV2GroupingSeverityAttemptsPublishCreateBody =
+  zod.object({
+    lease_token: zod
+      .string()
+      .min(1)
+      .max(
+        tracerInternalErrorFeedV2GroupingSeverityAttemptsPublishCreateBodyLeaseTokenMax,
+      ),
+    receipt_id: zod.string().uuid(),
+  });
+
+export const TracerInternalErrorFeedV2GroupingSeverityAttemptsPublishCreateResponse =
+  zod.object({
+    state: zod.string().min(1).optional(),
+    status: zod.string().min(1).optional(),
+    checkpoint_revision: zod.number().optional(),
+    receipt_id: zod.string().uuid().optional(),
+  });
+
+export const TracerInternalErrorFeedV2GroupingSeverityAttemptsReserveCreateParams =
+  zod.object({
+    job_id: zod.string(),
+  });
+
+export const tracerInternalErrorFeedV2GroupingSeverityAttemptsReserveCreateBodyLeaseTokenMax = 255;
+
+export const tracerInternalErrorFeedV2GroupingSeverityAttemptsReserveCreateBodyRequestKeyMax = 255;
+
+export const tracerInternalErrorFeedV2GroupingSeverityAttemptsReserveCreateBodyRequestDigestRegExp =
+  new RegExp("^sha256:[a-f0-9]{64}$");
+
+export const tracerInternalErrorFeedV2GroupingSeverityAttemptsReserveCreateBodyRepairIntentPrimaryReceiptIdRegExp =
+  new RegExp("^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$");
+export const tracerInternalErrorFeedV2GroupingSeverityAttemptsReserveCreateBodyRepairIntentGroupIndexMin = 0;
+export const tracerInternalErrorFeedV2GroupingSeverityAttemptsReserveCreateBodyRepairIntentGroupIndexMax = 99;
+
+export const tracerInternalErrorFeedV2GroupingSeverityAttemptsReserveCreateBodyRepairIntentMissingOwnReportIdsItemRegExp =
+  new RegExp("^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$");
+export const tracerInternalErrorFeedV2GroupingSeverityAttemptsReserveCreateBodyRepairIntentMissingOwnReportIdsMax = 100;
+
+export const TracerInternalErrorFeedV2GroupingSeverityAttemptsReserveCreateBody =
+  zod.object({
+    lease_token: zod
+      .string()
+      .min(1)
+      .max(
+        tracerInternalErrorFeedV2GroupingSeverityAttemptsReserveCreateBodyLeaseTokenMax,
+      ),
+    request_key: zod
+      .string()
+      .min(1)
+      .max(
+        tracerInternalErrorFeedV2GroupingSeverityAttemptsReserveCreateBodyRequestKeyMax,
+      ),
+    request_digest: zod
+      .string()
+      .min(1)
+      .regex(
+        tracerInternalErrorFeedV2GroupingSeverityAttemptsReserveCreateBodyRequestDigestRegExp,
+      ),
+    max_cost_usd: zod.string(),
+    repair_intent: zod
+      .object({
+        primary_receipt_id: zod
+          .string()
+          .min(1)
+          .regex(
+            tracerInternalErrorFeedV2GroupingSeverityAttemptsReserveCreateBodyRepairIntentPrimaryReceiptIdRegExp,
+          ),
+        group_index: zod
+          .number()
+          .min(
+            tracerInternalErrorFeedV2GroupingSeverityAttemptsReserveCreateBodyRepairIntentGroupIndexMin,
+          )
+          .max(
+            tracerInternalErrorFeedV2GroupingSeverityAttemptsReserveCreateBodyRepairIntentGroupIndexMax,
+          ),
+        missing_own_report_ids: zod
+          .array(
+            zod
+              .string()
+              .min(1)
+              .regex(
+                tracerInternalErrorFeedV2GroupingSeverityAttemptsReserveCreateBodyRepairIntentMissingOwnReportIdsItemRegExp,
+              ),
+          )
+          .min(1)
+          .max(
+            tracerInternalErrorFeedV2GroupingSeverityAttemptsReserveCreateBodyRepairIntentMissingOwnReportIdsMax,
+          ),
+      })
+      .optional(),
+  });
+
+export const TracerInternalErrorFeedV2GroupingSeverityAttemptsReserveCreateResponse =
+  zod.object({
+    state: zod.string().min(1).optional(),
+    status: zod.string().min(1).optional(),
+    checkpoint_revision: zod.number().optional(),
+    receipt_id: zod.string().uuid().optional(),
+  });
+
+export const TracerInternalErrorFeedV2GroupingSeverityAttemptsSettleCreateParams =
+  zod.object({
+    job_id: zod.string(),
+  });
+
+export const tracerInternalErrorFeedV2GroupingSeverityAttemptsSettleCreateBodyLeaseTokenMax = 255;
+
+export const tracerInternalErrorFeedV2GroupingSeverityAttemptsSettleCreateBodyRequestKeyMax = 255;
+
+export const tracerInternalErrorFeedV2GroupingSeverityAttemptsSettleCreateBodyRequestDigestRegExp =
+  new RegExp("^sha256:[a-f0-9]{64}$");
+export const tracerInternalErrorFeedV2GroupingSeverityAttemptsSettleCreateBodyModelUsedMax = 255;
+
+export const tracerInternalErrorFeedV2GroupingSeverityAttemptsSettleCreateBodyInputTokensMin = 0;
+
+export const tracerInternalErrorFeedV2GroupingSeverityAttemptsSettleCreateBodyOutputTokensMin = 0;
+
+export const tracerInternalErrorFeedV2GroupingSeverityAttemptsSettleCreateBodyFailureCodeDefault = ``;
+export const tracerInternalErrorFeedV2GroupingSeverityAttemptsSettleCreateBodyFailureCodeMax = 100;
+
+export const TracerInternalErrorFeedV2GroupingSeverityAttemptsSettleCreateBody =
+  zod.object({
+    lease_token: zod
+      .string()
+      .min(1)
+      .max(
+        tracerInternalErrorFeedV2GroupingSeverityAttemptsSettleCreateBodyLeaseTokenMax,
+      ),
+    request_key: zod
+      .string()
+      .min(1)
+      .max(
+        tracerInternalErrorFeedV2GroupingSeverityAttemptsSettleCreateBodyRequestKeyMax,
+      ),
+    request_digest: zod
+      .string()
+      .min(1)
+      .regex(
+        tracerInternalErrorFeedV2GroupingSeverityAttemptsSettleCreateBodyRequestDigestRegExp,
+      ),
+    status: zod.enum(["settled", "unknown"]),
+    result: zod.object({}).passthrough().optional(),
+    model_used: zod
+      .string()
+      .min(1)
+      .max(
+        tracerInternalErrorFeedV2GroupingSeverityAttemptsSettleCreateBodyModelUsedMax,
+      )
+      .optional(),
+    input_tokens: zod
+      .number()
+      .min(
+        tracerInternalErrorFeedV2GroupingSeverityAttemptsSettleCreateBodyInputTokensMin,
+      )
+      .optional(),
+    output_tokens: zod
+      .number()
+      .min(
+        tracerInternalErrorFeedV2GroupingSeverityAttemptsSettleCreateBodyOutputTokensMin,
+      )
+      .optional(),
+    cost_usd: zod.string().optional(),
+    failure_code: zod
+      .string()
+      .max(
+        tracerInternalErrorFeedV2GroupingSeverityAttemptsSettleCreateBodyFailureCodeMax,
+      )
+      .default(
+        tracerInternalErrorFeedV2GroupingSeverityAttemptsSettleCreateBodyFailureCodeDefault,
+      ),
+  });
+
+export const TracerInternalErrorFeedV2GroupingSeverityAttemptsSettleCreateResponse =
+  zod.object({
+    state: zod.string().min(1).optional(),
+    status: zod.string().min(1).optional(),
+    checkpoint_revision: zod.number().optional(),
+    receipt_id: zod.string().uuid().optional(),
+  });
+
+export const tracerInternalErrorFeedV2GroupingSeverityClaimsCreateBodyWorkerIdMax = 255;
+
+export const tracerInternalErrorFeedV2GroupingSeverityClaimsCreateBodyLimitMax = 10;
+
+export const TracerInternalErrorFeedV2GroupingSeverityClaimsCreateBody =
+  zod.object({
+    worker_id: zod
+      .string()
+      .min(1)
+      .max(
+        tracerInternalErrorFeedV2GroupingSeverityClaimsCreateBodyWorkerIdMax,
+      ),
+    limit: zod
+      .number()
+      .min(1)
+      .max(tracerInternalErrorFeedV2GroupingSeverityClaimsCreateBodyLimitMax),
+  });
+
+export const TracerInternalErrorFeedV2GroupingSeverityClaimsCreateResponse =
+  zod.object({
+    claims: zod.array(zod.object({}).passthrough()),
+  });
+
+export const tracerInternalErrorFeedV2NotificationsCreateBodyDeliveriesItemPartitionMin = 0;
+
+export const tracerInternalErrorFeedV2NotificationsCreateBodyDeliveriesItemOffsetMin = 0;
+
+export const tracerInternalErrorFeedV2NotificationsCreateBodyDeliveriesItemValueVersionMax = 1;
+
+export const tracerInternalErrorFeedV2NotificationsCreateBodyDeliveriesItemValueTracesItemRootSpanIdMax = 64;
+
+export const TracerInternalErrorFeedV2NotificationsCreateBody = zod.object({
+  deliveries: zod.array(
+    zod.object({
+      topic: zod.enum(["error-feed.trace-available.v1"]),
+      partition: zod
+        .number()
+        .min(
+          tracerInternalErrorFeedV2NotificationsCreateBodyDeliveriesItemPartitionMin,
+        ),
+      offset: zod
+        .number()
+        .min(
+          tracerInternalErrorFeedV2NotificationsCreateBodyDeliveriesItemOffsetMin,
+        ),
+      value: zod.object({
+        version: zod
+          .number()
+          .min(1)
+          .max(
+            tracerInternalErrorFeedV2NotificationsCreateBodyDeliveriesItemValueVersionMax,
+          ),
+        event_id: zod.string().uuid(),
+        organization_id: zod.string().uuid(),
+        workspace_id: zod.string().uuid(),
+        project_id: zod.string().uuid(),
+        event_kind: zod.enum(["root_span_written"]),
+        traces: zod.array(
+          zod.object({
+            trace_id: zod.string().uuid(),
+            root_span_id: zod
+              .string()
+              .min(1)
+              .max(
+                tracerInternalErrorFeedV2NotificationsCreateBodyDeliveriesItemValueTracesItemRootSpanIdMax,
+              ),
+            root_end_time: zod.string().datetime({ offset: true }),
+          }),
+        ),
+        emitted_at: zod.string().datetime({ offset: true }),
+      }),
+    }),
+  ),
+});
+
+export const tracerInternalErrorFeedV2NotificationsCreateResponseAcceptedEventsMin = 0;
+
+export const tracerInternalErrorFeedV2NotificationsCreateResponseDuplicateEventsMin = 0;
+
+export const TracerInternalErrorFeedV2NotificationsCreateResponse = zod.object({
+  accepted_events: zod
+    .number()
+    .min(tracerInternalErrorFeedV2NotificationsCreateResponseAcceptedEventsMin),
+  duplicate_events: zod
+    .number()
+    .min(
+      tracerInternalErrorFeedV2NotificationsCreateResponseDuplicateEventsMin,
+    ),
+  pending: zod.array(
+    zod.object({
+      organization_id: zod.string().uuid(),
+      workspace_id: zod.string().uuid(),
+      project_id: zod.string().uuid(),
+      trace_id: zod.string().uuid(),
+      job_id: zod.string().uuid(),
+      generation: zod.number().min(1),
+      state: zod.string().min(1),
+      not_before: zod.string().datetime({ offset: true }),
+    }),
+  ),
+});
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyIdempotencyKeyMax = 255;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyLeaseTokenMax = 255;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultEngineVersionMax = 20;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultMemorySnapshotIdMax = 128;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultMemoryDigestMax = 71;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultEvidenceDigestRegExp =
+  new RegExp("^sha256:[a-f0-9]{64}$");
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemFindingIdMax = 128;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemKindMax = 64;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemStatementMax = 8000;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemRequirementIdMax = 128;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemEvidenceIdsItemMax = 128;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemEvidenceIdsMax = 100;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemRecoveryMax = 64;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemAttributionOriginSpanIdMax = 64;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemAttributionOriginEvidenceIdsItemMax = 128;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemAttributionOriginEvidenceIdsMax = 100;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemAttributionOriginExplanationMax = 600;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemAttributionDecisiveSpanIdMax = 64;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemAttributionDecisiveEvidenceIdsItemMax = 128;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemAttributionDecisiveEvidenceIdsMax = 100;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemAttributionDecisiveExplanationMax = 600;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemAttributionSymptomSpanIdMax = 64;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemAttributionSymptomEvidenceIdsItemMax = 128;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemAttributionSymptomEvidenceIdsMax = 100;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemAttributionSymptomExplanationMax = 600;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultRequirementChecksItemRequirementIdMax = 128;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultRequirementChecksItemRequirementMax = 8000;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultRequirementChecksItemStatusMax = 64;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultRequirementChecksItemEvidenceIdsItemMax = 128;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultRequirementChecksItemEvidenceIdsMax = 100;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultEvidenceReceiptsItemEvidenceIdMax = 128;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultEvidenceReceiptsItemSpanIdMax = 64;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultEvidenceReceiptsItemParentSpanIdMax = 64;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultEvidenceReceiptsItemExcerptMax = 8000;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultVerificationReceiptsItemReceiptIdMax = 128;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultCoverageScopeMax = 255;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultCoverageObservedSpanCountMin = 0;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultUsageModelCallsMin = 0;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultUsageInputTokensMin = 0;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultUsageOutputTokensMin = 0;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultUsageCostUsdMin = 0;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultUsageCostStatusMax = 64;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultGatewayAccountingItemRequestIdMax = 255;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultGatewayAccountingItemModelUsedMax = 255;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultGatewayAccountingItemCostMin = 0;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultGatewayAccountingItemInputTokensMin = 0;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultGatewayAccountingItemOutputTokensMin = 0;
+
+export const tracerInternalErrorFeedV2ReportsCreateBodyResultResultDigestRegExp =
+  new RegExp("^sha256:[a-f0-9]{64}$");
+
+export const TracerInternalErrorFeedV2ReportsCreateBody = zod.object({
+  idempotency_key: zod
+    .string()
+    .min(1)
+    .max(tracerInternalErrorFeedV2ReportsCreateBodyIdempotencyKeyMax),
+  lease_token: zod
+    .string()
+    .min(1)
+    .max(tracerInternalErrorFeedV2ReportsCreateBodyLeaseTokenMax),
+  result: zod.object({
+    contract_version: zod.enum(["omega-investigation/v1"]),
+    organization_id: zod.string().uuid(),
+    workspace_id: zod.string().uuid(),
+    project_id: zod.string().uuid(),
+    job_id: zod.string().uuid(),
+    generation: zod.number().min(1),
+    attempt_id: zod.string().uuid(),
+    trace_id: zod.string().uuid(),
+    engine_version: zod
+      .string()
+      .min(1)
+      .max(tracerInternalErrorFeedV2ReportsCreateBodyResultEngineVersionMax),
+    read_cutoff: zod.string().datetime({ offset: true }),
+    memory_snapshot_id: zod
+      .string()
+      .min(1)
+      .max(tracerInternalErrorFeedV2ReportsCreateBodyResultMemorySnapshotIdMax),
+    memory_digest: zod
+      .string()
+      .min(1)
+      .max(tracerInternalErrorFeedV2ReportsCreateBodyResultMemoryDigestMax),
+    evidence_digest: zod
+      .string()
+      .min(1)
+      .regex(
+        tracerInternalErrorFeedV2ReportsCreateBodyResultEvidenceDigestRegExp,
+      ),
+    execution_status: zod.enum(["completed", "failed"]),
+    outcome: zod.enum(["success", "failure", "unknown"]),
+    findings: zod.array(
+      zod.object({
+        finding_id: zod
+          .string()
+          .min(1)
+          .max(
+            tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemFindingIdMax,
+          ),
+        kind: zod
+          .string()
+          .min(1)
+          .max(
+            tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemKindMax,
+          ),
+        statement: zod
+          .string()
+          .min(1)
+          .max(
+            tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemStatementMax,
+          ),
+        requirement_id: zod
+          .string()
+          .min(1)
+          .max(
+            tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemRequirementIdMax,
+          )
+          .optional(),
+        evidence_ids: zod
+          .array(
+            zod
+              .string()
+              .min(1)
+              .max(
+                tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemEvidenceIdsItemMax,
+              ),
+          )
+          .max(
+            tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemEvidenceIdsMax,
+          ),
+        recovery: zod
+          .string()
+          .min(1)
+          .max(
+            tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemRecoveryMax,
+          ),
+        attribution: zod.object({
+          origin: zod.object({
+            status: zod.enum(["supported", "unsupported", "unknown"]),
+            span_id: zod
+              .string()
+              .min(1)
+              .max(
+                tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemAttributionOriginSpanIdMax,
+              )
+              .optional(),
+            evidence_ids: zod
+              .array(
+                zod
+                  .string()
+                  .min(1)
+                  .max(
+                    tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemAttributionOriginEvidenceIdsItemMax,
+                  ),
+              )
+              .max(
+                tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemAttributionOriginEvidenceIdsMax,
+              ),
+            explanation: zod
+              .string()
+              .max(
+                tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemAttributionOriginExplanationMax,
+              )
+              .optional(),
+          }),
+          decisive: zod.object({
+            status: zod.enum(["supported", "unsupported", "unknown"]),
+            span_id: zod
+              .string()
+              .min(1)
+              .max(
+                tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemAttributionDecisiveSpanIdMax,
+              )
+              .optional(),
+            evidence_ids: zod
+              .array(
+                zod
+                  .string()
+                  .min(1)
+                  .max(
+                    tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemAttributionDecisiveEvidenceIdsItemMax,
+                  ),
+              )
+              .max(
+                tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemAttributionDecisiveEvidenceIdsMax,
+              ),
+            explanation: zod
+              .string()
+              .max(
+                tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemAttributionDecisiveExplanationMax,
+              )
+              .optional(),
+          }),
+          symptom: zod.object({
+            status: zod.enum(["supported", "unsupported", "unknown"]),
+            span_id: zod
+              .string()
+              .min(1)
+              .max(
+                tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemAttributionSymptomSpanIdMax,
+              )
+              .optional(),
+            evidence_ids: zod
+              .array(
+                zod
+                  .string()
+                  .min(1)
+                  .max(
+                    tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemAttributionSymptomEvidenceIdsItemMax,
+                  ),
+              )
+              .max(
+                tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemAttributionSymptomEvidenceIdsMax,
+              ),
+            explanation: zod
+              .string()
+              .max(
+                tracerInternalErrorFeedV2ReportsCreateBodyResultFindingsItemAttributionSymptomExplanationMax,
+              )
+              .optional(),
+          }),
+        }),
+      }),
+    ),
+    requirement_checks: zod.array(
+      zod.object({
+        requirement_id: zod
+          .string()
+          .min(1)
+          .max(
+            tracerInternalErrorFeedV2ReportsCreateBodyResultRequirementChecksItemRequirementIdMax,
+          ),
+        requirement: zod
+          .string()
+          .min(1)
+          .max(
+            tracerInternalErrorFeedV2ReportsCreateBodyResultRequirementChecksItemRequirementMax,
+          ),
+        status: zod
+          .string()
+          .min(1)
+          .max(
+            tracerInternalErrorFeedV2ReportsCreateBodyResultRequirementChecksItemStatusMax,
+          ),
+        evidence_ids: zod
+          .array(
+            zod
+              .string()
+              .min(1)
+              .max(
+                tracerInternalErrorFeedV2ReportsCreateBodyResultRequirementChecksItemEvidenceIdsItemMax,
+              ),
+          )
+          .max(
+            tracerInternalErrorFeedV2ReportsCreateBodyResultRequirementChecksItemEvidenceIdsMax,
+          ),
+      }),
+    ),
+    evidence_receipts: zod.array(
+      zod.object({
+        evidence_id: zod
+          .string()
+          .min(1)
+          .max(
+            tracerInternalErrorFeedV2ReportsCreateBodyResultEvidenceReceiptsItemEvidenceIdMax,
+          ),
+        span_id: zod
+          .string()
+          .min(1)
+          .max(
+            tracerInternalErrorFeedV2ReportsCreateBodyResultEvidenceReceiptsItemSpanIdMax,
+          ),
+        parent_span_id: zod
+          .string()
+          .min(1)
+          .max(
+            tracerInternalErrorFeedV2ReportsCreateBodyResultEvidenceReceiptsItemParentSpanIdMax,
+          )
+          .optional(),
+        excerpt: zod
+          .string()
+          .min(1)
+          .max(
+            tracerInternalErrorFeedV2ReportsCreateBodyResultEvidenceReceiptsItemExcerptMax,
+          ),
+        end_time: zod.string().datetime({ offset: true }).optional(),
+      }),
+    ),
+    verification_receipts: zod.array(
+      zod.object({
+        receipt_id: zod
+          .string()
+          .min(1)
+          .max(
+            tracerInternalErrorFeedV2ReportsCreateBodyResultVerificationReceiptsItemReceiptIdMax,
+          ),
+        executed: zod.boolean(),
+      }),
+    ),
+    coverage: zod.object({
+      scope: zod
+        .string()
+        .min(1)
+        .max(tracerInternalErrorFeedV2ReportsCreateBodyResultCoverageScopeMax),
+      observed_span_count: zod
+        .number()
+        .min(
+          tracerInternalErrorFeedV2ReportsCreateBodyResultCoverageObservedSpanCountMin,
+        ),
+      read_complete: zod.boolean(),
+      future_arrivals_known: zod.boolean(),
+    }),
+    usage: zod.object({
+      model_calls: zod
+        .number()
+        .min(
+          tracerInternalErrorFeedV2ReportsCreateBodyResultUsageModelCallsMin,
+        ),
+      input_tokens: zod
+        .number()
+        .min(
+          tracerInternalErrorFeedV2ReportsCreateBodyResultUsageInputTokensMin,
+        ),
+      output_tokens: zod
+        .number()
+        .min(
+          tracerInternalErrorFeedV2ReportsCreateBodyResultUsageOutputTokensMin,
+        ),
+      cost_usd: zod
+        .number()
+        .min(tracerInternalErrorFeedV2ReportsCreateBodyResultUsageCostUsdMin)
+        .optional(),
+      cost_status: zod
+        .string()
+        .min(1)
+        .max(
+          tracerInternalErrorFeedV2ReportsCreateBodyResultUsageCostStatusMax,
+        ),
+    }),
+    gateway_accounting: zod.array(
+      zod.object({
+        request_id: zod
+          .string()
+          .min(1)
+          .max(
+            tracerInternalErrorFeedV2ReportsCreateBodyResultGatewayAccountingItemRequestIdMax,
+          )
+          .optional(),
+        model_used: zod
+          .string()
+          .min(1)
+          .max(
+            tracerInternalErrorFeedV2ReportsCreateBodyResultGatewayAccountingItemModelUsedMax,
+          ),
+        cost: zod
+          .number()
+          .min(
+            tracerInternalErrorFeedV2ReportsCreateBodyResultGatewayAccountingItemCostMin,
+          ),
+        input_tokens: zod
+          .number()
+          .min(
+            tracerInternalErrorFeedV2ReportsCreateBodyResultGatewayAccountingItemInputTokensMin,
+          )
+          .optional(),
+        output_tokens: zod
+          .number()
+          .min(
+            tracerInternalErrorFeedV2ReportsCreateBodyResultGatewayAccountingItemOutputTokensMin,
+          )
+          .optional(),
+        raw: zod.object({}).passthrough().optional(),
+      }),
+    ),
+    result_digest: zod
+      .string()
+      .min(1)
+      .regex(
+        tracerInternalErrorFeedV2ReportsCreateBodyResultResultDigestRegExp,
+      ),
+  }),
+});
+
+export const TracerInternalErrorFeedV2ReportsCreateResponse = zod.object({
+  status: zod.enum(["accepted", "duplicate"]),
+  report_id: zod.string().uuid(),
+  occurrence_ids: zod.array(zod.string().uuid()),
+  grouping_status: zod.string().min(1),
 });
 
 /**
