@@ -2157,14 +2157,6 @@ describe("WidgetEditor filter-value picker", () => {
       custom_attribute: 29,
       custom_column: 0,
     };
-    const customResponseCounts = {
-      all: 29,
-      system_metric: 0,
-      eval_metric: 0,
-      annotation_metric: 0,
-      custom_attribute: 29,
-      custom_column: 0,
-    };
     const sidebarCounts = resolveWidgetCatalogSidebarCounts({
       requestSettled: true,
       search: "cost",
@@ -2191,7 +2183,7 @@ describe("WidgetEditor filter-value picker", () => {
     expect(
       getWidgetCatalogExactResultCount({
         request: { category: "custom_attribute" },
-        categoryCounts: customResponseCounts,
+        categoryCounts: sidebarCounts,
         categoryCountsExact: true,
         requestSettled: true,
       }),
@@ -2233,6 +2225,41 @@ describe("WidgetEditor filter-value picker", () => {
       exact: false,
     });
   });
+
+  it.each(["eval_metric", "annotation_metric"])(
+    "uses the All request totals for the %s result badge",
+    (category) => {
+      const args = {
+        request: { category, search: "quality", role: "metric" },
+        countRequest: { search: "quality", role: "metric" },
+        categoryCounts: { all: 55, [category]: 27 },
+        categoryCountsExact: true,
+        requestSettled: true,
+      };
+      expect(getWidgetCatalogExactResultCount(args)).toBe(27);
+      expect(
+        getWidgetCatalogExactResultCount({ ...args, requestSettled: false }),
+      ).toBeNull();
+      expect(
+        getWidgetCatalogExactResultCount({
+          ...args,
+          categoryCountsExact: false,
+        }),
+      ).toBeNull();
+      for (const scope of [
+        { source: "traces" },
+        { search: "other" },
+        { role: "filter" },
+      ]) {
+        expect(
+          getWidgetCatalogExactResultCount({
+            ...args,
+            request: { ...args.request, ...scope },
+          }),
+        ).toBeNull();
+      }
+    },
+  );
 
   it("uses one 20-item unified catalog for every property category", () => {
     expect(

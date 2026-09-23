@@ -669,6 +669,7 @@ export function buildWidgetCatalogPickerOptions({
 // eslint-disable-next-line react-refresh/only-export-components
 export function getWidgetCatalogExactResultCount({
   request,
+  countRequest = request,
   categoryCounts,
   categoryCountsExact,
   requestSettled,
@@ -676,6 +677,14 @@ export function getWidgetCatalogExactResultCount({
   selectedBreakdowns = [],
 }) {
   if (!requestSettled || !categoryCountsExact || !categoryCounts) return null;
+  // Search-wide counts can serve a category, but not a narrower source/search.
+  if (
+    ["source", "search", "role"].some(
+      (key) => (request?.[key] || "") !== (countRequest?.[key] || ""),
+    )
+  ) {
+    return null;
+  }
   // Inventory counts do not include local adapter/grouping capability gates.
   // A loaded-page count cannot stand in for the restricted result total.
   if (
@@ -794,8 +803,8 @@ export function mergeWidgetCursorAttributeOptions(
     if (seen.has(identity)) return false;
     seen.add(identity);
     return true;
-        });
-        }
+  });
+}
 
 export function getWidgetMetricCatalogRequest({
   pickerCategory,
@@ -2757,8 +2766,16 @@ export default function WidgetEditorView() {
         ? activeLegacyMetricCatalog.total
         : getWidgetCatalogExactResultCount({
             request: activeCatalogRequest,
-            categoryCounts: activeCategoryCounts,
-            categoryCountsExact: activeCategoryCountsExact,
+            countRequest: activeCategoryCountsExact
+              ? activeCatalogRequest
+              : trimmedDebouncedPickerSearch
+                ? allSearchWidgetCatalogRequest
+                : baseWidgetCatalogRequest,
+            categoryCounts: activeCategoryCountsExact
+              ? activeCategoryCounts
+              : pickerSidebarCategoryCounts,
+            categoryCountsExact:
+              activeCategoryCountsExact || pickerSidebarCategoryCountsExact,
             requestSettled: activeRequestSettled,
             pickerMode,
             selectedBreakdowns: breakdowns,
