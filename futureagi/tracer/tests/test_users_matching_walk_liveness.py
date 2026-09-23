@@ -225,7 +225,8 @@ class _CappedEngine(Engine):
     metrics and evals statements that finish it. Records every replay as
     ``(ids, capped, stopped)``, and every finishing statement as ``(kind,
     ids, capped, stopped)``. With a ``clock``, every statement spends its
-    time on it: 1 ms, a stopped statement its cap, and a slice what
+    time on it: 1 ms, an instant read ``instant_ms``, an enrichment statement
+    ``enrich_ms``, a stopped statement its cap, and a slice what
     ``slice_ms(width, returned_rows)`` says. A slice that costs more than the
     cap it was sent with is stopped there; one sent without a cap runs to
     the end whatever it costs. Records every slice as ``(width, cap,
@@ -240,6 +241,7 @@ class _CappedEngine(Engine):
         clock: _Clock | None = None,
         slice_ms: Callable[[timedelta, bool], float] | None = None,
         instant_ms: float = 1.0,
+        enrich_ms: float = 1.0,
     ) -> None:
         super().__init__(world)
         self.heavy = heavy
@@ -247,6 +249,7 @@ class _CappedEngine(Engine):
         self.clock = clock
         self.slice_ms = slice_ms
         self.instant_ms = instant_ms
+        self.enrich_ms = enrich_ms
         self.replays: list[tuple[tuple[str, ...], bool, bool]] = []
         # Per replay: ms into the request when it was sent, rows it returned.
         self.replay_info: list[tuple[float, int]] = []
@@ -320,7 +323,7 @@ class _CappedEngine(Engine):
         )
         if kind == "replay":
             self.replay_info[-1] = (self.replay_info[-1][0], len(result.data or ()))
-        cost = self.instant_ms if kind == "instant" else 1.0
+        cost = {"instant": self.instant_ms, "enrich": self.enrich_ms}.get(kind, 1.0)
         if kind == "slice":
             width = TICK * (params["slice_end_us"] - params["slice_start_us"])
             if self.slice_ms is not None:
@@ -1648,6 +1651,79 @@ def test_a_budget_refusal_below_an_empty_slice_ends_without_a_crawl(gap_hours):
 
     assert names == [f"user-{n}" for n in range(1, 31)]
     assert all(per_hop[:-1]), per_hop
+
+
+@pytest.mark.parametrize(
+    ("world_kind", "gap_hours"),
+    [
+        ("failure_spends_the_wall", 4),
+        ("failure_spends_the_wall", 10),
+        ("failure_spends_the_wall", 20),
+        ("slow_enrichment", 3),
+        ("slow_enrichment", 7),
+    ],
+)
+def test_a_wall_stop_below_an_empty_slice_is_the_next_requests_head(
+    world_kind, gap_hours
+):
+    """The page wall, not a read, refuses a batch below an empty first slice.
+
+    Two ways a request whose first slice is empty (so it no longer owes
+    progress) meets its users only after the 5 s page wall is spent: three
+    users ``gap_hours`` below the end, 90 minutes apart, whose batch fails
+    after 5.1 s (a user alone fits at six-hour buckets); or three clusters of
+    five users ``gap_hours`` apart, 100 attribute keys, and every enrichment
+    statement taking 200 ms, no faults, so a batch's 26 statements outlast
+    the wall. Either way the request stops for ``wall`` with its coverage
+    just above the refused batch, not at the empty slice's floor an hour
+    down, and the next request decides it: no two requests in a row publish
+    nobody, unless the first stopped for ``read_budget``.
+    """
+    world = World()
+    if world_kind == "failure_spends_the_wall":
+        for n in range(3):
+            moment = WINDOW_END - timedelta(hours=gap_hours, minutes=90 * n)
+            world.user(n + 1, key=moment, raw=(moment,))
+        keys = 0
+    else:
+        for n in range(15):
+            cluster, member = divmod(n, 5)
+            moment = WINDOW_END - timedelta(
+                hours=gap_hours * (cluster + 1), minutes=2 * member
+            )
+            world.user(n + 1, key=moment, raw=(moment,))
+        keys = 100
+    clock = _Clock()
+    names: list[str] = []
+    per_hop: list[int] = []
+    stops: list[list[str]] = []
+    cursor = None
+    with _shipped_walls(), _scripted_clock(clock):
+        for _hop in range(20):
+            if world_kind == "failure_spends_the_wall":
+                engine = _MemoryEngine(
+                    world, clock=clock, width=timedelta(hours=6), fail_ms=5_100.0
+                )
+            else:
+                engine = _CappedEngine(world, clock=clock, enrich_ms=200.0)
+            with capture_logs() as logs:
+                read = _keyed_page(
+                    page_size=25, cursor=cursor, engine=engine, keys=keys
+                )
+            names.extend(_names(read))
+            per_hop.append(len(_names(read)))
+            stops.append(_exhausted(logs))
+            if not read.has_more:
+                break
+            cursor = _signed_cursor(read)
+
+    assert names == [f"user-{n}" for n in range(1, len(world.users) + 1)]
+    assert "wall" in [stop for hop in stops for stop in hop], stops
+    for n in range(1, len(per_hop) - 1):
+        assert per_hop[n - 1] or per_hop[n] or stops[n - 1] == ["read_budget"], (
+            per_hop,
+            stops,
+        )
 
 
 @pytest.mark.parametrize("slices", ["cheap", "every_capped_slice_stopped"])

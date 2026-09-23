@@ -70,10 +70,11 @@ a user whose replay the server stopped without the cap, once
 (``_materialise``).
 
 Time splits. A batch's attribute read (``_certify``) is never split in time.
-When it runs out of a read budget (``is_read_budget_error``: memory, row and
-time limits, cancellation, overload, a socket timeout), its head-of-line user
-is read alone, charged as a second enrichment (``_head_statements`` reserves
-both), and the rest of the request certifies one user at a time. Only the
+When the server stops it on a read budget (``is_read_budget_error`` other than
+the request's own wall: memory, row and time limits, cancellation, overload, a
+socket timeout), its head-of-line user is read alone, charged as a second
+enrichment (``_head_statements`` reserves both), and the rest of the request
+certifies one user at a time; the request's wall stops it outright. Only the
 head-of-line user of a request that has decided nothing may have its read
 split in time (``UsersListManager._read_span_attributes``): one user a
 request, up to
@@ -84,9 +85,13 @@ the analytics wall is already spent, and otherwise runs against what is left
 of it (``_admission_deadline``). One stall is known and left open: a split
 that starts with some of the wall left and outlasts it stops every request at
 that user, having decided no one. Any other user whose read runs out of a read
-budget stops the request (``read_budget``) with its coverage just above that
-user, so the next request decides it as its head of line. A request that has
-decided something certifies a batch only when it can also publish it.
+budget stops the request (``read_budget``), and so does a batch the page wall
+refuses (``wall``), with the coverage just above the refused batch's first
+candidate: the refused user, unless an already-decided user precedes it, which
+the next request finishes first. Either way the next request decides it as
+its head of line. A refusal by the statement count keeps the boundary it had.
+A request that has decided something certifies a batch only when the
+statements left also pay one materialisation.
 
 Tied instant. Inside one timestamp the slice's raw id order is not the
 page's resolved id order (an alias may resolve to a survivor on either side of
@@ -845,7 +850,8 @@ def _certify(state: _WalkState, batch: list[_Candidate]) -> int:
     if not state.progress_owed and state.budget.remaining_statements() < (
         statements + _materialisation_statement_count(manager)
     ):
-        # Off the head of line, certify only what this request can publish.
+        # Off the head of line, only when one materialisation is paid too
+        # (``progress_owed``: defensive, the floor always leaves the head room).
         state.budget.exhausted_by = "statements"
         return 0
     if not state.budget.take(statements, finish=state.progress_owed):
@@ -877,7 +883,7 @@ def _certify(state: _WalkState, batch: list[_Candidate]) -> int:
         if head or not is_read_budget_error(exc):
             raise
         if len(batch) == 1:
-            # Not the head of line: the request stops just above this user.
+            # Not the head of line: the request stops above this batch.
             state.budget.exhausted_by = "read_budget"
             return 0
         state.certify_singly = True
@@ -1343,9 +1349,10 @@ def walk_matching_activity_page(
             batch = _certified_prefix(state, candidates[start : start + batch_size])
             if batch is None:
                 state.stopped = True
-                if state.budget.exhausted_by == "read_budget":
-                    # Just above the refused user, the next head of line; a
-                    # budget or wall refusal keeps the boundary it had.
+                if state.budget.exhausted_by in ("read_budget", "wall"):
+                    # Just above the refused batch's first candidate. A count
+                    # refusal keeps its boundary: in a tie, moving it would
+                    # re-open the instant.
                     boundary = candidates[start].newest_witness
                 break
             start += len(batch)
