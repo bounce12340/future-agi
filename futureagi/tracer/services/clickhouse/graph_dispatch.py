@@ -376,7 +376,7 @@ def _select_raw_trace_seed_candidate(
             # (type mismatch, unknown identifier, no common type) out of a
             # request that succeeds without any probe at all.
             logger.warning(
-                "graph seed probe degraded",
+                "graph_seed_probe_degraded",
                 probe_index=probe_count,
                 error_type=type(exc).__name__,
                 exc_info=True,
