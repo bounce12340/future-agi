@@ -256,6 +256,9 @@ _GENERAL_CH_NATIVE_PORT_VARIABLES = (
 # production server carries it. Every client proves it before its caller can
 # issue a statement.
 CH_TEST_SIDECAR_NATIVE_PORT_VARIABLE = "FI_CH_TEST_SIDECAR_NATIVE_PORT"
+# The same for the sidecar's HTTP interface (published on 18123).
+_GENERAL_CH_HTTP_PORT_VARIABLES = ("CH25_HTTP_PORT", "CH_HTTP_PORT")
+CH_TEST_SIDECAR_HTTP_PORT_VARIABLE = "FI_CH_TEST_SIDECAR_HTTP_PORT"
 _CH_TEST_SIDECAR_REPLICA = "test-01"
 _CH_TEST_SIDECAR_STATEMENT = "SELECT getMacro('replica')"
 
@@ -296,6 +299,16 @@ def _ch_test_native_port(
         environ,
         opt_in=CH_TEST_SIDECAR_NATIVE_PORT_VARIABLE,
         general=_GENERAL_CH_NATIVE_PORT_VARIABLES,
+    )
+
+
+def _ch_test_http_port(
+    environ: Mapping[str, str] = os.environ,
+) -> ClickHouseTestPort:
+    return _resolve_ch_test_port(
+        environ,
+        opt_in=CH_TEST_SIDECAR_HTTP_PORT_VARIABLE,
+        general=_GENERAL_CH_HTTP_PORT_VARIABLES,
     )
 
 
@@ -387,6 +400,42 @@ def _ch_test_owned_database(
             yield database
         finally:
             admin.execute(f"DROP DATABASE IF EXISTS {database} SYNC")
+
+
+def _open_ch_test_http_client(
+    *,
+    database: str = "default",
+    environ: Mapping[str, str] = os.environ,
+    **client_kwargs,
+):
+    """``_open_ch_test_native_client`` over HTTP. The caller closes the client."""
+
+    import clickhouse_connect
+
+    target = _ch_test_http_port(environ)
+    host = environ.get("CH25_HOST", "127.0.0.1")
+    _require_safe_ch25_test_target(host=host, database=database)
+    options = {
+        "username": environ.get("CH25_USER") or environ.get("CH_USERNAME") or "default",
+        "password": environ.get("CH25_PASSWORD") or environ.get("CH_PASSWORD") or "",
+        **client_kwargs,
+    }
+    try:
+        client = clickhouse_connect.get_client(
+            host=host, port=target.port, database=database, **options
+        )
+    except Exception as exc:
+        pytest.skip(
+            f"test ClickHouse is not reachable on {host}:{target.port} ({exc!r})"
+        )
+    try:
+        _require_ch_test_sidecar(
+            target, lambda statement: client.query(statement).result_rows
+        )
+    except BaseException:
+        client.close()
+        raise
+    return client
 
 
 def _apply_ch25_schema_for_tests():
