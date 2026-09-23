@@ -633,6 +633,16 @@ def _logged(logs: list[dict], event: str) -> list[str]:
     return [entry["reason"] for entry in logs if entry["event"] == event]
 
 
+def _exhausted(logs: list[dict]) -> list[str]:
+    """Why each stopped request stopped, as the walk logged it."""
+
+    return [
+        entry["exhausted_by"]
+        for entry in logs
+        if entry["event"] == "users_matching_walk_budget_exhausted"
+    ]
+
+
 def _lower_position(new: tuple, old: tuple) -> bool:
     """Whether cursor position ``(last_key, last_id)`` ``new`` is below ``old``."""
 
@@ -1465,7 +1475,8 @@ def test_only_the_head_of_line_decision_of_a_request_splits_in_time():
             memory = _MemoryEngine(
                 world, clock=clock, width=timedelta(minutes=10), fail_ms=5.0
             )
-            read, _engine = _page(world, page_size=25, cursor=cursor, engine=memory)
+            with capture_logs() as logs:
+                read, _engine = _page(world, page_size=25, cursor=cursor, engine=memory)
             names.extend(_names(read))
             if not read.has_more:
                 break
@@ -1478,6 +1489,8 @@ def test_only_the_head_of_line_decision_of_a_request_splits_in_time():
             alone = [f for n, b, f in memory.enrichments if n == 1 and b == WINDOW]
             assert alone == [True, True], memory.enrichments[-1]
             assert memory.enrichments[-1] == (1, WINDOW, True)
+            # A stop of its own kind, not a wall, and the page is degraded.
+            assert _exhausted(logs) == ["read_budget"]
             assert read.payload["query_status"] == "degraded"
             cursor = _signed_cursor(read)
 
@@ -1517,12 +1530,7 @@ def test_a_user_refused_below_an_empty_slice_is_the_next_requests_head(gap_hours
             # next, refused unsplit: only the head of line splits.
             split = {world.users[uid]["name"] for uid in memory.split}
             assert split == set(_names(read)), (per_hop, split)
-            exhausted = [
-                e["exhausted_by"]
-                for e in logs
-                if e["event"] == "users_matching_walk_budget_exhausted"
-            ]
-            assert exhausted == ["wall"], exhausted
+            assert _exhausted(logs) == ["read_budget"]
             assert read.payload["query_status"] == "degraded"
             cursor = _signed_cursor(read)
 
@@ -1613,12 +1621,7 @@ def test_a_split_that_outlasts_the_analytics_wall_is_a_known_stall(
                 read, _engine = _page(world, page_size=25, cursor=cursor, engine=memory)
             published.extend(_names(read))
             assert read.has_more and read.payload["query_status"] == "degraded"
-            exhausted = [
-                e["exhausted_by"]
-                for e in logs
-                if e["event"] == "users_matching_walk_budget_exhausted"
-            ]
-            assert exhausted == ["wall"], exhausted
+            assert _exhausted(logs) == ["wall"], _exhausted(logs)
             if slices == "cheap" or hop > 0:
                 # Split under the wall, and stopped by it.
                 stalled_ms.append((clock.now - started) * 1000)

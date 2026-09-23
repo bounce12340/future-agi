@@ -198,6 +198,7 @@ class _WalkBudget:
         self.deadline = ReadDeadline.start(wall_ms)
         self.max_statements = int(max_statements)
         self.statements = 0
+        # "statements" (sticky), "wall", or "read_budget" (``_certify``).
         self.exhausted_by: str | None = None
 
     def take(self, statements: int, *, finish: bool = False) -> bool:
@@ -887,7 +888,7 @@ def _certify(state: _WalkState, batch: list[_Candidate]) -> int:
             raise
         if len(batch) == 1:
             # Not the head of line: the request stops just above this user.
-            state.budget.exhausted_by = "wall"
+            state.budget.exhausted_by = "read_budget"
             return 0
         state.certify_singly = True
         logger.info(
