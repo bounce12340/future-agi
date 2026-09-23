@@ -58,7 +58,10 @@ Budget. The walk owns a wall (``USER_LIST_PAGE_WALL_MS``) and a statement
 budget (``USER_LIST_WALK_MAX_STATEMENTS``). On exhaustion it returns the users
 certified so far, in order, with a cursor; it never falls back to the
 whole-window statement. A slice that fails on a read budget is retried
-narrower, never wider.
+narrower, never wider. The finishing statements run past the page wall under
+a server cap (``_finish_deadline``); a batch the server stops is replayed one
+user at a time, and a page that has published nothing decides a user whose
+replay the server stopped without the cap, once (``_materialise``).
 
 Tied instant. Inside one timestamp the slice's raw id order is not the
 page's resolved id order (an alias may resolve to a survivor on either side of
@@ -78,7 +81,11 @@ re-discovered published user at the enrichment step, before any replay, and
 inside an instant it names the lowest decided position, published or not.
 ``open_instant`` (present only when true; a four-element cursor is read as
 false) tells the next request to decide the instant just below ``coverage``
-first, from ``last_id`` when ``last_key`` is that instant.
+first, from ``last_id`` when ``last_key`` is that instant. A user whose key
+is at or above the coverage a request resumed from was decided before it,
+published or rejected by its replay, so it is never pending again however a
+lower row witnesses it, and no cursor's coverage rises above the one it
+resumed from: each request decides something new or moves down.
 """
 
 from __future__ import annotations
@@ -219,9 +226,19 @@ class _WalkState:
     budget: _WalkBudget
     last_key: datetime | None
     last_id: str | None
+    # The coverage this request resumed from. Every user whose key is at or
+    # above it was decided by an earlier request, published or rejected by
+    # its replay, however a lower row witnesses it again now; nothing there
+    # is pending, and the cursor never moves back above it.
+    decided_from: datetime
     certified: dict[str, _Certified] = field(default_factory=dict)
     published: list[dict[str, Any]] = field(default_factory=list)
     stopped: bool = False
+    # A capped finish was stopped: later ones replay one user at a time
+    # (``_materialise``), and one user whose own replay was stopped may be
+    # decided without the cap, once per request.
+    finish_singly: bool = False
+    uncapped_finish: bool = False
     # The tied instant being decided, the id below which it was entered, and
     # the resolved ids it returned (certified), in descending order.
     instant: datetime | None = None
@@ -251,6 +268,7 @@ class _WalkState:
             and not entry.published
             and not (entry.materialised and not entry.member)
             and _clears(entry, boundary)
+            and entry.order_key < self.decided_from
             and self.keyset_admits(entry.order_key, entry.end_user_id)
         ]
         rows.sort(key=lambda entry: (entry.order_key, entry.end_user_id), reverse=True)
@@ -692,9 +710,11 @@ def _finish_deadline(state: _WalkState) -> ReadDeadline:
     (``USER_LIST_QUERY_TIMEOUT_MS`` / ``USER_LIST_ENRICHMENT_TIMEOUT_MS``) and
     what is left as ``max_execution_time``, so a running replay, metrics,
     evals or relation statement is stopped there, not only refused admission
-    after it. A statement the server stops raises ``ReadDeadlineExceeded``:
-    the page is published as degraded with its certified users carried in
-    the cursor. On a server profile locked at ``readonly=1`` no query
+    after it. A statement the server stops raises ``ReadDeadlineExceeded``;
+    ``_materialise`` then replays one user at a time, publishes the page as
+    degraded with the rest carried in the cursor once a user's own replay is
+    stopped, and decides that user without the cap only when the page has
+    published nothing. On a server profile locked at ``readonly=1`` no query
     setting reaches ClickHouse and only the profile's limits apply.
     """
 
@@ -704,44 +724,89 @@ def _finish_deadline(state: _WalkState) -> ReadDeadline:
     )
 
 
-def _materialise(state: _WalkState, entries: list[_Certified]) -> bool:
-    """Whole-window replay plus final membership for publishable users only."""
+def _replay(
+    state: _WalkState, entries: list[_Certified], deadline: ReadDeadline | None
+) -> list[dict[str, Any]]:
+    """The whole-window replay of ``entries`` and its finishing statements."""
 
-    manager = state.manager
-    if not state.budget.take(_materialisation_statement_count(manager), finish=True):
-        return False
-    ids = [entry.end_user_id for entry in entries]
     scan_ids = list(
         dict.fromkeys(alias for entry in entries for alias in entry.alias_ids)
     )
     alias_map = {
         alias: entry.end_user_id for entry in entries for alias in entry.alias_ids
     }
-    try:
-        rows = manager._read_exact_candidate_rows(
-            candidate_ids=ids,
-            candidate_scan_ids=scan_ids,
-            candidate_end_user_id_map=alias_map,
-            frozen_filters=state.frozen_filters,
-            window_start=state.window_start,
-            window_end=state.window_end,
-            # Finish mode: the PAGE wall does not govern these statements.
-            # Passing the walk's own deadline would let the replay spend the
-            # last of it and the metrics read that follows raise on the client
-            # clock, dropping a user the page had already certified. The
-            # analytics wall MINUS what the walk has already spent keeps that
-            # property, reaches ClickHouse as each statement's
-            # ``max_execution_time`` (which ``deadline=None`` never did), and
-            # ends the finish by the analytics wall instead of granting a
-            # second full wall here.
-            deadline=_finish_deadline(state),
-            enrich_rows=True,
-            candidate_rows=None,
-            skip_attribute_read=True,
-        )
-    except ReadDeadlineExceeded:
-        state.budget.exhausted_by = "wall"
+    return state.manager._read_exact_candidate_rows(
+        candidate_ids=[entry.end_user_id for entry in entries],
+        candidate_scan_ids=scan_ids,
+        candidate_end_user_id_map=alias_map,
+        frozen_filters=state.frozen_filters,
+        window_start=state.window_start,
+        window_end=state.window_end,
+        deadline=deadline,
+        enrich_rows=True,
+        candidate_rows=None,
+        skip_attribute_read=True,
+    )
+
+
+def _materialise(state: _WalkState, entries: list[_Certified]) -> bool:
+    """Whole-window replay plus final membership for publishable users only.
+
+    Returns ``False`` when the page must stop here, and ``True`` without
+    deciding anyone when the server stopped a batch: from then on the caller
+    replays one user at a time, so a heavy user no longer stops the users
+    ahead of it, and a user whose own replay is stopped is known to be heavy.
+    """
+
+    manager = state.manager
+    statements = _materialisation_statement_count(manager)
+    if not state.budget.take(statements, finish=True):
         return False
+    try:
+        # Finish mode: the PAGE wall does not govern these statements.
+        # Passing the walk's own deadline would let the replay spend the last
+        # of it and the metrics read that follows raise on the client clock,
+        # dropping a user the page had already certified. The analytics wall
+        # MINUS what the walk has already spent keeps that property, reaches
+        # ClickHouse as each statement's ``max_execution_time``, and ends the
+        # finish by the analytics wall instead of granting a second full wall
+        # here.
+        rows = _replay(state, entries, _finish_deadline(state))
+    except ReadDeadlineExceeded:
+        state.finish_singly = True
+        must_decide = not state.published and not state.uncapped_finish
+        if len(entries) > 1 and (
+            not must_decide or state.budget.remaining_statements() >= 2 * statements
+        ):
+            logger.info("users_matching_walk_finish_stopped", users=len(entries))
+            return True
+        if not must_decide or not state.budget.take(statements, finish=True):
+            state.budget.exhausted_by = "wall"
+            return False
+        # A page that has published nothing decides its head-of-line user
+        # alone, with no deadline at all: no server cap and no admission
+        # check. A user whose replay outlasts every cap would otherwise stop
+        # every request at the same place, and an exact list can neither skip
+        # it nor publish anyone ranked behind it first, so no bounded retry
+        # keeps the list both exact and moving. These statements (the replay
+        # and its metrics, evals and relation reads) are the request's only
+        # unbounded ones: one user, once per request, and, whenever the
+        # budget affords the capped attempt first, only a user whose own
+        # capped replay was stopped. Admitting them against the analytics
+        # wall, as the finish did before the cap existed, would not do: a
+        # replay that spent the wall would refuse the metrics read after it,
+        # and the same user would stall the cursor there instead.
+        state.uncapped_finish = True
+        entries = entries[:1]
+        try:
+            rows = _replay(state, entries, None)
+        except ReadDeadlineExceeded:
+            state.budget.exhausted_by = "wall"
+            return False
+        logger.info(
+            "users_matching_walk_uncapped_finish",
+            statements=state.budget.statements,
+        )
     by_id = {str(row.get("end_user_id")): row for row in rows if row.get("end_user_id")}
     for entry in entries:
         row = by_id.get(entry.end_user_id)
@@ -775,7 +840,7 @@ def _publish(state: _WalkState, boundary: datetime | None) -> bool:
         ]
         if not unmaterialised:
             return True
-        room = state.page_size - len(state.published)
+        room = 1 if state.finish_singly else state.page_size - len(state.published)
         if not _materialise(state, unmaterialised[:room]):
             return False
     return True
@@ -916,8 +981,9 @@ def walk_matching_activity_page(
         ),
         last_key=last_key,
         last_id=last_id,
+        decided_from=min(coverage, window_end),
     )
-    slice_end = min(coverage, window_end)
+    slice_end = state.decided_from
     width = USER_LIST_WALK_INITIAL_SLICE
     before: tuple[datetime, str] | None = None
     # Every undecided user's newest matching row lies at or below this line
@@ -1056,7 +1122,10 @@ def walk_matching_activity_page(
             USER_LIST_MATCHING_CURSOR_ORDER,
             last_key,
             last_id,
-            min(next_coverage, window_end),
+            # Never above the coverage this request resumed from: everything
+            # at or after it was decided before, so restating it is exact,
+            # and a cursor that moved back up would repeat its hops.
+            min(next_coverage, state.decided_from),
         )
         # An instant left undecided, or a walk its budget stopped, resumes by
         # deciding the instant below ``coverage`` in resolved order: a raw

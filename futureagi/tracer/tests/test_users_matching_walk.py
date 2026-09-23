@@ -1004,7 +1004,9 @@ class _NativeDriver:
 
     It answers each statement from the scripted engine and records the
     settings the native client actually sent, so the assertion is on what
-    ClickHouse would receive, not on what the walk asked for.
+    ClickHouse would receive, not on what the walk asked for. A statement of
+    ``fail_kind`` sent with a ``max_execution_time`` is stopped there, as the
+    server stops it at its cap; the same statement sent without one runs.
     """
 
     def __init__(self, engine: Engine) -> None:
@@ -1015,7 +1017,8 @@ class _NativeDriver:
     def execute(self, query, params=None, *, with_column_types=False, settings=None):
         kind = kind_of(query)
         self.sent.append((kind, settings))
-        if kind == self.fail_kind:
+        capped = float((settings or {}).get("max_execution_time") or 0) > 0
+        if kind == self.fail_kind and capped:
             from clickhouse_driver.errors import ErrorCodes, ServerException
 
             raise ServerException(
@@ -1070,8 +1073,16 @@ def test_finish_mode_reaches_the_native_driver_as_max_execution_time():
         assert sent[kind]["max_execution_time"] == 0, kind
 
 
-def test_a_finish_statement_the_server_stops_degrades_the_page_and_carries_the_user():
-    """The server's timeout is the finishing deadline, not a failed request."""
+def test_a_finish_the_server_stops_on_an_empty_page_is_retried_without_the_cap():
+    """The server's timeout is the finishing deadline, not a failed request.
+
+    The page has published nothing when the server stops its capped replay,
+    so it decides its head-of-line user alone, once, with no cap, instead of
+    returning empty with the user carried: for a user whose replay always
+    outlasts the cap, that empty page came back on every request
+    (``test_users_matching_walk_liveness`` follows those to the end, and the
+    page that has already published something, which the cap still ends).
+    """
 
     world = World()
     world.user(1, key=minutes_before_end(3), raw=(minutes_before_end(3),))
@@ -1080,13 +1091,15 @@ def test_a_finish_statement_the_server_stops_degrades_the_page_and_carries_the_u
 
     read = _real_service_page(world, driver)
 
-    assert read.payload["table"] == []
-    assert read.payload["query_status"] == "degraded"
-    assert read.has_more is True
-
-    driver.fail_kind = None
-    resumed = _real_service_page(world, driver, cursor=_signed_cursor(read))
-    assert _names(resumed) == ["user-1"]
+    assert _names(read) == ["user-1"]
+    caps = [
+        settings["max_execution_time"]
+        for kind, settings in driver.sent
+        if kind == "replay"
+    ]
+    assert len(caps) == 2 and 0 < caps[0] <= 8.0 and caps[1] == 0
+    assert read.has_more is False
+    assert read.payload["query_status"] == "complete"
 
 
 def test_finish_mode_does_not_start_a_second_full_wall_after_the_page_wall():
