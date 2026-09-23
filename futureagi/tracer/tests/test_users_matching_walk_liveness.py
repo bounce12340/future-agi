@@ -1450,7 +1450,8 @@ def test_only_the_head_of_line_decision_of_a_request_splits_in_time():
     fails, its head-of-line user alone is split down to buckets that fit and
     is published; the next user's own enrichment then fails over the whole
     window and ends the request, degraded, rather than split a second user's
-    read uncounted. The next request decides that user as its head of line.
+    read uncounted. The request stops with its coverage just above that user,
+    so the next request decides it as its head of line.
     """
     world, expected = _spread_world(5, 3)
     clock = _Clock()
@@ -1478,6 +1479,53 @@ def test_only_the_head_of_line_decision_of_a_request_splits_in_time():
             cursor = _signed_cursor(read)
 
     assert names == expected
+
+
+@pytest.mark.parametrize("gap_hours", [4, 10, 20])
+def test_a_user_refused_below_an_empty_slice_is_the_next_requests_head(gap_hours):
+    """A user refused off the head path below an empty slice is decided next.
+
+    Every enrichment wider than ten minutes runs out of memory, cheaply. Three
+    users sit ``gap_hours`` and more below the window end, 90 minutes apart,
+    so a request's first slice is empty: it decides no one, but the request
+    no longer owes progress, and the user the widened slice below it meets is
+    refused without a split. That request stops with its coverage just above
+    the refused user, not at the empty slice's floor an hour down, so the
+    next request decides it as its head of line: users are published on
+    consecutive requests.
+    """
+    world = World()
+    for n in range(3):
+        moment = WINDOW_END - timedelta(hours=gap_hours, minutes=90 * n)
+        world.user(n + 1, key=moment, raw=(moment,))
+    expected = ["user-1", "user-2", "user-3"]
+    clock = _Clock()
+    per_hop: list[list[str]] = []
+    cursor = None
+    with _shipped_walls(), _scripted_clock(clock):
+        for _hop in range(8):
+            memory = _MemoryEngine(world, clock=clock, width=TEN_MINUTES, fail_ms=5.0)
+            with capture_logs() as logs:
+                read, _engine = _page(world, page_size=25, cursor=cursor, engine=memory)
+            per_hop.append(_names(read))
+            if not read.has_more:
+                break
+            # Each request decides one user, published, and stops at the
+            # next, refused unsplit: only the head of line splits.
+            split = {world.users[uid]["name"] for uid in memory.split}
+            assert split == set(_names(read)), (per_hop, split)
+            exhausted = [
+                e["exhausted_by"]
+                for e in logs
+                if e["event"] == "users_matching_walk_budget_exhausted"
+            ]
+            assert exhausted == ["wall"], exhausted
+            assert read.payload["query_status"] == "degraded"
+            cursor = _signed_cursor(read)
+
+    assert [name for names in per_hop for name in names] == expected
+    # The first request only finds the first user; every later one publishes.
+    assert [len(names) for names in per_hop] == [0, 1, 1, 1], per_hop
 
 
 @pytest.mark.parametrize("slices", ["cheap", "every_capped_slice_stopped"])

@@ -843,7 +843,8 @@ def _certify(state: _WalkState, batch: list[_Candidate]) -> int:
     for each enrichment statement, not counted against the statement budget
     and bounded in time only by ``_admission_deadline`` (no deadline on the
     head path). Any other user whose read runs out of a read budget stops the
-    request, and the next one decides that user as its head of line.
+    request with its coverage just above that user (the main loop's boundary,
+    or the open instant), so the next request decides it as its head of line.
     """
 
     manager = state.manager
@@ -879,7 +880,7 @@ def _certify(state: _WalkState, batch: list[_Candidate]) -> int:
         if head or not is_read_budget_error(exc):
             raise
         if len(batch) == 1:
-            # Not the head of line: the next request decides this user first.
+            # Not the head of line: the request stops just above this user.
             state.budget.exhausted_by = "wall"
             return 0
         state.certify_singly = True
@@ -1347,6 +1348,7 @@ def walk_matching_activity_page(
             batch = _certified_prefix(state, candidates[start : start + batch_size])
             if batch is None:
                 state.stopped = True
+                boundary = candidates[start].newest_witness
                 break
             start += len(batch)
             remaining = candidates[start:]
