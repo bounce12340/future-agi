@@ -1311,17 +1311,10 @@ def _dashboard_metric_key(metric):
 
 
 def _dashboard_rollup_expression(metric):
-    """Return (physical source, aggregate expression, strategy, exact).
+    """Return (physical source, aggregate expression, estimate strategy).
 
     Expressions are selected only from this code-owned whitelist. No request
     value is interpolated as a table, column, function, or alias.
-
-    ``exact`` says whether the published value is a count or a sum over the
-    selected rows rather than an approximation. Every ``latency`` aggregation
-    is a stored tDigest quantile — and the ``avg`` case additionally publishes
-    the median under an average's name — so latency is never exact. The
-    ``trace_count`` source is untouched by this route and keeps the claim it
-    has always made.
     """
 
     if metric.get("type", "system_metric") != "system_metric":
@@ -1342,7 +1335,6 @@ def _dashboard_rollup_expression(metric):
             _DASHBOARD_SPAN_STATE_SOURCE,
             f"(quantilesTDigestMerge(0.5, 0.95, 0.99)(latency_q))[{quantile_index}]",
             strategy,
-            False,
         )
 
     if metric_name in _DASHBOARD_ROLLUP_SUM_COLUMNS:
@@ -1359,7 +1351,6 @@ def _dashboard_rollup_expression(metric):
             _DASHBOARD_SPAN_STATE_SOURCE,
             expression,
             "hourly_aggregate_states",
-            True,
         )
 
     if metric_name == "error_rate":
@@ -1375,7 +1366,6 @@ def _dashboard_rollup_expression(metric):
             _DASHBOARD_SPAN_STATE_SOURCE,
             expression,
             "hourly_aggregate_states",
-            True,
         )
 
     if metric_name in {"span_count", "traffic"} and aggregation in {
@@ -1387,7 +1377,6 @@ def _dashboard_rollup_expression(metric):
             _DASHBOARD_SPAN_STATE_SOURCE,
             "countMerge(n)",
             "hourly_aggregate_states",
-            True,
         )
 
     if metric_name == "project" and aggregation in {"count", "count_distinct"}:
@@ -1395,7 +1384,6 @@ def _dashboard_rollup_expression(metric):
             _DASHBOARD_SPAN_STATE_SOURCE,
             "uniqExact(project_id)",
             "hourly_state_keys",
-            True,
         )
 
     if metric_name == "trace_count" and aggregation in {
@@ -1406,7 +1394,6 @@ def _dashboard_rollup_expression(metric):
             "trace_count_rollup",
             "uniqExactMerge(uniq_traces_state)",
             "hourly_exact_trace_states",
-            False,
         )
     return None
 
@@ -1601,7 +1588,7 @@ def _read_dashboard_rollup_fast_path(
                 refresh_state=refresh_state,
                 error_code="bounded_shape_unavailable",
             )
-        source, aggregate_expression, strategy, exact = expression
+        source, aggregate_expression, strategy = expression
         prepared.append(
             {
                 "index": index,
@@ -1610,7 +1597,6 @@ def _read_dashboard_rollup_fast_path(
                 "alias": f"metric_{index}",
                 "expression": aggregate_expression,
                 "strategy": strategy,
-                "exact": exact,
             }
         )
 
@@ -1814,10 +1800,11 @@ def _read_dashboard_rollup_fast_path(
             "query_complete": True,
             "query_status": "complete",
             "query_sampled": False,
-            # A payload is exact only when every metric in it is; a single
-            # tDigest latency series or a trace-count metric keeps the whole
-            # response honest about being an approximation.
-            "query_exact": all(item["exact"] for item in prepared),
+            # Neither source reduces to the latest live row version: the span
+            # states are built per physical part, so unmerged versions and
+            # retained ``is_deleted`` tombstones are counted, and trace counts
+            # come from an independently refreshed rollup.
+            "query_exact": False,
             "query_provenance": "materialized_rollup",
             "query_count": query_count,
             "query_rows_returned": rows_returned,
@@ -1831,7 +1818,7 @@ def _read_dashboard_rollup_fast_path(
     for item, formatted_metric in zip(prepared, formatted["metrics"], strict=True):
         formatted_metric.update(
             {
-                "query_exact": item["exact"],
+                "query_exact": False,
                 "query_provenance": "materialized_rollup",
                 "query_sampling_strategy": item["strategy"],
                 "query_sampling_interval_seconds": 3_600,

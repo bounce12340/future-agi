@@ -218,26 +218,33 @@ def test_state_source_scopes_by_the_predicate_it_is_given():
     assert "WHERE project_id = %(project_id)s" in single
     assert "WHERE project_id IN %(project_ids)s" in many
     for rendered in (single, many):
+        # ``is_deleted`` is not a projection column: a predicate on it would
+        # stop the states matching. Tombstones are therefore counted, which is
+        # one reason the route never publishes ``query_exact``.
         assert "is_deleted" not in rendered
         assert "PREWHERE" not in rendered
 
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    ("metric_id", "expected_exact"),
+    "metric_id",
     [
-        ("traffic", True),
-        ("tokens", True),
-        ("total_tokens", True),
-        ("prompt_tokens", True),
-        ("completion_tokens", True),
-        ("cost", True),
-        ("error_rate", True),
-        ("latency", False),
+        "traffic",
+        "tokens",
+        "total_tokens",
+        "prompt_tokens",
+        "completion_tokens",
+        "cost",
+        "error_rate",
+        "latency",
     ],
 )
-def test_graph_reports_exactness_per_metric(metric_id, expected_exact):
-    """Counts and sums are the base table's own numbers; latency is a tDigest."""
+def test_graph_never_reports_the_aggregate_states_as_exact(metric_id):
+    """The states are per part, not latest-live; latency is also a tDigest.
+
+    ``test_hourly_aggregate_state_exactness_ch25`` shows the numbers that
+    make this false on a real ClickHouse.
+    """
 
     analytics = mock.Mock()
     analytics.supports_per_query_read_settings = True
@@ -267,7 +274,7 @@ def test_graph_reports_exactness_per_metric(metric_id, expected_exact):
     )
 
     assert response["query_status"] == "complete"
-    assert response["query_exact"] is expected_exact
+    assert response["query_exact"] is False
     assert "spans_hourly_rollup" not in analytics.execute_ch_query.call_args.args[0]
 
 
@@ -311,19 +318,19 @@ def _widget_config(metric_id, aggregation):
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    ("metric_id", "aggregation", "expected_exact"),
+    ("metric_id", "aggregation"),
     [
-        ("tokens", "sum", True),
-        ("cost", "avg", True),
-        ("error_rate", "avg", True),
-        ("span_count", "count", True),
-        ("project", "count_distinct", True),
-        ("latency", "avg", False),
-        ("latency", "p95", False),
+        ("tokens", "sum"),
+        ("cost", "avg"),
+        ("error_rate", "avg"),
+        ("span_count", "count"),
+        ("project", "count_distinct"),
+        ("latency", "avg"),
+        ("latency", "p95"),
     ],
 )
-def test_dashboard_widget_routes_and_reports_exactness(
-    monkeypatch, metric_id, aggregation, expected_exact
+def test_dashboard_widget_routes_and_reports_inexact(
+    monkeypatch, metric_id, aggregation
 ):
     analytics = _CapturingAnalytics()
     monkeypatch.setattr(dashboard_view, "V2AnalyticsQueryService", lambda: analytics)
@@ -331,8 +338,8 @@ def test_dashboard_widget_routes_and_reports_exactness(
     result = _read_dashboard_rollup_fast_path(_widget_config(metric_id, aggregation))
 
     assert result["query_status"] == "complete"
-    assert result["query_exact"] is expected_exact
-    assert result["metrics"][0]["query_exact"] is expected_exact
+    assert result["query_exact"] is False
+    assert result["metrics"][0]["query_exact"] is False
     query = analytics.queries[0]
     assert "spans_hourly_rollup" not in query
     assert "FROM spans\n" in query

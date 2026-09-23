@@ -583,12 +583,6 @@ _SYSTEM_METRIC_FIELDS: dict[str, tuple[str, tuple[str, ...]]] = {
 }
 
 
-# Series whose published value is an approximation rather than a count or a
-# sum over the selected rows. ``latency`` is rendered from stored tDigest
-# quantile states on the unfiltered route, as it always has been.
-_APPROXIMATE_SYSTEM_METRICS = frozenset({"latency"})
-
-
 def _resolved_system_metric(
     ch_data: dict[str, list[dict[str, Any]]], metric_id: str
 ) -> tuple[str, tuple[str, ...]]:
@@ -1399,9 +1393,10 @@ def _fetch_rollup_system_metric_graph(
             expected_columns=_TRACE_ROLLUP_RESULT_COLUMNS,
         )
         query_count = 1
-    metrics = builder.format_result(rows, columns)
-    metric_key, _ = _resolved_system_metric(metrics, metric_id)
-    response = format_system_metric_graph(metrics, metric_id)
+    response = format_system_metric_graph(
+        builder.format_result(rows, columns),
+        metric_id,
+    )
     response.update(
         _complete_metadata(
             started=started,
@@ -1411,14 +1406,13 @@ def _fetch_rollup_system_metric_graph(
     )
     response.update(
         {
-            # Still a materialized pre-aggregate, but one maintained inside
-            # ``spans`` rather than a separate delivery-counting view, so the
-            # traffic, token, cost and error-rate series are the same numbers
-            # a base-table scan returns over the deduplicated rows.
-            # ``latency`` stays the stored tDigest median it has always been:
-            # approximate, unchanged by this route, and reported as such.
+            # ``spans``'s aggregate projections are built per physical part,
+            # with no latest-version reduction and no ``is_deleted``
+            # predicate: unmerged versions and retained tombstones are both
+            # counted. No series on this route is the latest-live answer, so
+            # none is published as exact.
             "query_provenance": "materialized_rollup",
-            "query_exact": metric_key not in _APPROXIMATE_SYSTEM_METRICS,
+            "query_exact": False,
         }
     )
     return enforce_exact_graph_data_contract(response)
