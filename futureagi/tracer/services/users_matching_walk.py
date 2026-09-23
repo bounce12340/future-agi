@@ -55,17 +55,18 @@ where it was. The pair is asked at most once per page and once more after
 each populated slice, never twice in a row.
 
 Budget. The walk owns a wall (``USER_LIST_PAGE_WALL_MS``) and a statement
-budget (``USER_LIST_WALK_MAX_STATEMENTS``). On exhaustion it returns the users
-certified so far, in order, with a cursor; it never falls back to the
-whole-window statement. A slice that fails on a read budget is retried
-narrower, never wider. Until a request certifies its first batch, the
-statements that decide it are admitted against the analytics wall rather than
-the page wall, so a slice that outlasts the page wall is not read again by
-every request (``_decision_deadline``). The finishing statements run past the
-page wall under a server cap (``_finish_deadline``); a batch the server stops
-is replayed one user at a time, and a page that has published nothing decides
-a user whose replay the server stopped without the cap, once
-(``_materialise``).
+budget (``USER_LIST_WALK_MAX_STATEMENTS``, never less than one batch's
+decision: ``_statement_budget``). On exhaustion it returns the users certified
+so far, in order, with a cursor; it never falls back to the whole-window
+statement. A slice that fails on a read budget is retried narrower, never
+wider. Every request decides something before it stops: until it does, its
+search is admitted against the analytics wall rather than the page wall
+(``_admission_deadline``), a slice the server stops at its cap is retried
+narrower, and when it cannot be, the head-of-line slice is read once without
+a cap (``_read_slice``). The finishing statements run past the page wall
+under a server cap (``_finish_deadline``); a batch the server stops is
+replayed one user at a time, and a page that has published nothing decides a
+user whose replay the server stopped without the cap, once (``_materialise``).
 
 Tied instant. Inside one timestamp the slice's raw id order is not the
 page's resolved id order (an alias may resolve to a survivor on either side of
@@ -245,10 +246,14 @@ class _WalkState:
     # decided without the cap, once per request.
     finish_singly: bool = False
     uncapped_finish: bool = False
-    # Until this request certifies a batch, the statements that decide the
-    # first batch of a read that returned rows are admitted against the
-    # analytics wall, not the page wall (``_decision_deadline``).
-    first_batch_owed: bool = True
+    # Until this request decides something (certifies a batch, or reads a
+    # slice that proves its range empty before any slice was stopped), its
+    # search is admitted against the analytics wall rather than the page
+    # wall, a slice the server stops is narrowed, and one head-of-line slice
+    # may be read without a cap (``_admission_deadline``, ``_read_slice``).
+    progress_owed: bool = True
+    slice_stopped: bool = False
+    slice_uncapped: bool = False
     # The tied instant being decided, the id below which it was entered, and
     # the resolved ids it returned (certified), in descending order.
     instant: datetime | None = None
@@ -332,8 +337,10 @@ def _statement_budget(manager: Any) -> int:
     """The statements a request may spend: its budget, or one decision.
 
     One decision is what a request needs to decide its first batch: the open
-    instant, a slice, its survivor statement, the batch's enrichment and a
-    finish with its uncapped retry. The enrichment alone reads every
+    instant, a slice and its retries a quarter as wide down to the least
+    width, the head-of-line slice read again without a cap (``_read_slice``),
+    its survivor statement, the batch's enrichment and a finish with its
+    uncapped retry. The enrichment alone reads every
     requested attribute key, four ordinary keys a statement, so at the view's
     100 keys it is 26 statements, more than the configured 24: every
     certification was refused and the list never moved. The bound stays
@@ -341,9 +348,29 @@ def _statement_budget(manager: Any) -> int:
     """
     return max(
         USER_LIST_WALK_MAX_STATEMENTS,
-        3
+        2 + _narrowings() + _head_statements(manager),
+    )
+
+
+def _narrowings() -> int:
+    """Retries a quarter as wide that take the first slice to the least width."""
+
+    width, count = USER_LIST_WALK_INITIAL_SLICE, 0
+    while width > USER_LIST_WALK_MIN_SLICE:
+        width, count = max(USER_LIST_WALK_MIN_SLICE, width / 4), count + 1
+    return count
+
+
+def _head_statements(manager: Any) -> int:
+    """What deciding the head-of-line slice's first batch costs, uncapped.
+
+    The slice itself, its survivor statement, one batch's enrichment and a
+    finish with its uncapped retry.
+    """
+    return (
+        2
         + _enrichment_statement_count(manager)
-        + 2 * _materialisation_statement_count(manager),
+        + 2 * _materialisation_statement_count(manager)
     )
 
 
@@ -422,18 +449,53 @@ def _read_slice(
     slice_end: datetime,
     before: tuple[datetime, str] | None,
 ) -> _Slice | None:
-    """One slice statement, retried narrower on a read-budget failure.
+    """One slice statement, under a server cap, retried narrower when stopped.
 
     A populated slice is followed by the bounded survivor statement over the
     raw ids it returned. Returns ``None`` when the walk's own budget stops it
     first; a slice whose survivor statement the budget refuses is discarded
     whole, so the cursor stays at the slice's end and re-reads it.
+
+    Every slice asks the server to stop it at half of what is left of the
+    analytics wall (``_slice_cap``), and one the server stops is retried a
+    quarter as wide, down to ``USER_LIST_WALK_MIN_SLICE``, if its wall
+    admits the retry. A slice denser than every cap was read again by every
+    request and stopped at the same place (before the cap it ran past the
+    walls and was discarded). So while the request has decided nothing
+    (``progress_owed``), a retry is admitted against the analytics wall and
+    only while the budget still affords the head-of-line decision after it.
+    When the slice cannot be narrowed or retried, or that wall is spent,
+    the request reads its head-of-line slice (the least width below the
+    coverage, clipped at the window start) once more without a cap, and
+    decides that slice's first batch with no deadline (``_admission_deadline``):
+    an exact list can neither skip that slice nor publish anyone below it
+    first, so no bounded retry keeps the list both exact and moving. That
+    slice is the request's only uncapped one; its statements and the
+    finish's uncapped replay (``_materialise``) are its only unbounded ones.
+    Once the request has decided something, a stopped slice it cannot
+    narrow, or whose retry the page wall refuses, ends it.
     """
     from tracer.services import users_list_manager as ulm
 
+    manager = state.manager
+    escape = False
     while True:
-        if not state.budget.take(1):
+        owed = state.progress_owed
+        if not state.budget.take(1, finish=owed):
             return None
+        deadline = _admission_deadline(state)
+        head = owed and (escape or deadline is None)
+        if head:
+            if state.slice_uncapped:
+                state.budget.exhausted_by = "wall"
+                return None
+            state.slice_uncapped = True
+            slice_start = max(state.window_start, slice_end - USER_LIST_WALK_MIN_SLICE)
+            logger.info(
+                "users_matching_walk_uncapped_slice",
+                width_seconds=(slice_end - slice_start).total_seconds(),
+            )
+        width = slice_end - slice_start
         query, params = state.builder.build_matching_activity_slice_query(
             slice_start=slice_start,
             slice_end=slice_end,
@@ -442,19 +504,43 @@ def _read_slice(
         )
         started = time.monotonic()
         try:
-            result = ulm.V2AnalyticsQueryService().execute_ch_query(
-                query,
-                params,
-                timeout_ms=state.budget.deadline.remaining_ms(),
-                settings=ulm._page_replay_read_settings(
-                    max_result_rows=USER_LIST_WALK_SLICE_USER_LIMIT
-                ),
-            )
+            timeout_ms = None if head else deadline.remaining_ms()
         except ReadDeadlineExceeded:
             state.budget.exhausted_by = "wall"
             return None
+        try:
+            result = ulm.V2AnalyticsQueryService().execute_ch_query(
+                query,
+                params,
+                timeout_ms=timeout_ms,
+                settings=ulm._page_replay_read_settings(
+                    max_result_rows=USER_LIST_WALK_SLICE_USER_LIMIT
+                ),
+                server_execution_cap_ms=None if head else _slice_cap(state),
+            )
+        except ReadDeadlineExceeded:
+            if head:
+                state.budget.exhausted_by = "wall"
+                return None
+            state.slice_stopped = True
+            room = not owed or (
+                state.budget.remaining_statements() >= 1 + _head_statements(manager)
+            )
+            if width > USER_LIST_WALK_MIN_SLICE and room:
+                narrower = max(USER_LIST_WALK_MIN_SLICE, width / 4)
+                slice_start = max(state.window_start, slice_end - narrower)
+            elif owed:
+                escape = True
+            else:
+                state.budget.exhausted_by = "wall"
+                return None
+            logger.info(
+                "users_matching_walk_slice_stopped",
+                width_seconds=width.total_seconds(),
+                retry_width_seconds=(slice_end - slice_start).total_seconds(),
+            )
+            continue
         except Exception as exc:
-            width = slice_end - slice_start
             if not is_read_budget_error(exc) or width <= USER_LIST_WALK_MIN_SLICE:
                 raise
             narrower = max(USER_LIST_WALK_MIN_SLICE, width / 4)
@@ -475,6 +561,11 @@ def _read_slice(
             if raw_id and newest is not None:
                 raw_rows.append((raw_id, newest))
         ordered = sorted(raw_rows, key=lambda item: (item[1], item[0]), reverse=True)
+        if not ordered and not state.slice_stopped:
+            # Nothing witnessed in the range: the coverage moves past it. After
+            # a stopped slice, the narrow empty ranges it leaves are too small
+            # to count, and the request goes on until it decides a user.
+            state.progress_owed = False
         query_ms = _statement_ms(result, started)
         remap = _read_survivors(state, [raw_id for raw_id, _newest in raw_rows])
         if remap is None:
@@ -499,7 +590,7 @@ def _read_survivors(
 
     if not ids:
         return [], 0.0
-    if not state.budget.take(1, finish=state.first_batch_owed):
+    if not state.budget.take(1, finish=state.progress_owed):
         return None
     query, params = state.builder.build_dimension_survivor_query(ids)
     started = time.monotonic()
@@ -507,7 +598,7 @@ def _read_survivors(
         result = ulm.V2AnalyticsQueryService().execute_ch_query(
             query,
             params,
-            timeout_ms=_decision_deadline(state).remaining_ms(),
+            timeout_ms=_timeout_ms(_admission_deadline(state)),
             settings=ulm._page_read_settings(
                 max_result_rows=ulm._USER_LIST_ATTR_RESULT_ROWS
             ),
@@ -528,7 +619,7 @@ def _read_instant(
     """
     from tracer.services import users_list_manager as ulm
 
-    if not state.budget.take(1):
+    if not state.budget.take(1, finish=state.progress_owed):
         return None
     query, params = state.builder.build_matching_activity_instant_query(
         instant=instant,
@@ -540,7 +631,7 @@ def _read_instant(
         result = ulm.V2AnalyticsQueryService().execute_ch_query(
             query,
             params,
-            timeout_ms=state.budget.deadline.remaining_ms(),
+            timeout_ms=_timeout_ms(_admission_deadline(state)),
             settings=ulm._page_replay_read_settings(
                 max_result_rows=USER_LIST_WALK_SLICE_USER_LIMIT
             ),
@@ -680,7 +771,7 @@ def _certify(state: _WalkState, batch: list[_Candidate]) -> bool:
 
     manager = state.manager
     statements = _enrichment_statement_count(manager)
-    if not state.budget.take(statements, finish=state.first_batch_owed):
+    if not state.budget.take(statements, finish=state.progress_owed):
         return False
     rows = [{"end_user_id": candidate.end_user_id} for candidate in batch]
     scan_ids = list(
@@ -694,7 +785,7 @@ def _certify(state: _WalkState, batch: list[_Candidate]) -> bool:
     try:
         manager._read_span_attributes(
             rows,
-            _decision_deadline(state),
+            _admission_deadline(state),
             start_date=state.window_start,
             end_date=state.window_end,
             candidate_scan_ids=scan_ids,
@@ -703,7 +794,7 @@ def _certify(state: _WalkState, batch: list[_Candidate]) -> bool:
     except ReadDeadlineExceeded:
         state.budget.exhausted_by = "wall"
         return False
-    state.first_batch_owed = False
+    state.progress_owed = False
     for candidate in batch:
         uid = candidate.end_user_id
         order_key = manager._matching_activity_by_user.get(uid, {}).get(
@@ -720,29 +811,42 @@ def _certify(state: _WalkState, batch: list[_Candidate]) -> bool:
     return True
 
 
-def _decision_deadline(state: _WalkState) -> ReadDeadline:
-    """What admits a survivor or enrichment statement: the page wall, mostly.
+def _admission_deadline(state: _WalkState) -> ReadDeadline | None:
+    """What admits a search statement now; ``None`` admits it with no deadline.
 
     A request that stops before it decides anyone returns about the cursor
     it was given, and the next request does the same work again. A slice
     that returns rows and whose own statement outlasts the page wall is such
-    a stop: it is admitted inside the wall and runs past it (search
-    statements carry no server cap), its survivor statement was refused, the
-    slice was discarded whole, and every later request read it again. So
-    until the request certifies its first batch, the survivor and enrichment
-    statements that decide that batch are admitted against the analytics
-    wall measured from the walk's start (the finish mode's budget, admission
-    only like every search statement) instead of the page wall. That is at
-    most one survivor statement and one batch's enrichment past the page
-    wall per request; the replay that follows is finish mode already. A
-    slice that outlasts the analytics wall itself still stops the request
-    before anyone is decided.
+    a stop: its survivor statement was refused, the slice discarded whole,
+    and every later request read it again. So until the request decides
+    something (``progress_owed``), its search statements are admitted
+    against the analytics wall measured from the walk's start (the finish
+    mode's budget; admission only, like every search statement) instead of
+    the page wall. Once that wall is spent, or the request has read its
+    head-of-line slice without a cap (``_read_slice``), the statements that
+    decide that slice's first batch are admitted with no deadline: at most
+    one survivor statement and one batch's enrichment, once per request.
     """
 
-    if not state.first_batch_owed:
+    if not state.progress_owed:
         return state.budget.deadline
-    spent = state.budget.deadline.elapsed_ms()
-    return ReadDeadline.start(max(1.0, USER_LIST_WALK_FINISH_WALL_MS - spent))
+    left = USER_LIST_WALK_FINISH_WALL_MS - state.budget.deadline.elapsed_ms()
+    if state.slice_uncapped or left < 25:
+        return None
+    return ReadDeadline.start(int(left))
+
+
+def _timeout_ms(deadline: ReadDeadline | None) -> int | None:
+    return deadline.remaining_ms() if deadline is not None else None
+
+
+def _slice_cap(state: _WalkState) -> int:
+    """Half of what is left of the analytics wall: a slice's server cap.
+
+    Half, so that a slice the server stops leaves room for a narrower one.
+    """
+    left = USER_LIST_WALK_FINISH_WALL_MS - state.budget.deadline.elapsed_ms()
+    return max(25, int(left / 2))
 
 
 def _finish_deadline(state: _WalkState) -> ReadDeadline:

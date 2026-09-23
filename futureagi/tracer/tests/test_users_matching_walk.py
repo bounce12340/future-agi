@@ -875,12 +875,18 @@ def test_slice_read_exhaustion_returns_partial_page_and_cursor_without_fallback(
         query, params=None, timeout_ms=None, settings=None, **caps
     ):
         if len(engine.calls) == 1 and kind_of(query) == "slice":
+            import time
+
+            # The statement outlives the page wall, and then fails: the
+            # narrower retry it would earn is refused by that wall.
+            time.sleep(0.08)
             engine.calls.append(query)
             raise ReadDeadlineExceeded("read deadline exceeded")
         return original(query, params, timeout_ms, settings, **caps)
 
     engine.execute_ch_query = wall_spent_in_transport
-    read, engine = _page(world, page_size=25, engine=engine)
+    with patch.object(walk, "USER_LIST_PAGE_WALL_MS", 60):
+        read, engine = _page(world, page_size=25, engine=engine)
     assert _kinds(engine) == ["slice", "slice"]
     assert read.payload["table"] == [] and read.has_more is True
     assert read.checkpoint_order[3] == engine.slice_ranges[0][0] + walk._TICK
@@ -975,9 +981,12 @@ def test_finish_mode_statements_ask_the_server_to_enforce_their_deadline():
     -- are deliberately not governed by the page wall, which is what lets a
     page publish users it has already certified; they ask the service for a
     server execution cap from the request's analytics wall instead. Search
-    statements keep the application policy: admitted, never capped.
+    statements keep the application policy, admitted and never capped, except
+    a slice: it asks the server to stop it at half of what is left of the
+    analytics wall, so that a slice too dense for that is narrowed instead of
+    read again by every request (``_read_slice``).
     (``test_finish_mode_reaches_the_native_driver_as_max_execution_time``
-    follows the cap through the real service and client.)
+    follows the caps through the real service and client.)
     """
 
     world = World()
@@ -997,6 +1006,9 @@ def test_finish_mode_statements_ask_the_server_to_enforce_their_deadline():
     for index, kind in enumerate(kinds):
         if index in finish:
             assert engine.caps[index] == engine.timeouts[index], kind
+        elif kind == "slice":
+            cap = engine.caps[index]
+            assert 0 < cap <= walk.USER_LIST_WALK_FINISH_WALL_MS / 2, kind
         else:
             assert engine.caps[index] is None, kind
     # The finish-mode budget is the analytics wall LESS what the search
@@ -1060,8 +1072,9 @@ def test_finish_mode_reaches_the_native_driver_as_max_execution_time():
     """Through ``V2AnalyticsQueryService`` and ``ClickHouseClient`` unmocked.
 
     The finish-mode replay arrives at the driver with a real, positive
-    ``max_execution_time`` no larger than its 8,000 ms statement cap; every
-    search statement still arrives with the application policy's 0.
+    ``max_execution_time`` no larger than its 8,000 ms statement cap, and a
+    slice with half of the analytics wall; every other search statement
+    still arrives with the application policy's 0.
     """
 
     world = World()
@@ -1076,7 +1089,9 @@ def test_finish_mode_reaches_the_native_driver_as_max_execution_time():
     assert 0 < replay_cap <= 8.0
     assert sent["replay"]["timeout_overflow_mode"] == "throw"
     assert sent["replay"]["max_rows_to_read"] == 0
-    for kind in ("slice", "remap", "enrich"):
+    slice_cap = sent["slice"]["max_execution_time"]
+    assert 0 < slice_cap <= walk.USER_LIST_WALK_FINISH_WALL_MS / 2000
+    for kind in ("remap", "enrich"):
         assert sent[kind]["max_execution_time"] == 0, kind
 
 

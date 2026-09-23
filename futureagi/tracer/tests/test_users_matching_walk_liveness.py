@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import random
 import uuid
+from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -106,13 +107,17 @@ def _check_uncapped(
 
     ``replays`` is one request's ``(ids, capped, stopped)``, in order. The
     replay just before it was stopped under the cap and led with that user;
-    with ``proven`` (a budget that affords the capped attempt first), it was
-    that user's own.
+    with ``proven`` (a budget that affords the capped attempt first, and an
+    analytics wall with room for it), it was that user's own. Without, the
+    capped attempt may have been refused before it was sent, when the
+    search had spent the analytics wall.
     """
     uncapped = [i for i, (_ids, capped, _stopped) in enumerate(replays) if not capped]
     assert len(uncapped) <= 1, replays
     for index in uncapped:
         (user,) = replays[index][0]
+        if not proven and (index == 0 or not replays[index - 1][2]):
+            continue
         assert index > 0, replays
         before, capped, stopped = replays[index - 1]
         assert capped and stopped and before[0] == user, replays
@@ -159,9 +164,11 @@ class _CappedEngine(Engine):
     (``ReadDeadlineExceeded``, as the service maps code 159 under a cap); the
     same replay without a cap runs to completion. Records every replay as
     ``(ids, capped, stopped)``. With a ``clock``, every statement spends its
-    time on it: 1 ms, a stopped replay its cap, and a slice that returns rows
-    ``slow_slice_ms`` when that is set (search statements carry no server
-    cap, so a slow slice runs to the end whatever the page wall says).
+    time on it: 1 ms, a stopped statement its cap, and a slice what
+    ``slice_ms(width, returned_rows)`` says. A slice that costs more than the
+    cap it was sent with is stopped there; one sent without a cap runs to
+    the end whatever it costs. Records every slice as ``(width, cap,
+    stopped)``.
     """
 
     def __init__(
@@ -170,14 +177,15 @@ class _CappedEngine(Engine):
         heavy: frozenset[str] = frozenset(),
         batch_limit: int | None = None,
         clock: _Clock | None = None,
-        slow_slice_ms: float = 0.0,
+        slice_ms: Callable[[timedelta, bool], float] | None = None,
     ) -> None:
         super().__init__(world)
         self.heavy = heavy
         self.batch_limit = batch_limit
         self.clock = clock
-        self.slow_slice_ms = slow_slice_ms
+        self.slice_ms = slice_ms
         self.replays: list[tuple[tuple[str, ...], bool, bool]] = []
+        self.slices: list[tuple[timedelta, float | None, bool]] = []
 
     def execute_ch_query(
         self,
@@ -211,11 +219,36 @@ class _CappedEngine(Engine):
             settings,
             server_execution_cap_ms=server_execution_cap_ms,
         )
+        cost = 1.0
+        if kind_of(query) == "slice":
+            width = TICK * (params["slice_end_us"] - params["slice_start_us"])
+            if self.slice_ms is not None:
+                cost = self.slice_ms(width, bool(result.data))
+            cap = server_execution_cap_ms
+            stopped = cap is not None and cost > cap
+            self.slices.append((width, cap, stopped))
+            if stopped:
+                if self.clock is not None:
+                    self.clock.spend(cap)
+                raise ReadDeadlineExceeded("ClickHouse statement exceeded its cap")
         if self.clock is not None:
-            slow = self.slow_slice_ms and kind_of(query) == "slice" and result.data
-            result.query_time_ms = self.slow_slice_ms if slow else 1.0
-            self.clock.spend(result.query_time_ms)
+            result.query_time_ms = cost
+            self.clock.spend(cost)
         return result
+
+
+def _every_slice(ms: float) -> Callable[[timedelta, bool], float]:
+    """Every slice that returns rows costs ``ms``; an empty one, 1 ms."""
+
+    return lambda _width, rows: ms if rows else 1.0
+
+
+def _per_hour(ms: float) -> Callable[[timedelta, bool], float]:
+    """A slice that returns rows costs ``ms`` per hour of its width."""
+
+    return lambda width, rows: (
+        max(1.0, ms * width / timedelta(hours=1)) if rows else 1.0
+    )
 
 
 def _follow(
@@ -226,7 +259,7 @@ def _follow(
     max_statements: int | None = None,
     heavy: frozenset[str] = frozenset(),
     mutate=None,
-    slow_slice_ms: float = 0.0,
+    slice_ms: Callable[[timedelta, bool], float] | None = None,
 ) -> tuple[list[str], int]:
     """Follow the cursor to the end; returns the published names and the hops.
 
@@ -247,7 +280,7 @@ def _follow(
             max_statements=max_statements,
             heavy=heavy,
             mutate=mutate,
-            slow_slice_ms=slow_slice_ms,
+            slice_ms=slice_ms,
         )
 
 
@@ -260,7 +293,7 @@ def _follow_on(
     max_statements: int | None,
     heavy: frozenset[str],
     mutate,
-    slow_slice_ms: float,
+    slice_ms: Callable[[timedelta, bool], float] | None,
 ) -> tuple[list[str], int]:
     budget = _decision_budget(max_statements or walk.USER_LIST_WALK_MAX_STATEMENTS)
     names: list[str] = []
@@ -270,11 +303,12 @@ def _follow_on(
     stalled = False
     cursor = None
     for hop in range(1, max_hops + 1):
-        engine = _CappedEngine(world, heavy, clock=clock, slow_slice_ms=slow_slice_ms)
+        engine = _CappedEngine(world, heavy, clock=clock, slice_ms=slice_ms)
         read, _engine = _page(world, page_size=page_size, cursor=cursor, engine=engine)
         names.extend(_names(read))
         assert len(engine.calls) <= budget, (hop, len(engine.calls))
         _check_uncapped(engine.replays, proven=False)
+        _check_uncapped_slices(engine.slices)
         if not read.has_more:
             return names, hop
         order = tuple(read.checkpoint_order)
@@ -300,16 +334,28 @@ def _follow_on(
 def _decision_budget(configured: int) -> int:
     """The statements a request may spend: its budget, or one decision.
 
-    One decision: the open instant, a slice, its survivors, one batch's
-    enrichment, and a finish with its uncapped retry.
+    One decision: the open instant, a slice and three retries a quarter as
+    wide (one hour down to one minute), the head-of-line slice without a
+    cap, its survivors, one batch's enrichment, and a finish with its
+    uncapped retry.
     """
+    assert walk.USER_LIST_WALK_INITIAL_SLICE == timedelta(hours=1)
+    assert walk.USER_LIST_WALK_MIN_SLICE == timedelta(minutes=1)
     manager = _manager()
     return max(
         configured,
-        3
+        7
         + walk._enrichment_statement_count(manager)
         + 2 * walk._materialisation_statement_count(manager),
     )
+
+
+def _check_uncapped_slices(slices: list[tuple[timedelta, float | None, bool]]):
+    """At most one slice without a cap per request, and no wider than the least."""
+
+    uncapped = [width for width, cap, _stopped in slices if cap is None]
+    assert len(uncapped) <= 1, slices
+    assert all(width <= walk.USER_LIST_WALK_MIN_SLICE for width in uncapped), slices
 
 
 def _lower_position(new: tuple, old: tuple) -> bool:
@@ -600,48 +646,146 @@ def _spread_world(users: int, every_minutes: int) -> tuple[World, list[str]]:
 def test_a_slice_that_outlasts_the_page_wall_still_decides_its_first_batch():
     """Every slice that returns rows takes 6 s against the 5 s page wall.
 
-    The slice statement is admitted inside the wall and runs past it (search
-    statements carry no server cap). Its survivor statement was then refused,
-    the slice discarded whole, and the next request read the same slice
-    again, so the list never got past it. A request that has certified
-    nothing yet now finishes that slice's first batch against the analytics
-    wall: every request publishes, and the list ends.
+    The slice statement is admitted inside the wall and runs past it. Its
+    survivor statement was then refused, the slice discarded whole, and the
+    next request read the same slice again, so the list never got past it.
+    A request that has decided nothing yet finishes that slice's first batch
+    against the analytics wall: every request publishes, and the list ends.
     """
     world, expected = _spread_world(60, 2)
 
     with _shipped_walls():
-        names, hops = _follow(world, page_size=25, max_hops=8, slow_slice_ms=6_000)
+        names, hops = _follow(
+            world, page_size=25, max_hops=8, slice_ms=_every_slice(6_000)
+        )
 
     assert names == expected
     assert hops <= 6
 
 
-def test_a_slice_that_outlasts_the_analytics_wall_still_stalls_the_list():
-    """Known residual, left to the owner: a slice slower than the whole request.
+def _stopped_slice_hops(world, slice_ms, max_hops):
+    """Every request, on the scripted clock: ``(names, slices)`` per hop."""
 
-    Every slice that returns rows takes 31 s, past the analytics wall (30 s)
-    that bounds a request's admissions. Nothing after it may start, so the
-    request publishes nothing; the next request's open instant moves the
-    coverage down one microsecond before the same slice is read again. The
-    list shows empty, degraded pages, each taking over 30 s, and never gets
-    past that slice. Ending it needs either a statement admitted with no
-    deadline at all or a narrower slice carried in the cursor.
-    """
-    world, _expected_names = _spread_world(3, 5)
     clock = _Clock()
+    hops = []
     cursor = None
-    coverages = []
     with _shipped_walls(), _scripted_clock(clock):
-        for _hop in range(4):
-            engine = _CappedEngine(world, clock=clock, slow_slice_ms=31_000)
+        for _hop in range(max_hops):
+            engine = _CappedEngine(world, clock=clock, slice_ms=slice_ms)
             read, _engine = _page(world, page_size=25, cursor=cursor, engine=engine)
-            assert read.payload["table"] == []
-            assert read.has_more is True
-            assert read.payload["query_status"] == "degraded"
-            coverages.append(read.checkpoint_order[3])
+            _check_uncapped_slices(engine.slices)
+            hops.append((_names(read), engine.slices))
+            if not read.has_more:
+                return hops
             cursor = _signed_cursor(read)
+    raise AssertionError(f"no end after {max_hops} hops: {[h[0] for h in hops]}")
 
-    assert WINDOW_END - coverages[-1] <= 2 * TICK
+
+def test_a_slice_that_outlasts_every_cap_is_read_uncapped_at_its_narrowest():
+    """Every slice that returns rows takes 40 s: longer than the whole request.
+
+    Every capped attempt is stopped, however narrow, and the analytics wall
+    (30 s) cannot hold even one of them. The request narrows while it can,
+    then reads its head-of-line slice once more, at the least width, without
+    a cap, and decides that slice's first batch with no deadline: the same
+    minimal escape as a replay that outlasts every cap.
+    """
+    world, expected = _spread_world(12, 5)
+
+    hops = _stopped_slice_hops(world, _every_slice(40_000), max_hops=14)
+
+    # Only an uncapped slice can read rows here, and a request reads one:
+    # every request decides one user (the last proves the rest empty).
+    published = [names for names, _slices in hops if names]
+    assert published == [[name] for name in expected]
+    assert len(hops) <= len(expected) + 1
+    first = hops[0][1]
+    assert [w for w, _c, _s in first[:3]] == [
+        walk.USER_LIST_WALK_INITIAL_SLICE / 4**n for n in range(3)
+    ]
+    assert [s for _w, _c, s in first[:2]] == [True, True]
+    width, cap, stopped = first[-1]
+    assert cap is None and not stopped and width == walk.USER_LIST_WALK_MIN_SLICE
+
+
+def test_a_slice_that_outlasts_its_cap_only_when_wide_is_narrowed_not_uncapped():
+    """A slice costs 40 s per hour of width: stopped when wide, fine when narrow.
+
+    The request narrows the stopped slice a quarter at a time and reads the
+    narrower one under a cap; no slice is ever sent without one.
+    """
+    world, expected = _spread_world(12, 5)
+
+    hops = _stopped_slice_hops(world, _per_hour(40_000), max_hops=14)
+
+    assert [name for names, _slices in hops for name in names] == expected
+    assert all(names for names, _slices in hops[:-1])
+    slices = [entry for _names_, hop in hops for entry in hop]
+    assert any(stopped for _width, _cap, stopped in slices)
+    assert all(cap is not None for _width, cap, _stopped in slices)
+
+
+def test_a_stopped_slice_at_the_window_start_is_read_at_what_is_left():
+    """The slice at the window's start is narrower than the least width.
+
+    It cannot be narrowed; when it is stopped the request reads that slice,
+    clipped at the window start, without a cap.
+    """
+    world = World()
+    ids = []
+    for n, seconds in enumerate((20, 10, 5), start=1):
+        moment = WINDOW_START + timedelta(seconds=seconds)
+        ids.append(world.user(n, key=moment, raw=(moment,)))
+    expected = ["user-1", "user-2", "user-3"]
+
+    hops = _stopped_slice_hops(world, _every_slice(40_000), max_hops=12)
+
+    assert [name for names, _slices in hops for name in names] == expected
+    uncapped = [w for _n, hop in hops for w, cap, _s in hop if cap is None]
+    assert uncapped and all(w < walk.USER_LIST_WALK_MIN_SLICE for w in uncapped)
+
+
+class _SlowSliceDriver(_NativeDriver):
+    """The server stops a capped slice wider than ``limit``, as code 159."""
+
+    def __init__(self, engine: Engine, limit: timedelta) -> None:
+        super().__init__(engine)
+        self.limit = limit
+        self.slices: list[tuple[timedelta, float]] = []
+
+    def execute(self, query, params=None, *, with_column_types=False, settings=None):
+        if kind_of(query) == "slice":
+            width = TICK * (params["slice_end_us"] - params["slice_start_us"])
+            cap = float((settings or {}).get("max_execution_time") or 0)
+            self.slices.append((width, cap))
+            if cap > 0 and width > self.limit:
+                from clickhouse_driver.errors import ErrorCodes, ServerException
+
+                raise ServerException(
+                    "Timeout exceeded: elapsed 15.0 seconds, maximum: 15",
+                    code=ErrorCodes.TIMEOUT_EXCEEDED,
+                )
+        return super().execute(
+            query, params, with_column_types=with_column_types, settings=settings
+        )
+
+
+def test_a_slice_the_server_stops_is_narrowed_through_the_real_client():
+    """Through ``V2AnalyticsQueryService`` and ``ClickHouseClient`` unmocked.
+
+    Every slice reaches the driver with a positive ``max_execution_time``;
+    the server stops the wide ones (code 159 under that cap), and the walk
+    narrows them and publishes every user.
+    """
+    world, expected = _spread_world(6, 7)
+    driver = _SlowSliceDriver(Engine(world), timedelta(minutes=20))
+
+    read = _real_service_page(world, driver)
+
+    assert _names(read) == expected
+    assert all(cap > 0 for _width, cap in driver.slices)
+    widths = [width for width, _cap in driver.slices]
+    assert widths[:2] == [timedelta(hours=1), timedelta(minutes=15)]
 
 
 # --------------------------------------------------------------------------
@@ -700,7 +844,7 @@ def test_the_views_largest_key_count_still_decides_every_user():
     cursor = None
     for _hop in range(6):
         read, statements = page(cursor)
-        assert statements <= 3 + 26 + 2 * 1, statements
+        assert statements <= 7 + 26 + 2 * 1, statements
         names.extend(_names(read))
         if not read.has_more:
             break
@@ -765,9 +909,9 @@ def _world(rng: random.Random, n_users: int) -> World:
 
 
 # (slice user limit, statement budget, certify batch, finishing statements,
-# enrichment statements): tiny budgets, up to the shipped limits. A request
-# never has fewer statements than one decision (``walk._statement_budget``),
-# so the tiniest budgets here are lifted to that.
+# enrichment statements): tiny budgets, each large enough to decide one heavy
+# user (a slice or an instant, its survivors, enrichment, a stopped replay
+# and the uncapped retry), up to the shipped limits.
 LIMITS = [
     (2, 6, 1, 1, 1),
     (2, 8, 2, 2, 1),
@@ -779,15 +923,34 @@ LIMITS = [
     (200, 24, 25, 4, 1),
 ]
 PAGE_SIZES = [1, 2, 3, 7, 25, 100]
-STATIC_WORLDS = 320
-CHANGING_WORLDS = 96
-# Every fourth run of the limit grid: every slice that returns rows takes
-# longer than the page wall (and less than the analytics wall).
-SLOW_SLICE_MS = 6_000.0
+STATIC_WORLDS = 256
+CHANGING_WORLDS = 64
+# What a slice that returns rows costs, per run of the limit grid: nothing
+# much; 6 s, past the page wall; 40 s, past the whole request; or 40 s an
+# hour, past its cap only while it is wide.
+SLICE_MODELS = [
+    None,
+    _every_slice(6_000),
+    None,
+    _every_slice(40_000),
+    _per_hour(40_000),
+]
 
 
-def _slow_slice_ms(seed: int) -> float:
-    return SLOW_SLICE_MS if (seed // len(LIMITS)) % 4 == 1 else 0.0
+def _slice_model(seed: int) -> Callable[[timedelta, bool], float] | None:
+    return SLICE_MODELS[(seed // len(LIMITS)) % len(SLICE_MODELS)]
+
+
+def _slice_hops(world: World, seed: int) -> int:
+    """Extra hops a world may take when no capped slice can return rows.
+
+    Then only the head-of-line slice read without a cap, one least width
+    wide, returns rows, and a request reads one: every least-width window
+    that holds a witnessed row may cost a request of its own.
+    """
+    if _slice_model(seed) is not SLICE_MODELS[3]:
+        return 0
+    return len({moment.replace(second=0, microsecond=0) for moment, _id in world.raw})
 
 
 @contextmanager
@@ -831,10 +994,11 @@ def test_every_hop_sequence_ends_exact_and_never_raises_the_coverage(seed):
         names, _hops = _follow(
             world,
             page_size=page_size,
-            max_hops=_hop_bound(n_users, page_size, len(heavy)),
+            max_hops=_hop_bound(n_users, page_size, len(heavy))
+            + _slice_hops(world, seed),
             max_statements=max_statements,
             heavy=heavy,
-            slow_slice_ms=_slow_slice_ms(seed),
+            slice_ms=_slice_model(seed),
         )
 
     assert len(names) == len(set(names)), "a user was published twice"
@@ -875,11 +1039,12 @@ def test_users_that_stop_matching_between_hops_never_stall_or_repeat(seed):
         names, _hops = _follow(
             world,
             page_size=page_size,
-            max_hops=_hop_bound(n_users, page_size, len(heavy)),
+            max_hops=_hop_bound(n_users, page_size, len(heavy))
+            + _slice_hops(world, seed),
             max_statements=max_statements,
             heavy=heavy,
             mutate=_stop_matching(rng, changed),
-            slow_slice_ms=_slow_slice_ms(seed),
+            slice_ms=_slice_model(seed),
         )
 
     assert len(names) == len(set(names)), "a user was published twice"
