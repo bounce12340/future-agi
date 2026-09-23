@@ -418,9 +418,9 @@ _USERS_REMAP_SHA = "090df268267944b22e713077c59d4836e4046fadb60bfbb78116f3a43af4
 # ``shasum -a 256 futureagi/<module path>.py``; the offline unit test
 # ``UsersSourcePinTests`` fails the moment these drift from the tree again.
 _USERS_SOURCE_PINS = {
-    "tracer.services.users_list_manager": "76ee7470c6cb0bfd600e293d76396465e56a0283e5fd1ba91610f105e87acfda",
-    "tracer.services.users_matching_walk": "e0715bfe859ee0374fd0cf179fe36df5c7f94018c1a2b98eff2d92ad238469f0",
-    "tracer.services.clickhouse.query_builders.user_list": "5c56a3a7125a937416366e66b9c76b1cb267d2dc5373073abd08d4d5f21ebcfb",
+    "tracer.services.users_list_manager": "39e4a54ab19626afd7d25f8f38e933ea45eac77d11579c377d7c02e9e3100183",
+    "tracer.services.users_matching_walk": "76f77d6197550eee262dd47ce9c8b7dcf1083aedd2b44e506997bef8503b9efe",
+    "tracer.services.clickhouse.query_builders.user_list": "db6f7566c1a80bf685e18b9f6cf5d6f11f5693702c06ff85948bb8d6b8effcbe",
     "tracer.services.clickhouse.v2.query_builders.user_list": "d5024fe5a46b7cbdf2621d04dfd02027c17816f7250f84120c920a0dd3c9908e",
     "tracer.services.clickhouse.v2.id_remap_sql": "56903f382c0f8dc40099e5ebfda45a8ab853c0b8f7ec16b5712f9c11092fe24a",
 }
@@ -728,7 +728,15 @@ class ReadOnlyExecutor:
                     raise replay.ReplayError("USERS_REMAP_RESULT_INVALID")
                 seen.add(alias)
 
-    def execute_ch_query(self, query, params=None, timeout_ms=None, settings=None):
+    def execute_ch_query(
+        self,
+        query,
+        params=None,
+        timeout_ms=None,
+        settings=None,
+        *,
+        server_execution_cap_ms=None,
+    ):
         from clickhouse_driver.errors import Error
         from tracer.services.clickhouse.query_service import QueryResult
         from tracer.services.clickhouse.read_budget import ReadDeadlineExceeded
@@ -768,7 +776,17 @@ class ReadOnlyExecutor:
 
             # Candidate qualification still exercises application policy first,
             # followed by separate, explicit run-only diagnostic safeguards.
-            candidate_settings = application_read_settings(settings)
+            if server_execution_cap_ms is None:
+                candidate_settings = application_read_settings(settings)
+            else:
+                from tracer.services.clickhouse.application_read_policy import (
+                    application_read_context,
+                )
+
+                with application_read_context(
+                    execution_cap_ms=server_execution_cap_ms
+                ):
+                    candidate_settings = application_read_settings(settings)
         limits = diagnostic_read_settings(
             candidate_settings if self.mode == "candidate" else settings,
             remaining_ms=remaining,
@@ -776,6 +794,14 @@ class ReadOnlyExecutor:
             preserve_caller_caps=self.mode == "reference_diagnostic",
             timeout_ms=timeout_ms,
         )
+        # A statement the product asks the server to stop keeps that cap here
+        # too, so the rig measures the deadline production enforces.
+        product_capped = (
+            server_execution_cap_ms is not None
+            and server_execution_cap_ms / 1000 < limits["max_execution_time"]
+        )
+        if product_capped:
+            limits["max_execution_time"] = server_execution_cap_ms / 1000
         query_id = f"{self.prefix}-{len(self.calls) + 1}"
         record = {
             "query_id": query_id,
@@ -825,6 +851,14 @@ class ReadOnlyExecutor:
                 exception_class=type(exc).__name__,
                 elapsed_ms=round((time.monotonic() - start) * 1000, 2),
             )
+            if product_capped:
+                from clickhouse_driver.errors import ErrorCodes
+
+                if exc.code != ErrorCodes.TIMEOUT_EXCEEDED:
+                    raise
+                raise ReadDeadlineExceeded(
+                    "ClickHouse statement exceeded its execution cap"
+                ) from exc
             raise
         finally:
             timing_origin = getattr(self, "timing_origin", None)

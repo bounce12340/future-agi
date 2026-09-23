@@ -1,6 +1,7 @@
 """ClickHouse query builder for Observe end-user list and detail metrics."""
 
 from collections.abc import Iterable, Mapping
+from datetime import timedelta
 from typing import Any
 
 from tracer.services.clickhouse.eval_logger_table import eval_logger_source
@@ -661,6 +662,65 @@ class UserListQueryBuilder(BaseQueryBuilder):
         GROUP BY raw_end_user_id
         {keyset}
         ORDER BY raw_newest DESC, raw_end_user_id DESC
+        LIMIT %(slice_user_limit)s
+        {_SEEDED_PAGE_READ_SETTINGS}
+        """
+        return query, params
+
+    def build_matching_activity_instant_query(
+        self,
+        *,
+        instant: Any,
+        limit: int,
+        before_end_user_id: str | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Resolved users witnessed at exactly one instant, newest id first.
+
+        The slice statement orders RAW ids; the page orders resolved users by
+        ``(key DESC, id DESC)``. Inside one tied instant those orders differ
+        wherever an alias resolves to a survivor of another id, so a raw
+        position cannot say which resolved users at that instant are still
+        undecided. This statement reads the same witnessed rows as a slice of
+        ``[instant, instant + 1us)``, resolves each raw id through the
+        survivor map of exactly the groups those ids touch, and returns the
+        resolved ids in descending order, continued past
+        ``before_end_user_id``. Every resolved user with a witnessed row at
+        the instant and an id in ``[last returned, before)`` is in the result,
+        so a caller may treat that id range as decided.
+
+        Bounded by the instant: the spans scan is one microsecond of one
+        project, and the remap reads only the groups its raw ids touch.
+        """
+        if limit <= 0:
+            raise ValueError("matching activity instant limit must be positive")
+        params = self._matching_activity_range_params(
+            instant, instant + timedelta(microseconds=1)
+        )
+        params["slice_user_limit"] = int(limit)
+        keyset = ""
+        if before_end_user_id is not None:
+            params["instant_before_end_user_id"] = str(before_end_user_id)
+            keyset = "HAVING instant_end_user_id < %(instant_before_end_user_id)s"
+        remap = _touched_survivor_map_subquery(
+            remap_table="end_user_id_remap",
+            candidate_cte="instant_raw",
+            candidate_column="instant_raw_id",
+        )
+        resolved = resolved_id_expr("instant_raw.instant_raw_id", "instant_remap")
+        query = f"""
+        WITH instant_raw AS (
+            SELECT DISTINCT end_user_id AS instant_raw_id
+            FROM spans
+            PREWHERE {self._matching_activity_range_predicate()}
+            WHERE {params.pop("_witness_sql")}
+        )
+        SELECT toString({resolved}) AS instant_end_user_id
+        FROM instant_raw
+        LEFT JOIN ({remap}) AS instant_remap
+            ON instant_raw.instant_raw_id = instant_remap.any_id
+        GROUP BY instant_end_user_id
+        {keyset}
+        ORDER BY instant_end_user_id DESC
         LIMIT %(slice_user_limit)s
         {_SEEDED_PAGE_READ_SETTINGS}
         """

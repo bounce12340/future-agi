@@ -346,7 +346,15 @@ class _LiveExecutor:
         self.tables = tables
         self.statements: list[str] = []
 
-    def execute_ch_query(self, query, params=None, timeout_ms=None, settings=None):
+    def execute_ch_query(
+        self,
+        query,
+        params=None,
+        timeout_ms=None,
+        settings=None,
+        *,
+        server_execution_cap_ms=None,
+    ):
         self.statements.append(query)
         rows, columns = self.client.execute(
             _bind(query, self.tables), params or {}, with_column_types=True

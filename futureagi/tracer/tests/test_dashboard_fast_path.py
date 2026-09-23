@@ -79,10 +79,10 @@ def test_w1_w6_simple_metrics_use_bounded_rollup(monkeypatch, preset, granularit
     )
 
     assert result["query_status"] == "complete"
-    # A summed token series off the in-table states is the base table's own
-    # number, so the payload may finally say so.
-    assert result["query_exact"] is True
-    assert result["metrics"][0]["query_exact"] is True
+    # The in-table states are per physical part: unmerged versions and
+    # retained tombstones are counted, so the series is not latest-live.
+    assert result["query_exact"] is False
+    assert result["metrics"][0]["query_exact"] is False
     assert result["query_provenance"] == "materialized_rollup"
     assert len(analytics.calls) == 1
     query, params, timeout_ms, settings = analytics.calls[0]
@@ -151,14 +151,11 @@ def test_span_and_trace_rollups_share_one_deadline(monkeypatch):
         for call in analytics.calls
     }
     assert all("spans_hourly_rollup" not in call[0] for call in analytics.calls)
-    # The trace-count source is a different table this change does not touch,
-    # so a payload carrying it stays inexact even though the token series is
-    # now the base table's own number.
+    # Neither source is latest-live, so neither the payload nor any metric in
+    # it claims exactness.
     assert result["query_exact"] is False
-    exactness = {
-        metric["name"]: metric["query_exact"] for metric in result["metrics"]
-    }
-    assert exactness == {"tokens": True, "trace_count": False}
+    exactness = {metric["name"]: metric["query_exact"] for metric in result["metrics"]}
+    assert exactness == {"tokens": False, "trace_count": False}
 
 
 @pytest.mark.unit

@@ -231,7 +231,10 @@ def _page(ch_client, table, value, statements):
             data, schema = ch_client.execute(
                 query,
                 params,
-                settings={**settings, "max_execution_time": max(timeout_ms / 1000, 5.0)},
+                settings={
+                    **settings,
+                    "max_execution_time": max(timeout_ms / 1000, 5.0),
+                },
                 with_column_types=True,
             )
             names = [name for name, _type in schema]
@@ -291,9 +294,7 @@ def test_bounded_anchor_returns_the_same_rows_as_no_hint_at_all(
     # Guard against a vacuous pass: the anchored lane must really have run.
     assert any("indexHint(arrayStringConcat" in sql for sql in hinted_statements)
 
-    monkeypatch.setattr(
-        trace_list_module, "_LONG_TEXT_SEED_INLINE_BUDGET_BYTES", 0
-    )
+    monkeypatch.setattr(trace_list_module, "_LONG_TEXT_SEED_INLINE_BUDGET_BYTES", 0)
     monkeypatch.setattr(
         latest_filter_predicates, "_MAX_INDEX_COMPANION_VALUE_UTF8_BYTES", 0
     )

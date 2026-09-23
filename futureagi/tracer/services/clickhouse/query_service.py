@@ -14,6 +14,8 @@ from enum import StrEnum
 from typing import Any, Protocol
 
 import structlog
+from clickhouse_driver.errors import Error as ClickHouseError
+from clickhouse_driver.errors import ErrorCodes
 from django.conf import settings
 
 from tracer.services.clickhouse.application_read_policy import (
@@ -224,6 +226,8 @@ class AnalyticsQueryService:
         params: dict = None,
         timeout_ms: int | None = APPLICATION_READ_TIMEOUT_MS,
         settings: dict | None = None,
+        *,
+        server_execution_cap_ms: int | None = None,
     ) -> QueryResult:
         """Execute analytics without a per-statement time/row/byte abort cap.
 
@@ -231,16 +235,23 @@ class AnalyticsQueryService:
         longer a statement deadline. Request/continuation admission and transport
         failure detection are separate from server query execution limits.
 
+        ``server_execution_cap_ms`` is the explicit exception: a caller that
+        owns a real deadline for this one statement passes it, and the native
+        client sends it as ``max_execution_time`` (every other abort cap stays
+        off). The server's timeout then surfaces as ``ReadDeadlineExceeded``.
+        A server profile locked at ``readonly=1`` accepts no query settings, so
+        on that lane only the profile's own limits apply.
+
         The result carries the statement's own native rows-read and
         bytes-read progress: a caller may size its next read by the rows and
         learn what this scope costs per row from the bytes. The transport
         leaves either unmeasured when the server reported none.
         """
-        if self.supports_per_query_read_settings:
-            settings = application_read_settings(settings)
         start = time.monotonic()
         try:
-            with application_read_context():
+            with application_read_context(execution_cap_ms=server_execution_cap_ms):
+                if self.supports_per_query_read_settings:
+                    settings = application_read_settings(settings)
                 (
                     rows,
                     columns,
@@ -258,6 +269,15 @@ class AnalyticsQueryService:
             if isinstance(exc, ReadDeadlineExceeded):
                 raise
             raise ReadDeadlineExceeded("ClickHouse query timed out") from exc
+        except ClickHouseError as exc:
+            if (
+                server_execution_cap_ms is not None
+                and getattr(exc, "code", None) == ErrorCodes.TIMEOUT_EXCEEDED
+            ):
+                raise ReadDeadlineExceeded(
+                    "ClickHouse statement exceeded its execution cap"
+                ) from exc
+            raise
         elapsed = (time.monotonic() - start) * 1000
 
         col_names = [c[0] if isinstance(c, tuple) else c for c in columns]

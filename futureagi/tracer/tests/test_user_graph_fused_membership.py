@@ -148,8 +148,7 @@ def test_explicit_raw_flags_fuse_without_recompiling_or_pruning_spans(days, coun
     for index, predicate in enumerate(plan.predicates):
         assert predicate in sql
         assert (
-            f"countIf(rs.user_member_match_{index}) AS user_member_trace_{index}"
-            in sql
+            f"countIf(rs.user_member_match_{index}) AS user_member_trace_{index}" in sql
         )
         assert f"sum(user_member_trace_{index}) AS user_member_bucket_{index}" in sql
         assert (
@@ -209,8 +208,7 @@ def test_typed_flags_keep_shared_negative_null_and_presence_contract(kind, value
     ):
         assert predicate in sql
         assert (
-            f"countIf(rs.user_member_match_{index}) AS user_member_trace_{index}"
-            in sql
+            f"countIf(rs.user_member_match_{index}) AS user_member_trace_{index}" in sql
         )
         assert f"user_member_window_{index} {'> 0' if required else '= 0'}" in sql
     assert all(params[key] == value for key, value in expected_params.items())
