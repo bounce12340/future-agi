@@ -15,6 +15,8 @@ from clickhouse_connect.driver.exceptions import (
 )
 from clickhouse_driver.errors import Error as ClickHouseDriverError
 from django.conf import settings
+from django_redis.exceptions import ConnectionInterrupted
+from redis.exceptions import RedisError
 
 from model_hub.models.choices import AnnotationTypeChoices
 from model_hub.models.develop_annotations import AnnotationsLabels
@@ -787,6 +789,13 @@ def graph_payload_is_publishable(
         ):
             return False
     return True
+
+
+# What can reach the scheduling fallback from cache or worker transport. The
+# django-redis backend wraps redis failures in ConnectionInterrupted, which is
+# not a RedisError; socket-level failures are OSError. Temporal dispatch
+# failures are already absorbed and logged inside the snapshot scheduler.
+_EXACT_REFRESH_TRANSPORT_ERRORS = (ConnectionInterrupted, RedisError, OSError)
 
 
 def _read_or_refresh_exact_graph(
@@ -1843,9 +1852,15 @@ def fetch_user_system_metric_graph_ch(
                 organization_id=organization_id,
                 workspace_id=workspace_id,
             )
-        except Exception:
+        except _EXACT_REFRESH_TRANSPORT_ERRORS as exc:
             # The direct failure is already sanitized. Cache/worker transport
             # availability must not turn it into a raw API exception.
+            logger.warning(
+                "user graph exact refresh scheduling degraded",
+                metric_id=normalized_metric_id,
+                error_type=type(exc).__name__,
+                exc_info=True,
+            )
             return degraded
     return degraded
 

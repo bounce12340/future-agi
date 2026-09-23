@@ -165,19 +165,19 @@ def test_winner_carries_every_map_key_the_outer_statement_reads(
     assert reads, "the outer statement is expected to read attrs_string"
     for match in reads:
         column = (
-            match.group("keys_map") or match.group("has_map") or match.group("index_map")
+            match.group("keys_map")
+            or match.group("has_map")
+            or match.group("index_map")
         )
         token = (
-            match.group("keys_key") or match.group("has_key") or match.group("index_key")
+            match.group("keys_key")
+            or match.group("has_key")
+            or match.group("index_key")
         )
         if column != "attrs_string":
             # attrs_number/attrs_bool are carried whole; nothing to check.
             continue
-        key = (
-            params[token[2:-2]]
-            if token.startswith("%(")
-            else token[1:-1]
-        )
+        key = params[token[2:-2]] if token.startswith("%(") else token[1:-1]
         assert key in carried, f"outer reads attrs_string[{key!r}], winner drops it"
 
     # Any other way of naming attrs_string in the outer query would read a
@@ -185,7 +185,11 @@ def test_winner_carries_every_map_key_the_outer_statement_reads(
     assert outer.count("attrs_string") == sum(
         1
         for match in reads
-        if (match.group("keys_map") or match.group("has_map") or match.group("index_map"))
+        if (
+            match.group("keys_map")
+            or match.group("has_map")
+            or match.group("index_map")
+        )
         == "attrs_string"
     )
 
@@ -233,9 +237,10 @@ def test_overflow_json_filters_pack_the_overflow_column_and_others_do_not():
         }
     )
     _, overflow_sql, _ = _build(overflow)
-    assert "attributes_extra" in overflow_sql.split(
-        "FROM spans AS dashboard_replay_source", 1
-    )[1]
+    assert (
+        "attributes_extra"
+        in overflow_sql.split("FROM spans AS dashboard_replay_source", 1)[1]
+    )
     assert "dashboard_candidate_source.attributes_extra" in overflow_sql
 
 
