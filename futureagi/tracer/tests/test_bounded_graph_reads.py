@@ -7,6 +7,8 @@ from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
+from django_redis.exceptions import ConnectionInterrupted
+from redis.exceptions import ConnectionError as RedisConnectionError
 
 from tracer.selectors.trace_filter_reads import BoundedFilterPage
 from tracer.services.clickhouse import bounded_graph_reads, graph_dispatch
@@ -4991,6 +4993,126 @@ def test_users_graph_non_budget_failure_still_raises(monkeypatch):
     with pytest.raises(ValueError):
         graph_dispatch.fetch_user_system_metric_graph_ch(
             analytics=object(),
+            project_id=PROJECT_ID,
+            filters=[_date_filter()],
+            interval="hour",
+            metric_id="active_users",
+            organization_id=USERS_GRAPH_ORG_ID,
+            workspace_id=USERS_GRAPH_WORKSPACE_ID,
+        )
+
+
+def _users_graph_scheduling_fails(monkeypatch, *, error):
+    """Answer the cache-only probe with a cold miss and fail the scheduling."""
+
+    calls = []
+
+    def _read_or_schedule(namespace, identity, **kwargs):
+        calls.append((namespace, identity, kwargs))
+        if kwargs.get("schedule_on_miss") is False:
+            return {
+                **kwargs["pending_payload"],
+                "query_refreshing": False,
+                "query_refresh_failed": False,
+            }
+        raise error
+
+    monkeypatch.setattr(
+        graph_dispatch,
+        "read_or_schedule_exact_snapshot",
+        _read_or_schedule,
+    )
+    return calls
+
+
+class _AffordableScanEstimateAnalytics:
+    """Answer only a scan cost estimate, and answer it as affordable.
+
+    The reader is patched in these tests, so no graph statement reaches this
+    object. A dispatcher that costs the scan before reading gets an estimate
+    that keeps the read on the interactive path under test.
+    """
+
+    supports_per_query_read_settings = True
+
+    def execute_ch_query(self, query, params=None, **kwargs):
+        assert "EXPLAIN ESTIMATE" in query, "only a cost estimate may reach this fake"
+        return SimpleNamespace(
+            data=[
+                {
+                    "database": "default",
+                    "table": "spans",
+                    "parts": 1,
+                    "rows": 1_000,
+                    "marks": 1,
+                }
+            ],
+            columns=["database", "table", "parts", "rows", "marks"],
+            query_time_ms=1,
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "error",
+    [
+        ConnectionInterrupted(connection=None),
+        RedisConnectionError("cache unavailable"),
+        ConnectionRefusedError("worker transport unavailable"),
+    ],
+    ids=lambda exc: type(exc).__name__,
+)
+def test_users_graph_scheduling_transport_failure_is_logged_and_degrades(
+    monkeypatch, error
+):
+    calls = _users_graph_scheduling_fails(monkeypatch, error=error)
+    _users_graph_reader(
+        monkeypatch,
+        outcome=ReadDeadlineExceeded("graph read budget exhausted"),
+    )
+    warning_calls = []
+    monkeypatch.setattr(
+        graph_dispatch,
+        "logger",
+        SimpleNamespace(
+            warning=lambda *args, **kwargs: warning_calls.append((args, kwargs))
+        ),
+    )
+
+    response = graph_dispatch.fetch_user_system_metric_graph_ch(
+        analytics=_AffordableScanEstimateAnalytics(),
+        project_id=PROJECT_ID,
+        filters=[_date_filter()],
+        interval="hour",
+        metric_id="active_users",
+        organization_id=USERS_GRAPH_ORG_ID,
+        workspace_id=USERS_GRAPH_WORKSPACE_ID,
+    )
+
+    assert [options["refresh"] for _n, _i, options in calls] == [False, True]
+    assert response["query_status"] == "degraded"
+    assert response["query_complete"] is False
+    assert response["query_error_code"] == "read_budget_exceeded"
+    assert len(warning_calls) == 1
+    assert warning_calls[0][1]["exc_info"] is True
+    assert warning_calls[0][1]["error_type"] == type(error).__name__
+    assert warning_calls[0][1]["metric_id"] == "active_users"
+
+
+@pytest.mark.unit
+def test_users_graph_scheduling_defect_is_not_absorbed(monkeypatch):
+    _users_graph_scheduling_fails(
+        monkeypatch,
+        error=RuntimeError("scheduler defect"),
+    )
+    _users_graph_reader(
+        monkeypatch,
+        outcome=ReadDeadlineExceeded("graph read budget exhausted"),
+    )
+
+    with pytest.raises(RuntimeError, match="scheduler defect"):
+        graph_dispatch.fetch_user_system_metric_graph_ch(
+            analytics=_AffordableScanEstimateAnalytics(),
             project_id=PROJECT_ID,
             filters=[_date_filter()],
             interval="hour",
