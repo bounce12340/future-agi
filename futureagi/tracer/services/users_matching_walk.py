@@ -59,14 +59,20 @@ budget (``USER_LIST_WALK_MAX_STATEMENTS``, never less than one batch's
 decision: ``_statement_budget``). On exhaustion it returns the users certified
 so far, in order, with a cursor; it never falls back to the whole-window
 statement. A slice that fails on a read budget is retried narrower, never
-wider. Every request decides something before it stops: until it does, its
-search is admitted against the analytics wall rather than the page wall
-(``_admission_deadline``), a slice the server stops at its cap is retried
-narrower, and when it cannot be, the head-of-line slice is read once without
-a cap (``_read_slice``). The finishing statements run past the page wall
-under a server cap (``_finish_deadline``); a batch the server stops is
-replayed one user at a time, and a page that has published nothing decides a
-user whose replay the server stopped without the cap, once (``_materialise``).
+wider. Until a request decides something, its search is admitted against the
+analytics wall rather than the page wall (``_admission_deadline``), a slice
+the server stops at its cap is retried narrower, and when it cannot be, the
+head-of-line slice is read once without a cap and its first batch decided
+with no deadline (``_read_slice``). The finishing statements run past the
+page wall under a server cap (``_finish_deadline``); a batch the server stops
+is replayed one user at a time, and a page that has published nothing decides
+a user whose replay the server stopped without the cap, once
+(``_materialise``). One stall is known and left open: the head-of-line user's
+read, split in time when it runs out of a read budget (``_certify``), has no
+deadline only after that uncapped slice. Reached any other way, on cheap
+slices or in an open instant, it is admitted against the analytics wall, and
+when the split outlasts that wall every request stops at that user, having
+decided no one.
 
 Tied instant. Inside one timestamp the slice's raw id order is not the
 page's resolved id order (an alias may resolve to a survivor on either side of
@@ -95,9 +101,9 @@ lower row witnesses it, and no cursor's coverage rises above the one it
 resumed from. That holds for the data as each request saw it. Between
 requests: a user whose newest match moves to a key at or above a cursor's
 coverage is not published by that cursor (a new first page shows it); one
-whose key moves below the coverage is published where it now sorts; and a
-published user whose key moves below the coverage is published again, the
-usual limit of a keyset over changing data.
+whose key moves below the coverage and ahead of the keyset is published where
+it now sorts; and a published user whose key moves below the coverage is
+published again, the usual limit of a keyset over changing data.
 """
 
 from __future__ import annotations
@@ -499,8 +505,11 @@ def _read_slice(
     a wall only decides whether they start. The escape lifts even that, once
     per request, for the head-of-line decision: the uncapped slice, its
     survivor statement, the instant read and its survivor statement when the
-    slice comes back tied at one instant, one batch's enrichment and the
-    finish's uncapped replay (``_materialise``) start with no wall at all.
+    slice comes back tied at one instant, and one batch's enrichment (and its
+    head-of-line user's alone when that fails) start with no wall at all.
+    The finish's uncapped replay is not part of it: ``_materialise`` sends it
+    when a page that has published nothing had its head-of-line user's
+    capped replay stopped or refused, whether or not a slice was uncapped.
     That decision may split the head-of-line user's read in time when it
     runs out of a read budget (``_certify``): up to ``2 ** (ceil(log2(window
     / _USER_LIST_ATTRIBUTE_MIN_BUCKET)) + 1) - 1`` statements (4,095 over
@@ -929,10 +938,13 @@ def _admission_deadline(state: _WalkState) -> ReadDeadline | None:
     something (``progress_owed``), its search statements are admitted
     against the analytics wall measured from the walk's start instead of
     the page wall. For a read of one statement (a slice, a survivor
-    statement, an instant read) that never refuses: the deadline returned
-    has at least 25 ms left or is ``None``, and the application service
-    sends no timeout for it. It can stop only a read of several statements,
-    a batch's enrichment between its key statements and time buckets. Once
+    statement, an instant read) the deadline returned has at least 25 ms
+    left or is ``None``, and the application service sends no timeout for
+    it; one returned with less than 26 ms left can still fall below the
+    25 ms floor before it is read, and then stops the request. Otherwise it
+    can stop only a read of several statements, a batch's enrichment between
+    its key statements and time buckets: a head-of-line split that outlasts
+    the wall is stopped there, the known stall (module docstring). Once
     that wall is spent, or the request has read its head-of-line slice
     without a cap (``_read_slice``), the statements that decide that slice's
     first batch are admitted with no deadline, once per request: its
@@ -977,10 +989,11 @@ def _finish_deadline(state: _WalkState) -> ReadDeadline:
     analytics wall measured from the walk's start instead of a further full
     wall after the page wall. The search before it is bounded at admission,
     by the page wall or, while the request has decided nothing, by the
-    analytics wall (``_admission_deadline``); its slices also carry a server
-    cap (``_slice_cap``), its other statements none, so one of those admitted
-    in time may still run past the wall; a finish that then has less than a
-    statement's floor left is refused, not started.
+    analytics wall (``_admission_deadline``); its capped slices also carry a
+    server cap (``_slice_cap``), while the head-of-line slice read without one
+    (``_read_slice``) and its other statements carry none, so one of those
+    admitted in time may still run past the wall; a finish that then has less
+    than a statement's floor left is refused, not started.
 
     The deadline is enforced on the server (``enforce_on_server``): each
     finishing statement sends the smaller of its own cap

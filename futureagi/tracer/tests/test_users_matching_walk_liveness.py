@@ -13,7 +13,9 @@ These tests drive the real walk and manager through the scripted ``World`` /
 ``Engine`` of ``test_users_matching_walk`` (and, for the server cap, through
 the real ``V2AnalyticsQueryService`` and ``ClickHouseClient`` over a recording
 native driver). The property test generates worlds from fixed seeds and
-follows every cursor to the end.
+follows every cursor to the end. One stall is known and documented, not
+fixed: a head-of-line split that outlasts the analytics wall
+(``test_a_split_that_outlasts_the_analytics_wall_is_a_known_stall``).
 """
 
 from __future__ import annotations
@@ -368,9 +370,12 @@ def _follow(
     """Follow the cursor to the end; returns the published names and the hops.
 
     Every hop must keep the coverage where it was or lower it, send no more
-    statements than the walk's own budget for the page (every finishing
-    statement included), and send at most one replay without a server cap,
-    for one user, right after a capped replay it led was stopped. In a
+    statements than one decision or the page's budget (``_one_decision``,
+    every finishing statement included), and send at most one replay without
+    a server cap, for one user, while the page has published nothing: right
+    after its own capped replay was stopped, after a stopped batch it led
+    when the budget could not afford its own attempt, or when the search had
+    spent the analytics wall and its capped attempt was never sent. In a
     static world a repeated ``(cursor, seen rows)`` is a livelock, and no two
     hops in a row may both make no progress: publish a user, lower the
     coverage, or lower the decided position. The walls run on a scripted
@@ -1388,10 +1393,11 @@ def test_an_enrichment_that_fails_above_a_bucket_width_still_ends(slices):
     Only the head-of-line user's enrichment is narrowed in time, one user a
     request, down to buckets that fit: the ten-minute tree, inside the
     remainder the walk documents at the least bucket, and every other
-    statement inside the budget. The list still ends, each
-    user once and in order, whether the slices are cheap or every capped
-    slice is stopped (the head-of-line path, where that enrichment has no
-    deadline).
+    statement inside the budget. The list ends, each user once and in
+    order, whether the slices are cheap or every capped slice is stopped,
+    because a split here (255 failures at 50 ms, 12.75 s) fits the analytics
+    wall; one that does not is the known stall
+    (``test_a_split_that_outlasts_the_analytics_wall_is_a_known_stall``).
     """
     world, expected = _spread_world(5, 3)
     slice_ms = _every_slice(40_000) if slices != "cheap" else None
@@ -1412,6 +1418,77 @@ def test_an_enrichment_that_fails_above_a_bucket_width_still_ends(slices):
         assert narrowed in (0, _split_statements(TEN_MINUTES) - 1), narrowed
         assert narrowed <= least - 1
         assert statements - narrowed <= walk.USER_LIST_WALK_MAX_STATEMENTS
+
+
+@pytest.mark.parametrize(
+    ("slices", "fail_ms", "width"),
+    [
+        ("cheap", 120.0, TEN_MINUTES),
+        ("every_capped_slice_stopped", 150.0, TEN_MINUTES),
+        ("every_capped_slice_stopped", 50.0, timedelta(minutes=1)),
+    ],
+)
+def test_a_split_that_outlasts_the_analytics_wall_is_a_known_stall(
+    slices, fail_ms, width
+):
+    """The documented stall: a head-of-line split the analytics wall stops.
+
+    Every enrichment wider than ``width`` runs out of memory and a failure
+    costs ``fail_ms``, so splitting one user's read takes more than the 30 s
+    analytics wall (255 failures at ten minutes, 2,047 at one). That split
+    has no deadline only after the request reads its head-of-line slice
+    without a cap (``_read_slice``): the first request with every capped
+    slice stopped splits it whole, the documented bound at the least bucket,
+    but cannot publish it (its key is that slice's floor). Reached otherwise,
+    on cheap slices or in the open instant the next request decides first,
+    the wall stops the split and the request decides no one, and the next
+    request does the same. Each request still ends by that wall, degraded,
+    without raising the coverage; the list does not move past the user. The
+    walk documents this stall and does not retry it.
+    """
+    world, _expected = _spread_world(5, 3)
+    slice_ms = _every_slice(40_000) if slices != "cheap" else None
+    wall_ms = walk.USER_LIST_WALK_FINISH_WALL_MS
+    clock = _Clock()
+    cursor = None
+    published: list[str] = []
+    coverages = []
+    stalled_ms = []
+    with _shipped_walls(), _scripted_clock(clock):
+        for hop in range(4):
+            memory = _MemoryEngine(
+                world,
+                clock=clock,
+                width=width,
+                fail_ms=fail_ms,
+                slice_ms=slice_ms,
+            )
+            started = clock.now
+            with capture_logs() as logs:
+                read, _engine = _page(world, page_size=25, cursor=cursor, engine=memory)
+            published.extend(_names(read))
+            assert read.has_more and read.payload["query_status"] == "degraded"
+            exhausted = [
+                e["exhausted_by"]
+                for e in logs
+                if e["event"] == "users_matching_walk_budget_exhausted"
+            ]
+            assert exhausted == ["wall"], exhausted
+            if slices == "cheap" or hop > 0:
+                # Split under the wall, and stopped by it.
+                stalled_ms.append((clock.now - started) * 1000)
+                assert memory.split, hop
+            else:
+                # Split with no deadline: the whole tree, root included.
+                assert list(memory.split.values()) == [_split_statements(width) - 1]
+            coverages.append(read.checkpoint_order[3])
+            cursor = _signed_cursor(read)
+
+    assert published == []
+    # Within a failure and the admission floor of the wall, either side.
+    assert all(abs(ms - wall_ms) <= fail_ms + 25 for ms in stalled_ms), stalled_ms
+    assert coverages == sorted(coverages, reverse=True)
+    assert coverages[0] - coverages[-1] <= 4 * TICK, coverages
 
 
 # --------------------------------------------------------------------------
