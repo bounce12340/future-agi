@@ -33,6 +33,7 @@ from tracer.services import users_matching_walk as walk
 from tracer.services.clickhouse import read_budget
 from tracer.services.clickhouse.read_budget import ReadDeadline, ReadDeadlineExceeded
 from tracer.tests.test_users_matching_walk import (
+    PROJECT,
     SERVICE,
     WINDOW_END,
     WINDOW_START,
@@ -158,14 +159,40 @@ def _shipped_walls():
         yield
 
 
+# The statements that finish a materialisation after the replay; each names
+# the users it reads in ``candidate_end_user_ids``.
+FINISHING = frozenset(
+    {"replay", "relation", "session_metrics", "span_metrics", "evals"}
+)
+
+
+def _statement_kind(query: str, params: dict | None) -> str:
+    """``kind_of``, told apart for every finishing statement."""
+
+    params = params or {}
+    if "latest_relation_candidate_spans AS" in query:
+        return "relation"
+    if "eval_eu_ids" in params:
+        return "evals"
+    if "session_rows AS" in query:
+        return "session_metrics"
+    if "candidate_users AS" in query:
+        return "replay"
+    if "candidate_end_user_ids" in params:
+        return "span_metrics"
+    return kind_of(query)
+
+
 class _CappedEngine(Engine):
     """A scripted server on which a heavy user's replay outlasts any cap.
 
     A replay that carries a heavy user, or more than ``batch_limit`` users,
     and asks the server to stop at a cap is stopped there
     (``ReadDeadlineExceeded``, as the service maps code 159 under a cap); the
-    same replay without a cap runs to completion. Records every replay as
-    ``(ids, capped, stopped)``. With a ``clock``, every statement spends its
+    same replay without a cap runs to completion; so do the relation,
+    metrics and evals statements that finish it. Records every replay as
+    ``(ids, capped, stopped)``, and every finishing statement as ``(kind,
+    ids, capped, stopped)``. With a ``clock``, every statement spends its
     time on it: 1 ms, a stopped statement its cap, and a slice what
     ``slice_ms(width, returned_rows)`` says. A slice that costs more than the
     cap it was sent with is stopped there; one sent without a cap runs to
@@ -187,6 +214,7 @@ class _CappedEngine(Engine):
         self.clock = clock
         self.slice_ms = slice_ms
         self.replays: list[tuple[tuple[str, ...], bool, bool]] = []
+        self.finishing: list[tuple[str, tuple[str, ...], bool, bool]] = []
         self.slices: list[tuple[timedelta, float | None, bool]] = []
 
     def execute_ch_query(
@@ -198,14 +226,17 @@ class _CappedEngine(Engine):
         *,
         server_execution_cap_ms=None,
     ):
-        if kind_of(query) == "replay":
+        kind = _statement_kind(query, params)
+        if kind in FINISHING:
             ids = tuple((params or {})["candidate_end_user_ids"])
             capped = server_execution_cap_ms is not None
             stopped = capped and (
                 bool(self.heavy.intersection(ids))
                 or (self.batch_limit is not None and len(ids) > self.batch_limit)
             )
-            self.replays.append((ids, capped, stopped))
+            self.finishing.append((kind, ids, capped, stopped))
+            if kind == "replay":
+                self.replays.append((ids, capped, stopped))
             if stopped:
                 self.calls.append(query)
                 self.settings.append(settings)
@@ -214,6 +245,19 @@ class _CappedEngine(Engine):
                 if self.clock is not None:
                     self.clock.spend(server_execution_cap_ms)
                 raise ReadDeadlineExceeded("ClickHouse statement exceeded its cap")
+            if kind != "replay":
+                self.calls.append(query)
+                self.settings.append(settings)
+                self.timeouts.append(timeout_ms)
+                self.caps.append(server_execution_cap_ms)
+                if self.clock is not None:
+                    self.clock.spend(1.0)
+                # Every user matches the relation filter; metrics and evals
+                # carry nothing a filter reads.
+                data = (
+                    [{"end_user_id": uid} for uid in ids] if kind == "relation" else []
+                )
+                return SimpleNamespace(data=data, query_time_ms=1.0)
         result = super().execute_ch_query(
             query,
             params,
@@ -263,17 +307,20 @@ def _follow(
     mutate=None,
     slice_ms: Callable[[timedelta, bool], float] | None = None,
     keys: int = 0,
+    finish: int = 1,
 ) -> tuple[list[str], int]:
     """Follow the cursor to the end; returns the published names and the hops.
 
-    Every hop must keep the coverage where it was or lower it, stay inside
-    the statement budget, and send at most one replay without a server cap,
+    Every hop must keep the coverage where it was or lower it, send no more
+    statements than the walk's own budget for the page (every finishing
+    statement included), and send at most one replay without a server cap,
     for one user, right after a capped replay it led was stopped. In a
     static world a repeated ``(cursor, seen rows)`` is a livelock, and no two
     hops in a row may both make no progress: publish a user, lower the
     coverage, or lower the decided position. The walls run on a scripted
     clock (``_CappedEngine``); the page shows ``keys`` attribute columns
-    besides the filtered one.
+    besides the filtered one, and the columns and filters that make
+    ``finish`` finishing statements (``FINISH_SHAPES``).
     """
     with _scripted_clock(_Clock()) as clock:
         return _follow_on(
@@ -286,6 +333,7 @@ def _follow(
             mutate=mutate,
             slice_ms=slice_ms,
             keys=keys,
+            finish=finish,
         )
 
 
@@ -300,10 +348,10 @@ def _follow_on(
     mutate,
     slice_ms: Callable[[timedelta, bool], float] | None,
     keys: int,
+    finish: int,
 ) -> tuple[list[str], int]:
-    budget = _decision_budget(
-        max_statements or walk.USER_LIST_WALK_MAX_STATEMENTS, keys
-    )
+    budget = walk._statement_budget(_keyed_manager(keys, finish))
+    assert budget >= (max_statements or walk.USER_LIST_WALK_MAX_STATEMENTS)
     names: list[str] = []
     seen_states: set = set()
     coverage = WINDOW_END
@@ -312,7 +360,9 @@ def _follow_on(
     cursor = None
     for hop in range(1, max_hops + 1):
         engine = _CappedEngine(world, heavy, clock=clock, slice_ms=slice_ms)
-        read = _keyed_page(page_size=page_size, cursor=cursor, engine=engine, keys=keys)
+        read = _keyed_page(
+            page_size=page_size, cursor=cursor, engine=engine, keys=keys, finish=finish
+        )
         names.extend(_names(read))
         assert len(engine.calls) <= budget, (hop, len(engine.calls))
         _check_uncapped(engine.replays, proven=False)
@@ -339,49 +389,72 @@ def _follow_on(
     raise AssertionError(f"no end after {max_hops} hops; published {len(names)}")
 
 
-def _keyed_manager(keys: int):
-    """The page's manager, showing ``keys`` attribute columns besides ``tag``."""
+ANNOTATION_FILTER = {
+    "column_id": str(uuid.UUID(int=77)),
+    "filter_config": {
+        "filter_type": "number",
+        "filter_op": "greater_than",
+        "filter_value": 3,
+        "col_type": "ANNOTATION",
+    },
+}
+# Finishing statements per materialisation: the columns and relation filter
+# that make them. A session metric, a span metric, a relation filter and an
+# eval column each add one statement after the replay.
+FINISH_SHAPES = {
+    1: ((), False),
+    2: (("num_sessions",), False),
+    3: (("avg_session_duration", "avg_trace_latency"), False),
+    4: (("avg_session_duration", "avg_trace_latency"), True),
+    5: (("avg_session_duration", "avg_trace_latency", "eval_score"), True),
+}
+
+
+def _keyed_manager(keys: int, finish: int = 1):
+    """The page's manager: ``keys`` attribute columns besides ``tag``, and the
+    columns and filters that make ``finish`` finishing statements."""
 
     from tracer.services.users_list_manager import UsersListManager
 
     base = _manager()
-    return UsersListManager(
+    columns, relation = FINISH_SHAPES[finish]
+    manager = UsersListManager(
         organization_id=base.organization_id,
         allowed_project_ids=list(base.scoped_project_ids),
         project_id=base.project_id,
-        filters=base.filters,
-        requested_columns=[],
+        filters=[*base.filters, *([ANNOTATION_FILTER] if relation else [])],
+        requested_columns=list(columns),
         attribute_keys=[f"k{n:03d}" for n in range(keys)],
     )
+    assert walk._materialisation_statement_count(manager) == finish
+    return manager
 
 
-def _keyed_page(*, page_size: int, cursor, engine: Engine, keys: int):
-    manager = _keyed_manager(keys)
+@contextmanager
+def _eval_configs():
+    """One eval config in the project, so an eval column sends its statement."""
+
+    from unittest.mock import MagicMock
+
+    configs = MagicMock()
+    configs.filter.return_value.values_list.return_value = [
+        (PROJECT, str(uuid.UUID(int=88)))
+    ]
+    with patch(
+        "tracer.models.custom_eval_config.CustomEvalConfig.no_workspace_objects",
+        configs,
+    ):
+        yield
+
+
+def _keyed_page(*, page_size: int, cursor, engine: Engine, keys: int, finish: int = 1):
+    manager = _keyed_manager(keys, finish)
     with (
         patch(SERVICE, return_value=engine),
         patch.object(manager, "_read_dimension_candidates", side_effect=_never_seed),
+        _eval_configs(),
     ):
         return manager.list_cursor_payload(page_size=page_size, cursor=cursor)
-
-
-def _decision_budget(configured: int, keys: int = 0) -> int:
-    """The statements a request may spend: its budget, or one decision.
-
-    One decision: the open instant, a slice and three retries a quarter as
-    wide (one hour down to one minute), the head-of-line slice without a
-    cap and its survivors, the instant read and its survivors when that
-    slice is tied at one instant, one batch's enrichment, and a finish with
-    its uncapped retry.
-    """
-    assert walk.USER_LIST_WALK_INITIAL_SLICE == timedelta(hours=1)
-    assert walk.USER_LIST_WALK_MIN_SLICE == timedelta(minutes=1)
-    manager = _keyed_manager(keys)
-    return max(
-        configured,
-        9
-        + walk._enrichment_statement_count(manager)
-        + 2 * walk._materialisation_statement_count(manager),
-    )
 
 
 def _check_uncapped_slices(slices: list[tuple[timedelta, float | None, bool]]):
@@ -424,7 +497,8 @@ class _SlowUserDriver(_NativeDriver):
         self.caps: list[float] = []
 
     def execute(self, query, params=None, *, with_column_types=False, settings=None):
-        if kind_of(query) == "replay":
+        kind = _statement_kind(query, params)
+        if kind == "replay":
             ids = tuple((params or {}).get("candidate_end_user_ids", ()))
             cap = float((settings or {}).get("max_execution_time") or 0)
             stopped = cap > 0 and (
@@ -441,9 +515,16 @@ class _SlowUserDriver(_NativeDriver):
                     "Timeout exceeded: elapsed 8.0 seconds, maximum: 8",
                     code=ErrorCodes.TIMEOUT_EXCEEDED,
                 )
-        return super().execute(
-            query, params, with_column_types=with_column_types, settings=settings
-        )
+        if kind not in FINISHING:
+            return super().execute(
+                query, params, with_column_types=with_column_types, settings=settings
+            )
+        self.sent.append((kind, settings))
+        result = self.engine.execute_ch_query(query, params)
+        data = list(result.data or ())
+        columns = list(getattr(result, "columns", None) or (data[0] if data else ()))
+        rows = [tuple(row.get(name) for name in columns) for row in data]
+        return rows, [(name, "String") for name in columns]
 
 
 def _real_service_hops(world: World, driver: _SlowUserDriver, max_hops: int):
@@ -471,7 +552,7 @@ def test_a_sole_user_whose_replay_always_outlasts_the_cap_is_published():
 
     world = World()
     uid = world.user(1, key=minutes_before_end(3), raw=(minutes_before_end(3),))
-    driver = _SlowUserDriver(Engine(world), {uid})
+    driver = _SlowUserDriver(_CappedEngine(world), {uid})
 
     hops = _real_service_hops(world, driver, max_hops=3)
 
@@ -502,7 +583,7 @@ def test_a_heavy_user_never_blocks_the_users_ranked_around_it(heavy_rank, pages)
         world.user(n, key=minutes_before_end(n), raw=(minutes_before_end(n),))
         for n in range(1, 6)
     ]
-    driver = _SlowUserDriver(Engine(world), {ids[heavy_rank - 1]})
+    driver = _SlowUserDriver(_CappedEngine(world), {ids[heavy_rank - 1]})
 
     hops = _real_service_hops(world, driver, max_hops=4)
 
@@ -524,7 +605,7 @@ def test_a_batch_that_outlasts_the_cap_publishes_its_users_one_at_a_time():
     world = World()
     for n in range(1, 41):
         world.user(n, key=minutes_before_end(n), raw=(minutes_before_end(n),))
-    driver = _SlowUserDriver(Engine(world), set(), batch_limit=3)
+    driver = _SlowUserDriver(_CappedEngine(world), set(), batch_limit=3)
 
     hops = _real_service_hops(world, driver, max_hops=4)
 
@@ -535,10 +616,67 @@ def test_a_batch_that_outlasts_the_cap_publishes_its_users_one_at_a_time():
     assert all(capped for _ids, capped, _stopped in driver.replays)
 
 
+def test_metric_columns_are_charged_one_statement_per_metric_group():
+    """A session metric and a span metric column are two metrics statements.
+
+    Through the real service and client. Every replay of more than three
+    users is stopped, so the page materialises one user at a time, and each
+    materialisation sends the replay and both metrics statements. They were
+    charged as one, and a request sent 30-31 statements at a budget of 24;
+    every request now stays within its budget.
+    """
+    from tracer.services.clickhouse.client import ClickHouseClient
+    from tracer.services.users_list_manager import UsersListManager
+
+    world, expected = _spread_world(30, 5)
+    driver = _SlowUserDriver(_CappedEngine(world), set(), batch_limit=3)
+    base = _manager()
+
+    def manager():
+        return UsersListManager(
+            organization_id=base.organization_id,
+            allowed_project_ids=list(base.scoped_project_ids),
+            project_id=base.project_id,
+            filters=base.filters,
+            requested_columns=["avg_session_duration", "avg_trace_latency"],
+            attribute_keys=[],
+        )
+
+    assert walk._materialisation_statement_count(manager()) == 3
+    budget = walk._statement_budget(manager())
+    names, cursor, per_request = [], None, []
+    for _hop in range(12):
+        client = ClickHouseClient(host="localhost", port=39999, pool_size=1)
+        page = manager()
+        before = len(driver.sent)
+        with (
+            patch.object(client, "_get_client", return_value=driver),
+            patch.object(client, "_return_client"),
+            patch(
+                "tracer.services.clickhouse.v2.query_service.get_v2_query_client",
+                return_value=client,
+            ),
+            patch.object(page, "_read_dimension_candidates", side_effect=_never_seed),
+        ):
+            read = page.list_cursor_payload(page_size=25, cursor=cursor)
+        per_request.append(driver.sent[before:])
+        names.extend(_names(read))
+        if not read.has_more:
+            break
+        cursor = _signed_cursor(read)
+
+    assert names == expected
+    assert all(len(sent) <= budget for sent in per_request), [
+        len(sent) for sent in per_request
+    ]
+    kinds = [kind for sent in per_request for kind, _settings in sent]
+    assert kinds.count("session_metrics") == kinds.count("span_metrics") > 0
+
+
 def test_a_heavy_user_inside_a_large_tie_does_not_stall_the_instant():
     world, expected = _tied_world(601)
     heavy = next(u for u, v in world.users.items() if v["name"] == expected[59])
-    driver = _SlowUserDriver(Engine(world), {heavy})
+    driver = _SlowUserDriver(_CappedEngine(world), {heavy})
 
     hops = _real_service_hops(world, driver, max_hops=30)
 
@@ -556,7 +694,7 @@ def test_a_finish_the_server_stops_after_the_page_published_carries_the_rest():
     world = World()
     cheap = world.user(1, key=minutes_before_end(3), raw=(minutes_before_end(3),))
     heavy = world.user(2, key=minutes_before_end(5), raw=(minutes_before_end(5),))
-    driver = _SlowUserDriver(Engine(world), {heavy})
+    driver = _SlowUserDriver(_CappedEngine(world), {heavy})
 
     first = _real_service_page(world, driver)
 
@@ -586,7 +724,7 @@ def test_a_finish_the_analytics_wall_refuses_is_decided_without_the_cap():
     """
     world = World()
     uid = world.user(1, key=minutes_before_end(3), raw=(minutes_before_end(3),))
-    driver = _SlowUserDriver(Engine(world), set())
+    driver = _SlowUserDriver(_CappedEngine(world), set())
     spent = ReadDeadline.start(1, enforce_on_server=True)
 
     with patch.object(walk, "_finish_deadline", return_value=spent):
@@ -658,8 +796,7 @@ def test_a_dense_rejecting_world_ends_at_shipped_limits():
     rng = random.Random(1)
     n = rng.choice([2000, 4000])
     world = _unique_time_world(rng, n, reject_rate=rng.choice([0.7, 0.9, 0.97]))
-    with patch.object(walk, "_materialisation_statement_count", return_value=2):
-        names, _hops = _follow(world, page_size=25, max_hops=400)
+    names, _hops = _follow(world, page_size=25, max_hops=400, finish=2)
 
     assert names == _expected(world)
 
@@ -1079,7 +1216,8 @@ def _world(rng: random.Random, n_users: int) -> World:
 # (slice user limit, statement budget, certify batch, finishing statements):
 # tiny budgets up to the shipped limits. A request never has fewer
 # statements than one decision (``walk._statement_budget``), so the tiniest
-# budgets here are lifted to that.
+# budgets here are lifted to that. The finishing statements are real ones:
+# the page shows the columns and filters that make them (``FINISH_SHAPES``).
 LIMITS = [
     (2, 6, 1, 1),
     (2, 8, 2, 2),
@@ -1088,7 +1226,7 @@ LIMITS = [
     (5, 12, 5, 3),
     (8, 24, 25, 4),
     (200, 24, 25, 1),
-    (200, 24, 25, 4),
+    (200, 24, 25, 5),
 ]
 PAGE_SIZES = [1, 2, 3, 7, 25, 100]
 STATIC_WORLDS = 160
@@ -1136,16 +1274,16 @@ def _slice_hops(world: World, seed: int) -> int:
 
 @contextmanager
 def _limits(seed: int):
-    """The walk's limits for ``seed``; yields its statement budget."""
+    """The walk's limits for ``seed``; yields its statement budget and the
+    finishing statements its page makes."""
 
     slice_limit, max_statements, batch, finish = LIMITS[seed % len(LIMITS)]
     with (
         patch.object(walk, "USER_LIST_WALK_SLICE_USER_LIMIT", slice_limit),
         patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", max_statements),
         patch.object(walk, "USER_LIST_WALK_CERTIFY_BATCH_SIZE", batch),
-        patch.object(walk, "_materialisation_statement_count", return_value=finish),
     ):
-        yield max_statements
+        yield max_statements, finish
 
 
 def _hop_bound(n_users: int, page_size: int, heavy: int) -> int:
@@ -1170,7 +1308,7 @@ def test_every_hop_sequence_ends_exact_and_never_raises_the_coverage(seed):
     heavy = frozenset(
         rng.sample(sorted(world.users), min(n_users, rng.choice([0, 0, 0, 1, 2, 3])))
     )
-    with _limits(seed) as max_statements, _shipped_walls():
+    with _limits(seed) as (max_statements, finish), _shipped_walls():
         names, _hops = _follow(
             world,
             page_size=page_size,
@@ -1180,6 +1318,7 @@ def test_every_hop_sequence_ends_exact_and_never_raises_the_coverage(seed):
             heavy=heavy,
             slice_ms=_slice_model(seed),
             keys=_key_count(seed),
+            finish=finish,
         )
 
     assert len(names) == len(set(names)), "a user was published twice"
@@ -1216,7 +1355,7 @@ def test_users_that_stop_matching_between_hops_never_stall_or_repeat(seed):
     page_size = rng.choice([1, 3, 7, 25])
     heavy = frozenset(rng.sample(sorted(world.users), rng.choice([0, 0, 1, 2])))
     changed: set[str] = set()
-    with _limits(seed) as max_statements, _shipped_walls():
+    with _limits(seed) as (max_statements, finish), _shipped_walls():
         names, _hops = _follow(
             world,
             page_size=page_size,
@@ -1227,6 +1366,7 @@ def test_users_that_stop_matching_between_hops_never_stall_or_repeat(seed):
             mutate=_stop_matching(rng, changed),
             slice_ms=_slice_model(seed),
             keys=_key_count(seed),
+            finish=finish,
         )
 
     assert len(names) == len(set(names)), "a user was published twice"

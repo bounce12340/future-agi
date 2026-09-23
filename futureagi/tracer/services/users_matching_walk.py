@@ -106,6 +106,10 @@ import structlog
 from django.conf import settings
 
 from tracer.services.clickhouse.list_cursor import ListCursorError
+from tracer.services.clickhouse.query_builders.user_list import (
+    REQUESTED_PAGE_SESSION_METRIC_FIELDS,
+    REQUESTED_PAGE_SPAN_METRIC_FIELDS,
+)
 from tracer.services.clickhouse.read_budget import (
     ReadDeadline,
     ReadDeadlineExceeded,
@@ -328,11 +332,19 @@ def _enrichment_statement_count(manager: Any) -> int:
 
 
 def _materialisation_statement_count(manager: Any) -> int:
+    """The statements one materialisation sends, whatever its batch.
+
+    The replay; the relation statement, when relation filters are set; one
+    metrics statement per group with a requested field, sessions and spans
+    (``build_requested_page_metric_queries``); and the evals statement.
+    """
+    metrics = manager.metric_keys
     return (
         1
-        + bool(manager.metric_keys)
-        + bool(manager.needs_evals)
         + bool(manager.relation_filters)
+        + bool(metrics & set(REQUESTED_PAGE_SESSION_METRIC_FIELDS))
+        + bool(metrics & set(REQUESTED_PAGE_SPAN_METRIC_FIELDS))
+        + bool(manager.needs_evals)
     )
 
 
