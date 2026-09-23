@@ -366,6 +366,8 @@ def _follow(
     keys: int = 0,
     finish: int = 1,
     outage_every: int | None = None,
+    fault: Callable[[int, int], bool] | None = None,
+    fail_ms: float = 50.0,
 ) -> tuple[list[str], int]:
     """Follow the cursor to the end; returns the published names and the hops.
 
@@ -387,8 +389,11 @@ def _follow(
     statement is stopped every later replay carries one user
     (``_check_singly``). With ``outage_every``, every such hop finds the
     server unreachable: it must not raise the coverage, and it is left out of
-    the progress and livelock checks. ``mutate(world, published, cursor)``
-    runs between hops.
+    the progress and livelock checks. ``fault(users, index)`` says which
+    enrichment statements run out of memory, each costing ``fail_ms``
+    (``_MemoryEngine``): at most one user's read a hop may be split in time,
+    uncounted, inside the documented bound. ``mutate(world, published,
+    cursor)`` runs between hops.
     """
     with _scripted_clock(_Clock()) as clock:
         return _follow_on(
@@ -403,6 +408,8 @@ def _follow(
             keys=keys,
             finish=finish,
             outage_every=outage_every,
+            fault=fault,
+            fail_ms=fail_ms,
         )
 
 
@@ -419,6 +426,8 @@ def _follow_on(
     keys: int,
     finish: int,
     outage_every: int | None,
+    fault: Callable[[int, int], bool] | None,
+    fail_ms: float,
 ) -> tuple[list[str], int]:
     budget = max(
         max_statements or walk.USER_LIST_WALK_MAX_STATEMENTS,
@@ -432,8 +441,17 @@ def _follow_on(
     stalled = False
     cursor = None
     finish_wall = walk.USER_LIST_WALK_FINISH_WALL_MS
+    enrichment = 1 + -(-keys // 4)
+    least = _split_statements(ulm._USER_LIST_ATTRIBUTE_MIN_BUCKET)
     for hop in range(1, max_hops + 1):
-        engine = _CappedEngine(world, heavy, clock=clock, slice_ms=slice_ms)
+        engine = _MemoryEngine(
+            world,
+            heavy,
+            clock=clock,
+            fault=fault,
+            fail_ms=fail_ms,
+            slice_ms=slice_ms,
+        )
         engine.outage = outage_every is not None and hop % outage_every == 0
         with capture_logs() as logs:
             read = _keyed_page(
@@ -444,7 +462,11 @@ def _follow_on(
                 finish=finish,
             )
         names.extend(_names(read))
-        assert len(engine.calls) <= budget, (hop, len(engine.calls))
+        # One user's read split in time, at most, outside the budget.
+        narrowed = sum(engine.split.values())
+        assert len(engine.split) <= 1, (hop, engine.split)
+        assert narrowed <= enrichment * (least - 1), (hop, narrowed)
+        assert len(engine.calls) - narrowed <= budget, (hop, len(engine.calls))
         if not engine.outage:
             _check_uncapped(
                 engine.replays,
@@ -761,6 +783,32 @@ def test_a_batch_that_outlasts_the_cap_publishes_its_users_one_at_a_time():
     ]
     assert len(hops[0][0]) > 1
     assert all(capped for _ids, capped, _stopped in driver.replays)
+
+
+def test_a_stopped_batch_the_budget_cannot_retry_singly_decides_its_head_uncapped():
+    """``batch_stopped``: the budget cannot afford the head's own capped attempt.
+
+    Any replay of more than one user is stopped at the cap. With five
+    statements, the slice, its survivor statement, the batch's enrichment and
+    its stopped replay leave one: a page that has published nothing replays
+    its head-of-line user alone without the cap, once, and publishes it.
+    """
+    world, expected = _spread_world(3, 3)
+    engine = _CappedEngine(world, batch_limit=1, clock=_Clock())
+    with (
+        _scripted_clock(engine.clock),
+        patch.object(walk, "_statement_budget", return_value=5),
+        capture_logs() as logs,
+    ):
+        read, _engine = _page(world, page_size=25, engine=engine)
+
+    assert _names(read) == expected[:1]
+    ids = tuple(world.users)
+    assert engine.replays == [(ids, True, True), (ids[:1], False, False)]
+    reasons = _logged(logs, "users_matching_walk_uncapped_finish")
+    assert reasons == ["batch_stopped"]
+    _check_uncapped(engine.replays, reasons, replay_info=engine.replay_info)
+    assert len(engine.calls) == 5
 
 
 def test_metric_columns_are_charged_one_statement_per_metric_group():
@@ -1196,25 +1244,30 @@ class _MemoryEngine(_CappedEngine):
     """An enrichment runs out of memory (code 241) when it holds too much.
 
     It fails when its bucket is wider than ``width``, whatever it carries,
-    or when its users times its bucket's hours exceed ``user_hours``; a
-    failure costs ``fail_ms``. Records every enrichment as ``(users, bucket
-    width, failed)``, and counts, per user, the statements of that user
-    alone over less than the window (its read split in time).
+    when its users times its bucket's hours exceed ``user_hours``, or when
+    ``fault(users, index)`` says so, ``index`` counting the request's
+    enrichment statements from 0; a failure costs ``fail_ms``. Records every
+    enrichment as ``(users, bucket width, failed)``, and counts, per user,
+    the statements of that user alone over less than the window (its read
+    split in time).
     """
 
     def __init__(
         self,
         world: World,
+        heavy: frozenset[str] = frozenset(),
         *,
         clock: _Clock,
         width: timedelta | None = None,
         user_hours: float | None = None,
+        fault: Callable[[int, int], bool] | None = None,
         fail_ms: float = 50.0,
         slice_ms: Callable[[timedelta, bool], float] | None = None,
     ) -> None:
-        super().__init__(world, clock=clock, slice_ms=slice_ms)
+        super().__init__(world, heavy, clock=clock, slice_ms=slice_ms)
         self.width = width
         self.user_hours = user_hours
+        self.fault = fault
         self.fail_ms = fail_ms
         self.enrichments: list[tuple[int, timedelta, bool]] = []
         self.split: dict[str, int] = {}
@@ -1228,12 +1281,16 @@ class _MemoryEngine(_CappedEngine):
         *,
         server_execution_cap_ms=None,
     ):
-        if kind_of(query) == "enrich":
+        if _statement_kind(query, params) == "enrich":
             bucket = _from_us(params["attr_end_us"]) - _from_us(params["attr_start_us"])
             users = len(params["eu_ids"])
-            failed = (self.width is not None and bucket > self.width) or (
-                self.user_hours is not None
-                and users * (bucket / timedelta(hours=1)) > self.user_hours
+            failed = (
+                (self.width is not None and bucket > self.width)
+                or (
+                    self.user_hours is not None
+                    and users * (bucket / timedelta(hours=1)) > self.user_hours
+                )
+                or (self.fault is not None and self.fault(users, len(self.enrichments)))
             )
             self.enrichments.append((users, bucket, failed))
             if users == 1 and bucket < WINDOW:
@@ -1307,6 +1364,40 @@ def test_a_batch_whose_enrichment_runs_out_of_memory_certifies_its_head_alone():
     assert all(statements <= 24 for _n, statements, _e in hops)
     # Nothing was narrowed in time, so nothing is marked inexact.
     assert last.payload["query_exact"] is True
+
+
+def test_a_tied_instant_whose_batch_runs_out_of_memory_publishes_everyone():
+    """A tie decided at its own instant, whose batches run out of memory.
+
+    Twelve users share one instant and a slice returns five raw ids, so the
+    walk decides the instant with its own statement (``_decide_instant``).
+    Five users over the window do not fit in memory, one does: each batch
+    falls back to its head-of-line user, and the instant moves on by the
+    users certified, not by the batch it tried. Every user is published
+    once, in order.
+    """
+    world, expected = _tied_world(12)
+    clock = _Clock()
+    names: list[str] = []
+    cursor = None
+    failed_batches = instant_reads = 0
+    with (
+        _shipped_walls(),
+        _scripted_clock(clock),
+        patch.object(walk, "USER_LIST_WALK_SLICE_USER_LIMIT", 5),
+    ):
+        for _hop in range(30):
+            memory = _MemoryEngine(world, clock=clock, user_hours=30.0)
+            read, _engine = _page(world, page_size=25, cursor=cursor, engine=memory)
+            names.extend(_names(read))
+            failed_batches += sum(1 for n, _b, f in memory.enrichments if n > 1 and f)
+            instant_reads += sum(1 for q in memory.calls if kind_of(q) == "instant")
+            if not read.has_more:
+                break
+            cursor = _signed_cursor(read)
+
+    assert failed_batches > 0 and instant_reads > 0
+    assert names == expected
 
 
 @pytest.mark.parametrize("tied", [False, True], ids=["spread", "tied"])
@@ -1658,6 +1749,30 @@ def _key_count(seed: int) -> int:
     return random.Random(7_919 * seed + 1).choice(KEY_COUNTS)
 
 
+# Enrichment faults per world (``_MemoryEngine``): none, most often; every
+# enrichment of more than one user runs out of memory, so the head-of-line
+# user alone is certified again, at 40, 44 or 100 keys; one enrichment
+# statement fails at the request's k-th; or a failed batch costs more than
+# the whole analytics wall, and what decides the head of line after it runs
+# with no deadline.
+FAULTS = ["none", "none", "batch", "index", "batch_past_the_wall"]
+
+
+def _fault(seed: int, keys: int):
+    """``(fault, fail_ms, keys)`` for ``seed``'s world, which shows ``keys``."""
+
+    rng = random.Random(6_007 * seed + 5)
+    kind = rng.choice(FAULTS)
+    if kind == "none":
+        return None, 50.0, keys
+    if kind == "index":
+        k = rng.randrange(3 * (1 + -(-keys // 4)))
+        return (lambda _users, index: index == k), 50.0, keys
+    keys = rng.choice([40, 44, 100])
+    fail_ms = 40_000.0 if kind == "batch_past_the_wall" else 50.0
+    return (lambda users, _index: users > 1), fail_ms, keys
+
+
 def _slice_hops(world: World, seed: int) -> int:
     """Extra hops a world may take when no capped slice can return rows.
 
@@ -1709,6 +1824,7 @@ def test_every_hop_sequence_ends_exact_and_never_raises_the_coverage(seed):
     # A quarter of the worlds lose the server on every fifth request.
     outage = random.Random(31 * seed + 7).random() < 0.25
     bound = _hop_bound(n_users, page_size, len(heavy)) + _slice_hops(world, seed)
+    fault, fail_ms, keys = _fault(seed, _key_count(seed))
     with _limits(seed) as (max_statements, finish), _shipped_walls():
         names, _hops = _follow(
             world,
@@ -1717,9 +1833,11 @@ def test_every_hop_sequence_ends_exact_and_never_raises_the_coverage(seed):
             max_statements=max_statements,
             heavy=heavy,
             slice_ms=_slice_model(seed),
-            keys=_key_count(seed),
+            keys=keys,
             finish=finish,
             outage_every=5 if outage else None,
+            fault=fault,
+            fail_ms=fail_ms,
         )
 
     assert len(names) == len(set(names)), "a user was published twice"
@@ -1756,6 +1874,7 @@ def test_users_that_stop_matching_between_hops_never_stall_or_repeat(seed):
     page_size = rng.choice([1, 3, 7, 25])
     heavy = frozenset(rng.sample(sorted(world.users), rng.choice([0, 0, 1, 2])))
     changed: set[str] = set()
+    fault, fail_ms, keys = _fault(10_000 + seed, _key_count(seed))
     with _limits(seed) as (max_statements, finish), _shipped_walls():
         names, _hops = _follow(
             world,
@@ -1766,8 +1885,10 @@ def test_users_that_stop_matching_between_hops_never_stall_or_repeat(seed):
             heavy=heavy,
             mutate=_stop_matching(rng, changed),
             slice_ms=_slice_model(seed),
-            keys=_key_count(seed),
+            keys=keys,
             finish=finish,
+            fault=fault,
+            fail_ms=fail_ms,
         )
 
     assert len(names) == len(set(names)), "a user was published twice"
