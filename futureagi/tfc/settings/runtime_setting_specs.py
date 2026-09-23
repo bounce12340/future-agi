@@ -212,10 +212,19 @@ RUN_ENTRY_MAX_ATTEMPTS = 3
 # it. See ``tracer.services.eval_tasks.recovery.recover_task``.
 LONGEST_RUNNING_ENTRY_SECONDS = RUN_ENTRY_CEILING_SECONDS * RUN_ENTRY_MAX_ATTEMPTS
 
-# ``SWEEP_STALE_RUNNING_SECONDS`` must stay above that bound at every value an
-# operator can configure — not merely at the default. Below it the sweep can
-# requeue an entry whose run is still in flight from a closed execution and
-# spend one of the entry's three reclaims on it.
+# ``SWEEP_STALE_RUNNING_SECONDS`` is the threshold of the sweep's *own* reap,
+# and stays above that bound at every value an operator can configure, so that
+# reap never requeues an entry whose run is still in flight from a closed
+# execution. It does not bound the recovery as a whole. The workflow the sweep
+# then restarts reaps first at ``ReapInput``'s 600 s, on the evidence of the
+# same describe (``RESTART_REAP_SECONDS`` in
+# ``tracer.services.eval_tasks.recovery``), so a claim older than ten minutes
+# is reclaimed as soon as that run starts, whatever this is set to — and a run
+# of the closed execution can still be in flight under it. What keeps the row
+# correct there is the claim-epoch fence, which refuses that run's write; the
+# cost is one evaluation paid for twice and one of the entry's three reclaims.
+# Raising this setting does not prevent that. It only moves which reap
+# reclaims a row, and so what the tick's ``entries_requeued`` counts.
 EVAL_EXECUTION_SETTING_SPECS = {
     **_specs(
         (

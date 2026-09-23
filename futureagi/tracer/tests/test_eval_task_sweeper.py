@@ -740,6 +740,9 @@ def test_sweep_stale_threshold_exceeds_a_live_entrys_longest_run():
     start-to-close ceiling (times its retry attempts, kept as headroom: a closed
     execution dispatches no retries). Below that bound the sweep requeues an
     entry a worker is still evaluating and spends one of its three reclaims.
+    This bounds the sweep's own reap only: the workflow it restarts reaps at
+    ``RESTART_REAP_SECONDS`` (600 s) whatever the setting says, and the
+    claim-epoch fence is what keeps that reap's rows correct.
 
     Asserted against the spec's **minimum**, not against the live setting. The
     setting resolves from the process environment through ``load_numeric_settings``

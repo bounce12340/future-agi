@@ -76,9 +76,16 @@ def recover_task(task: EvalTask, *, stale_running_seconds: int) -> dict:
     else looks at them until something starts a workflow. The one run that can
     still be in flight here belongs to an execution that has since closed —
     bounded by a single activity attempt, because a closed execution dispatches
-    no retries — which is what ``EVAL_TASK_SWEEP_STALE_RUNNING_SECONDS`` is
-    floored to exceed. Its writes are fenced on the claim stamp it took, not
-    merely on ``RUNNING``, so a requeue and a re-claim refuse them.
+    no retries — and ``EVAL_TASK_SWEEP_STALE_RUNNING_SECONDS`` is floored to
+    exceed it, so *this* reap never requeues that run's entry. The floor is not
+    the guarantee, though: the workflow restarted below reaps first at
+    ``RESTART_REAP_SECONDS`` (600 s) on the same describe's evidence, so a claim
+    older than that is reclaimed as soon as it starts, whatever the setting
+    says. What makes that safe is the fence — the in-flight run's writes are
+    fenced on the claim stamp it took, not merely on ``RUNNING``, so a requeue
+    and a re-claim refuse them — and what it costs is one evaluation paid for
+    twice (``effective_stale_seconds``). Raising the setting does not remove
+    that cost.
 
     **Deferral.** A workflow that stopped a few minutes ago leaves claims
     younger than both this reap and the ``RESTART_REAP_SECONDS`` the restarted
