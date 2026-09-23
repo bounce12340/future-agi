@@ -665,7 +665,19 @@ def test_positive_text_attribute_filter_walks_matching_activity_not_the_seed():
         ) as analytics_cls,
     ):
 
-        def empty_server(query, params=None, timeout_ms=None, settings=None):
+        def empty_server(
+            query,
+            params=None,
+            timeout_ms=None,
+            settings=None,
+            *,
+            server_execution_cap_ms=None,
+        ):
+            # A slice asks the server to stop it at half of what is left of
+            # the analytics wall; nothing else in this page sends a cap.
+            assert (server_execution_cap_ms is not None) == (
+                "AS raw_end_user_id" in query
+            ), query
             if query.lstrip().startswith("EXPLAIN ESTIMATE"):
                 # The estimate table for a tail the blooms exclude entirely:
                 # ClickHouse 25.3 reports a row of zeros, not an empty result.
