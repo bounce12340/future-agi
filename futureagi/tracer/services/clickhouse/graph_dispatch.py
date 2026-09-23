@@ -9,6 +9,11 @@ from time import monotonic
 from typing import Any
 from uuid import UUID
 
+import structlog
+from clickhouse_connect.driver.exceptions import (
+    ClickHouseError as ClickHouseConnectError,
+)
+from clickhouse_driver.errors import Error as ClickHouseDriverError
 from django.conf import settings
 
 from model_hub.models.choices import AnnotationTypeChoices
@@ -44,6 +49,8 @@ from tracer.services.clickhouse.read_budget import (
 from tracer.services.exact_aggregation_cache import (
     read_or_schedule_exact_snapshot,
 )
+
+logger = structlog.get_logger(__name__)
 
 GRAPH_WALL_DEADLINE_MS = settings.GRAPH_BACKGROUND_WALL_MS
 GRAPH_QUERY_TIMEOUT_MS = settings.GRAPH_BACKGROUND_WALL_MS
@@ -88,6 +95,11 @@ _TRACE_ROLLUP_RESULT_COLUMNS = frozenset(
 _GRAPH_SEED_ESTIMATE_WALL_MS = 2_500
 _GRAPH_SEED_ESTIMATE_QUERY_MS = 1_500
 _GRAPH_SEED_ESTIMATE_MAX_CANDIDATES = 10
+# What a probe statement can fail with and still leave the unseeded read
+# correct: any ClickHouse answer from either driver, and transport or deadline
+# failures (TimeoutError, including ReadDeadlineExceeded, is an OSError).
+# Anything else is a defect in this code, not an unanswered probe.
+_GRAPH_SEED_PROBE_ERRORS = (ClickHouseDriverError, ClickHouseConnectError, OSError)
 # Twice _GRAPH_SEED_ESTIMATE_WALL_MS: the shortest wall on which spending the
 # whole probe budget still leaves the main read a floor of at least that
 # budget. Below it the single-node path does not probe at all rather than
@@ -349,13 +361,19 @@ def _select_raw_trace_seed_candidate(
                     "max_result_bytes": 64 * 1024,
                 },
             )
-        except Exception:
+        except _GRAPH_SEED_PROBE_ERRORS as exc:
             # Pruning is optional, so a failed probe must mean "no candidate",
             # never a failed request: the unseeded statement is still correct.
             # Classifying the failure here would propagate ClickHouse codes
             # the narrow read-budget/transport helpers deliberately reject
             # (type mismatch, unknown identifier, no common type) out of a
             # request that succeeds without any probe at all.
+            logger.warning(
+                "graph seed probe degraded",
+                probe_index=probe_count,
+                error_type=type(exc).__name__,
+                exc_info=True,
+            )
             continue
 
         estimate_rows = list(result.data or [])
