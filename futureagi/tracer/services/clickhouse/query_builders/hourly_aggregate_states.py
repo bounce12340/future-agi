@@ -14,9 +14,24 @@ for the highest-volume tenant, while every filtered graph — which reads
 ``spans`` already carries aggregate projections keyed on ``(project_id,
 toStartOfHour(start_time), ...)``.  A projection lives *inside* the table and
 is rebuilt with the part it belongs to (``deduplicate_merge_projection_mode =
-'rebuild'``), so it tracks the deduplicated rows instead of drifting away from
-them.  Measured against the base table on the months where the rollup is
-wrong, it agrees exactly.
+'rebuild'``), so a replayed batch stops counting once its parts are merged,
+instead of counting forever.  Measured against the base table on the months
+where the rollup is wrong, it agrees exactly.
+
+That is agreement with the merged parts, not with the latest live row.  A
+projection is per part: it applies no latest-version reduction and cannot
+filter ``is_deleted``.  So this source is an approximation, and every caller
+publishes it with ``query_exact`` false:
+
+* Until a merge, every version of a corrected row is counted, each at its own
+  values.
+* ``ReplacingMergeTree(_version, is_deleted)`` keeps the tombstone as the
+  surviving row of an ordinary merge (the table does not enable delete
+  cleanup), so a deleted row is counted at its tombstone's values even after
+  ``OPTIMIZE ... FINAL``.
+
+``test_hourly_aggregate_state_exactness_ch25`` pins both on a real
+ClickHouse against the ``FINAL ... is_deleted = 0`` answer.
 
 Why the aggregates below are written as ``-State`` rather than plainly: a
 ``PROJECTION`` body applies ``-State`` implicitly, and these projections were
@@ -47,10 +62,10 @@ table and see the same merged parts.  Write the shape, not the target.
 One semantic the projections cannot express: ``is_deleted``.  It is not a
 projection column, so a predicate on it would stop the query matching.  Soft
 deletes are therefore counted here, where the retired view body excluded them
-(``WHERE is_deleted = 0``).  Production measurement puts live tombstones at
-zero across the whole diverging band, and unlike the rollup's permanent
-inflation this one is bounded by the number of live tombstones and clears
-when they are collapsed.
+(``WHERE is_deleted = 0``).  Merging does not clear them: the tombstone is
+the row a merge keeps.  Production measurement put live tombstones at zero
+across the whole diverging band, which bounds today's error but is not a
+contract.
 """
 
 SPANS_TABLE = "spans"

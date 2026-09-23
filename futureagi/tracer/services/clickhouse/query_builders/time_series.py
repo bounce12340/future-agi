@@ -8,8 +8,9 @@ Strategy:
 - Unfiltered queries read ``spans``'s own hourly aggregate states through
   ``hourly_aggregate_state_source`` and combine them with ``countMerge`` /
   ``sumMerge`` / ``quantilesTDigestMerge``. The states live in projections
-  maintained inside ``spans``, so they see the same deduplicated rows a base
-  scan would and the result is exact.
+  maintained inside ``spans``, per physical part: unmerged row versions and
+  retained ``is_deleted`` tombstones are counted, so the result is an
+  approximation of the latest live rows and is published as inexact.
 - When attribute filters are present, scans the v2 ``spans`` table directly.
 
 Both branches therefore read one physical table. The unfiltered branch used to
@@ -334,9 +335,10 @@ class TimeSeriesQueryBuilder(BaseQueryBuilder):
         The inner source emits aggregate states at ``(project_id, hour,
         status)`` grain — the grain ``spans``'s aggregate projections are
         maintained at — and this level merges them into the requested bucket.
-        Because those states are rebuilt with the parts they belong to, the
-        numbers here are the numbers a base-table scan would return, which is
-        what the separate hourly rollup this replaced had stopped being.
+        Those states are rebuilt with the parts they belong to, so replayed
+        deliveries stop counting once merged, which the separate hourly rollup
+        this replaced never did. They are still per part, not latest-live:
+        see ``hourly_aggregate_states``.
         """
         bucket_fn = self.time_bucket_expr(self.interval)
 
