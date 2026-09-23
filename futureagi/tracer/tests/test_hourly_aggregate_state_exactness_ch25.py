@@ -23,40 +23,19 @@ measured fact rather than a comment.
 
 from __future__ import annotations
 
-import os
 import uuid
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import NamedTuple
 
 import pytest
 from clickhouse_driver import Client
-from clickhouse_driver.errors import Error as ClickHouseDriverError
 
-from conftest import UnsafeClickHouseTestTarget, _require_safe_ch25_test_target
+from conftest import _ch_test_native_client, _ch_test_owned_database
 from tracer.services.clickhouse import graph_dispatch
 from tracer.views import dashboard as dashboard_view
 from tracer.views.dashboard import _read_dashboard_rollup_fast_path
 
 pytestmark = pytest.mark.integration
-
-# Ports an operator host forwards a remote ClickHouse onto. This module issues
-# DDL, so it never takes one of them from CH25_NATIVE_PORT / CH_NATIVE_PORT,
-# whatever else the environment says, and it never defaults to a port.
-_FORWARDED_PORTS = frozenset({19010, 19000, 19001, 19002, 18230, 18231, 18232})
-# CI's own ClickHouse is published on 19000 (``docker-compose.test.yml``), one
-# of those ports, so the CI job names it through this purpose-named variable
-# instead. A port taken from it is trusted only after the server proves it is
-# the test sidecar: ``.ci/clickhouse-test-config.xml`` sets the replica macro
-# below, and no production server carries it. The proof runs before any DDL.
-_PARITY_PORT_VARIABLE = "FI_CH_PARITY_NATIVE_PORT"
-_TEST_SIDECAR_REPLICA = "test-01"
-
-CH_HOST = os.environ.get("CH25_HOST", "127.0.0.1")
-CH_USER = os.environ.get("CH25_USER") or os.environ.get("CH_USERNAME") or "default"
-CH_PASSWORD = os.environ.get("CH25_PASSWORD") or os.environ.get("CH_PASSWORD") or ""
 
 PROJECT_ID = "00000000-0000-4000-8000-000000000001"
 
@@ -145,126 +124,28 @@ _SCENARIOS = {
 }
 
 
-class _NativeTarget(NamedTuple):
-    port: int
-    requires_test_sidecar: bool
-
-
-def _native_target(environ: Mapping[str, str] = os.environ) -> _NativeTarget:
-    """Resolve the native port, refusing a forwarded one before any socket."""
-    opted_in = environ.get(_PARITY_PORT_VARIABLE)
-    if opted_in:
-        return _NativeTarget(int(opted_in), requires_test_sidecar=True)
-    port_text = environ.get("CH25_NATIVE_PORT") or environ.get("CH_NATIVE_PORT")
-    if not port_text:
-        pytest.skip(
-            f"{_PARITY_PORT_VARIABLE} / CH25_NATIVE_PORT / CH_NATIVE_PORT is not set"
-        )
-    port = int(port_text)
-    if port in _FORWARDED_PORTS:
-        raise UnsafeClickHouseTestTarget(
-            f"Refusing ClickHouse DDL on forwarded port {port}. A disposable"
-            f" ClickHouse on such a port is named through {_PARITY_PORT_VARIABLE},"
-            " which requires the server to prove it is the test sidecar."
-        )
-    return _NativeTarget(port, requires_test_sidecar=False)
-
-
-def _ch_client(target: _NativeTarget, *, database: str) -> Client:
-    return Client(
-        host=CH_HOST,
-        port=target.port,
-        user=CH_USER,
-        password=CH_PASSWORD,
-        database=database,
-        connect_timeout=3,
-    )
-
-
-def _require_test_sidecar(client: Client, target: _NativeTarget) -> None:
-    """Refuse DDL on an opted-in port until the server proves it is the sidecar."""
-    if not target.requires_test_sidecar:
-        return
-    try:
-        rows = client.execute("SELECT getMacro('replica')")
-    except ClickHouseDriverError as exc:
-        # A server with no replica macro at all raises here (code 139).
-        raise UnsafeClickHouseTestTarget(
-            f"Refusing ClickHouse DDL on port {target.port}: the server has no"
-            f" replica macro, so it is not the test sidecar ({type(exc).__name__})."
-        ) from exc
-    if rows != [(_TEST_SIDECAR_REPLICA,)]:
-        raise UnsafeClickHouseTestTarget(
-            f"Refusing ClickHouse DDL on port {target.port}: its replica macro is"
-            f" not {_TEST_SIDECAR_REPLICA!r}, so it is not the test sidecar."
-        )
-
-
-@contextmanager
-def _test_owned_database(
-    environ: Mapping[str, str] = os.environ,
-) -> Iterator[str]:
-    """Create one unique test-owned database and remove it on exit."""
-
-    target = _native_target(environ)
-    database = f"test_agg_exact_{uuid.uuid4().hex}"
-    _require_safe_ch25_test_target(host=CH_HOST, database=database)
-    admin = _ch_client(target, database="default")
-    created = False
-    try:
-        try:
-            admin.execute("SELECT 1")
-        except Exception as exc:
-            pytest.skip(f"CH25 is not reachable on {CH_HOST} ({exc!r})")
-        _require_test_sidecar(admin, target)
-        admin.execute(f"CREATE DATABASE {database}")
-        created = True
+# conftest resolves the live target and, on an opted-in port, proves it is the
+# test sidecar before any DDL.
+@pytest.fixture(scope="module")
+def ch_database():
+    with _ch_test_owned_database("test_agg_exact_") as database:
         yield database
-    finally:
-        try:
-            if created:
-                admin.execute(f"DROP DATABASE IF EXISTS {database} SYNC")
-        finally:
-            admin.disconnect()
 
 
-@contextmanager
-def _test_spans_table(
-    database: str, environ: Mapping[str, str] = os.environ
-) -> Iterator[Client]:
+@pytest.fixture()
+def ch_client(ch_database):
     """A client on the test database with a fresh ``spans``, dropped on exit.
 
     The product statements name ``spans`` unqualified, so the table has to be
     called exactly that inside the test-owned database.
     """
 
-    target = _native_target(environ)
-    client = _ch_client(target, database=database)
-    try:
-        _require_test_sidecar(client, target)
+    with _ch_test_native_client(database=ch_database) as client:
         client.execute(_SPANS_DDL)
-    except BaseException:
-        client.disconnect()
-        raise
-    try:
-        yield client
-    finally:
         try:
-            client.execute("DROP TABLE IF EXISTS spans SYNC")
+            yield client
         finally:
-            client.disconnect()
-
-
-@pytest.fixture(scope="module")
-def ch_database():
-    with _test_owned_database() as database:
-        yield database
-
-
-@pytest.fixture()
-def ch_client(ch_database):
-    with _test_spans_table(ch_database) as client:
-        yield client
+            client.execute("DROP TABLE IF EXISTS spans SYNC")
 
 
 class _LiveAnalytics:

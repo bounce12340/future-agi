@@ -87,10 +87,11 @@ jobs:
       CH25_DATABASE: test_tfc
       CH_DATABASE: test_tfc
       # Native port docker-compose.test.yml publishes for this job's own
-      # ClickHouse. The aggregate-state parity module issues DDL, so it takes
-      # a forwarded port only from this variable, and only after the server
-      # reports the replica macro .ci/clickhouse-test-config.xml sets.
-      FI_CH_PARITY_NATIVE_PORT: "19000"
+      # ClickHouse. Live ClickHouse test modules issue DDL, so they take a
+      # forwarded port only from this variable, and only after the server
+      # reports the replica macro .ci/clickhouse-test-config.xml sets
+      # (conftest.py, _open_ch_test_native_client).
+      FI_CH_TEST_SIDECAR_NATIVE_PORT: "19000"
       PYTHONHASHSEED: "0"
       FI_CH25_SCHEMA_APPLY_STRICT: "1"
       EE_REPO_BRANCH: ${{ github.head_ref || github.ref_name }}
