@@ -255,6 +255,8 @@ class _CappedEngine(Engine):
         self.slice_at: list[float] = []
         # Every statement fails in the transport: the server is unreachable.
         self.outage = False
+        # Every statement's kind, in the order sent.
+        self.kinds: list[str] = []
         self.start = clock.now if clock is not None else 0.0
 
     def _elapsed_ms(self) -> float:
@@ -270,6 +272,7 @@ class _CappedEngine(Engine):
         server_execution_cap_ms=None,
     ):
         kind = _statement_kind(query, params)
+        self.kinds.append(kind)
         if self.outage:
             self.calls.append(query)
             raise ReadDeadlineExceeded("the server is unreachable")
@@ -1631,6 +1634,41 @@ def test_a_split_that_outlasts_the_analytics_wall_is_a_known_stall(
     assert all(abs(ms - wall_ms) <= fail_ms + 25 for ms in stalled_ms), stalled_ms
     assert coverages == sorted(coverages, reverse=True)
     assert coverages[0] - coverages[-1] <= 4 * TICK, coverages
+
+
+@pytest.mark.parametrize(("keys", "finish"), [(21, 1), (13, 3)])
+def test_a_request_certifies_only_what_it_can_also_publish(keys, finish):
+    """Off the head of line, a batch is certified only when its replay fits too.
+
+    One decision reserves two enrichments and two finishes, so after two
+    certified batches the budget left can hold a third batch's enrichment and
+    not its replay: that request certified users it could not publish, ended
+    in their instant, and the next request read the instant and enriched the
+    same users again. No row here shares an instant, so a cursor opens one
+    only for users it certified and could not publish: none may.
+    """
+    world = _unique_time_world(random.Random(3), 400, 0.0)
+    clock = _Clock()
+    names: list[str] = []
+    cursor = None
+    requests = statements = 0
+    with _shipped_walls(), _scripted_clock(clock):
+        for _hop in range(60):
+            engine = _CappedEngine(world, clock=clock)
+            read = _keyed_page(
+                page_size=25, cursor=cursor, engine=engine, keys=keys, finish=finish
+            )
+            names.extend(_names(read))
+            requests += 1
+            statements += len(engine.calls)
+            if not read.has_more:
+                break
+            order = tuple(read.checkpoint_order)
+            assert len(order) == 4 or not order[4], (requests, engine.kinds)
+            cursor = _signed_cursor(read)
+
+    assert names == _expected(world)
+    print(f"keys={keys} finish={finish}: {requests} requests, {statements} statements")
 
 
 # --------------------------------------------------------------------------

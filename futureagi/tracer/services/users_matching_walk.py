@@ -851,6 +851,12 @@ def _certify(state: _WalkState, batch: list[_Candidate]) -> int:
     if state.certify_singly:
         batch = batch[:1]
     statements = _enrichment_statement_count(manager)
+    if not state.progress_owed and state.budget.remaining_statements() < (
+        statements + _materialisation_statement_count(manager)
+    ):
+        # Off the head of line, certify only what this request can publish.
+        state.budget.exhausted_by = "statements"
+        return 0
     if not state.budget.take(statements, finish=state.progress_owed):
         return 0
     rows = [{"end_user_id": candidate.end_user_id} for candidate in batch]
