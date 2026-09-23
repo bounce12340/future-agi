@@ -444,7 +444,7 @@ def _follow_on(
     stalled = False
     cursor = None
     finish_wall = walk.USER_LIST_WALK_FINISH_WALL_MS
-    enrichment = 1 + -(-keys // 4)
+    enrichment = _enrichments(keys)
     least = _split_statements(ulm._USER_LIST_ATTRIBUTE_MIN_BUCKET)
     for hop in range(1, max_hops + 1):
         engine = _MemoryEngine(
@@ -559,15 +559,20 @@ def _one_decision(keys: int, finish: int = 1) -> int:
     its retries a quarter as wide down to the least width; the head-of-line
     slice read without a cap and its survivor statement, then the instant
     read and its survivor statement; a batch's enrichment, and the
-    head-of-line user's alone after it fails, each one statement for the
-    filtered key and one per four of the ``keys`` others; and a finish of
-    ``finish`` statements with its uncapped retry.
+    head-of-line user's alone after it fails (``_enrichments``); and a
+    finish of ``finish`` statements with its uncapped retry.
     """
     width, retries = walk.USER_LIST_WALK_INITIAL_SLICE, 0
     while width > walk.USER_LIST_WALK_MIN_SLICE:
         width, retries = width / 4, retries + 1
-    enrichment = 1 + -(-keys // 4)
-    return 1 + 1 + retries + 2 + 2 + 2 * enrichment + 2 * finish
+    return 1 + 1 + retries + 2 + 2 + 2 * _enrichments(keys) + 2 * finish
+
+
+def _enrichments(keys: int) -> int:
+    """One enrichment's statements for a page of ``keys`` attribute columns:
+    one for the filtered key and one per four of the others."""
+
+    return 1 + -(-keys // 4)
 
 
 @contextmanager
@@ -1589,13 +1594,14 @@ def test_a_split_that_outlasts_the_analytics_wall_is_a_known_stall(
     Every enrichment wider than ``width`` runs out of memory and a failure
     costs ``fail_ms``, so splitting one user's read takes more than the 30 s
     analytics wall (255 failures at ten minutes, 2,047 at one). That split
-    has no deadline only after the request reads its head-of-line slice
-    without a cap (``_read_slice``): the first request with every capped
-    slice stopped splits it whole, the documented bound at the least bucket,
-    but cannot publish it (its key is that slice's floor). Reached otherwise,
-    on cheap slices or in the open instant the next request decides first,
-    the wall stops the split and the request decides no one, and the next
-    request does the same. Each request still ends by that wall, degraded,
+    has no deadline after the request reads its head-of-line slice without a
+    cap, or once the analytics wall is already spent: the first request with
+    every capped slice stopped splits it whole, the documented bound at the
+    least bucket, but cannot publish it (its key is that slice's floor). A
+    split that starts with some of the wall left, on cheap slices or in the
+    open instant the next request decides first, is stopped by the wall: the
+    request decides no one, and the next request does the same. Each request
+    still ends by that wall, degraded,
     without raising the coverage; the list does not move past the user. The
     walk documents this stall and does not retry it.
     """
@@ -1858,7 +1864,7 @@ def _fault(seed: int, keys: int):
     if kind == "none":
         return None, 50.0, keys
     if kind == "index":
-        k = rng.randrange(3 * (1 + -(-keys // 4)))
+        k = rng.randrange(3 * _enrichments(keys))
         return (lambda _users, index: index == k), 50.0, keys
     keys = rng.choice([40, 44, 100])
     fail_ms = 40_000.0 if kind == "batch_past_the_wall" else 50.0

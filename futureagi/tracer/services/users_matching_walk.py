@@ -67,12 +67,26 @@ with no deadline (``_read_slice``). The finishing statements run past the
 page wall under a server cap (``_finish_deadline``); a batch the server stops
 is replayed one user at a time, and a page that has published nothing decides
 a user whose replay the server stopped without the cap, once
-(``_materialise``). One stall is known and left open: the head-of-line user's
-read, split in time when it runs out of a read budget (``_certify``), has no
-deadline only after that uncapped slice. Reached any other way, on cheap
-slices or in an open instant, it is admitted against the analytics wall, and
-when the split outlasts that wall every request stops at that user, having
-decided no one.
+(``_materialise``).
+
+Time splits. A batch's attribute read (``_certify``) is never split in time.
+When it runs out of a read budget (``is_read_budget_error``: memory, row and
+time limits, cancellation, overload, a socket timeout), its head-of-line user
+is read alone, charged as a second enrichment (``_head_statements`` reserves
+both), and the rest of the request certifies one user at a time. Only the
+head-of-line user of a request that has decided nothing may have its read
+split in time (``UsersListManager._read_span_attributes``): one user a
+request, up to
+``2 ** (ceil(log2(window / _USER_LIST_ATTRIBUTE_MIN_BUCKET)) + 1) - 1``
+statements (4,095 over 24 h) per enrichment statement, outside the statement
+budget. The split has no deadline after the uncapped slice, or once
+the analytics wall is already spent, and otherwise runs against what is left
+of it (``_admission_deadline``). One stall is known and left open: a split
+that starts with some of the wall left and outlasts it stops every request at
+that user, having decided no one. Any other user whose read runs out of a read
+budget stops the request (``read_budget``) with its coverage just above that
+user, so the next request decides it as its head of line. A request that has
+decided something certifies a batch only when it can also publish it.
 
 Tied instant. Inside one timestamp the slice's raw id order is not the
 page's resolved id order (an alias may resolve to a survivor on either side of
@@ -362,15 +376,9 @@ def _statement_budget(manager: Any) -> int:
 
     One decision is what a request needs to decide its first batch: the open
     instant, a slice and its retries a quarter as wide down to the least
-    width, and the head-of-line decision (``_head_statements``). The
-    enrichment alone reads every requested attribute key, four ordinary keys
-    a statement, so at the view's 100 keys it is 26 statements, more than the
-    configured 24: every certification was refused and the list never moved.
-    A batch whose enrichment runs out of a read budget is charged it again
-    for its head-of-line user alone, so one decision at 100 keys is 63.
-    The bound stays explicit, the larger of two numbers known before the
-    first statement; outside it are only the time buckets the head-of-line
-    user's enrichment may split into, once per request (``_certify``).
+    width, and the head-of-line decision (``_head_statements``), 63
+    statements at the view's 100 keys. Both numbers are known before the
+    first statement; only time splits fall outside them (module docstring).
     """
     return max(
         USER_LIST_WALK_MAX_STATEMENTS,
@@ -511,12 +519,8 @@ def _read_slice(
     The finish's uncapped replay is not part of it: ``_materialise`` sends it
     when a page that has published nothing had its head-of-line user's
     capped replay stopped or refused, whether or not a slice was uncapped.
-    That decision may split the head-of-line user's read in time when it
-    runs out of a read budget (``_certify``): up to ``2 ** (ceil(log2(window
-    / _USER_LIST_ATTRIBUTE_MIN_BUCKET)) + 1) - 1`` statements (4,095 over
-    24 h) for each of its enrichment statements (one per accelerated key and
-    per four other keys), with no wall and not counted against the statement
-    budget. On a lane whose ClickHouse profile is read-only
+    The head-of-line user's read may also split in time (module docstring,
+    Time splits). On a lane whose ClickHouse profile is read-only
     (``CH*_SERVER_ENFORCED_READONLY``) no setting reaches the server, so the
     slice cap is not sent there either and slices are admitted only.
     """
@@ -830,22 +834,8 @@ def _certify(state: _WalkState, batch: list[_Candidate]) -> int:
 
     Returns how many of ``batch``, from its head, are certified; ``0`` when
     the budget or the wall refused, or one user's read ran out of a read
-    budget off the head-of-line path. A batch's enrichment is not split in
-    time: when it runs out of a read budget (``is_read_budget_error``:
-    memory, row and time limits, cancellation, overload, a socket timeout),
-    the head-of-line user alone is certified instead, a statement that holds
-    a batch's fraction of the rows, charged as a second enrichment (the
-    failed one may have sent any of its statements; ``_head_statements``
-    reserves both). The rest of the request certifies one user at a time.
-    Only the head-of-line decision of a request that owes progress splits one
-    user's time buckets (``UsersListManager._read_span_attributes``), so at
-    most one user a request: up to ``2 ** (ceil(log2(window /
-    _USER_LIST_ATTRIBUTE_MIN_BUCKET)) + 1) - 1`` statements (4,095 over 24 h)
-    for each enrichment statement, not counted against the statement budget
-    and bounded in time only by ``_admission_deadline`` (no deadline on the
-    head path). Any other user whose read runs out of a read budget stops the
-    request with its coverage just above that user (the main loop's boundary,
-    or the open instant), so the next request decides it as its head of line.
+    budget off the head of line. The fallback to the head-of-line user, who
+    alone may split, and each stop follow the module docstring's Time splits.
     """
 
     manager = state.manager
@@ -957,10 +947,8 @@ def _admission_deadline(state: _WalkState) -> ReadDeadline | None:
     without a cap (``_read_slice``), the statements that decide that slice's
     first batch are admitted with no deadline, once per request: its
     survivor statement, the instant read and its survivor statement when the
-    slice is tied at one instant, and one batch's enrichment, including the
-    time buckets the head-of-line user's enrichment may split into (up to
-    ``2 ** (ceil(log2(window / _USER_LIST_ATTRIBUTE_MIN_BUCKET)) + 1) - 1``
-    statements for each enrichment statement, ``_certify``).
+    slice is tied at one instant, and one batch's enrichment with any time
+    split (module docstring).
     """
 
     if not state.progress_owed:
