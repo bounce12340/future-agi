@@ -58,6 +58,7 @@ _LIVE_MODULES = (
     "tracer/tests/test_hourly_aggregate_state_exactness_ch25.py",
     "tracer/tests/test_score_filter_hard_tombstone_ch25.py",
     "tracer/tests/test_trace_conjunction_seed_gate_ch25.py",
+    "tracer/tests/test_user_graph_latest_state_ch25.py",
     "tracer/tests/test_users_matching_walk_ch25.py",
     "tracer/tests/test_users_matching_walk_differential_ch25.py",
     "tracer/tests/test_users_seeded_page_read_settings_ch25.py",

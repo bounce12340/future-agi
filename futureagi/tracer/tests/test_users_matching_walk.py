@@ -665,7 +665,7 @@ def test_a_tied_cohort_progresses_under_a_tiny_budget():
     world, expected = _tied_world(6)
     with (
         patch.object(walk, "USER_LIST_WALK_SLICE_USER_LIMIT", 2),
-        patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 6),
+        patch.object(walk, "_statement_budget", return_value=6),
     ):
         names, counts, _engines = _walk_every_page(world, max_hops=8)
 
@@ -810,9 +810,12 @@ def test_budget_exhaustion_returns_partial_page_and_cursor_without_fallback():
             ordinal, key=minutes_before_end(minutes), raw=(minutes_before_end(minutes),)
         )
 
-    # One statement: the slice runs, its survivor statement is refused, the
-    # slice is discarded whole and the cursor re-reads it.
-    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 1):
+    # A request never has fewer statements than one batch's decision
+    # (``_statement_budget``); these budgets are forced below that to reach
+    # each exhaustion point. One statement: the slice runs, its survivor
+    # statement is refused, the slice is discarded whole and the cursor
+    # re-reads it.
+    with patch.object(walk, "_statement_budget", return_value=1):
         read, engine = _page(world, page_size=25)
     assert read.payload["table"] == []
     assert read.has_more is True
@@ -822,14 +825,14 @@ def test_budget_exhaustion_returns_partial_page_and_cursor_without_fallback():
     assert read.checkpoint_order[3] == WINDOW_END
 
     # Two statements: resolved but not certified; nothing is enriched.
-    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 2):
+    with patch.object(walk, "_statement_budget", return_value=2):
         read, engine = _page(world, page_size=25)
     assert read.payload["table"] == [] and read.has_more is True
     assert _kinds(engine) == ["slice", "remap"] and engine.enriched == []
 
     # Three statements: certified but not materialised; the cursor carries the
     # certified keys so the next page starts above them.
-    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 3):
+    with patch.object(walk, "_statement_budget", return_value=3):
         read, engine = _page(world, page_size=25)
     assert read.payload["table"] == []
     assert read.has_more is True
@@ -857,7 +860,7 @@ def test_slice_read_exhaustion_returns_partial_page_and_cursor_without_fallback(
     world = World()
     world.user(1, key=minutes_before_end(3), raw=(minutes_before_end(3),))
 
-    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 4):
+    with patch.object(walk, "_statement_budget", return_value=4):
         read, engine = _page(world, page_size=25)
     assert _kinds(engine) == ["slice", "remap", "enrich", "replay"]
     assert _names(read) == ["user-1"] and read.has_more is True
@@ -872,12 +875,18 @@ def test_slice_read_exhaustion_returns_partial_page_and_cursor_without_fallback(
         query, params=None, timeout_ms=None, settings=None, **caps
     ):
         if len(engine.calls) == 1 and kind_of(query) == "slice":
+            import time
+
+            # The statement outlives the page wall, and then fails: the
+            # narrower retry it would earn is refused by that wall.
+            time.sleep(0.08)
             engine.calls.append(query)
             raise ReadDeadlineExceeded("read deadline exceeded")
         return original(query, params, timeout_ms, settings, **caps)
 
     engine.execute_ch_query = wall_spent_in_transport
-    read, engine = _page(world, page_size=25, engine=engine)
+    with patch.object(walk, "USER_LIST_PAGE_WALL_MS", 60):
+        read, engine = _page(world, page_size=25, engine=engine)
     assert _kinds(engine) == ["slice", "slice"]
     assert read.payload["table"] == [] and read.has_more is True
     assert read.checkpoint_order[3] == engine.slice_ranges[0][0] + walk._TICK
@@ -887,9 +896,12 @@ def test_wall_exhaustion_stops_between_statements():
     world = World()
     world.user(1, key=minutes_before_end(3), raw=(minutes_before_end(3),))
 
-    # The wall is checked between statements: the slice statement alone
-    # outlives it, so its survivor statement is refused and the page is
-    # partial.
+    # The wall is checked between statements, and the slice statement alone
+    # outlives it. The request has decided nobody yet, so the survivor and
+    # enrichment statements of that slice's first batch are admitted against
+    # the analytics wall and its user is published: discarding the slice
+    # here had every later request read it again, and the list never got
+    # past it. The next slice is refused, and the page is partial.
     with patch.object(walk, "USER_LIST_PAGE_WALL_MS", 60):
         engine = Engine(world)
         original = engine.execute_ch_query
@@ -903,9 +915,10 @@ def test_wall_exhaustion_stops_between_statements():
         engine.execute_ch_query = slow
         read, engine = _page(world, page_size=25, engine=engine)
 
-    assert read.payload["table"] == []
+    assert _names(read) == ["user-1"]
     assert read.has_more is True
-    assert _kinds(engine) == ["slice"]
+    assert read.payload["query_status"] == "degraded"
+    assert _kinds(engine) == ["slice", "remap", "enrich", "replay"]
 
 
 def test_an_exhausted_walk_publishes_degraded_and_incomplete_not_complete():
@@ -926,7 +939,7 @@ def test_an_exhausted_walk_publishes_degraded_and_incomplete_not_complete():
         )
 
     # Exhausted by the statement budget.
-    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 1):
+    with patch.object(walk, "_statement_budget", return_value=1):
         read, _engine = _page(world, page_size=25)
     assert read.payload["table"] == []
     assert read.has_more is True
@@ -968,9 +981,12 @@ def test_finish_mode_statements_ask_the_server_to_enforce_their_deadline():
     -- are deliberately not governed by the page wall, which is what lets a
     page publish users it has already certified; they ask the service for a
     server execution cap from the request's analytics wall instead. Search
-    statements keep the application policy: admitted, never capped.
+    statements keep the application policy, admitted and never capped, except
+    a slice: it asks the server to stop it at half of what is left of the
+    analytics wall, so that a slice too dense for that is narrowed instead of
+    read again by every request (``_read_slice``).
     (``test_finish_mode_reaches_the_native_driver_as_max_execution_time``
-    follows the cap through the real service and client.)
+    follows the caps through the real service and client.)
     """
 
     world = World()
@@ -990,6 +1006,9 @@ def test_finish_mode_statements_ask_the_server_to_enforce_their_deadline():
     for index, kind in enumerate(kinds):
         if index in finish:
             assert engine.caps[index] == engine.timeouts[index], kind
+        elif kind == "slice":
+            cap = engine.caps[index]
+            assert 0 < cap <= walk.USER_LIST_WALK_FINISH_WALL_MS / 2, kind
         else:
             assert engine.caps[index] is None, kind
     # The finish-mode budget is the analytics wall LESS what the search
@@ -1004,7 +1023,9 @@ class _NativeDriver:
 
     It answers each statement from the scripted engine and records the
     settings the native client actually sent, so the assertion is on what
-    ClickHouse would receive, not on what the walk asked for.
+    ClickHouse would receive, not on what the walk asked for. A statement of
+    ``fail_kind`` sent with a ``max_execution_time`` is stopped there, as the
+    server stops it at its cap; the same statement sent without one runs.
     """
 
     def __init__(self, engine: Engine) -> None:
@@ -1015,7 +1036,8 @@ class _NativeDriver:
     def execute(self, query, params=None, *, with_column_types=False, settings=None):
         kind = kind_of(query)
         self.sent.append((kind, settings))
-        if kind == self.fail_kind:
+        capped = float((settings or {}).get("max_execution_time") or 0) > 0
+        if kind == self.fail_kind and capped:
             from clickhouse_driver.errors import ErrorCodes, ServerException
 
             raise ServerException(
@@ -1050,8 +1072,9 @@ def test_finish_mode_reaches_the_native_driver_as_max_execution_time():
     """Through ``V2AnalyticsQueryService`` and ``ClickHouseClient`` unmocked.
 
     The finish-mode replay arrives at the driver with a real, positive
-    ``max_execution_time`` no larger than its 8,000 ms statement cap; every
-    search statement still arrives with the application policy's 0.
+    ``max_execution_time`` no larger than its 8,000 ms statement cap, and a
+    slice with half of the analytics wall; every other search statement
+    still arrives with the application policy's 0.
     """
 
     world = World()
@@ -1066,12 +1089,22 @@ def test_finish_mode_reaches_the_native_driver_as_max_execution_time():
     assert 0 < replay_cap <= 8.0
     assert sent["replay"]["timeout_overflow_mode"] == "throw"
     assert sent["replay"]["max_rows_to_read"] == 0
-    for kind in ("slice", "remap", "enrich"):
+    slice_cap = sent["slice"]["max_execution_time"]
+    assert 0 < slice_cap <= walk.USER_LIST_WALK_FINISH_WALL_MS / 2000
+    for kind in ("remap", "enrich"):
         assert sent[kind]["max_execution_time"] == 0, kind
 
 
-def test_a_finish_statement_the_server_stops_degrades_the_page_and_carries_the_user():
-    """The server's timeout is the finishing deadline, not a failed request."""
+def test_a_finish_the_server_stops_on_an_empty_page_is_retried_without_the_cap():
+    """The server's timeout is the finishing deadline, not a failed request.
+
+    The page has published nothing when the server stops its capped replay,
+    so it decides its head-of-line user alone, once, with no cap, instead of
+    returning empty with the user carried: for a user whose replay always
+    outlasts the cap, that empty page came back on every request
+    (``test_users_matching_walk_liveness`` follows those to the end, and the
+    page that has already published something, which the cap still ends).
+    """
 
     world = World()
     world.user(1, key=minutes_before_end(3), raw=(minutes_before_end(3),))
@@ -1080,13 +1113,15 @@ def test_a_finish_statement_the_server_stops_degrades_the_page_and_carries_the_u
 
     read = _real_service_page(world, driver)
 
-    assert read.payload["table"] == []
-    assert read.payload["query_status"] == "degraded"
-    assert read.has_more is True
-
-    driver.fail_kind = None
-    resumed = _real_service_page(world, driver, cursor=_signed_cursor(read))
-    assert _names(resumed) == ["user-1"]
+    assert _names(read) == ["user-1"]
+    caps = [
+        settings["max_execution_time"]
+        for kind, settings in driver.sent
+        if kind == "replay"
+    ]
+    assert len(caps) == 2 and 0 < caps[0] <= 8.0 and caps[1] == 0
+    assert read.has_more is False
+    assert read.payload["query_status"] == "complete"
 
 
 def test_finish_mode_does_not_start_a_second_full_wall_after_the_page_wall():
@@ -1222,7 +1257,7 @@ def test_an_estimate_over_the_target_or_unreadable_licenses_no_wide_statement():
     ):
         engine = Engine(World())
         engine.estimate_override = override
-        with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 4):
+        with patch.object(walk, "_statement_budget", return_value=4):
             read, engine = _page(
                 World(), page_size=25, filters=thirty_days, engine=engine
             )
@@ -1296,7 +1331,7 @@ def test_a_probe_the_budget_refuses_or_that_fails_licenses_nothing():
         return result
 
     engine.execute_ch_query = failing_probe
-    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 4):
+    with patch.object(walk, "_statement_budget", return_value=4):
         read, engine = _page(world, page_size=25, filters=thirty_days, engine=engine)
     # The failed probe changed nothing: the walk went on slicing at the cap
     # and stopped on its statement budget with a cursor.
@@ -1314,14 +1349,14 @@ def test_a_probe_the_budget_refuses_or_that_fails_licenses_nothing():
         return original(query, params, timeout_ms, settings, **caps)
 
     engine.execute_ch_query = failing_estimate
-    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 4):
+    with patch.object(walk, "_statement_budget", return_value=4):
         read, engine = _page(world, page_size=25, filters=thirty_days, engine=engine)
     assert _kinds(engine) == ["slice", "estimate", "slice", "slice"]
     assert read.has_more is True and read.payload["table"] == []
 
     # With the budget spent on the estimate itself, the page ends there.
     engine = Engine(world)
-    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 2):
+    with patch.object(walk, "_statement_budget", return_value=2):
         read, engine = _page(world, page_size=25, filters=thirty_days, engine=engine)
     assert _kinds(engine) == ["slice", "estimate"]
     assert read.has_more is True and read.payload["table"] == []
@@ -1363,7 +1398,7 @@ def test_an_estimate_over_its_time_budget_licenses_no_wide_statement():
     thirty_days = _filters(window_start=WINDOW_END - timedelta(days=30))
     engine = Engine(World())
     engine.estimate_ms = walk.USER_LIST_WALK_PROBE_WALL_MS / 2 + 1
-    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 4):
+    with patch.object(walk, "_statement_budget", return_value=4):
         read, engine = _page(World(), page_size=25, filters=thirty_days, engine=engine)
     assert _kinds(engine) == ["slice", "estimate", "slice", "slice"]
     assert read.has_more is True and read.payload["table"] == []
@@ -1397,7 +1432,7 @@ def test_a_probe_deadline_raised_in_the_transport_ends_the_probe_not_the_page():
         return original(query, params, timeout_ms, settings, **caps)
 
     engine.execute_ch_query = probe_deadline
-    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 4):
+    with patch.object(walk, "_statement_budget", return_value=4):
         read, engine = _page(world, page_size=25, filters=thirty_days, engine=engine)
     assert _kinds(engine) == ["slice", "estimate", "slice", "slice"]
     assert read.has_more is True and read.payload["table"] == []

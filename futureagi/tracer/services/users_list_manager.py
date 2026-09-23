@@ -785,8 +785,15 @@ class UsersListManager:
         end_date: datetime | None = None,
         candidate_scan_ids: list[str] | None = None,
         candidate_end_user_id_map: dict[str, str] | None = None,
+        split_buckets: bool = True,
     ) -> dict[str, dict[str, object]]:
-        """Return page-user attributes under the request-owned wall deadline."""
+        """Return page-user attributes under the request-owned wall deadline.
+
+        A statement that runs out of a read budget is split in half in time
+        and retried, down to ``_USER_LIST_ATTRIBUTE_MIN_BUCKET``; without
+        ``split_buckets`` it raises instead, for a caller that has a cheaper
+        retry (the matching-activity walk certifies one user alone).
+        """
 
         end_user_ids = [r.get("end_user_id") for r in rows if r.get("end_user_id")]
         if not end_user_ids or not self.attribute_keys:
@@ -904,7 +911,8 @@ class UsersListManager:
                 raise
             except Exception as exc:
                 can_split = (
-                    is_read_budget_error(exc)
+                    split_buckets
+                    and is_read_budget_error(exc)
                     and bucket_start is not None
                     and bucket_end is not None
                     and bucket_end - bucket_start > _USER_LIST_ATTRIBUTE_MIN_BUCKET
