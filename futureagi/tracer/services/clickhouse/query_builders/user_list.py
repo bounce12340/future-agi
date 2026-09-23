@@ -22,6 +22,16 @@ class UnsupportedBoundedUserListQuery(ValueError):
     """Raised when an exact user page cannot use the bounded query path."""
 
 
+# The page metrics ``build_requested_page_metric_queries`` reads, one
+# statement per group that has a requested field: sessions, then spans.
+REQUESTED_PAGE_SESSION_METRIC_FIELDS = ("num_sessions", "avg_session_duration")
+REQUESTED_PAGE_SPAN_METRIC_FIELDS = (
+    "avg_trace_latency",
+    "num_llm_calls",
+    "num_guardrails_triggered",
+    "num_active_days",
+    "num_traces_with_errors",
+)
 # The estimate table ``EXPLAIN ESTIMATE`` returns on ClickHouse 25.3; the
 # matching-activity walk reads its ``rows`` to cost a tail existence statement.
 _MATCHING_ACTIVITY_ESTIMATE_COLUMNS = frozenset(
@@ -1885,13 +1895,8 @@ class UserListQueryBuilder(BaseQueryBuilder):
     ) -> list[tuple[str, dict[str, Any], tuple[str, ...]]]:
         """Read only requested metric states; keep filters unrounded."""
         requested = set(metric_keys) & {
-            "num_sessions",
-            "avg_session_duration",
-            "avg_trace_latency",
-            "num_llm_calls",
-            "num_guardrails_triggered",
-            "num_active_days",
-            "num_traces_with_errors",
+            *REQUESTED_PAGE_SESSION_METRIC_FIELDS,
+            *REQUESTED_PAGE_SPAN_METRIC_FIELDS,
         }
         if not end_user_ids or not requested:
             return []
@@ -1900,7 +1905,7 @@ class UserListQueryBuilder(BaseQueryBuilder):
         queries: list[tuple[str, dict[str, Any], tuple[str, ...]]] = []
         session_fields = tuple(
             field
-            for field in ("num_sessions", "avg_session_duration")
+            for field in REQUESTED_PAGE_SESSION_METRIC_FIELDS
             if field in requested
         )
         if session_fields:
@@ -1984,15 +1989,7 @@ class UserListQueryBuilder(BaseQueryBuilder):
             queries.append((query, dict(base_params), session_fields))
 
         span_fields = tuple(
-            field
-            for field in (
-                "avg_trace_latency",
-                "num_llm_calls",
-                "num_guardrails_triggered",
-                "num_active_days",
-                "num_traces_with_errors",
-            )
-            if field in requested
+            field for field in REQUESTED_PAGE_SPAN_METRIC_FIELDS if field in requested
         )
         if span_fields:
             state_selects: list[str] = []
