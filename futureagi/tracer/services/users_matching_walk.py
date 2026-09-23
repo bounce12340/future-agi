@@ -328,6 +328,25 @@ def _materialisation_statement_count(manager: Any) -> int:
     )
 
 
+def _statement_budget(manager: Any) -> int:
+    """The statements a request may spend: its budget, or one decision.
+
+    One decision is what a request needs to decide its first batch: the open
+    instant, a slice, its survivor statement, the batch's enrichment and a
+    finish with its uncapped retry. The enrichment alone reads every
+    requested attribute key, four ordinary keys a statement, so at the view's
+    100 keys it is 26 statements, more than the configured 24: every
+    certification was refused and the list never moved. The bound stays
+    explicit, the larger of two numbers known before the first statement.
+    """
+    return max(
+        USER_LIST_WALK_MAX_STATEMENTS,
+        3
+        + _enrichment_statement_count(manager)
+        + 2 * _materialisation_statement_count(manager),
+    )
+
+
 @dataclass
 class _Slice:
     candidates: list[_Candidate]
@@ -1014,7 +1033,7 @@ def walk_matching_activity_page(
         window_end=window_end,
         frozen_filters=frozen_filters,
         budget=_WalkBudget(
-            wall_ms=USER_LIST_PAGE_WALL_MS, max_statements=USER_LIST_WALK_MAX_STATEMENTS
+            wall_ms=USER_LIST_PAGE_WALL_MS, max_statements=_statement_budget(manager)
         ),
         last_key=last_key,
         last_id=last_id,

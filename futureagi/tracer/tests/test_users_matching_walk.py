@@ -665,7 +665,7 @@ def test_a_tied_cohort_progresses_under_a_tiny_budget():
     world, expected = _tied_world(6)
     with (
         patch.object(walk, "USER_LIST_WALK_SLICE_USER_LIMIT", 2),
-        patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 6),
+        patch.object(walk, "_statement_budget", return_value=6),
     ):
         names, counts, _engines = _walk_every_page(world, max_hops=8)
 
@@ -810,9 +810,12 @@ def test_budget_exhaustion_returns_partial_page_and_cursor_without_fallback():
             ordinal, key=minutes_before_end(minutes), raw=(minutes_before_end(minutes),)
         )
 
-    # One statement: the slice runs, its survivor statement is refused, the
-    # slice is discarded whole and the cursor re-reads it.
-    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 1):
+    # A request never has fewer statements than one batch's decision
+    # (``_statement_budget``); these budgets are forced below that to reach
+    # each exhaustion point. One statement: the slice runs, its survivor
+    # statement is refused, the slice is discarded whole and the cursor
+    # re-reads it.
+    with patch.object(walk, "_statement_budget", return_value=1):
         read, engine = _page(world, page_size=25)
     assert read.payload["table"] == []
     assert read.has_more is True
@@ -822,14 +825,14 @@ def test_budget_exhaustion_returns_partial_page_and_cursor_without_fallback():
     assert read.checkpoint_order[3] == WINDOW_END
 
     # Two statements: resolved but not certified; nothing is enriched.
-    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 2):
+    with patch.object(walk, "_statement_budget", return_value=2):
         read, engine = _page(world, page_size=25)
     assert read.payload["table"] == [] and read.has_more is True
     assert _kinds(engine) == ["slice", "remap"] and engine.enriched == []
 
     # Three statements: certified but not materialised; the cursor carries the
     # certified keys so the next page starts above them.
-    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 3):
+    with patch.object(walk, "_statement_budget", return_value=3):
         read, engine = _page(world, page_size=25)
     assert read.payload["table"] == []
     assert read.has_more is True
@@ -857,7 +860,7 @@ def test_slice_read_exhaustion_returns_partial_page_and_cursor_without_fallback(
     world = World()
     world.user(1, key=minutes_before_end(3), raw=(minutes_before_end(3),))
 
-    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 4):
+    with patch.object(walk, "_statement_budget", return_value=4):
         read, engine = _page(world, page_size=25)
     assert _kinds(engine) == ["slice", "remap", "enrich", "replay"]
     assert _names(read) == ["user-1"] and read.has_more is True
@@ -930,7 +933,7 @@ def test_an_exhausted_walk_publishes_degraded_and_incomplete_not_complete():
         )
 
     # Exhausted by the statement budget.
-    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 1):
+    with patch.object(walk, "_statement_budget", return_value=1):
         read, _engine = _page(world, page_size=25)
     assert read.payload["table"] == []
     assert read.has_more is True
@@ -1239,7 +1242,7 @@ def test_an_estimate_over_the_target_or_unreadable_licenses_no_wide_statement():
     ):
         engine = Engine(World())
         engine.estimate_override = override
-        with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 4):
+        with patch.object(walk, "_statement_budget", return_value=4):
             read, engine = _page(
                 World(), page_size=25, filters=thirty_days, engine=engine
             )
@@ -1313,7 +1316,7 @@ def test_a_probe_the_budget_refuses_or_that_fails_licenses_nothing():
         return result
 
     engine.execute_ch_query = failing_probe
-    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 4):
+    with patch.object(walk, "_statement_budget", return_value=4):
         read, engine = _page(world, page_size=25, filters=thirty_days, engine=engine)
     # The failed probe changed nothing: the walk went on slicing at the cap
     # and stopped on its statement budget with a cursor.
@@ -1331,14 +1334,14 @@ def test_a_probe_the_budget_refuses_or_that_fails_licenses_nothing():
         return original(query, params, timeout_ms, settings, **caps)
 
     engine.execute_ch_query = failing_estimate
-    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 4):
+    with patch.object(walk, "_statement_budget", return_value=4):
         read, engine = _page(world, page_size=25, filters=thirty_days, engine=engine)
     assert _kinds(engine) == ["slice", "estimate", "slice", "slice"]
     assert read.has_more is True and read.payload["table"] == []
 
     # With the budget spent on the estimate itself, the page ends there.
     engine = Engine(world)
-    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 2):
+    with patch.object(walk, "_statement_budget", return_value=2):
         read, engine = _page(world, page_size=25, filters=thirty_days, engine=engine)
     assert _kinds(engine) == ["slice", "estimate"]
     assert read.has_more is True and read.payload["table"] == []
@@ -1380,7 +1383,7 @@ def test_an_estimate_over_its_time_budget_licenses_no_wide_statement():
     thirty_days = _filters(window_start=WINDOW_END - timedelta(days=30))
     engine = Engine(World())
     engine.estimate_ms = walk.USER_LIST_WALK_PROBE_WALL_MS / 2 + 1
-    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 4):
+    with patch.object(walk, "_statement_budget", return_value=4):
         read, engine = _page(World(), page_size=25, filters=thirty_days, engine=engine)
     assert _kinds(engine) == ["slice", "estimate", "slice", "slice"]
     assert read.has_more is True and read.payload["table"] == []
@@ -1414,7 +1417,7 @@ def test_a_probe_deadline_raised_in_the_transport_ends_the_probe_not_the_page():
         return original(query, params, timeout_ms, settings, **caps)
 
     engine.execute_ch_query = probe_deadline
-    with patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", 4):
+    with patch.object(walk, "_statement_budget", return_value=4):
         read, engine = _page(world, page_size=25, filters=thirty_days, engine=engine)
     assert _kinds(engine) == ["slice", "estimate", "slice", "slice"]
     assert read.has_more is True and read.payload["table"] == []

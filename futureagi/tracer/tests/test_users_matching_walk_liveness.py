@@ -18,6 +18,7 @@ follows every cursor to the end.
 
 from __future__ import annotations
 
+import json
 import random
 import uuid
 from contextlib import contextmanager
@@ -35,8 +36,10 @@ from tracer.tests.test_users_matching_walk import (
     WINDOW_START,
     Engine,
     World,
+    _manager,
     _names,
     _NativeDriver,
+    _never_seed,
     _page,
     _real_service_page,
     _signed_cursor,
@@ -259,7 +262,7 @@ def _follow_on(
     mutate,
     slow_slice_ms: float,
 ) -> tuple[list[str], int]:
-    budget = max_statements or walk.USER_LIST_WALK_MAX_STATEMENTS
+    budget = _decision_budget(max_statements or walk.USER_LIST_WALK_MAX_STATEMENTS)
     names: list[str] = []
     seen_states: set = set()
     coverage = WINDOW_END
@@ -292,6 +295,21 @@ def _follow_on(
         if mutate is not None:
             mutate(world, set(names))
     raise AssertionError(f"no end after {max_hops} hops; published {len(names)}")
+
+
+def _decision_budget(configured: int) -> int:
+    """The statements a request may spend: its budget, or one decision.
+
+    One decision: the open instant, a slice, its survivors, one batch's
+    enrichment, and a finish with its uncapped retry.
+    """
+    manager = _manager()
+    return max(
+        configured,
+        3
+        + walk._enrichment_statement_count(manager)
+        + 2 * walk._materialisation_statement_count(manager),
+    )
 
 
 def _lower_position(new: tuple, old: tuple) -> bool:
@@ -627,6 +645,70 @@ def test_a_slice_that_outlasts_the_analytics_wall_still_stalls_the_list():
 
 
 # --------------------------------------------------------------------------
+# The view's largest attribute key count.
+# --------------------------------------------------------------------------
+
+
+def test_the_views_largest_key_count_still_decides_every_user():
+    """100 attribute keys, the most the Users view accepts, one of them filtered.
+
+    Certifying a batch reads every key, four ordinary keys a statement: 26
+    statements, more than the 24-statement budget, so every certification
+    was refused and the list returned empty, degraded pages forever. A
+    request may always spend one batch's decision.
+    """
+    from tracer.serializers.trace import UsersQuerySerializer
+    from tracer.services.clickhouse.client import ClickHouseClient
+    from tracer.services.users_list_manager import UsersListManager
+
+    keys = [f"k{n:02d}" for n in range(99)] + ["tag"]
+    assert UsersQuerySerializer(data={"attribute_keys": json.dumps(keys)}).is_valid()
+    too_many = json.dumps([*keys, "k99"])
+    assert not UsersQuerySerializer(data={"attribute_keys": too_many}).is_valid()
+
+    world, expected = _spread_world(30, 3)
+    driver = _NativeDriver(Engine(world))
+
+    def page(cursor):
+        client = ClickHouseClient(host="localhost", port=39999, pool_size=1)
+        base = _manager()
+        manager = UsersListManager(
+            organization_id=base.organization_id,
+            allowed_project_ids=list(base.scoped_project_ids),
+            project_id=base.project_id,
+            filters=base.filters,
+            requested_columns=[],
+            attribute_keys=keys,
+        )
+        assert walk._enrichment_statement_count(manager) == 26
+        with (
+            patch.object(client, "_get_client", return_value=driver),
+            patch.object(client, "_return_client"),
+            patch(
+                "tracer.services.clickhouse.v2.query_service.get_v2_query_client",
+                return_value=client,
+            ),
+            patch.object(
+                manager, "_read_dimension_candidates", side_effect=_never_seed
+            ),
+        ):
+            before = len(driver.sent)
+            read = manager.list_cursor_payload(page_size=25, cursor=cursor)
+        return read, len(driver.sent) - before
+
+    names = []
+    cursor = None
+    for _hop in range(6):
+        read, statements = page(cursor)
+        assert statements <= 3 + 26 + 2 * 1, statements
+        names.extend(_names(read))
+        if not read.has_more:
+            break
+        cursor = _signed_cursor(read)
+    assert names == expected
+
+
+# --------------------------------------------------------------------------
 # Property: generated worlds, from tiny budgets to the shipped limits.
 # --------------------------------------------------------------------------
 
@@ -683,9 +765,9 @@ def _world(rng: random.Random, n_users: int) -> World:
 
 
 # (slice user limit, statement budget, certify batch, finishing statements,
-# enrichment statements): tiny budgets, each large enough to decide one heavy
-# user (a slice or an instant, its survivors, enrichment, a stopped replay
-# and the uncapped retry), up to the shipped limits.
+# enrichment statements): tiny budgets, up to the shipped limits. A request
+# never has fewer statements than one decision (``walk._statement_budget``),
+# so the tiniest budgets here are lifted to that.
 LIMITS = [
     (2, 6, 1, 1, 1),
     (2, 8, 2, 2, 1),
