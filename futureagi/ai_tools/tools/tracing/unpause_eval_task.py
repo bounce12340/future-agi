@@ -20,8 +20,9 @@ class UnpauseEvalTaskInput(PydanticBaseModel):
 class UnpauseEvalTaskTool(BaseTool):
     name = "unpause_eval_task"
     description = (
-        "Resumes a paused eval task. Only tasks with 'paused' status can be "
-        "resumed. The task will restart processing from where it left off."
+        "Resumes a paused or failed eval task. Only tasks with 'paused' or "
+        "'failed' status can be resumed. The task will restart processing "
+        "from where it left off."
     )
     category = "tracing"
     input_model = UnpauseEvalTaskInput
@@ -31,7 +32,12 @@ class UnpauseEvalTaskTool(BaseTool):
         from django.db import transaction
 
         from tfc.temporal.eval_tasks.client import start_eval_task_workflow_sync
-        from tracer.models.eval_task import EvalTask, EvalTaskLogger, EvalTaskStatus
+        from tracer.models.eval_task import (
+            RESUMABLE_TASK_STATUSES,
+            EvalTask,
+            EvalTaskLogger,
+            EvalTaskStatus,
+        )
 
         with transaction.atomic():
             try:
@@ -42,12 +48,14 @@ class UnpauseEvalTaskTool(BaseTool):
             except EvalTask.DoesNotExist:
                 return ToolResult.not_found("EvalTask", str(params.eval_task_id))
 
-            if eval_task.status != EvalTaskStatus.PAUSED:
+            # The same set the unpause endpoint accepts.
+            if eval_task.status not in RESUMABLE_TASK_STATUSES:
                 return ToolResult.error(
                     f"Cannot resume eval task with status '{eval_task.status}'. "
-                    "Only paused tasks can be resumed.",
+                    "Only paused or failed tasks can be resumed.",
                     error_code="VALIDATION_ERROR",
                 )
+            previous_status = eval_task.status
 
             # Resume the original selection/cursor. Mutating filters here would
             # silently change which historical rows remain eligible.
@@ -74,7 +82,7 @@ class UnpauseEvalTaskTool(BaseTool):
             [
                 ("Eval Task ID", f"`{eval_task.id}`"),
                 ("Name", eval_task.name or "—"),
-                ("Previous Status", format_status(EvalTaskStatus.PAUSED)),
+                ("Previous Status", format_status(previous_status)),
                 ("Current Status", format_status(EvalTaskStatus.PENDING)),
             ]
         )

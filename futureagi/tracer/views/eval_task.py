@@ -53,7 +53,13 @@ from tfc.utils.base_viewset import BaseModelViewSetMixin
 from tfc.utils.general_methods import GeneralMethods
 from tfc.utils.pagination import ExtendedPageNumberPagination
 from tracer.models.custom_eval_config import CustomEvalConfig
-from tracer.models.eval_task import EvalTask, EvalTaskLogger, EvalTaskStatus, RunType
+from tracer.models.eval_task import (
+    RESUMABLE_TASK_STATUSES,
+    EvalTask,
+    EvalTaskLogger,
+    EvalTaskStatus,
+    RunType,
+)
 from tracer.models.observation_span import EvalEntryStatus, EvalLogger, ObservationSpan
 from tracer.models.project import Project
 from tracer.serializers.eval_task import (
@@ -2834,14 +2840,9 @@ class EvalTaskView(BaseModelViewSetMixin, ModelViewSet):
             except EvalTask.DoesNotExist:
                 return self._gm.bad_request("Eval task not found")
 
-            # FAILED is resumable for the same reason PAUSED is: both leave the
-            # entries untouched and exit the workflow, so a fresh run reconciles,
-            # reaps and drains whatever is left. A task fails when one control
-            # activity exhausts its retry budget, so without this a brief
-            # infrastructure blip stranded every remaining entry permanently —
-            # no endpoint accepted a failed task at all.
-            resumable = {EvalTaskStatus.PAUSED, EvalTaskStatus.FAILED}
-            if eval_task.status not in resumable:
+            # PAUSED and FAILED; ``RESUMABLE_TASK_STATUSES`` says why failed is
+            # in it. The AI tool and the task UIs accept the same set.
+            if eval_task.status not in RESUMABLE_TASK_STATUSES:
                 return self._gm.bad_request(
                     f"Cannot unpause eval task with status '{eval_task.status}'. "
                     "Only paused or failed tasks can be resumed."
