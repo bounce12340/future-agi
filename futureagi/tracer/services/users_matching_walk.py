@@ -254,6 +254,9 @@ class _WalkState:
     progress_owed: bool = True
     slice_stopped: bool = False
     slice_uncapped: bool = False
+    # A batch's enrichment ran out of a read budget: later certifications
+    # read one user at a time (``_certify``).
+    certify_singly: bool = False
     # The tied instant being decided, the id below which it was entered, and
     # the resolved ids it returned (certified), in descending order.
     instant: datetime | None = None
@@ -469,14 +472,24 @@ def _read_slice(
     coverage, clipped at the window start) once more without a cap, and
     decides that slice's first batch with no deadline (``_admission_deadline``):
     an exact list can neither skip that slice nor publish anyone below it
-    first, so no bounded retry keeps the list both exact and moving. That
-    slice is the request's only uncapped slice. It, the statements that
-    decide its first batch (its survivor statement; the instant read and its
-    survivor statement when it comes back tied at one instant; one batch's
-    enrichment) and the finish's uncapped replay (``_materialise``) are the
-    request's only unbounded statements.
-    Once the request has decided something, a stopped slice it cannot
-    narrow, or whose retry the page wall refuses, ends it.
+    first, so no bounded retry keeps the list both exact and moving. Once the
+    request has decided something, a stopped slice it cannot narrow, or
+    whose retry the page wall refuses, ends it.
+
+    What stays unbounded. Survivor, instant, enrichment and tail-probe
+    statements never carry a server cap (the application's no-abort policy):
+    a wall only decides whether they start. The escape lifts even that, once
+    per request, for the head-of-line decision: the uncapped slice, its
+    survivor statement, the instant read and its survivor statement when the
+    slice comes back tied at one instant, one batch's enrichment and the
+    finish's uncapped replay (``_materialise``) start with no wall at all.
+    That enrichment may split one user's read in time when it runs out of
+    memory (``_certify``): up to 2 x window / ``_USER_LIST_ATTRIBUTE_MIN_BUCKET``
+    statements for each of its enrichment statements (one per accelerated key
+    and per four other keys), with no wall and not counted against the
+    statement budget. On a lane whose ClickHouse profile is read-only
+    (``CH*_SERVER_ENFORCED_READONLY``) no setting reaches the server, so the
+    slice cap is not sent there either and slices are admitted only.
     """
     from tracer.services import users_list_manager as ulm
 
@@ -769,13 +782,24 @@ def _tail_is_empty(state: _WalkState, *, below: datetime) -> bool | None:
     return not list(result.data or ())
 
 
-def _certify(state: _WalkState, batch: list[_Candidate]) -> bool:
-    """Attribute enrichment for a batch: membership superset and order key."""
+def _certify(state: _WalkState, batch: list[_Candidate]) -> int:
+    """Attribute enrichment for a batch: membership superset and order key.
+
+    Returns how many of ``batch``, from its head, are certified; ``0`` when
+    the budget or the wall refused. A batch's enrichment is not split in
+    time: when it runs out of a read budget (memory, rows), the head-of-line
+    user alone is certified instead, a statement that holds a batch's
+    fraction of the rows, and only that one may split its time buckets
+    (``UsersListManager._read_span_attributes``). The rest of the request
+    certifies one user at a time.
+    """
 
     manager = state.manager
+    if state.certify_singly:
+        batch = batch[:1]
     statements = _enrichment_statement_count(manager)
     if not state.budget.take(statements, finish=state.progress_owed):
-        return False
+        return 0
     rows = [{"end_user_id": candidate.end_user_id} for candidate in batch]
     scan_ids = list(
         dict.fromkeys(alias for candidate in batch for alias in candidate.alias_ids)
@@ -793,10 +817,21 @@ def _certify(state: _WalkState, batch: list[_Candidate]) -> bool:
             end_date=state.window_end,
             candidate_scan_ids=scan_ids,
             candidate_end_user_id_map=alias_map,
+            split_buckets=len(batch) == 1,
         )
     except ReadDeadlineExceeded:
         state.budget.exhausted_by = "wall"
-        return False
+        return 0
+    except Exception as exc:
+        if len(batch) == 1 or not is_read_budget_error(exc):
+            raise
+        state.certify_singly = True
+        logger.info(
+            "users_matching_walk_certify_singly",
+            users=len(batch),
+            error_type=type(exc).__name__,
+        )
+        return _certify(state, batch)
     state.progress_owed = False
     for candidate in batch:
         uid = candidate.end_user_id
@@ -811,7 +846,28 @@ def _certify(state: _WalkState, batch: list[_Candidate]) -> bool:
             alias_ids=candidate.alias_ids,
             order_key=order_key if member else None,
         )
-    return True
+    return len(batch)
+
+
+def _certified_prefix(
+    state: _WalkState, batch: list[_Candidate]
+) -> list[_Candidate] | None:
+    """Certify ``batch``; returns its decided prefix, or ``None`` when refused.
+
+    The prefix runs from the batch's head through the last user now
+    certified: all of it when the whole batch was, less when the enrichment
+    fell back to one user (``_certify``).
+    """
+
+    fresh = [c for c in batch if c.end_user_id not in state.certified]
+    if not fresh:
+        return batch
+    done = _certify(state, fresh)
+    if not done:
+        return None
+    if done == len(fresh):
+        return batch
+    return batch[: batch.index(fresh[done])]
 
 
 def _admission_deadline(state: _WalkState) -> ReadDeadline | None:
@@ -823,14 +879,20 @@ def _admission_deadline(state: _WalkState) -> ReadDeadline | None:
     a stop: its survivor statement was refused, the slice discarded whole,
     and every later request read it again. So until the request decides
     something (``progress_owed``), its search statements are admitted
-    against the analytics wall measured from the walk's start (the finish
-    mode's budget; admission only, like every search statement) instead of
-    the page wall. Once that wall is spent, or the request has read its
-    head-of-line slice without a cap (``_read_slice``), the statements that
-    decide that slice's first batch are admitted with no deadline: its
-    survivor statement, the instant read and its survivor statement when
-    the slice is tied at one instant, and one batch's enrichment, once per
-    request.
+    against the analytics wall measured from the walk's start instead of
+    the page wall. For a read of one statement (a slice, a survivor
+    statement, an instant read) that never refuses: the deadline returned
+    has at least 25 ms left or is ``None``, and the application service
+    sends no timeout for it. It can stop only a read of several statements,
+    a batch's enrichment between its key statements and time buckets. Once
+    that wall is spent, or the request has read its head-of-line slice
+    without a cap (``_read_slice``), the statements that decide that slice's
+    first batch are admitted with no deadline, once per request: its
+    survivor statement, the instant read and its survivor statement when the
+    slice is tied at one instant, and one batch's enrichment, including the
+    time buckets one user's enrichment may split into when it runs out of
+    memory, up to 2 x window / ``_USER_LIST_ATTRIBUTE_MIN_BUCKET`` statements
+    for each of its enrichment statements (``_certify``).
     """
 
     if not state.progress_owed:
@@ -1034,12 +1096,15 @@ def _decide_instant(
         if read is None:
             state.stopped = True
             return False, boundary
-        for start in range(0, len(read.candidates), batch_size):
-            batch = read.candidates[start : start + batch_size]
-            fresh = [c for c in batch if c.end_user_id not in state.certified]
-            if fresh and not _certify(state, fresh):
+        start = 0
+        while start < len(read.candidates):
+            batch = _certified_prefix(
+                state, read.candidates[start : start + batch_size]
+            )
+            if batch is None:
                 state.stopped = True
                 return False, boundary
+            start += len(batch)
             state.instant_ids.extend(c.end_user_id for c in batch)
             boundary = (instant, batch[-1].end_user_id)
             if not _publish(state, boundary):
@@ -1200,13 +1265,14 @@ def walk_matching_activity_page(
             width = max(USER_LIST_WALK_MIN_SLICE, width / 4)
             continue
         batch_size = USER_LIST_WALK_CERTIFY_BATCH_SIZE
-        for start in range(0, len(candidates), batch_size):
-            batch = candidates[start : start + batch_size]
-            remaining = candidates[start + batch_size :]
-            fresh = [c for c in batch if c.end_user_id not in state.certified]
-            if fresh and not _certify(state, fresh):
+        start = 0
+        while start < len(candidates):
+            batch = _certified_prefix(state, candidates[start : start + batch_size])
+            if batch is None:
                 state.stopped = True
                 break
+            start += len(batch)
+            remaining = candidates[start:]
             boundary = remaining[0].newest_witness if remaining else floor
             if not _publish(state, boundary):
                 state.stopped = True

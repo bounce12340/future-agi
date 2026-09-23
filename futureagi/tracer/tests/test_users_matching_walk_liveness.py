@@ -38,6 +38,7 @@ from tracer.tests.test_users_matching_walk import (
     WINDOW_START,
     Engine,
     World,
+    _from_us,
     _manager,
     _names,
     _NativeDriver,
@@ -819,6 +820,140 @@ def test_a_slice_the_server_stops_is_narrowed_through_the_real_client():
     assert all(cap > 0 for _width, cap in driver.slices)
     widths = [width for width, _cap in driver.slices]
     assert widths[:2] == [timedelta(hours=1), timedelta(minutes=15)]
+
+
+# --------------------------------------------------------------------------
+# Certification that runs out of a read budget.
+# --------------------------------------------------------------------------
+
+
+class _MemoryEngine(_CappedEngine):
+    """An enrichment runs out of memory (code 241) when it holds too much.
+
+    It fails when its bucket is wider than ``width``, whatever it carries,
+    or when its users times its bucket's hours exceed ``user_hours``.
+    Records every enrichment as ``(users, bucket width, failed)``.
+    """
+
+    def __init__(
+        self,
+        world: World,
+        *,
+        clock: _Clock,
+        width: timedelta | None = None,
+        user_hours: float | None = None,
+        slice_ms: Callable[[timedelta, bool], float] | None = None,
+    ) -> None:
+        super().__init__(world, clock=clock, slice_ms=slice_ms)
+        self.width = width
+        self.user_hours = user_hours
+        self.enrichments: list[tuple[int, timedelta, bool]] = []
+
+    def execute_ch_query(
+        self,
+        query,
+        params=None,
+        timeout_ms=None,
+        settings=None,
+        *,
+        server_execution_cap_ms=None,
+    ):
+        if kind_of(query) == "enrich":
+            bucket = _from_us(params["attr_end_us"]) - _from_us(params["attr_start_us"])
+            users = len(params["eu_ids"])
+            failed = (self.width is not None and bucket > self.width) or (
+                self.user_hours is not None
+                and users * (bucket / timedelta(hours=1)) > self.user_hours
+            )
+            self.enrichments.append((users, bucket, failed))
+            if failed:
+                from clickhouse_driver.errors import ErrorCodes, ServerException
+
+                self.calls.append(query)
+                self.clock.spend(50.0)
+                raise ServerException(
+                    "Memory limit exceeded", code=ErrorCodes.MEMORY_LIMIT_EXCEEDED
+                )
+        return super().execute_ch_query(
+            query,
+            params,
+            timeout_ms,
+            settings,
+            server_execution_cap_ms=server_execution_cap_ms,
+        )
+
+
+def _memory_hops(world, *, max_hops, **engine):
+    """Every request on the scripted clock: ``(names, statements, enrichments)``."""
+
+    clock = _Clock()
+    hops = []
+    cursor = None
+    with _shipped_walls(), _scripted_clock(clock):
+        for _hop in range(max_hops):
+            memory = _MemoryEngine(world, clock=clock, **engine)
+            read, _engine = _page(world, page_size=25, cursor=cursor, engine=memory)
+            hops.append((_names(read), len(memory.calls), memory.enrichments))
+            if not read.has_more:
+                return hops, read
+            cursor = _signed_cursor(read)
+    raise AssertionError(f"no end after {max_hops} hops: {[h[0] for h in hops]}")
+
+
+WINDOW = WINDOW_END - WINDOW_START
+
+
+def test_a_batch_whose_enrichment_runs_out_of_memory_certifies_its_head_alone():
+    """Memory grows with users times bucket: five users do not fit, one does.
+
+    The batch's enrichment is tried once over the whole window and not split
+    in time; when it runs out of a read budget the head-of-line user is
+    certified alone, and the rest of the request certifies one user at a
+    time. No enrichment is ever narrowed in time, and every request stays
+    within its statement budget.
+    """
+    world, expected = _spread_world(5, 3)
+
+    hops, last = _memory_hops(world, max_hops=4, user_hours=30.0)
+
+    assert [name for names, _s, _e in hops for name in names] == expected
+    enrichments = [entry for _n, _s, hop in hops for entry in hop]
+    assert all(bucket == WINDOW for _users, bucket, _failed in enrichments)
+    assert [users for users, _b, failed in enrichments if failed] == [5]
+    assert all(statements <= 24 for _n, statements, _e in hops)
+    # Nothing was narrowed in time, so nothing is marked inexact.
+    assert last.payload["query_exact"] is True
+
+
+@pytest.mark.parametrize("slices", ["cheap", "every_capped_slice_stopped"])
+def test_an_enrichment_that_fails_above_a_bucket_width_still_ends(slices):
+    """Every enrichment wider than ten minutes runs out of memory, one user or five.
+
+    Only a single user's enrichment is narrowed in time, down to buckets
+    that fit: its statements are the documented remainder, at most two per
+    bucket of the least width over the window. The list still ends, each
+    user once and in order, whether the slices are cheap or every capped
+    slice is stopped (the head-of-line path, where that enrichment has no
+    deadline).
+    """
+    world, expected = _spread_world(5, 3)
+    slice_ms = _every_slice(40_000) if slices != "cheap" else None
+
+    hops, _last = _memory_hops(
+        world, max_hops=12, width=timedelta(minutes=10), slice_ms=slice_ms
+    )
+
+    assert [name for names, _s, _e in hops for name in names] == expected
+    for _, statements, enrichments in hops:
+        # A batch of more than one user is never narrowed in time.
+        assert all(
+            bucket == WINDOW for users, bucket, _f in enrichments if users > 1
+        ), enrichments
+        bisection_bound = 2 * (WINDOW / timedelta(minutes=1))
+        assert statements <= 43 + bisection_bound, statements
+        assert len(enrichments) <= 1 + 2 * (WINDOW / timedelta(minutes=5)), len(
+            enrichments
+        )
 
 
 # --------------------------------------------------------------------------
