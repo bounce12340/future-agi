@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import os
 import uuid
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
-from clickhouse_driver import Client
 
+from conftest import _ch_test_native_client
 from model_hub.services.bulk_selection import (
     BulkSelectionAmbiguousIdentity,
     _resolve_span_ids_clickhouse,
@@ -24,31 +23,11 @@ from tracer.services.clickhouse.v2.query_builders.trace_list import (
 
 pytestmark = pytest.mark.integration
 
-CH_HOST = os.environ.get("CH25_HOST", "127.0.0.1")
-# Native port from the environment only: CH25_NATIVE_PORT (CI names it), then
-# the port tfc/settings/test.py resolved, then 1 -- unserved, so the gate below
-# skips rather than reaching a developer's port-forward to a shared cluster.
-CH_NATIVE_PORT = int(
-    os.environ.get("CH25_NATIVE_PORT") or os.environ.get("CH25_TCP_PORT") or "1"
-)
-CH_USER = os.environ.get("CH25_USER", "default")
-CH_PASSWORD = os.environ.get("CH25_PASSWORD", "")
-
 
 @pytest.fixture(scope="module")
 def ch_client():
-    client = Client(
-        host=CH_HOST,
-        port=CH_NATIVE_PORT,
-        user=CH_USER,
-        password=CH_PASSWORD,
-        connect_timeout=3,
-    )
-    try:
-        client.execute("SELECT 1")
-    except Exception as exc:
-        pytest.skip(f"CH25 is not reachable on {CH_HOST}:{CH_NATIVE_PORT} ({exc!r})")
-    return client
+    with _ch_test_native_client() as client:
+        yield client
 
 
 @pytest.fixture()

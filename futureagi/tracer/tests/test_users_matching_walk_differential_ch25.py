@@ -24,7 +24,6 @@ The published SET and each published user's whole-window totals must be
 identical; only the order may differ.
 """
 
-import os
 import re
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -32,21 +31,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-from clickhouse_driver import Client
 
-from conftest import _require_safe_ch25_test_target
+from conftest import _ch_test_native_client, _ch_test_owned_database
 from tracer.services import users_matching_walk as walk
 from tracer.services.clickhouse.list_cursor import ListCursor
 from tracer.services.users_list_manager import UsersListManager
-
-CH_HOST = os.environ.get("CH25_HOST", "127.0.0.1")
-# No default port: a loopback port-forward to a shared server passes the
-# loopback trust of ``_require_safe_ch25_test_target``, so this module runs
-# only against a port the environment names explicitly (the test target).
-_CONFIGURED_PORT = os.environ.get("CH25_NATIVE_PORT") or os.environ.get("CH25_TCP_PORT")
-CH_NATIVE_PORT = int(_CONFIGURED_PORT or 0)
-CH_USER = os.environ.get("CH25_USER") or os.environ.get("CH_USERNAME") or "default"
-CH_PASSWORD = os.environ.get("CH25_PASSWORD") or os.environ.get("CH_PASSWORD") or ""
 
 PROJECT = str(uuid.UUID(int=71))
 ORGANIZATION = str(uuid.UUID(int=72))
@@ -67,50 +56,16 @@ WINDOW_END = WINDOW_START + timedelta(days=3)
 SERVICE = "tracer.services.users_list_manager.V2AnalyticsQueryService"
 
 
-def _ch_client(*, database):
-    return Client(
-        host=CH_HOST,
-        port=CH_NATIVE_PORT,
-        user=CH_USER,
-        password=CH_PASSWORD,
-        database=database,
-        connect_timeout=3,
-    )
-
-
 @pytest.fixture(scope="module")
 def ch_database():
-    database = f"test_walk_differential_{uuid.uuid4().hex}"
-    if not _CONFIGURED_PORT:
-        pytest.skip("CH25_NATIVE_PORT / CH25_TCP_PORT must name the local test CH")
-    _require_safe_ch25_test_target(host=CH_HOST, database=database)
-    admin = _ch_client(database="default")
-    created = False
-    try:
-        try:
-            admin.execute("SELECT 1")
-        except Exception as exc:
-            pytest.skip(
-                f"CH25 is not reachable on {CH_HOST}:{CH_NATIVE_PORT} ({exc!r})"
-            )
-        admin.execute(f"CREATE DATABASE {database}")
-        created = True
+    with _ch_test_owned_database("test_walk_differential_") as database:
         yield database
-    finally:
-        try:
-            if created:
-                admin.execute(f"DROP DATABASE IF EXISTS {database} SYNC")
-        finally:
-            admin.disconnect()
 
 
 @pytest.fixture(scope="module")
 def ch_client(ch_database):
-    client = _ch_client(database=ch_database)
-    try:
+    with _ch_test_native_client(database=ch_database) as client:
         yield client
-    finally:
-        client.disconnect()
 
 
 @pytest.fixture(scope="module")

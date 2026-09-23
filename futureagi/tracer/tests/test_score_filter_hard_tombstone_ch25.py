@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import os
 import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from clickhouse_driver import Client
 
+from conftest import _ch_test_native_client
 from tracer.services.clickhouse.v2.query_builders.filters import rewrite_v1_sql_to_v2
 from tracer.services.clickhouse.v2.query_builders.session_list import (
     SessionListQueryBuilderV2,
@@ -19,16 +18,6 @@ from tracer.services.clickhouse.v2.query_builders.span_list import (
 from tracer.services.clickhouse.v2.query_builders.trace_list import (
     TraceListQueryBuilderV2,
 )
-
-CH_HOST = os.environ.get("CH25_HOST", "127.0.0.1")
-# Native port from the environment only: CH25_NATIVE_PORT (CI names it), then
-# the port tfc/settings/test.py resolved, then 1 -- unserved, so the gate below
-# skips rather than reaching a developer's port-forward to a shared cluster.
-CH_NATIVE_PORT = int(
-    os.environ.get("CH25_NATIVE_PORT") or os.environ.get("CH25_TCP_PORT") or "1"
-)
-CH_USER = os.environ.get("CH25_USER", "default")
-CH_PASSWORD = os.environ.get("CH25_PASSWORD", "")
 
 PROJECT_ID = "00000000-0000-4000-8000-000000000601"
 TRACE_ID = "00000000-0000-4000-8000-000000000602"
@@ -133,18 +122,8 @@ def test_v2_rewrite_preserves_only_proven_score_alias_cdc_columns() -> None:
 
 @pytest.fixture(scope="module")
 def ch_client():
-    client = Client(
-        host=CH_HOST,
-        port=CH_NATIVE_PORT,
-        user=CH_USER,
-        password=CH_PASSWORD,
-        connect_timeout=3,
-    )
-    try:
-        client.execute("SELECT version()")
-    except Exception as exc:
-        pytest.skip(f"CH25 not reachable on {CH_HOST}:{CH_NATIVE_PORT} ({exc!r})")
-    return client
+    with _ch_test_native_client() as client:
+        yield client
 
 
 @pytest.fixture()

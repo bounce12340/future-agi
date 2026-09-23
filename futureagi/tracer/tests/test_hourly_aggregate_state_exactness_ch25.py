@@ -23,7 +23,6 @@ measured fact rather than a comment.
 
 from __future__ import annotations
 
-import os
 import uuid
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -31,28 +30,12 @@ from types import SimpleNamespace
 import pytest
 from clickhouse_driver import Client
 
-from conftest import _require_safe_ch25_test_target
+from conftest import _ch_test_native_client, _ch_test_owned_database
 from tracer.services.clickhouse import graph_dispatch
 from tracer.views import dashboard as dashboard_view
 from tracer.views.dashboard import _read_dashboard_rollup_fast_path
 
 pytestmark = pytest.mark.integration
-
-# Ports an operator host forwards a remote ClickHouse onto. This module issues
-# DDL, so off CI it refuses them outright instead of defaulting to one. On
-# GitHub Actions there is no forward, and 19000 is the native port
-# ``docker-compose.test.yml`` publishes for the job's own ClickHouse.
-_FORWARDED_PORTS = frozenset({19010, 19000, 19001, 19002, 18230, 18231, 18232})
-_ON_GITHUB_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
-
-CH_HOST = os.environ.get("CH25_HOST", "127.0.0.1")
-CH_NATIVE_PORT_TEXT = (
-    os.environ.get("CH25_NATIVE_PORT")
-    or os.environ.get("CH_NATIVE_PORT")
-    or ("19000" if _ON_GITHUB_ACTIONS else None)
-)
-CH_USER = os.environ.get("CH25_USER") or os.environ.get("CH_USERNAME") or "default"
-CH_PASSWORD = os.environ.get("CH25_PASSWORD") or os.environ.get("CH_PASSWORD") or ""
 
 PROJECT_ID = "00000000-0000-4000-8000-000000000001"
 
@@ -141,68 +124,28 @@ _SCENARIOS = {
 }
 
 
-def _native_port() -> int:
-    if not CH_NATIVE_PORT_TEXT:
-        pytest.skip("CH25_NATIVE_PORT / CH_NATIVE_PORT is not set")
-    port = int(CH_NATIVE_PORT_TEXT)
-    assert _ON_GITHUB_ACTIONS or port not in _FORWARDED_PORTS, (
-        f"refusing to run ClickHouse DDL on forwarded port {port}"
-    )
-    return port
-
-
-def _ch_client(*, database: str) -> Client:
-    return Client(
-        host=CH_HOST,
-        port=_native_port(),
-        user=CH_USER,
-        password=CH_PASSWORD,
-        database=database,
-        connect_timeout=3,
-    )
-
-
+# conftest resolves the live target and, on an opted-in port, proves it is the
+# test sidecar before any DDL.
 @pytest.fixture(scope="module")
 def ch_database():
-    """Create one unique test-owned database and remove it after the module."""
-
-    database = f"test_agg_exact_{uuid.uuid4().hex}"
-    _require_safe_ch25_test_target(host=CH_HOST, database=database)
-    admin = _ch_client(database="default")
-    created = False
-    try:
-        try:
-            admin.execute("SELECT 1")
-        except Exception as exc:
-            pytest.skip(f"CH25 is not reachable on {CH_HOST} ({exc!r})")
-        admin.execute(f"CREATE DATABASE {database}")
-        created = True
+    with _ch_test_owned_database("test_agg_exact_") as database:
         yield database
-    finally:
-        try:
-            if created:
-                admin.execute(f"DROP DATABASE IF EXISTS {database} SYNC")
-        finally:
-            admin.disconnect()
 
 
 @pytest.fixture()
 def ch_client(ch_database):
-    """A client on the test database with a fresh ``spans`` per test.
+    """A client on the test database with a fresh ``spans``, dropped on exit.
 
     The product statements name ``spans`` unqualified, so the table has to be
     called exactly that inside the test-owned database.
     """
 
-    client = _ch_client(database=ch_database)
-    client.execute(_SPANS_DDL)
-    try:
-        yield client
-    finally:
+    with _ch_test_native_client(database=ch_database) as client:
+        client.execute(_SPANS_DDL)
         try:
-            client.execute("DROP TABLE IF EXISTS spans SYNC")
+            yield client
         finally:
-            client.disconnect()
+            client.execute("DROP TABLE IF EXISTS spans SYNC")
 
 
 class _LiveAnalytics:

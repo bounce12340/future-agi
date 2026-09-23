@@ -108,9 +108,16 @@ _GRAPH_SEED_ESTIMATE_QUERY_MS = 1_500
 _GRAPH_SEED_ESTIMATE_MAX_CANDIDATES = 10
 # What a probe statement can fail with and still leave the unseeded read
 # correct: any ClickHouse answer from either driver, and transport or deadline
-# failures (TimeoutError, including ReadDeadlineExceeded, is an OSError).
-# Anything else is a defect in this code, not an unanswered probe.
-_GRAPH_SEED_PROBE_ERRORS = (ClickHouseDriverError, ClickHouseConnectError, OSError)
+# failures (TimeoutError, including ReadDeadlineExceeded, is an OSError). A
+# server that closes the connection mid-response surfaces as a bare EOFError
+# from the native reader, which is not an OSError and which the driver does
+# not wrap. Anything else is a defect in this code, not an unanswered probe.
+_GRAPH_SEED_PROBE_ERRORS = (
+    ClickHouseDriverError,
+    ClickHouseConnectError,
+    OSError,
+    EOFError,
+)
 # Twice _GRAPH_SEED_ESTIMATE_WALL_MS: the shortest wall on which spending the
 # whole probe budget still leaves the main read a floor of at least that
 # budget. Below it the single-node path does not probe at all rather than
@@ -405,7 +412,7 @@ def _select_raw_trace_seed_candidate(
             # read-budget/transport helpers deliberately reject (type
             # mismatch, unknown identifier, no common type).
             logger.warning(
-                "graph seed probe degraded",
+                "graph_seed_probe_degraded",
                 probe_index=probe_count,
                 error_type=type(exc).__name__,
                 exc_info=True,
@@ -2306,7 +2313,7 @@ def fetch_user_system_metric_graph_ch(
             # The direct failure is already sanitized. Cache/worker transport
             # availability must not turn it into a raw API exception.
             logger.warning(
-                "user graph exact refresh scheduling degraded",
+                "user_graph_exact_refresh_scheduling_degraded",
                 metric_id=normalized_metric_id,
                 error_type=type(exc).__name__,
                 exc_info=True,

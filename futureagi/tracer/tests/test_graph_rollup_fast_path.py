@@ -563,6 +563,9 @@ def _seed_probe_graph_filters() -> list[dict]:
         NetworkError("probe transport"),
         ReadDeadlineExceeded("read deadline exceeded"),
         ClickHouseConnectDatabaseError("Code: 53. probe diagnostic"),
+        # What the native reader raises when the server closes the socket
+        # mid-response: not an OSError, and not wrapped by the driver.
+        EOFError("Unexpected EOF while reading bytes"),
     ],
     ids=lambda exc: type(exc).__name__,
 )
@@ -601,6 +604,7 @@ def test_seed_probe_failure_is_logged_with_its_traceback(monkeypatch, probe_erro
     assert "trace_id IN (" not in analytics.execute_ch_query.call_args_list[1].args[0]
     assert response["query_status"] == "complete"
     assert len(warning_calls) == 1
+    assert warning_calls[0][0] == ("graph_seed_probe_degraded",)
     assert warning_calls[0][1]["exc_info"] is True
     assert warning_calls[0][1]["error_type"] == type(probe_error).__name__
     assert warning_calls[0][1]["probe_index"] == 1
