@@ -97,6 +97,43 @@ const backgroundEnvironment = {
   TEMPORAL_ALL_QUEUES: 'true', TEMPORAL_EXCLUDED_QUEUES: 'simulation_runner',
 };
 
+for (const evalBackground of [false, true]) {
+  test(`managed mock accepts only the optional E2E webhook secret (background=${evalBackground})`, async () => {
+    const optionalEnvironments: Record<string, string>[] = [{}, { AGENTCC_WEBHOOK_SECRET: '' },
+      { AGENTCC_WEBHOOK_SECRET: 'e2e-agentcc-webhook-secret' }];
+    for (const service of ['backend', 'worker', 'agentcc-gateway', 'mock-llm']) {
+      for (const optional of optionalEnvironments) {
+        validateMockEnvironment(service, { ...backgroundEnvironment, ...optional }, evalBackground);
+      }
+    }
+    const fake = registrationDouble();
+    await registerMockModel(fake.actor, fake.probe, () => {
+      validateMockEnvironment('backend', { ...backgroundEnvironment,
+        AGENTCC_WEBHOOK_SECRET: 'e2e-agentcc-webhook-secret' }, evalBackground);
+      validateMockRouting(source, evalBackground);
+    });
+    expect(fake.calls).toHaveLength(1);
+  });
+
+  for (const [name, override] of [
+    ['non-mock webhook secret', { AGENTCC_WEBHOOK_SECRET: 'private-webhook-secret' }],
+    ['webhook secret prefix', { AGENTCC_WEBHOOK_SECRET: 'e2e-agentcc-webhook-secret-extra' }],
+    ['lookalike gateway key', { AGENTCC_WEBHOOK_SECRET_EXTRA: 'e2e-agentcc-webhook-secret' }],
+    ['external gateway', { AGENTCC_INTERNAL_URL: 'https://gateway.invalid' }],
+    ['provider credential', { OPENAI_API_KEY: 'private-provider-key' }],
+  ] as [string, Record<string, string>][]) {
+    test(`managed mock webhook allowance rejects ${name} before registration (background=${evalBackground})`, async () => {
+      const fake = registrationDouble();
+      await expect(registerMockModel(fake.actor, fake.probe, () => {
+        validateMockEnvironment('backend', { ...backgroundEnvironment,
+          AGENTCC_WEBHOOK_SECRET: 'e2e-agentcc-webhook-secret', ...override }, evalBackground);
+      })).rejects.toThrow('STOP: managed mock');
+      expect(fake.calls).toEqual([]);
+      expect(fake.readCount()).toBe(0);
+    });
+  }
+}
+
 const gatewayMounts = [
   { Type: 'bind', Source: '/fixture/gateway.e2e.yaml', Destination: '/app/config.yaml', RW: false },
   { Type: 'bind', Source: '/dev/null', Destination: '/app/Vertex_AI_Creds.json', RW: false },

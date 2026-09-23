@@ -335,8 +335,17 @@ def test_filter_values_maps_reader_value_error_to_400(settings):
 
 @pytest.mark.parametrize("has_more", [False, True])
 @pytest.mark.parametrize("counts", [None, {"all": 516, "custom_attribute": 516}])
+@pytest.mark.parametrize(
+    "category,cursor,include_counts",
+    [
+        ("", None, True),
+        ("custom_attribute", None, False),
+        ("system_metric", None, False),
+        ("", "next-page", False),
+    ],
+)
 def test_current_metrics_envelope_describes_the_index_page_only(
-    settings, has_more, counts
+    settings, has_more, counts, category, cursor, include_counts
 ):
     settings.PROPERTY_CATALOG_DATABASE = "test_index"
     reader = Mock()
@@ -360,7 +369,7 @@ def test_current_metrics_envelope_describes_the_index_page_only(
         patch("tracer.services.clickhouse.client.ClickHouseClient") as extra_client,
     ):
         response = inspect.unwrap(DashboardViewSet.metrics)(
-            DashboardViewSet(), _request()
+            DashboardViewSet(), _request(category=category, cursor=cursor)
         )
     assert response.status_code == 200
     result = response.data["result"]
@@ -369,7 +378,7 @@ def test_current_metrics_envelope_describes_the_index_page_only(
     assert result["query_complete"] is True and result["query_status"] == "complete"
     assert result["has_more"] is has_more
     assert result["next_cursor"] == ("next-page" if has_more else None)
-    assert reader.read_page.call_args.kwargs["include_counts"] is True
+    assert reader.read_page.call_args.kwargs["include_counts"] is include_counts
     if counts is not None:
         assert result["category_counts"] == counts
         assert result["category_counts_exact"] is True

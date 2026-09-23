@@ -74,7 +74,7 @@ func main() {
 	defer writer.Close()
 
 	if !cfg.Auth.IsEnabled() {
-		log.Error("FI_PG_WRITE is required — without it the collector cannot resolve API keys or project IDs")
+		log.Error("PostgreSQL auth configuration is required (auth.pg_write, FI_PG_WRITE, or FI_PG_WRITE_{HOST,PORT,DATABASE,USER}) — without it the collector cannot resolve API keys or project IDs")
 		os.Exit(1)
 	}
 
@@ -256,18 +256,25 @@ func applyEnvOverrides(log *slog.Logger, c *rootConfig) error {
 	if v := os.Getenv("FI_DEAD_LETTER_FILE"); v != "" {
 		c.Writer.DeadLetterFile = v
 	}
-	// Auth overrides (auth is active when PG_WRITE is set)
-	if v := os.Getenv("FI_PG_WRITE"); v != "" {
-		c.Auth.PGWrite = v
-	}
-	if v := os.Getenv("FI_PG_READ"); v != "" {
-		c.Auth.PGRead = v
-	}
-	if endpoint := auth.EndpointFromEnv(os.Getenv, "FI_PG_WRITE"); endpoint != "" {
-		c.Auth.PGWrite = endpoint
-	}
-	if endpoint := auth.EndpointFromEnv(os.Getenv, "FI_PG_READ"); endpoint != "" {
-		c.Auth.PGRead = endpoint
+	// Explicit connection strings keep their TLS/options and take precedence
+	// over separate fields. Still reject partial fields so a typo cannot silently
+	// select another database via URI/YAML fallback. Errors contain names only.
+	for _, endpoint := range []struct {
+		prefix string
+		target *string
+	}{
+		{"FI_PG_WRITE", &c.Auth.PGWrite},
+		{"FI_PG_READ", &c.Auth.PGRead},
+	} {
+		fields, err := auth.EndpointFromEnv(os.Getenv, endpoint.prefix)
+		if err != nil {
+			return err
+		}
+		if uri := os.Getenv(endpoint.prefix); uri != "" {
+			*endpoint.target = uri
+		} else if fields != "" {
+			*endpoint.target = fields
+		}
 	}
 	if v := os.Getenv("FI_AUTH_REDIS_ADDR"); v != "" {
 		c.Auth.RedisAddr = v

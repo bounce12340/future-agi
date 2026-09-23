@@ -822,6 +822,7 @@ class CurrentDefinitionSource:
             atomic=transaction.atomic,
             read_only=True,
             check_request=lambda: self.deadline.remaining_ms(floor_ms=1),
+            statement_timeout_ms=lambda: self.deadline.remaining_ms(floor_ms=1),
         ):
             return read()
 
@@ -1070,7 +1071,7 @@ class CurrentDefinitionSource:
             # Use the native PostgreSQL search contract. Ordering is UUID based,
             # never a page-local re-sort of locale-dependent display names.
             search = query.get("search", "")
-            if search and not any(search in token for token in (primary, kind)):
+            if search:
                 from django.db.models import Q
 
                 condition = Q(name__icontains=search)

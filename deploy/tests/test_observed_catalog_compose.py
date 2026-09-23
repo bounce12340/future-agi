@@ -57,6 +57,22 @@ def compose(
 
 
 class ComposeContractTests(unittest.TestCase):
+    def test_collector_receives_explicit_tls_configuration(self):
+        tls = {
+            "PGSSLMODE": "verify-full",
+            "PGSSLROOTCERT": "/run/certs/ca.pem",
+            "PGSSLCERT": "/run/certs/client.pem",
+            "PGSSLKEY": "/run/certs/client.key",
+        }
+        for overlays in ((), ("docker-compose.dev.yml",),
+                         ("e2e/stack/docker-compose.e2e.yml",)):
+            with self.subTest(overlays=overlays):
+                env = compose(*overlays, **tls)["services"]["fi-collector"]["environment"]
+                self.assertEqual({key: env[key] for key in tls}, tls)
+        default = compose()["services"]["fi-collector"]["environment"]
+        self.assertEqual(default["PGSSLMODE"], "prefer")
+        self.assertTrue(all(default[key] == "" for key in tls if key != "PGSSLMODE"))
+
     def test_collector_read_only_root_preserves_writable_spool_in_all_overlays(self):
         production_env = {
             key: "packaging-contract-only"

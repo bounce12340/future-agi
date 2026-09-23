@@ -334,6 +334,7 @@ function renderPanel({
   attributeSource,
   tab,
   allowWorkspaceScope = false,
+  categories,
   propertyFilter,
   catalogError = false,
   hasNextCatalogPage = false,
@@ -358,6 +359,7 @@ function renderPanel({
     attributeSource,
     tab,
     allowWorkspaceScope,
+    categories,
     propertyFilter,
     catalogError,
     hasNextCatalogPage,
@@ -390,6 +392,7 @@ function renderPanel({
         attributeSource={panelProps.attributeSource}
         tab={panelProps.tab}
         allowWorkspaceScope={panelProps.allowWorkspaceScope}
+        categories={panelProps.categories}
         propertyFilter={panelProps.propertyFilter}
         catalogError={panelProps.catalogError}
         hasNextCatalogPage={panelProps.hasNextCatalogPage}
@@ -2183,10 +2186,10 @@ describe("voice-call property search aliases", () => {
     fireEvent.click(screen.getByRole("button", { name: "Property" }));
     expect(
       screen.getByLabelText("Attributes property count unavailable"),
-    ).toHaveTextContent("…");
+    ).toHaveTextContent("—");
     expect(
       screen.getByLabelText("All property count unavailable"),
-    ).toHaveTextContent("…");
+    ).toHaveTextContent("—");
 
     data = [
       ...data,
@@ -2202,7 +2205,7 @@ describe("voice-call property search aliases", () => {
 
     expect(
       screen.getByLabelText("Attributes property count unavailable"),
-    ).toHaveTextContent("…");
+    ).toHaveTextContent("—");
     document.body.removeChild(anchorEl);
   });
 
@@ -2303,7 +2306,7 @@ describe("voice-call property search aliases", () => {
     ]) {
       expect(
         screen.getByLabelText(`${label} property count unavailable`),
-      ).toHaveTextContent("…");
+      ).toHaveTextContent("—");
     }
     expect(
       screen.queryByLabelText("Property search result count"),
@@ -2319,10 +2322,10 @@ describe("voice-call property search aliases", () => {
     rerenderPanel();
     expect(
       screen.getByLabelText("All property count unavailable"),
-    ).toHaveTextContent("…");
+    ).toHaveTextContent("—");
     expect(
       screen.getByLabelText("Attributes property count unavailable"),
-    ).toHaveTextContent("…");
+    ).toHaveTextContent("—");
     fireEvent.change(screen.getByPlaceholderText("Search properties..."), {
       target: { value: "customer" },
     });
@@ -2336,7 +2339,7 @@ describe("voice-call property search aliases", () => {
     ).not.toBeInTheDocument();
     expect(
       screen.getByLabelText("All property count unavailable"),
-    ).toHaveTextContent("…");
+    ).toHaveTextContent("—");
     document.body.removeChild(anchorEl);
   });
 
@@ -2558,10 +2561,10 @@ describe("voice-call property search aliases", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Property" }));
     expect(
-      screen.getByLabelText("All property count unavailable"),
+      screen.getByLabelText("All property count loading"),
     ).toHaveTextContent("…");
     expect(
-      screen.getByLabelText("System property count unavailable"),
+      screen.getByLabelText("System property count loading"),
     ).toHaveTextContent("…");
     expect(
       screen.getByLabelText("Attributes property count"),
@@ -2731,7 +2734,7 @@ describe("voice-call property search aliases", () => {
       screen.queryByLabelText("Property search result count"),
     ).not.toBeInTheDocument();
     expect(
-      screen.getByLabelText("All property count unavailable"),
+      screen.getByLabelText("All property count loading"),
     ).toHaveTextContent("…");
     await waitFor(() =>
       expect(screen.getByLabelText("All property count")).toHaveTextContent(
@@ -2745,7 +2748,7 @@ describe("voice-call property search aliases", () => {
       screen.queryByLabelText("Property search result count"),
     ).not.toBeInTheDocument();
     expect(
-      screen.getByLabelText("All property count unavailable"),
+      screen.getByLabelText("All property count loading"),
     ).toHaveTextContent("…");
     await waitFor(() =>
       expect(propertyCatalogMock).toHaveBeenCalledWith(
@@ -2757,13 +2760,488 @@ describe("voice-call property search aliases", () => {
     ).not.toBeInTheDocument();
     expect(
       screen.getByLabelText("All property count unavailable"),
-    ).toHaveTextContent("…");
+    ).toHaveTextContent("—");
     fireEvent.change(screen.getByPlaceholderText("Search properties..."), {
       target: { value: "" },
     });
     expect(screen.getByLabelText("All property count")).toHaveTextContent(
       /^516$/,
     );
+    document.body.removeChild(anchorEl);
+  });
+
+  it.each([false, true])(
+    "counts searched dataset columns with category sidebar=%s",
+    (hasSidebar) => {
+      const properties = [
+        { id: "region", name: "Region", category: "dataset" },
+        { id: "country", name: "Country", category: "dataset" },
+        { id: "quality", name: "Quality", category: "eval" },
+      ].map((property) => ({ ...property, type: "string" }));
+      const { anchorEl } = renderPanel({
+        properties,
+        source: "dataset",
+        projectId: "dataset-search-count",
+        categories: hasSidebar
+          ? [
+              { key: "all", label: "All" },
+              { key: "dataset", label: "Columns" },
+              { key: "eval", label: "Evals" },
+            ]
+          : [],
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Property" }));
+      const search = screen.getByPlaceholderText("Search properties...");
+      fireEvent.change(search, { target: { value: "region" } });
+      expect(
+        screen.getByLabelText("Property search result count"),
+      ).toHaveTextContent(/^1$/);
+      expect(
+        document.querySelectorAll("[data-filter-property-option]"),
+      ).toHaveLength(1);
+      if (hasSidebar) {
+        expect(
+          screen.getByLabelText("Columns property count"),
+        ).toHaveTextContent(/^1$/);
+        expect(screen.getByLabelText("Evals property count")).toHaveTextContent(
+          /^0$/,
+        );
+        fireEvent.click(screen.getByText("Evals"));
+        expect(
+          screen.getByLabelText("Property search result count"),
+        ).toHaveTextContent(/^0$/);
+        expect(
+          document.querySelectorAll("[data-filter-property-option]"),
+        ).toHaveLength(0);
+        fireEvent.click(screen.getByText("All"));
+      }
+      fireEvent.change(search, { target: { value: "missing" } });
+      expect(
+        screen.getByLabelText("Property search result count"),
+      ).toHaveTextContent(/^0$/);
+      fireEvent.change(search, { target: { value: "" } });
+      expect(
+        screen.getByLabelText("Property search result count"),
+      ).toHaveTextContent(/^3$/);
+      document.body.removeChild(anchorEl);
+    },
+  );
+
+  it.each(["missing", "failed", "invalid"])(
+    "distinguishes search-count loading from a settled %s count",
+    async (outcome) => {
+      let pending = true;
+      propertyCatalogMock.mockClear();
+      const metric = {
+        name: "customer.plan",
+        property_id: "custom_attribute:customer.plan",
+        category: "custom_attribute",
+        source: "traces",
+        type: "string",
+      };
+      propertyCatalogMock.mockImplementation(({ search = "" }) => ({
+        ...settledPropertyCatalog({ metrics: [metric] }),
+        ...(search
+          ? {
+              categoryCounts: null,
+              categoryCountsExact: false,
+              isLoading: pending,
+              isFetching: pending,
+              isRemoteCatalogSearchPending: pending,
+              isError: !pending && outcome === "failed",
+              cursorChainStopped: !pending && outcome === "invalid",
+              hasNextPage: true,
+            }
+          : {}),
+      }));
+      const { anchorEl, rerenderPanel } = renderPanel({
+        projectId: `search-count-${outcome}`,
+        source: "traces",
+        tab: "trace",
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Property" }));
+      fireEvent.change(screen.getByPlaceholderText("Search properties..."), {
+        target: { value: "customer" },
+      });
+      expect(
+        screen.getByLabelText("All property count loading"),
+      ).toHaveTextContent("…");
+      await waitFor(() =>
+        expect(propertyCatalogMock).toHaveBeenCalledWith(
+          expect.objectContaining({ search: "customer" }),
+        ),
+      );
+      expect(
+        screen.getByLabelText("All property count loading"),
+      ).toHaveAttribute("title", "Loading exact count");
+      pending = false;
+      rerenderPanel();
+      expect(
+        screen.getByLabelText("All property count unavailable"),
+      ).toHaveTextContent("—");
+      expect(
+        screen.queryByLabelText("All property count loading"),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.queryByLabelText("Property search result count"),
+      ).not.toBeInTheDocument();
+      document.body.removeChild(anchorEl);
+    },
+  );
+
+  it("shows loading only until the initial catalog read settles without counts", () => {
+    let pending = true;
+    propertyCatalogMock.mockImplementation(() => ({
+      ...settledPropertyCatalog(),
+      queryProvenance: pending ? null : "current_property_catalog",
+      categoryCounts: null,
+      categoryCountsExact: false,
+      isLoading: pending,
+      isFetching: pending,
+      isSuccess: !pending,
+    }));
+    const { anchorEl, rerenderPanel } = renderPanel({
+      projectId: "initial-count-loading",
+      source: "traces",
+      tab: "trace",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Property" }));
+    expect(
+      screen.getByLabelText("All property count loading"),
+    ).toHaveTextContent("…");
+    pending = false;
+    rerenderPanel();
+    expect(
+      screen.getByLabelText("All property count unavailable"),
+    ).toHaveTextContent("—");
+    document.body.removeChild(anchorEl);
+  });
+
+  it.each(["isError", "isFetchNextPageError", "cursorChainStopped"])(
+    "marks a failed native inventory unavailable: %s",
+    (failure) => {
+      const counts = {
+        all: 5,
+        system_metric: 5,
+        eval_metric: 0,
+        annotation_metric: 0,
+        custom_attribute: 0,
+        custom_column: 0,
+      };
+      propertyCatalogMock.mockImplementation(({ category = "", pageSize }) => ({
+        ...settledPropertyCatalog({ categoryCounts: counts }),
+        queryProvenance: "current_property_catalog",
+        ...(category === "system_metric" &&
+        pageSize === PROPERTY_CATALOG_PAGE_SIZE
+          ? { [failure]: true, isSuccess: false }
+          : {}),
+      }));
+      const { anchorEl } = renderPanel({
+        projectId: `native-count-${failure}`,
+        source: "traces",
+        tab: "trace",
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Property" }));
+      for (const label of ["All", "System"]) {
+        expect(
+          screen.getByLabelText(`${label} property count unavailable`),
+        ).toHaveTextContent("—");
+        expect(
+          screen.queryByLabelText(`${label} property count loading`),
+        ).not.toBeInTheDocument();
+      }
+      expect(screen.getByLabelText("Evals property count")).toHaveTextContent(
+        /^0$/,
+      );
+      document.body.removeChild(anchorEl);
+    },
+  );
+
+  it.each(["eval", "annotation", "trace"])(
+    "keeps name-only %s search counts aligned with eligible rows across categories",
+    async (search) => {
+      const native = [
+        ["trace_count", "number"],
+        ["start_time", "datetime"],
+        ["has_eval", "boolean"],
+        ["latency", "number"],
+      ].map(([name, type]) => ({
+        name,
+        type,
+        category: "system_metric",
+        source: "traces",
+        property_id: `system_attribute:traces:${name}`,
+      }));
+      const dynamic = [
+        ["eval_quality", "eval_metric"],
+        ["quality", "eval_metric"],
+        ["annotation_feedback", "annotation_metric"],
+        ["feedback", "annotation_metric"],
+        ["trace_quality", "eval_metric"],
+        ["trace_feedback", "annotation_metric"],
+      ].map(([display_name, category], index) => ({
+        name: `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+        display_name,
+        category,
+        source: category === "eval_metric" ? "all" : "both",
+        type: "string",
+        property_id: `${category}:${index}`,
+      }));
+      propertyCatalogMock.mockImplementation(
+        ({ category = "", search: query = "", pageSize }) => {
+          // The backend contract matches actual names, not source/family labels.
+          const matching = [...native, ...dynamic].filter(
+            ({ name, display_name = "" }) =>
+              name.includes(query) || display_name.includes(query),
+          );
+          const counts = {
+            all: matching.length,
+            system_metric: 0,
+            eval_metric: 0,
+            annotation_metric: 0,
+            custom_attribute: 0,
+            custom_column: 0,
+          };
+          for (const metric of matching) counts[metric.category] += 1;
+          return {
+            ...settledPropertyCatalog({
+              metrics:
+                category === "system_metric" &&
+                pageSize === PROPERTY_CATALOG_PAGE_SIZE
+                  ? native
+                  : matching.filter(
+                      (metric) => !category || metric.category === category,
+                    ),
+              categoryCounts: counts,
+            }),
+            queryProvenance: "current_property_catalog",
+          };
+        },
+      );
+      const { anchorEl } = renderPanel({
+        projectId: `family-name-${search}`,
+        source: "traces",
+        tab: "trace",
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Property" }));
+      fireEvent.change(screen.getByPlaceholderText("Search properties..."), {
+        target: { value: search },
+      });
+      await waitFor(() =>
+        expect(screen.getByLabelText("All property count")).toBeInTheDocument(),
+      );
+      const total = screen.getByLabelText("All property count").textContent;
+      for (const label of ["All", "Evals", "Annotations", "System", "All"]) {
+        fireEvent.click(screen.getByText(label));
+        expect(
+          screen.getByLabelText("Property search result count"),
+        ).toHaveTextContent(
+          new RegExp(
+            `^${document.querySelectorAll("[data-filter-property-option]").length}$`,
+          ),
+        );
+        expect(screen.getByLabelText("All property count")).toHaveTextContent(
+          total,
+        );
+      }
+      expect(
+        document.querySelector('[data-filter-property-option="trace_count"]'),
+      ).not.toBeInTheDocument();
+      for (const category of ["eval", "annotation"]) {
+        const expected = dynamic.filter(
+          (metric) =>
+            metric.category === `${category}_metric` &&
+            metric.display_name.includes(search),
+        );
+        const options = document.querySelectorAll(
+          `[data-filter-property-category="${category}"]`,
+        );
+        expect(
+          [...options].map((option) => option.dataset.filterPropertyOption),
+        ).toEqual(expected.map(({ name }) => name));
+      }
+      document.body.removeChild(anchorEl);
+    },
+  );
+
+  it.each(["trace", "voiceCalls"])(
+    "retains partial-template-matched native eval rows and paginated counts on %s",
+    async (tab) => {
+      let nextPageLoaded = false;
+      const metrics = ["Release gate", "Staging gate"].map(
+        (display_name, index) => ({
+          name: `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+          property_id: `eval_config:${index}`,
+          display_name,
+          eval_template_id: "safety-template",
+          category: "eval_metric",
+          source: "all",
+          sources: ["eval", "all"],
+          type: "number",
+          output_type: "SCORE",
+        }),
+      );
+      const fetchNextPage = vi.fn(() => {
+        nextPageLoaded = true;
+        return Promise.resolve();
+      });
+      propertyCatalogMock.mockImplementation(
+        ({ category = "", search = "" }) => {
+          // Matching template names are not repeated in the metric's display_name.
+          const matches = !search || "Safety".toLowerCase().includes(search);
+          const metricsMatchCategory = !category || category === "eval_metric";
+          return {
+            ...settledPropertyCatalog({
+              metrics:
+                matches && metricsMatchCategory
+                  ? metrics.slice(0, nextPageLoaded ? 2 : 1)
+                  : [],
+            }),
+            queryProvenance: "current_property_catalog",
+            categoryCounts: category
+              ? null
+              : {
+                  all: matches ? 2 : 0,
+                  system_metric: 0,
+                  eval_metric: matches ? 2 : 0,
+                  annotation_metric: 0,
+                  custom_attribute: 0,
+                  custom_column: 0,
+                },
+            categoryCountsExact: !category,
+            hasNextPage: matches && metricsMatchCategory && !nextPageLoaded,
+            continuationKey: "native-eval-next",
+            fetchNextPage,
+          };
+        },
+      );
+      const { anchorEl, rerenderPanel } = renderPanel({
+        projectId: `template-match-${tab}`,
+        source: "traces",
+        tab,
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Property" }));
+      fireEvent.change(screen.getByPlaceholderText("Search properties..."), {
+        target: { value: "saf" },
+      });
+      await waitFor(() =>
+        expect(screen.getByLabelText("All property count")).toHaveTextContent(
+          /^2$/,
+        ),
+      );
+      expect(
+        document.querySelectorAll("[data-filter-property-option]"),
+      ).toHaveLength(1);
+      expect(screen.getByText("Release gate")).toBeInTheDocument();
+      expect(
+        document.querySelector('[data-filter-property-option="annotator"]'),
+      ).not.toBeInTheDocument();
+      fireEvent.click(screen.getByText("Evals"));
+      expect(
+        screen.getByLabelText("Property search result count"),
+      ).toHaveTextContent(/^2$/);
+      triggerPropertyPageIntersection();
+      await waitFor(() => expect(fetchNextPage).toHaveBeenCalledOnce());
+      rerenderPanel();
+      expect(
+        document.querySelectorAll("[data-filter-property-option]"),
+      ).toHaveLength(2);
+      expect(screen.getByText("Staging gate")).toBeInTheDocument();
+      expect(screen.getByLabelText("All property count")).toHaveTextContent(
+        /^2$/,
+      );
+      fireEvent.click(screen.getByText("Annotations"));
+      expect(
+        document.querySelectorAll("[data-filter-property-option]"),
+      ).toHaveLength(0);
+      expect(
+        screen.getByLabelText("Property search result count"),
+      ).toHaveTextContent(/^0$/);
+      fireEvent.click(screen.getByText("All"));
+      fireEvent.change(screen.getByPlaceholderText("Search properties..."), {
+        target: { value: "other" },
+      });
+      expect(screen.queryByText("Release gate")).not.toBeInTheDocument();
+      await waitFor(() =>
+        expect(screen.getByLabelText("All property count")).toHaveTextContent(
+          /^0$/,
+        ),
+      );
+      document.body.removeChild(anchorEl);
+    },
+  );
+
+  it("keeps synthetic Annotator text-filtered beside backend annotation matches", async () => {
+    const label = {
+      name: "00000000-0000-4000-8000-000000000001",
+      property_id: "annotation:00000000-0000-4000-8000-000000000001",
+      display_name: "Feedback",
+      category: "annotation_metric",
+      source: "both",
+      sources: ["annotation", "datasets", "traces"],
+      type: "categorical",
+      output_type: "categorical",
+    };
+    propertyCatalogMock.mockImplementation(({ category = "", search = "" }) => {
+      const labelMatches = label.display_name.toLowerCase().includes(search);
+      return {
+        ...settledPropertyCatalog({
+          metrics:
+            labelMatches && (!category || category === "annotation_metric")
+              ? [label]
+              : [],
+        }),
+        queryProvenance: "current_property_catalog",
+        categoryCounts: category
+          ? null
+          : {
+              all: labelMatches ? 1 : 0,
+              system_metric: 0,
+              eval_metric: 0,
+              annotation_metric: labelMatches ? 1 : 0,
+              custom_attribute: 0,
+              custom_column: 0,
+            },
+        categoryCountsExact: !category,
+      };
+    });
+    const { anchorEl } = renderPanel({
+      projectId: "synthetic-annotator-text-filter",
+      source: "traces",
+      tab: "trace",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Property" }));
+    fireEvent.click(screen.getByText("Annotations"));
+    fireEvent.change(screen.getByPlaceholderText("Search properties..."), {
+      target: { value: "feed" },
+    });
+    await waitFor(() =>
+      expect(
+        screen.getByLabelText("Annotations property count"),
+      ).toHaveTextContent(/^1$/),
+    );
+    expect(screen.getByText("Feedback")).toBeInTheDocument();
+    expect(
+      document.querySelector('[data-filter-property-option="annotator"]'),
+    ).not.toBeInTheDocument();
+    expect(
+      document.querySelectorAll("[data-filter-property-option]"),
+    ).toHaveLength(1);
+    fireEvent.change(screen.getByPlaceholderText("Search properties..."), {
+      target: { value: "annotator" },
+    });
+    await waitFor(() =>
+      expect(
+        screen.getByLabelText("Annotations property count"),
+      ).toHaveTextContent(/^1$/),
+    );
+    expect(
+      document.querySelector('[data-filter-property-option="annotator"]'),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Feedback")).not.toBeInTheDocument();
+    expect(
+      screen.getByLabelText("Property search result count"),
+    ).toHaveTextContent(/^1$/);
     document.body.removeChild(anchorEl);
   });
 

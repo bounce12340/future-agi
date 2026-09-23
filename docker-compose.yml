@@ -239,7 +239,8 @@ services:
   clickhouse-cdc-bootstrap:
     <<: *backend-bootstrap
     entrypoint: ["python", "-m", "tracer.services.clickhouse.oss_cdc_install"]
-    command: ["--phase", "cdc", "--apply", "--wait-for-mirrors", "--timeout", "900"]
+    command:
+      ["--phase", "cdc", "--apply", "--wait-for-mirrors", "--timeout", "900"]
     environment:
       <<: *catalog-bootstrap-env
     depends_on:
@@ -760,6 +761,12 @@ services:
       FI_PG_READ_DATABASE: ${PG_DB:-futureagi}
       FI_PG_READ_USER: ${PG_USER:-futureagi}
       FI_PG_READ_PASSWORD: ${PG_PASSWORD:-futureagi}
+      # Standard pgx/libpq TLS options. Mount any referenced certificates
+      # read-only in a deployment override; remote databases need verify-full.
+      PGSSLMODE: ${PGSSLMODE:-prefer}
+      PGSSLROOTCERT: ${PGSSLROOTCERT:-}
+      PGSSLCERT: ${PGSSLCERT:-}
+      PGSSLKEY: ${PGSSLKEY:-}
       FI_AUTH_REDIS_ADDR: redis:6379
       FI_GRPC_ADDR: ":4317"
       # OTLP/HTTP receiver — needed by browser SDKs + lightweight clients.
@@ -991,7 +998,11 @@ services:
         mc mb --ignore-existing myminiopeerdb/peerdbbucket
         wait "$${server_pid}"
     healthcheck:
-      test: ["CMD-SHELL", "mc ready myminiopeerdb && mc stat myminiopeerdb/peerdbbucket >/dev/null"]
+      test:
+        [
+          "CMD-SHELL",
+          "mc ready myminiopeerdb && mc stat myminiopeerdb/peerdbbucket >/dev/null",
+        ]
       interval: 5s
       timeout: 5s
       retries: 30
@@ -1005,7 +1016,19 @@ services:
     # The pinned image includes BusyBox wget. GET /v1/version traverses the
     # HTTP gateway and RPC handler; this is API availability, not CDC readiness.
     healthcheck:
-      test: ["CMD", "wget", "-q", "-T", "3", "-Y", "off", "-O", "/dev/null", "http://127.0.0.1:8113/v1/version"]
+      test:
+        [
+          "CMD",
+          "wget",
+          "-q",
+          "-T",
+          "3",
+          "-Y",
+          "off",
+          "-O",
+          "/dev/null",
+          "http://127.0.0.1:8113/v1/version",
+        ]
       interval: 5s
       timeout: 5s
       retries: 30
@@ -1072,7 +1095,8 @@ services:
 
   peerdb-temporal-init:
     <<: *backend-bootstrap
-    entrypoint: ["python", "-m", "tracer.services.clickhouse.oss_peerdb_temporal"]
+    entrypoint:
+      ["python", "-m", "tracer.services.clickhouse.oss_peerdb_temporal"]
     command: ["--apply"]
     environment:
       <<: *backend-env

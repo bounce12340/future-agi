@@ -550,9 +550,19 @@ def definitions(tenant, **query):
     )
 
 
-@pytest.mark.parametrize("search", ["", "matching", "unmatched"])
+@pytest.mark.parametrize(
+    "search,eval_count,annotation_count",
+    [
+        ("", 1, 1),
+        ("matching", 1, 1),
+        ("unmatched", 0, 0),
+        ("eval", 1, 0),
+        ("annotation", 0, 1),
+        ("trace", 0, 0),
+    ],
+)
 def test_native_section_counts_match_full_search_and_exclude_other_tenants(
-    current_tenant, search
+    current_tenant, search, eval_count, annotation_count
 ):
     from model_hub.models.develop_annotations import AnnotationsLabels
     from model_hub.models.evals_metric import EvalTemplate
@@ -589,7 +599,7 @@ def test_native_section_counts_match_full_search_and_exclude_other_tenants(
     AnnotationsLabels.no_workspace_objects.bulk_create(
         [
             AnnotationsLabels(
-                name="matching label",
+                name="matching annotation label",
                 type="categorical",
                 organization=t.organization,
                 workspace=t.workspace,
@@ -611,9 +621,8 @@ def test_native_section_counts_match_full_search_and_exclude_other_tenants(
     all_matches = source.read_page(scope=t.scope, query=query, after=None, limit=1000)
     for category, count in counts.items():
         assert count == sum(d.category == category for d in all_matches)
-    assert (
-        counts["eval_metric"] == counts["annotation_metric"] == (search != "unmatched")
-    )
+    assert counts["eval_metric"] == eval_count
+    assert counts["annotation_metric"] == annotation_count
     assert counts["custom_column"] == counts["custom_attribute"] == 0
     assert (
         source.category_counts(scope=t.scope, query={**query, "role": "dimension"})[
@@ -621,6 +630,34 @@ def test_native_section_counts_match_full_search_and_exclude_other_tenants(
         ]
         == 0
     )
+
+
+def test_native_read_statement_timeout_restores_connection(current_tenant):
+    from django.db import OperationalError, connection
+
+    from tracer.services.clickhouse.read_budget import ReadDeadline
+    from tracer.services.clickhouse.v2.property_catalog.source_adapters import (
+        CurrentDefinitionSource,
+    )
+
+    if connection.vendor != "postgresql":
+        pytest.skip("requires PostgreSQL statement_timeout")
+    with connection.cursor() as cursor:
+        cursor.execute("SHOW statement_timeout")
+        prior = cursor.fetchone()[0]
+    source = CurrentDefinitionSource(ReadDeadline.start(100))
+
+    def slow_read():
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_sleep(1)")
+
+    with pytest.raises(OperationalError, match="statement timeout"):
+        source._read(slow_read)
+    with connection.cursor() as cursor:
+        cursor.execute("SHOW statement_timeout")
+        assert cursor.fetchone()[0] == prior
+        cursor.execute("SELECT 1")
+        assert cursor.fetchone()[0] == 1
 
 
 def test_live_native_options_updates_and_soft_deletes_without_clickhouse(
@@ -1324,6 +1361,7 @@ def test_real_clickhouse_grouped_observed_index_and_scoped_keysets():
 
             req = _request(
                 project_ids=[PROJECT],
+                category="",
                 search="",
                 page_size=1,
                 property_id="custom_attribute:key",

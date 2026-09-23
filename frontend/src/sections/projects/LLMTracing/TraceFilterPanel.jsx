@@ -973,6 +973,7 @@ export function filterPropertiesForPicker({
   category = "all",
   search = "",
   hasCategorySidebar = true,
+  catalogSearchMatches = [],
 }) {
   const rawQuery = String(search || "").trim();
   const query = normalizePropertySearchText(search);
@@ -990,6 +991,18 @@ export function filterPropertiesForPicker({
     list,
     rawQuery,
   );
+  // Native relational search also matches template names that are not in the
+  // returned display label. Keep those server-matched rows, while synthetic
+  // Annotator and local System aliases still have to match the visible search.
+  const nativeSearchIdentities = new Set(
+    catalogSearchMatches
+      .filter(
+        (property) =>
+          ["eval", "annotation"].includes(property.category) &&
+          !property.catalogSearchFallback,
+      )
+      .map(queryPropertyIdentity),
+  );
   const fuzzyMatches = list.filter((property) => {
     const name = normalizePropertySearchText(property.name);
     const id = normalizePropertySearchText(property.id);
@@ -999,7 +1012,12 @@ export function filterPropertiesForPicker({
       ...(property.searchAliases || []),
       ...(property.dynamicAliases || []),
     ].some((alias) => normalizePropertySearchText(alias).includes(query));
-    return name.includes(query) || id.includes(query) || aliases;
+    return (
+      nativeSearchIdentities.has(queryPropertyIdentity(property)) ||
+      name.includes(query) ||
+      id.includes(query) ||
+      aliases
+    );
   });
   // Exact ids and canonical System labels stay first, but All must retain all
   // fuzzy category matches. For example, `cost` must show Cost plus every
@@ -1773,6 +1791,7 @@ function PropertyPicker({
   enableExactAttributeLookup = true,
   unifiedCatalogActive = false,
   isSimulator = false,
+  catalogLoading = false,
   catalogError = false,
   hasNextCatalogPage = false,
   catalogContinuationKey = null,
@@ -2213,11 +2232,43 @@ function PropertyPicker({
         category,
         search,
         hasCategorySidebar,
+        catalogSearchMatches:
+          searchedCatalogOwnsResults && trimmedSearch
+            ? searchedCatalogProperties
+            : [],
       }),
-    [propertiesWithExactAttribute, category, search, hasCategorySidebar],
+    [
+      propertiesWithExactAttribute,
+      category,
+      search,
+      hasCategorySidebar,
+      searchedCatalogOwnsResults,
+      searchedCatalogProperties,
+      trimmedSearch,
+    ],
   );
 
   const counts = useMemo(() => {
+    // Dataset columns are a complete local inventory. Catalog totals (when
+    // supplied) do not describe this picker's client-side text search.
+    if (source === "dataset" && !unifiedCatalogActive && search.trim()) {
+      const matchingProperties = filterPropertiesForPicker({
+        properties: propertiesWithExactAttribute,
+        search,
+      });
+      const localCounts = {
+        all: matchingProperties.length,
+        system: 0,
+        eval: 0,
+        annotation: 0,
+        attribute: 0,
+        dataset: 0,
+      };
+      for (const property of matchingProperties)
+        localCounts[property.category] =
+          (localCounts[property.category] || 0) + 1;
+      return localCounts;
+    }
     const c = { all: propertiesWithExactAttribute.length };
     for (const p of propertiesWithExactAttribute)
       c[p.category] = (c[p.category] || 0) + 1;
@@ -2307,13 +2358,48 @@ function PropertyPicker({
   ]);
   const visibleProperties = filtered.slice(0, visiblePropertyLimit);
   const hiddenCount = Math.max(filtered.length - visiblePropertyLimit, 0);
-  const displayedPropertyCount = unifiedCatalogActive
-    ? counts[hasCategorySidebar ? category : "all"]
-    : search.trim()
-      ? Number.isSafeInteger(counts[category])
-        ? counts[category]
-        : filtered.length
-      : counts.all;
+  const displayedPropertyCount =
+    unifiedCatalogActive || source === "dataset"
+      ? counts[hasCategorySidebar ? category : "all"]
+      : search.trim()
+        ? Number.isSafeInteger(counts[category])
+          ? counts[category]
+          : filtered.length
+        : counts.all;
+  const isCategoryCountLoading = (categoryKey) => {
+    if (!unifiedCatalogActive) {
+      return (
+        ["all", "attribute"].includes(categoryKey) &&
+        Boolean(
+          effectiveAttributeLoading || effectiveIsFetchingNextAttributePage,
+        )
+      );
+    }
+    // Only the search-wide first-page request owns these counts. Loading a
+    // category or continuation page cannot recover omitted count metadata.
+    if (trimmedSearch) {
+      if (unifiedCatalogSearchPending) return true;
+      if (
+        allSearchCatalog.isLoading ||
+        allSearchCatalog.isRemoteCatalogSearchPending
+      )
+        return true;
+    } else if (catalogLoading) {
+      return true;
+    }
+    return Boolean(
+      currentCatalogActive &&
+        effectiveCatalogCategoryCountsExact &&
+        ["all", "system"].includes(categoryKey) &&
+        !systemInventoryComplete &&
+        !systemCatalog.isError &&
+        !systemCatalog.isFetchNextPageError &&
+        !systemCatalog.cursorChainStopped &&
+        (systemCatalog.isLoading ||
+          systemCatalog.isFetching ||
+          systemCatalog.hasNextPage),
+    );
+  };
   const catalogCategoryCanContinue = (
     unifiedCatalogActive
       ? ["all", "system", "eval", "annotation", "attribute"]
@@ -2655,17 +2741,23 @@ function PropertyPicker({
                       <Typography
                         aria-label={
                           counts[cat.key] === null
-                            ? `${cat.label} property count unavailable`
+                            ? `${cat.label} property count ${isCategoryCountLoading(cat.key) ? "loading" : "unavailable"}`
                             : `${cat.label} property count`
                         }
                         title={
                           counts[cat.key] === null
-                            ? "Exact count unavailable"
+                            ? isCategoryCountLoading(cat.key)
+                              ? "Loading exact count"
+                              : "Exact count unavailable"
                             : undefined
                         }
                         sx={{ fontSize: 10, color: "text.disabled" }}
                       >
-                        {counts[cat.key] === null ? "…" : counts[cat.key]}
+                        {counts[cat.key] === null
+                          ? isCategoryCountLoading(cat.key)
+                            ? "…"
+                            : "—"
+                          : counts[cat.key]}
                       </Typography>
                     )}
                   </Box>
@@ -3686,6 +3778,7 @@ function FilterRow({
   enableExactAttributeLookup = true,
   unifiedCatalogActive = false,
   isSimulator = false,
+  catalogLoading = false,
   catalogError = false,
   hasNextCatalogPage = false,
   catalogContinuationKey = null,
@@ -4217,6 +4310,7 @@ function FilterRow({
         enableExactAttributeLookup={enableExactAttributeLookup}
         unifiedCatalogActive={unifiedCatalogActive}
         isSimulator={isSimulator}
+        catalogLoading={catalogLoading}
         catalogError={catalogError}
         hasNextCatalogPage={hasNextCatalogPage}
         catalogContinuationKey={catalogContinuationKey}
@@ -4355,6 +4449,7 @@ const TraceFilterPanel = ({
   const {
     data: dynamicProperties = [],
     isLoading: dynamicPropsLoading,
+    isFetching: isFetchingDynamicProps,
     isError: dynamicPropsError,
     hasNextPage: hasNextDynamicPropsPage,
     continuationKey: dynamicPropsContinuationKey,
@@ -5369,6 +5464,12 @@ const TraceFilterPanel = ({
                   unifiedCatalogActive={unifiedPropertyCatalogActive}
                   catalogQueryProvenance={dynamicPropertyQueryProvenance}
                   isSimulator={isSimulator}
+                  catalogLoading={Boolean(
+                    propsLoading ||
+                      (!skipDynamicProperties &&
+                        isFetchingDynamicProps &&
+                        !isFetchingNextDynamicPropsPage),
+                  )}
                   catalogError={
                     skipDynamicProperties
                       ? externalCatalogError

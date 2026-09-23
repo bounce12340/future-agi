@@ -2486,7 +2486,8 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                     },
                     page_size=query_params["page_size"],
                     cursor_token=query_params.get("cursor"),
-                    include_counts=not query_params.get("cursor"),
+                    include_counts=not query_params.get("cursor")
+                    and not query_params.get("category"),
                 )
             except PropertyCatalogCursorError as exc:
                 return self._gm.custom_error_response(

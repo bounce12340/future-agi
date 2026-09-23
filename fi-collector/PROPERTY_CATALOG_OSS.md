@@ -108,24 +108,37 @@ choices/annotations/tags and observed attribute arrays keep their own contracts.
 
 The collector's PostgreSQL auth endpoint may be supplied either as the legacy
 `FI_PG_WRITE`/`FI_PG_READ` URI or, for new deployments, as separate fields:
-`FI_PG_{WRITE,READ}_{HOST,PORT,DATABASE,USER,PASSWORD}`. The separate form is
+`FI_PG_{WRITE,READ}_{HOST,PORT,DATABASE,USER}` plus an optional `PASSWORD`. The separate form is
 recommended because passwords are never interpolated into a URI by Compose and
-characters such as `%`, `@`, `?`, or whitespace remain unambiguous. If all five
-fields for an endpoint are present they take precedence over its legacy URI;
-incomplete field sets preserve the legacy behavior.
+characters such as `%`, `@`, `?`, or whitespace remain unambiguous. Explicit
+`FI_PG_WRITE`/`FI_PG_READ` connection strings take precedence over complete field
+sets, preserving their TLS options. Any partial or invalid field set fails
+startup, including when a legacy URI is present. Empty/unset passwords use the
+driver's normal password resolution or passwordless authentication.
+
+Separate fields honor the standard `PGSSLMODE` and `PGSSL*` certificate
+environment instead of forcing plaintext. Production/remote databases **must
+explicitly configure `verify-full`** with the appropriate CA and any required
+client certificates, via `PGSSL*` variables or each endpoint's URI options.
+An unset mode retains the libpq-compatible `prefer` default for local
+compatibility, which permits plaintext fallback and is not a secure production
+default. Strict explicit TLS never gains a plaintext fallback. See
+[PostgreSQL authentication configuration](README.md#postgresql-authentication-configuration)
+for precedence, IPv6 syntax and TLS configuration. Root Compose forwards the four
+TLS variables; certificate files still require read-only deployment mounts.
 
 See the repository-root `.env.example` for local defaults.
 
-| Setting | Default / purpose |
-| --- | --- |
-| `PROPERTY_CATALOG_DATABASE` | `property_catalog`; must differ from the source-span database |
-| `PROPERTY_CATALOG_CONSUMER_PASSWORD` | Local writer password |
-| `PROPERTY_CATALOG_API_PASSWORD` | Local reader password |
-| `PROPERTY_CATALOG_KAFKA_PORT` | `29092`, bound to host loopback |
-| `OBSERVED_CATALOG_KAFKA_TOPIC` | `futureagi.observed-attributes.v1` |
-| `OBSERVED_CATALOG_KAFKA_GROUP` | `futureagi.observed-attributes.consumer.v1` |
-| `OBSERVED_CATALOG_MAX_SPOOL_FILES` | `10000` |
-| `OBSERVED_CATALOG_MAX_SPOOL_BYTES` | `536870912` |
+| Setting                              | Default / purpose                                             |
+| ------------------------------------ | ------------------------------------------------------------- |
+| `PROPERTY_CATALOG_DATABASE`          | `property_catalog`; must differ from the source-span database |
+| `PROPERTY_CATALOG_CONSUMER_PASSWORD` | Local writer password                                         |
+| `PROPERTY_CATALOG_API_PASSWORD`      | Local reader password                                         |
+| `PROPERTY_CATALOG_KAFKA_PORT`        | `29092`, bound to host loopback                               |
+| `OBSERVED_CATALOG_KAFKA_TOPIC`       | `futureagi.observed-attributes.v1`                            |
+| `OBSERVED_CATALOG_KAFKA_GROUP`       | `futureagi.observed-attributes.consumer.v1`                   |
+| `OBSERVED_CATALOG_MAX_SPOOL_FILES`   | `10000`                                                       |
+| `OBSERVED_CATALOG_MAX_SPOOL_BYTES`   | `536870912`                                                   |
 
 Collector/consumer process variables use the `FI_OBSERVED_CATALOG_` prefix.
 The producer uses `MODE=kafka`, `KAFKA_BROKERS`, `KAFKA_TOPIC`, and

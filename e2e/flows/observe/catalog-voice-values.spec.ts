@@ -636,7 +636,9 @@ test('OBS-E2E-008: native and custom voice filters select only the current proje
         await page.getByRole('button', { name: 'Property', exact: true }).first().click();
       }, { timeout: UI_READY });
       const checkPropertySearch = async (searchMark: number, name: string) => {
-        const matching = (c: Capture) => (c.query.search ?? '') === name;
+        // Category-count requests share this endpoint/search but are not the
+        // All picker request whose complete wire and response we assert below.
+        const matching = (c: Capture) => c.query.category === undefined && (c.query.search ?? '') === name;
         const response = await readCapture(searchMark, METRICS, matching); // Fresh only; no cache fallback.
         for (const c of captures.slice(searchMark).filter(c => c.document === document && c.path === METRICS && matching(c))) {
           expect(c.method).toBe('POST'); expect(c.credential).toBe(openScope.credential);
@@ -657,7 +659,8 @@ test('OBS-E2E-008: native and custom voice filters select only the current proje
         return response;
       };
       // Do not cancel a captured initial page by typing before its response settles.
-      if (captures.some(c => c.document === document && c.path === METRICS && (c.query.search ?? '') === ''))
+      if (captures.some(c => c.document === document && c.path === METRICS &&
+        c.query.category === undefined && (c.query.search ?? '') === ''))
         await checkPropertySearch(0, '');
       const completePropertySearch = async (name: string, category: 'system' | 'attribute', visible = true) => {
         const searchMark = captures.length;

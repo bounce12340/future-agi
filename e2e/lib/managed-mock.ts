@@ -64,7 +64,11 @@ export function validateMockEnvironment(service: string, env: Record<string, str
     if (!value) continue;
     requireSafe(!/^(https?_proxy|all_proxy|node_options|ld_preload|pythonpath|pythonstartup)$/i.test(key),
       `${service} has a proxy/preload override`);
-    if (key.startsWith('AGENTCC_')) requireSafe(allowed[key] === value, `${service} has an unsupported gateway override`);
+    // The E2E backend enables webhook authentication; the worker may leave it
+    // unset. This dummy secret grants no provider route or credential override.
+    if (key.startsWith('AGENTCC_')) requireSafe(allowed[key] === value ||
+      (key === 'AGENTCC_WEBHOOK_SECRET' && value === 'e2e-agentcc-webhook-secret'),
+    `${service} has an unsupported gateway override`);
     if (/_API_KEY$/.test(key) || ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY'].includes(key)) {
       requireSafe(value === MOCK_KEY || value === 'e2e-mock', `${service} has a non-mock provider key`);
     }
