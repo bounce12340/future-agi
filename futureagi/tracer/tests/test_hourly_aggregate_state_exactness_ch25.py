@@ -38,13 +38,18 @@ from tracer.views.dashboard import _read_dashboard_rollup_fast_path
 
 pytestmark = pytest.mark.integration
 
-# Ports the operator forwards a remote ClickHouse onto. This module issues
-# DDL, so it refuses them outright instead of defaulting to one.
+# Ports an operator host forwards a remote ClickHouse onto. This module issues
+# DDL, so off CI it refuses them outright instead of defaulting to one. On
+# GitHub Actions there is no forward, and 19000 is the native port
+# ``docker-compose.test.yml`` publishes for the job's own ClickHouse.
 _FORWARDED_PORTS = frozenset({19010, 19000, 19001, 19002, 18230, 18231, 18232})
+_ON_GITHUB_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
 
 CH_HOST = os.environ.get("CH25_HOST", "127.0.0.1")
-CH_NATIVE_PORT_TEXT = os.environ.get("CH25_NATIVE_PORT") or os.environ.get(
-    "CH_NATIVE_PORT"
+CH_NATIVE_PORT_TEXT = (
+    os.environ.get("CH25_NATIVE_PORT")
+    or os.environ.get("CH_NATIVE_PORT")
+    or ("19000" if _ON_GITHUB_ACTIONS else None)
 )
 CH_USER = os.environ.get("CH25_USER") or os.environ.get("CH_USERNAME") or "default"
 CH_PASSWORD = os.environ.get("CH25_PASSWORD") or os.environ.get("CH_PASSWORD") or ""
@@ -140,7 +145,7 @@ def _native_port() -> int:
     if not CH_NATIVE_PORT_TEXT:
         pytest.skip("CH25_NATIVE_PORT / CH_NATIVE_PORT is not set")
     port = int(CH_NATIVE_PORT_TEXT)
-    assert port not in _FORWARDED_PORTS, (
+    assert _ON_GITHUB_ACTIONS or port not in _FORWARDED_PORTS, (
         f"refusing to run ClickHouse DDL on forwarded port {port}"
     )
     return port
