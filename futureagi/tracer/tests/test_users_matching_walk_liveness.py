@@ -40,6 +40,7 @@ from tracer.tests.test_users_matching_walk import (
     WINDOW_START,
     Engine,
     World,
+    _filters,
     _from_us,
     _manager,
     _names,
@@ -233,12 +234,14 @@ class _CappedEngine(Engine):
         batch_limit: int | None = None,
         clock: _Clock | None = None,
         slice_ms: Callable[[timedelta, bool], float] | None = None,
+        instant_ms: float = 1.0,
     ) -> None:
         super().__init__(world)
         self.heavy = heavy
         self.batch_limit = batch_limit
         self.clock = clock
         self.slice_ms = slice_ms
+        self.instant_ms = instant_ms
         self.replays: list[tuple[tuple[str, ...], bool, bool]] = []
         # Per replay: ms into the request when it was sent, rows it returned.
         self.replay_info: list[tuple[float, int]] = []
@@ -309,7 +312,7 @@ class _CappedEngine(Engine):
         )
         if kind == "replay":
             self.replay_info[-1] = (self.replay_info[-1][0], len(result.data or ()))
-        cost = 1.0
+        cost = self.instant_ms if kind == "instant" else 1.0
         if kind == "slice":
             width = TICK * (params["slice_end_us"] - params["slice_start_us"])
             if self.slice_ms is not None:
@@ -331,6 +334,12 @@ def _every_slice(ms: float) -> Callable[[timedelta, bool], float]:
     """Every slice that returns rows costs ``ms``; an empty one, 1 ms."""
 
     return lambda _width, rows: ms if rows else 1.0
+
+
+def _any_per_hour(ms: float) -> Callable[[timedelta, bool], float]:
+    """Every slice, rows or none, costs ``ms`` per hour of its width."""
+
+    return lambda width, _rows: max(1.0, ms * width / timedelta(hours=1))
 
 
 def _per_hour(ms: float) -> Callable[[timedelta, bool], float]:
@@ -943,8 +952,12 @@ def test_a_slice_that_outlasts_the_page_wall_still_decides_its_first_batch():
     assert hops <= 6
 
 
-def _stopped_slice_hops(world, slice_ms, max_hops):
-    """Every request, on the scripted clock: ``(names, slices)`` per hop."""
+def _stopped_slice_hops(world, slice_ms, max_hops, reasons=None, filters=None):
+    """Every request, on the scripted clock: ``(names, slices)`` per hop.
+
+    ``reasons``, when given, collects every uncapped slice's logged reason;
+    ``filters`` replaces the page's (a narrower window, say).
+    """
 
     clock = _Clock()
     hops = []
@@ -953,13 +966,18 @@ def _stopped_slice_hops(world, slice_ms, max_hops):
         for _hop in range(max_hops):
             engine = _CappedEngine(world, clock=clock, slice_ms=slice_ms)
             with capture_logs() as logs:
-                read, _engine = _page(world, page_size=25, cursor=cursor, engine=engine)
+                read, _engine = _page(
+                    world, page_size=25, cursor=cursor, engine=engine, filters=filters
+                )
+            logged = _logged(logs, "users_matching_walk_uncapped_slice")
             _check_uncapped_slices(
                 engine.slices,
-                _logged(logs, "users_matching_walk_uncapped_slice"),
+                logged,
                 slice_at=engine.slice_at,
                 finish_wall_ms=walk.USER_LIST_WALK_FINISH_WALL_MS,
             )
+            if reasons is not None:
+                reasons.extend(logged)
             hops.append((_names(read), engine.slices))
             if not read.has_more:
                 return hops
@@ -1009,6 +1027,72 @@ def test_a_slice_that_outlasts_its_cap_only_when_wide_is_narrowed_not_uncapped()
     slices = [entry for _names_, hop in hops for entry in hop]
     assert any(stopped for _width, _cap, stopped in slices)
     assert all(cap is not None for _width, cap, _stopped in slices)
+
+
+def test_slices_slow_even_when_empty_still_end():
+    """Every slice costs 40 s an hour, empty or not; the users are 90 minutes back.
+
+    A request that has decided nothing narrows its stopped slices and walks
+    the empty ones below them against the analytics wall, until a slice of
+    the least width is stopped; then it reads its head-of-line slice once
+    without a cap and stops, having moved its coverage down past everything
+    it read: about ten minutes a request here, the slow-slice cost left as
+    a follow-up. In a two-hour window the list ends, each user once, in
+    order.
+    """
+    world = World()
+    for n, minutes in enumerate((90, 100, 110), start=1):
+        moment = minutes_before_end(minutes)
+        world.user(n, key=moment, raw=(moment,))
+    reasons: list[str] = []
+    two_hours = _filters(window_start=WINDOW_END - timedelta(hours=2))
+
+    hops = _stopped_slice_hops(
+        world, _any_per_hour(40_000), 40, reasons, filters=two_hours
+    )
+
+    assert [name for names, _slices in hops for name in names] == [
+        "user-1",
+        "user-2",
+        "user-3",
+    ]
+    assert set(reasons) == {"narrowest_stopped"}, reasons
+
+
+def test_a_search_that_spent_the_analytics_wall_reads_its_head_slice_uncapped():
+    """The server was unreachable; then the open instant took the whole 30 s.
+
+    The first request fails in the transport and leaves the cursor where it
+    was, with its instant open. The next request's instant read takes the
+    whole analytics wall before any slice, so no capped slice can be
+    admitted: the request reads its head-of-line slice without a cap
+    (``wall_spent``), one least width below the coverage, and decides the
+    user there.
+    """
+    world = World()
+    world.user(1, key=minutes_before_end(0.5), raw=(minutes_before_end(0.5),))
+    expected = ["user-1"]
+    clock = _Clock()
+    with _shipped_walls(), _scripted_clock(clock):
+        down = _CappedEngine(world, clock=clock)
+        down.outage = True
+        first, _engine = _page(world, page_size=25, engine=down)
+        assert first.payload["table"] == [] and first.checkpoint_order[4] is True
+        slow = _CappedEngine(world, clock=clock, instant_ms=30_000)
+        with capture_logs() as logs:
+            read, _engine = _page(
+                world, page_size=25, cursor=_signed_cursor(first), engine=slow
+            )
+
+    reasons = _logged(logs, "users_matching_walk_uncapped_slice")
+    assert reasons == ["wall_spent"]
+    _check_uncapped_slices(
+        slow.slices,
+        reasons,
+        slice_at=slow.slice_at,
+        finish_wall_ms=walk.USER_LIST_WALK_FINISH_WALL_MS,
+    )
+    assert _names(read) == expected
 
 
 def test_a_stopped_slice_at_the_window_start_is_read_at_what_is_left():
