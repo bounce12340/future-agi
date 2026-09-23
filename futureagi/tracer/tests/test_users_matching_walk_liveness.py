@@ -182,12 +182,16 @@ def _follow(
     Every hop must keep the coverage where it was or lower it, stay inside
     the statement budget, and send at most one replay without a server cap,
     for one user, right after a capped replay it led was stopped. In a
-    static world a repeated ``(cursor, seen rows)`` is a livelock.
+    static world a repeated ``(cursor, seen rows)`` is a livelock, and no two
+    hops in a row may both make no progress: publish a user, lower the
+    coverage, or lower the decided position.
     """
     budget = max_statements or walk.USER_LIST_WALK_MAX_STATEMENTS
     names: list[str] = []
     seen_states: set = set()
     coverage = WINDOW_END
+    position: tuple = (None, None)
+    stalled = False
     cursor = None
     for hop in range(1, max_hops + 1):
         engine = _CappedEngine(world, heavy)
@@ -199,15 +203,30 @@ def _follow(
             return names, hop
         order = tuple(read.checkpoint_order)
         assert order[3] <= coverage, f"coverage moved up at hop {hop}: {order}"
-        coverage = order[3]
         if mutate is None:
             state = (order, read.seen_rows)
             assert state not in seen_states, f"livelock at hop {hop}: {state}"
             seen_states.add(state)
+            progressed = (
+                bool(_names(read))
+                or order[3] < coverage
+                or _lower_position(order[1:3], position)
+            )
+            assert progressed or not stalled, f"two hops without progress at {hop}"
+            stalled = not progressed
+        coverage, position = order[3], order[1:3]
         cursor = _signed_cursor(read)
         if mutate is not None:
             mutate(world, set(names))
     raise AssertionError(f"no end after {max_hops} hops; published {len(names)}")
+
+
+def _lower_position(new: tuple, old: tuple) -> bool:
+    """Whether cursor position ``(last_key, last_id)`` ``new`` is below ``old``."""
+
+    if new[0] is None:
+        return False
+    return old[0] is None or tuple(new) < tuple(old)
 
 
 # --------------------------------------------------------------------------

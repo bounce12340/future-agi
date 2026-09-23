@@ -81,11 +81,13 @@ re-discovered published user at the enrichment step, before any replay, and
 inside an instant it names the lowest decided position, published or not.
 ``open_instant`` (present only when true; a four-element cursor is read as
 false) tells the next request to decide the instant just below ``coverage``
-first, from ``last_id`` when ``last_key`` is that instant. A user whose key
+first, from ``last_id`` when ``last_key`` is that instant; a request sets it
+when it ends inside an instant, or stops where a raw restart would find the
+same users again (the checkpoint's comment says when). A user whose key
 is at or above the coverage a request resumed from was decided before it,
 published or rejected by its replay, so it is never pending again however a
 lower row witnesses it, and no cursor's coverage rises above the one it
-resumed from: each request decides something new or moves down.
+resumed from.
 """
 
 from __future__ import annotations
@@ -1114,23 +1116,33 @@ def walk_matching_activity_page(
         boundary_time = _boundary_time(boundary)
         anchors = [*keys, *([boundary_time] if boundary_time is not None else [])]
         next_coverage = max(anchors) + _TICK if anchors else window_start
+        # Never above the coverage this request resumed from: everything at
+        # or after it was decided before, so restating it is exact, and a
+        # cursor that moved back up would repeat its hops.
+        next_coverage = min(next_coverage, state.decided_from)
         last_key, last_id = state.last_key, state.last_id
         position = _instant_position(state) if state.instant is not None else None
         if position is not None:
             last_key, last_id = state.instant, position
-        checkpoint = (
-            USER_LIST_MATCHING_CURSOR_ORDER,
-            last_key,
-            last_id,
-            # Never above the coverage this request resumed from: everything
-            # at or after it was decided before, so restating it is exact,
-            # and a cursor that moved back up would repeat its hops.
-            min(next_coverage, state.decided_from),
+        checkpoint = (USER_LIST_MATCHING_CURSOR_ORDER, last_key, last_id, next_coverage)
+        # An instant left undecided resumes by deciding the instant below
+        # ``coverage`` in resolved order, and so does a walk its budget
+        # stopped where a raw restart would find the same users again: at
+        # the coverage it resumed from, or with users it certified at the new
+        # coverage's instant (a tie there larger than a request would stall
+        # it). Any other stop moved the coverage, and resumes with a raw
+        # slice, which costs no instant statement; were that request to stop
+        # without moving the coverage, it would open the instant then. A
+        # request that opens the instant decides a user there, exhausts it,
+        # or publishes, so in a fixed world no two requests in a row make no
+        # progress.
+        certified_there = any(
+            entry.order_key == next_coverage - _TICK
+            for entry in state.certified.values()
         )
-        # An instant left undecided, or a walk its budget stopped, resumes by
-        # deciding the instant below ``coverage`` in resolved order: a raw
-        # restart there would rediscover the same tied prefix and stall.
-        if state.instant is not None or state.stopped:
+        if state.instant is not None or (
+            state.stopped and (next_coverage == state.decided_from or certified_there)
+        ):
             checkpoint = (*checkpoint, True)
     if state.stopped:
         logger.info(
