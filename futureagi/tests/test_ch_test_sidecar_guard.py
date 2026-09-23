@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
+import clickhouse_connect
 import clickhouse_driver
 import pytest
 from clickhouse_driver.errors import ServerException
@@ -19,9 +21,11 @@ from clickhouse_driver.errors import ServerException
 from conftest import (
     _FORWARDED_CH_PORTS,
     UnsafeClickHouseTestTarget,
+    _ch_test_http_port,
     _ch_test_native_client,
     _ch_test_native_port,
     _ch_test_owned_database,
+    _open_ch_test_http_client,
     _open_ch_test_native_client,
 )
 
@@ -30,6 +34,8 @@ pytestmark = pytest.mark.unit
 _IDENTITY_STATEMENT = "SELECT getMacro('replica')"
 _OPT_IN = "FI_CH_TEST_SIDECAR_NATIVE_PORT"
 _GENERAL = ("CH25_NATIVE_PORT", "CH25_TCP_PORT", "CH_NATIVE_PORT")
+_HTTP_OPT_IN = "FI_CH_TEST_SIDECAR_HTTP_PORT"
+_HTTP_GENERAL = ("CH25_HTTP_PORT", "CH_HTTP_PORT")
 _SIDECAR_ANSWER = [("test-01",)]
 _FOREIGN_ANSWERS = pytest.mark.parametrize(
     "replica_answer",
@@ -44,11 +50,18 @@ _FOREIGN_ANSWERS = pytest.mark.parametrize(
 # Every module that opens a live ClickHouse client to issue DDL or INSERTs.
 _FUTUREAGI = Path(__file__).resolve().parents[1]
 _LIVE_MODULES = (
+    "model_hub/tests/test_bulk_selection_bounded_ch25.py",
+    "model_hub/tests/test_eval_usage_clickhouse_selector.py",
+    "tracer/tests/test_bounded_filter_key_ch25.py",
+    "tracer/tests/test_ch25_typed_json_roundtrip.py",
+    "tracer/tests/test_eval_status_reads_ch25.py",
     "tracer/tests/test_hourly_aggregate_state_exactness_ch25.py",
+    "tracer/tests/test_score_filter_hard_tombstone_ch25.py",
     "tracer/tests/test_trace_conjunction_seed_gate_ch25.py",
     "tracer/tests/test_users_matching_walk_ch25.py",
     "tracer/tests/test_users_matching_walk_differential_ch25.py",
     "tracer/tests/test_users_seeded_page_read_settings_ch25.py",
+    "tracer/tests/test_voice_trace_detail_bounded_ch25.py",
 )
 
 
@@ -276,6 +289,123 @@ def test_client_options_pass_through(recording_clients):
     }
 
 
+class _RecordingHttpClient:
+    def __init__(self, log, replica_answer, kwargs):
+        self._log = log
+        self._replica_answer = replica_answer
+        self.kwargs = kwargs
+        self.closes = 0
+
+    def query(self, statement, *args, **kwargs):
+        self._log.append(statement)
+        if statement == _IDENTITY_STATEMENT:
+            if isinstance(self._replica_answer, Exception):
+                raise self._replica_answer
+            return SimpleNamespace(result_rows=self._replica_answer)
+        return SimpleNamespace(result_rows=[])
+
+    def close(self):
+        self.closes += 1
+
+
+class _RecordingHttpClients:
+    """Stands in for ``clickhouse_connect.get_client``."""
+
+    def __init__(self, replica_answer):
+        self.replica_answer = replica_answer
+        self.clients: list[_RecordingHttpClient] = []
+        self.statements: list[str] = []
+
+    def __call__(self, **kwargs):
+        client = _RecordingHttpClient(self.statements, self.replica_answer, kwargs)
+        self.clients.append(client)
+        return client
+
+
+@pytest.fixture()
+def recording_http_clients(monkeypatch):
+    def install(replica_answer=None):
+        clients = _RecordingHttpClients(replica_answer)
+        monkeypatch.setattr(clickhouse_connect, "get_client", clients)
+        return clients
+
+    return install
+
+
+@pytest.mark.parametrize("variable", _HTTP_GENERAL)
+@pytest.mark.parametrize("port", sorted(_FORWARDED_CH_PORTS))
+def test_forwarded_http_port_from_a_general_variable_is_refused(
+    recording_http_clients, variable, port
+):
+    clients = recording_http_clients()
+
+    with pytest.raises(UnsafeClickHouseTestTarget, match=f"forwarded port {port}\\b"):
+        _open_ch_test_http_client(environ={variable: str(port)})
+
+    assert clients.clients == []
+
+
+def test_no_http_port_skips_before_constructing_a_client(recording_http_clients):
+    clients = recording_http_clients()
+
+    with pytest.raises(pytest.skip.Exception, match=_HTTP_OPT_IN):
+        _open_ch_test_http_client(environ={"CH25_NATIVE_PORT": "39000"})
+
+    assert clients.clients == []
+
+
+def test_the_http_opt_in_always_requires_the_sidecar_proof():
+    assert _ch_test_http_port({_HTTP_OPT_IN: "18123"}) == (18123, True)
+    assert _ch_test_http_port({"CH25_HTTP_PORT": "38123"}) == (38123, False)
+    assert _ch_test_http_port({_HTTP_OPT_IN: "38123", "CH25_HTTP_PORT": "19001"}) == (
+        38123,
+        True,
+    )
+
+
+@_FOREIGN_ANSWERS
+def test_http_opt_in_without_the_sidecar_replica_is_refused(
+    recording_http_clients, replica_answer
+):
+    clients = recording_http_clients(replica_answer)
+
+    with pytest.raises(UnsafeClickHouseTestTarget, match="test sidecar"):
+        _open_ch_test_http_client(environ={_HTTP_OPT_IN: "18123"})
+
+    (client,) = clients.clients
+    assert client.kwargs["port"] == 18123
+    assert clients.statements == [_IDENTITY_STATEMENT]
+    assert client.closes == 1
+
+
+def test_http_opt_in_with_the_sidecar_replica_proves_it_first(recording_http_clients):
+    clients = recording_http_clients(_SIDECAR_ANSWER)
+
+    client = _open_ch_test_http_client(
+        environ={_HTTP_OPT_IN: "18123"}, send_receive_timeout=5
+    )
+
+    assert clients.statements == [_IDENTITY_STATEMENT]
+    assert client.kwargs == {
+        "host": "127.0.0.1",
+        "port": 18123,
+        "username": "default",
+        "password": "",
+        "database": "default",
+        "send_receive_timeout": 5,
+    }
+    assert client.closes == 0
+
+
+def test_a_local_http_port_issues_no_identity_statement(recording_http_clients):
+    clients = recording_http_clients()
+
+    _open_ch_test_http_client(environ={"CH25_HTTP_PORT": "38123"})
+
+    assert [client.kwargs["port"] for client in clients.clients] == [38123]
+    assert clients.statements == []
+
+
 @pytest.mark.parametrize("module", _LIVE_MODULES)
 def test_live_module_takes_its_clients_from_the_guard(module):
     source = (_FUTUREAGI / module).read_text()
@@ -289,6 +419,6 @@ def test_live_module_takes_its_clients_from_the_guard(module):
     assert not re.search(r"(?<!\w)Client\(|get_client\(", source)
     assert re.search(
         r"\b(_ch_test_owned_database|_ch_test_native_client"
-        r"|_open_ch_test_native_client)\(",
+        r"|_open_ch_test_native_client|_open_ch_test_http_client)\(",
         source,
     )

@@ -92,6 +92,9 @@ jobs:
       # reports the replica macro .ci/clickhouse-test-config.xml sets
       # (conftest.py, _open_ch_test_native_client).
       FI_CH_TEST_SIDECAR_NATIVE_PORT: "19000"
+      # The same sidecar's HTTP port, for modules that go over HTTP
+      # (conftest.py, _open_ch_test_http_client).
+      FI_CH_TEST_SIDECAR_HTTP_PORT: "18123"
       PYTHONHASHSEED: "0"
       FI_CH25_SCHEMA_APPLY_STRICT: "1"
       EE_REPO_BRANCH: ${{ github.head_ref || github.ref_name }}
