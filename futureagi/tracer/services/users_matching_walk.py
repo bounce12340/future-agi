@@ -58,10 +58,14 @@ Budget. The walk owns a wall (``USER_LIST_PAGE_WALL_MS``) and a statement
 budget (``USER_LIST_WALK_MAX_STATEMENTS``). On exhaustion it returns the users
 certified so far, in order, with a cursor; it never falls back to the
 whole-window statement. A slice that fails on a read budget is retried
-narrower, never wider. The finishing statements run past the page wall under
-a server cap (``_finish_deadline``); a batch the server stops is replayed one
-user at a time, and a page that has published nothing decides a user whose
-replay the server stopped without the cap, once (``_materialise``).
+narrower, never wider. Until a request certifies its first batch, the
+statements that decide it are admitted against the analytics wall rather than
+the page wall, so a slice that outlasts the page wall is not read again by
+every request (``_decision_deadline``). The finishing statements run past the
+page wall under a server cap (``_finish_deadline``); a batch the server stops
+is replayed one user at a time, and a page that has published nothing decides
+a user whose replay the server stopped without the cap, once
+(``_materialise``).
 
 Tied instant. Inside one timestamp the slice's raw id order is not the
 page's resolved id order (an alias may resolve to a survivor on either side of
@@ -241,6 +245,10 @@ class _WalkState:
     # decided without the cap, once per request.
     finish_singly: bool = False
     uncapped_finish: bool = False
+    # Until this request certifies a batch, the statements that decide the
+    # first batch of a read that returned rows are admitted against the
+    # analytics wall, not the page wall (``_decision_deadline``).
+    first_batch_owed: bool = True
     # The tied instant being decided, the id below which it was entered, and
     # the resolved ids it returned (certified), in descending order.
     instant: datetime | None = None
@@ -472,7 +480,7 @@ def _read_survivors(
 
     if not ids:
         return [], 0.0
-    if not state.budget.take(1):
+    if not state.budget.take(1, finish=state.first_batch_owed):
         return None
     query, params = state.builder.build_dimension_survivor_query(ids)
     started = time.monotonic()
@@ -480,7 +488,7 @@ def _read_survivors(
         result = ulm.V2AnalyticsQueryService().execute_ch_query(
             query,
             params,
-            timeout_ms=state.budget.deadline.remaining_ms(),
+            timeout_ms=_decision_deadline(state).remaining_ms(),
             settings=ulm._page_read_settings(
                 max_result_rows=ulm._USER_LIST_ATTR_RESULT_ROWS
             ),
@@ -652,7 +660,8 @@ def _certify(state: _WalkState, batch: list[_Candidate]) -> bool:
     """Attribute enrichment for a batch: membership superset and order key."""
 
     manager = state.manager
-    if not state.budget.take(_enrichment_statement_count(manager)):
+    statements = _enrichment_statement_count(manager)
+    if not state.budget.take(statements, finish=state.first_batch_owed):
         return False
     rows = [{"end_user_id": candidate.end_user_id} for candidate in batch]
     scan_ids = list(
@@ -666,7 +675,7 @@ def _certify(state: _WalkState, batch: list[_Candidate]) -> bool:
     try:
         manager._read_span_attributes(
             rows,
-            state.budget.deadline,
+            _decision_deadline(state),
             start_date=state.window_start,
             end_date=state.window_end,
             candidate_scan_ids=scan_ids,
@@ -675,6 +684,7 @@ def _certify(state: _WalkState, batch: list[_Candidate]) -> bool:
     except ReadDeadlineExceeded:
         state.budget.exhausted_by = "wall"
         return False
+    state.first_batch_owed = False
     for candidate in batch:
         uid = candidate.end_user_id
         order_key = manager._matching_activity_by_user.get(uid, {}).get(
@@ -689,6 +699,31 @@ def _certify(state: _WalkState, batch: list[_Candidate]) -> bool:
             order_key=order_key if member else None,
         )
     return True
+
+
+def _decision_deadline(state: _WalkState) -> ReadDeadline:
+    """What admits a survivor or enrichment statement: the page wall, mostly.
+
+    A request that stops before it decides anyone returns about the cursor
+    it was given, and the next request does the same work again. A slice
+    that returns rows and whose own statement outlasts the page wall is such
+    a stop: it is admitted inside the wall and runs past it (search
+    statements carry no server cap), its survivor statement was refused, the
+    slice was discarded whole, and every later request read it again. So
+    until the request certifies its first batch, the survivor and enrichment
+    statements that decide that batch are admitted against the analytics
+    wall measured from the walk's start (the finish mode's budget, admission
+    only like every search statement) instead of the page wall. That is at
+    most one survivor statement and one batch's enrichment past the page
+    wall per request; the replay that follows is finish mode already. A
+    slice that outlasts the analytics wall itself still stops the request
+    before anyone is decided.
+    """
+
+    if not state.first_batch_owed:
+        return state.budget.deadline
+    spent = state.budget.deadline.elapsed_ms()
+    return ReadDeadline.start(max(1.0, USER_LIST_WALK_FINISH_WALL_MS - spent))
 
 
 def _finish_deadline(state: _WalkState) -> ReadDeadline:

@@ -22,11 +22,13 @@ import random
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
 from tracer.services import users_matching_walk as walk
+from tracer.services.clickhouse import read_budget
 from tracer.services.clickhouse.read_budget import ReadDeadline, ReadDeadlineExceeded
 from tracer.tests.test_users_matching_walk import (
     WINDOW_END,
@@ -115,6 +117,37 @@ def _check_uncapped(
             assert before == (user,), replays
 
 
+class _Clock:
+    """The monotonic clock of the walls, advanced by each scripted statement."""
+
+    def __init__(self) -> None:
+        self.now = 1_000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def spend(self, ms: float) -> None:
+        self.now += ms / 1000.0
+
+
+@contextmanager
+def _scripted_clock(clock: _Clock):
+    """Run the page wall, the finish deadline and statement timing on ``clock``."""
+
+    fake = SimpleNamespace(monotonic=clock.monotonic)
+    with patch.object(read_budget, "time", fake), patch.object(walk, "time", fake):
+        yield clock
+
+
+@contextmanager
+def _shipped_walls():
+    with (
+        patch.object(walk, "USER_LIST_PAGE_WALL_MS", 5_000),
+        patch.object(walk, "USER_LIST_WALK_FINISH_WALL_MS", 30_000),
+    ):
+        yield
+
+
 class _CappedEngine(Engine):
     """A scripted server on which a heavy user's replay outlasts any cap.
 
@@ -122,7 +155,10 @@ class _CappedEngine(Engine):
     and asks the server to stop at a cap is stopped there
     (``ReadDeadlineExceeded``, as the service maps code 159 under a cap); the
     same replay without a cap runs to completion. Records every replay as
-    ``(ids, capped, stopped)``.
+    ``(ids, capped, stopped)``. With a ``clock``, every statement spends its
+    time on it: 1 ms, a stopped replay its cap, and a slice that returns rows
+    ``slow_slice_ms`` when that is set (search statements carry no server
+    cap, so a slow slice runs to the end whatever the page wall says).
     """
 
     def __init__(
@@ -130,10 +166,14 @@ class _CappedEngine(Engine):
         world: World,
         heavy: frozenset[str] = frozenset(),
         batch_limit: int | None = None,
+        clock: _Clock | None = None,
+        slow_slice_ms: float = 0.0,
     ) -> None:
         super().__init__(world)
         self.heavy = heavy
         self.batch_limit = batch_limit
+        self.clock = clock
+        self.slow_slice_ms = slow_slice_ms
         self.replays: list[tuple[tuple[str, ...], bool, bool]] = []
 
     def execute_ch_query(
@@ -158,14 +198,21 @@ class _CappedEngine(Engine):
                 self.settings.append(settings)
                 self.timeouts.append(timeout_ms)
                 self.caps.append(server_execution_cap_ms)
+                if self.clock is not None:
+                    self.clock.spend(server_execution_cap_ms)
                 raise ReadDeadlineExceeded("ClickHouse statement exceeded its cap")
-        return super().execute_ch_query(
+        result = super().execute_ch_query(
             query,
             params,
             timeout_ms,
             settings,
             server_execution_cap_ms=server_execution_cap_ms,
         )
+        if self.clock is not None:
+            slow = self.slow_slice_ms and kind_of(query) == "slice" and result.data
+            result.query_time_ms = self.slow_slice_ms if slow else 1.0
+            self.clock.spend(result.query_time_ms)
+        return result
 
 
 def _follow(
@@ -176,6 +223,7 @@ def _follow(
     max_statements: int | None = None,
     heavy: frozenset[str] = frozenset(),
     mutate=None,
+    slow_slice_ms: float = 0.0,
 ) -> tuple[list[str], int]:
     """Follow the cursor to the end; returns the published names and the hops.
 
@@ -184,8 +232,33 @@ def _follow(
     for one user, right after a capped replay it led was stopped. In a
     static world a repeated ``(cursor, seen rows)`` is a livelock, and no two
     hops in a row may both make no progress: publish a user, lower the
-    coverage, or lower the decided position.
+    coverage, or lower the decided position. The walls run on a scripted
+    clock (``_CappedEngine``).
     """
+    with _scripted_clock(_Clock()) as clock:
+        return _follow_on(
+            world,
+            clock=clock,
+            page_size=page_size,
+            max_hops=max_hops,
+            max_statements=max_statements,
+            heavy=heavy,
+            mutate=mutate,
+            slow_slice_ms=slow_slice_ms,
+        )
+
+
+def _follow_on(
+    world: World,
+    *,
+    clock: _Clock,
+    page_size: int,
+    max_hops: int,
+    max_statements: int | None,
+    heavy: frozenset[str],
+    mutate,
+    slow_slice_ms: float,
+) -> tuple[list[str], int]:
     budget = max_statements or walk.USER_LIST_WALK_MAX_STATEMENTS
     names: list[str] = []
     seen_states: set = set()
@@ -194,7 +267,7 @@ def _follow(
     stalled = False
     cursor = None
     for hop in range(1, max_hops + 1):
-        engine = _CappedEngine(world, heavy)
+        engine = _CappedEngine(world, heavy, clock=clock, slow_slice_ms=slow_slice_ms)
         read, _engine = _page(world, page_size=page_size, cursor=cursor, engine=engine)
         names.extend(_names(read))
         assert len(engine.calls) <= budget, (hop, len(engine.calls))
@@ -494,6 +567,66 @@ def test_a_dense_rejecting_world_ends_at_shipped_limits():
 
 
 # --------------------------------------------------------------------------
+# P2: a populated slice whose own statement outlasts the page wall.
+# --------------------------------------------------------------------------
+
+
+def _spread_world(users: int, every_minutes: int) -> tuple[World, list[str]]:
+    world = World()
+    for n in range(1, users + 1):
+        moment = minutes_before_end(every_minutes * n)
+        world.user(n, key=moment, raw=(moment,))
+    return world, [f"user-{n}" for n in range(1, users + 1)]
+
+
+def test_a_slice_that_outlasts_the_page_wall_still_decides_its_first_batch():
+    """Every slice that returns rows takes 6 s against the 5 s page wall.
+
+    The slice statement is admitted inside the wall and runs past it (search
+    statements carry no server cap). Its survivor statement was then refused,
+    the slice discarded whole, and the next request read the same slice
+    again, so the list never got past it. A request that has certified
+    nothing yet now finishes that slice's first batch against the analytics
+    wall: every request publishes, and the list ends.
+    """
+    world, expected = _spread_world(60, 2)
+
+    with _shipped_walls():
+        names, hops = _follow(world, page_size=25, max_hops=8, slow_slice_ms=6_000)
+
+    assert names == expected
+    assert hops <= 6
+
+
+def test_a_slice_that_outlasts_the_analytics_wall_still_stalls_the_list():
+    """Known residual, left to the owner: a slice slower than the whole request.
+
+    Every slice that returns rows takes 31 s, past the analytics wall (30 s)
+    that bounds a request's admissions. Nothing after it may start, so the
+    request publishes nothing; the next request's open instant moves the
+    coverage down one microsecond before the same slice is read again. The
+    list shows empty, degraded pages, each taking over 30 s, and never gets
+    past that slice. Ending it needs either a statement admitted with no
+    deadline at all or a narrower slice carried in the cursor.
+    """
+    world, _expected_names = _spread_world(3, 5)
+    clock = _Clock()
+    cursor = None
+    coverages = []
+    with _shipped_walls(), _scripted_clock(clock):
+        for _hop in range(4):
+            engine = _CappedEngine(world, clock=clock, slow_slice_ms=31_000)
+            read, _engine = _page(world, page_size=25, cursor=cursor, engine=engine)
+            assert read.payload["table"] == []
+            assert read.has_more is True
+            assert read.payload["query_status"] == "degraded"
+            coverages.append(read.checkpoint_order[3])
+            cursor = _signed_cursor(read)
+
+    assert WINDOW_END - coverages[-1] <= 2 * TICK
+
+
+# --------------------------------------------------------------------------
 # Property: generated worlds, from tiny budgets to the shipped limits.
 # --------------------------------------------------------------------------
 
@@ -566,6 +699,13 @@ LIMITS = [
 PAGE_SIZES = [1, 2, 3, 7, 25, 100]
 STATIC_WORLDS = 320
 CHANGING_WORLDS = 96
+# Every fourth run of the limit grid: every slice that returns rows takes
+# longer than the page wall (and less than the analytics wall).
+SLOW_SLICE_MS = 6_000.0
+
+
+def _slow_slice_ms(seed: int) -> float:
+    return SLOW_SLICE_MS if (seed // len(LIMITS)) % 4 == 1 else 0.0
 
 
 @contextmanager
@@ -605,13 +745,14 @@ def test_every_hop_sequence_ends_exact_and_never_raises_the_coverage(seed):
     heavy = frozenset(
         rng.sample(sorted(world.users), min(n_users, rng.choice([0, 0, 0, 1, 2, 3])))
     )
-    with _limits(seed) as max_statements:
+    with _limits(seed) as max_statements, _shipped_walls():
         names, _hops = _follow(
             world,
             page_size=page_size,
             max_hops=_hop_bound(n_users, page_size, len(heavy)),
             max_statements=max_statements,
             heavy=heavy,
+            slow_slice_ms=_slow_slice_ms(seed),
         )
 
     assert len(names) == len(set(names)), "a user was published twice"
@@ -648,7 +789,7 @@ def test_users_that_stop_matching_between_hops_never_stall_or_repeat(seed):
     page_size = rng.choice([1, 3, 7, 25])
     heavy = frozenset(rng.sample(sorted(world.users), rng.choice([0, 0, 1, 2])))
     changed: set[str] = set()
-    with _limits(seed) as max_statements:
+    with _limits(seed) as max_statements, _shipped_walls():
         names, _hops = _follow(
             world,
             page_size=page_size,
@@ -656,6 +797,7 @@ def test_users_that_stop_matching_between_hops_never_stall_or_repeat(seed):
             max_statements=max_statements,
             heavy=heavy,
             mutate=_stop_matching(rng, changed),
+            slow_slice_ms=_slow_slice_ms(seed),
         )
 
     assert len(names) == len(set(names)), "a user was published twice"

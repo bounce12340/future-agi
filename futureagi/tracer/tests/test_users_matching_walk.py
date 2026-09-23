@@ -887,9 +887,12 @@ def test_wall_exhaustion_stops_between_statements():
     world = World()
     world.user(1, key=minutes_before_end(3), raw=(minutes_before_end(3),))
 
-    # The wall is checked between statements: the slice statement alone
-    # outlives it, so its survivor statement is refused and the page is
-    # partial.
+    # The wall is checked between statements, and the slice statement alone
+    # outlives it. The request has decided nobody yet, so the survivor and
+    # enrichment statements of that slice's first batch are admitted against
+    # the analytics wall and its user is published: discarding the slice
+    # here had every later request read it again, and the list never got
+    # past it. The next slice is refused, and the page is partial.
     with patch.object(walk, "USER_LIST_PAGE_WALL_MS", 60):
         engine = Engine(world)
         original = engine.execute_ch_query
@@ -903,9 +906,10 @@ def test_wall_exhaustion_stops_between_statements():
         engine.execute_ch_query = slow
         read, engine = _page(world, page_size=25, engine=engine)
 
-    assert read.payload["table"] == []
+    assert _names(read) == ["user-1"]
     assert read.has_more is True
-    assert _kinds(engine) == ["slice"]
+    assert read.payload["query_status"] == "degraded"
+    assert _kinds(engine) == ["slice", "remap", "enrich", "replay"]
 
 
 def test_an_exhausted_walk_publishes_degraded_and_incomplete_not_complete():
