@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 from datetime import timedelta
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 
@@ -186,6 +187,70 @@ def test_the_view_publishes_the_proved_count_as_its_lower_bound():
     ]
     assert selected.candidate_total_is_lower_bound is True
     assert selected.candidate_total_count == MATCHING
+
+
+class _HydratingAggregateEqualsServer(_AggregateEqualsServer):
+    """The counterexample, also answering the page's hydration statement."""
+
+    def execute_ch_query(self, query, params, *, timeout_ms, settings):
+        if "sum(cost) AS total_cost" in query:
+            self.calls.append(("hydrate", params))
+            return SimpleNamespace(
+                data=[
+                    {
+                        "session_id": sid,
+                        "session_start": min(self.roots[sid]),
+                        "session_end": min(self.roots[sid]),
+                        "duration": 0,
+                        "total_cost": 1,
+                        "total_tokens": 1,
+                        "traces_count": 1,
+                    }
+                    for sid in params["candidate_session_ids"]
+                ]
+            )
+        return super().execute_ch_query(
+            query, params, timeout_ms=timeout_ms, settings=settings
+        )
+
+
+@pytest.mark.unit
+def test_the_response_metadata_publishes_the_proved_lower_bound():
+    from tracer.tests.test_session_list_bounded_view import _view_and_request
+    from tracer.views.trace_session import TraceSessionView
+
+    view, request = _view_and_request()
+    view._fetch_session_names = mock.Mock(return_value={})
+    view._fetch_end_user_info = mock.Mock(return_value={})
+    server = _HydratingAggregateEqualsServer()
+    with mock.patch(
+        "tracer.views.trace_session.AnnotationsLabels.objects.filter",
+        return_value=[],
+    ):
+        status, payload = TraceSessionView._list_sessions_clickhouse(
+            view,
+            request,
+            project_id=PROJECT,
+            project=None,
+            analytics=server,
+            validated_data={
+                "filters": _traces_count_equals_one_filters(),
+                "sort_params": [],
+                "page_number": 0,
+                "page_size": MATCHING,
+                "cursor_mode": True,
+            },
+        )
+
+    assert status == "ok"
+    assert "hydrate" in server.kinds
+    assert [row["session_id"] for row in payload["table"]] == [
+        _sid(i) for i in range(MATCHING)
+    ]
+    metadata = payload["metadata"]
+    assert metadata["total_rows"] == MATCHING
+    assert metadata["total_rows_is_lower_bound"] is True
+    assert "total_rows_exact" not in metadata
 
 
 # --------------------------------------------------------------------------
