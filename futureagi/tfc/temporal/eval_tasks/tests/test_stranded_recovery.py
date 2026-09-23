@@ -345,6 +345,10 @@ class TestContinuousRestartReapsClaimsThatAge:
                 return await _entries(task_id) == [(EvalEntryStatus.COMPLETED, 1)]
 
             reaped = await _wait_for(_completed)
+            # Read before the cancel: a cancel that lands mid-activity reaches
+            # the run's catch-all and marks the task failed, which says
+            # nothing about the reap.
+            status_while_draining = await _task_status(task_id)
             await handle.cancel()
             try:
                 await handle.result()
@@ -354,4 +358,4 @@ class TestContinuousRestartReapsClaimsThatAge:
         await asyncio.sleep(0.2)
         await sync_to_async(close_old_connections)()
         assert reaped
-        assert await _task_status(task_id) == EvalTaskStatus.RUNNING
+        assert status_while_draining == EvalTaskStatus.RUNNING

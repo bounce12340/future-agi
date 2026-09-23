@@ -315,8 +315,14 @@ class TestHistoricalWorkflow:
         )
         await _make_running_stale(str(eval_task.id))
 
+        # The starter describes before every start and, finding the crashed
+        # execution closed, says so; without that evidence the first reap
+        # applies the blind floor, which an hour-old claim has not passed.
         result = await _run_historical(
-            workflow_environment, str(eval_task.id), batch_size=5
+            workflow_environment,
+            str(eval_task.id),
+            batch_size=5,
+            workflow_confirmed_stopped=True,
         )
 
         assert result.status == "completed"
