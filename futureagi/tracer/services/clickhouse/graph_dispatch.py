@@ -10,7 +10,13 @@ from typing import Any
 from uuid import UUID
 
 import structlog
+from clickhouse_connect.driver.exceptions import (
+    ClickHouseError as ClickHouseConnectError,
+)
+from clickhouse_driver.errors import Error as ClickHouseDriverError
 from django.conf import settings
+from django_redis.exceptions import ConnectionInterrupted
+from redis.exceptions import RedisError
 
 from model_hub.models.choices import AnnotationTypeChoices
 from model_hub.models.develop_annotations import AnnotationsLabels
@@ -97,6 +103,11 @@ _TRACE_ROLLUP_RESULT_COLUMNS = frozenset(
 _GRAPH_SEED_ESTIMATE_WALL_MS = 2_500
 _GRAPH_SEED_ESTIMATE_QUERY_MS = 1_500
 _GRAPH_SEED_ESTIMATE_MAX_CANDIDATES = 10
+# What a probe statement can fail with and still leave the unseeded read
+# correct: any ClickHouse answer from either driver, and transport or deadline
+# failures (TimeoutError, including ReadDeadlineExceeded, is an OSError).
+# Anything else is a defect in this code, not an unanswered probe.
+_GRAPH_SEED_PROBE_ERRORS = (ClickHouseDriverError, ClickHouseConnectError, OSError)
 # Twice _GRAPH_SEED_ESTIMATE_WALL_MS: the shortest wall on which spending the
 # whole probe budget still leaves the main read a floor of at least that
 # budget. Below it the single-node path does not probe at all rather than
@@ -380,7 +391,7 @@ def _select_raw_trace_seed_candidate(
                     "max_result_bytes": 64 * 1024,
                 },
             )
-        except Exception:
+        except _GRAPH_SEED_PROBE_ERRORS as exc:
             # A probe that cannot answer is not a licence to read everything.
             # It means this candidate is unproven, so it is not admitted; the
             # caller decides what an unadmitted candidate implies, and on the
@@ -390,6 +401,12 @@ def _select_raw_trace_seed_candidate(
             # failure here would propagate ClickHouse codes the narrow
             # read-budget/transport helpers deliberately reject (type
             # mismatch, unknown identifier, no common type).
+            logger.warning(
+                "graph seed probe degraded",
+                probe_index=probe_count,
+                error_type=type(exc).__name__,
+                exc_info=True,
+            )
             continue
 
         estimate_rows = list(result.data or [])
@@ -841,6 +858,13 @@ def graph_payload_is_publishable(
         ):
             return False
     return True
+
+
+# What can reach the scheduling fallback from cache or worker transport. The
+# django-redis backend wraps redis failures in ConnectionInterrupted, which is
+# not a RedisError; socket-level failures are OSError. Temporal dispatch
+# failures are already absorbed and logged inside the snapshot scheduler.
+_EXACT_REFRESH_TRANSPORT_ERRORS = (ConnectionInterrupted, RedisError, OSError)
 
 
 def _read_or_refresh_exact_graph(
@@ -2194,9 +2218,15 @@ def fetch_user_system_metric_graph_ch(
                 organization_id=organization_id,
                 workspace_id=workspace_id,
             )
-        except Exception:
+        except _EXACT_REFRESH_TRANSPORT_ERRORS as exc:
             # The direct failure is already sanitized. Cache/worker transport
             # availability must not turn it into a raw API exception.
+            logger.warning(
+                "user graph exact refresh scheduling degraded",
+                metric_id=normalized_metric_id,
+                error_type=type(exc).__name__,
+                exc_info=True,
+            )
             return degraded
     return degraded
 
