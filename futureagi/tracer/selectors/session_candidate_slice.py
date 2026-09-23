@@ -95,12 +95,15 @@ the row budget is the one issued.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Protocol
 
-from tracer.selectors.filter_seed_width import EMPTY_DENSITY_ESTIMATE
+from tracer.selectors.filter_seed_width import (
+    EMPTY_DENSITY_ESTIMATE,
+    EmptyDensityEstimate,
+)
 from tracer.services.clickhouse.query_builders.filter_seed_witness import floor_hour
 from tracer.services.clickhouse.read_budget import ReadDeadline
 
@@ -159,15 +162,62 @@ class _QueryExecutor(Protocol):
     ) -> Any: ...
 
 
+class CandidateSliceBuilder(Protocol):
+    """The Session-list builder methods this lane issues its statements from.
+
+    ``SessionListQueryBuilderV2`` is the one implementation. The density pair
+    and ``supports_bounded_filter_scan`` are still looked up defensively in
+    ``_slicing_is_available``: a builder that cannot answer them is read whole.
+    """
+
+    page_size: int
+    filters: list[dict]
+
+    def parse_time_range(
+        self, filters: list[dict]
+    ) -> tuple[datetime | None, datetime | None]: ...
+
+    def build_candidate_cursor_page_query(
+        self,
+        *,
+        before_start_time: datetime | None = None,
+        before_session_id: str | None = None,
+        scan_start_time: datetime | None = None,
+    ) -> tuple[str, dict[str, Any]]: ...
+
+    def build_filter_match_query(
+        self, candidate_ids: list[str]
+    ) -> tuple[str, dict[str, Any]]: ...
+
+    def build_candidate_slice_density_probe_query(
+        self, *, slice_start: datetime, slice_end: datetime
+    ) -> tuple[str, dict[str, Any]]: ...
+
+    def candidate_slice_density_estimate(
+        self,
+        rows: Iterable[Mapping[str, Any]],
+        columns: Iterable[str] | None = None,
+    ) -> int | EmptyDensityEstimate | None: ...
+
+    def supports_bounded_filter_scan(self) -> bool: ...
+
+    def recommended_filter_classify_batch_size(self) -> int: ...
+
+
 @dataclass(frozen=True)
 class SessionCandidateSlicePage:
     """One exact cursor page, plus what it cost to prove it.
 
     ``rows`` are the published candidates in the server's own order.
     ``has_more`` follows today's rule: the discovery statement returned more
-    candidates than the page holds. ``remaining_count`` is that statement's own
-    ``count() OVER()`` - exact when ``slice_start`` is ``None``, and a LOWER
-    BOUND otherwise, the same contract the bounded filter route publishes.
+    candidates than the page holds. When ``slice_start`` is ``None``,
+    ``remaining_count`` is the unsliced statement's own ``count() OVER()`` and
+    is exact. Otherwise it is a LOWER BOUND, the same contract the bounded
+    filter route publishes, and it counts only the candidates the full-window
+    verifier proved: a sliced statement's ``count() OVER()`` counts sessions
+    whose TRUNCATED root set passes a set-valued predicate such as
+    ``traces_count = 1``, and full state can reject any number of them, so
+    that count is not a bound on anything.
     """
 
     rows: list[dict[str, Any]]
@@ -186,7 +236,7 @@ class _Survivors:
 
 def read_candidate_slice_page(
     *,
-    builder: Any,
+    builder: CandidateSliceBuilder,
     analytics: _QueryExecutor,
     deadline: ReadDeadline,
     read_settings: Callable[[int], dict[str, Any]],
@@ -205,6 +255,10 @@ def read_candidate_slice_page(
 
     page_size = int(builder.page_size)
     request_start, request_end = builder.parse_time_range(builder.filters)
+    if request_start is None or request_end is None:
+        # The Session-list builder always resolves a finite window; this names
+        # the assumption every width decision below already makes.
+        raise ValueError("candidate slice page requires a bounded request window")
     # The cursor's keyset instant and the parsed request bounds do not have to
     # agree about tzinfo, and every width decision below is arithmetic on both.
     scan_end = _aligned(before_start_time, request_start) or request_end
@@ -250,7 +304,7 @@ def read_candidate_slice_page(
             return SessionCandidateSlicePage(
                 rows=survivors.rows[:page_size],
                 has_more=len(rows) > page_size,
-                remaining_count=count,
+                remaining_count=len(survivors.rows),
                 slice_start=floor,
                 statement_count=reader.statements,
             )
@@ -269,7 +323,7 @@ class _SliceReader:
     def __init__(
         self,
         *,
-        builder: Any,
+        builder: CandidateSliceBuilder,
         analytics: _QueryExecutor,
         deadline: ReadDeadline,
         read_settings: Callable[[int], dict[str, Any]],
@@ -512,13 +566,13 @@ def _aligned(moment: datetime | None, reference: datetime) -> datetime | None:
     return moment.replace(tzinfo=reference.tzinfo)
 
 
-def _classify_batch_size(builder: Any, candidates: int) -> int:
+def _classify_batch_size(builder: CandidateSliceBuilder, candidates: int) -> int:
     recommended = getattr(builder, "recommended_filter_classify_batch_size", None)
     size = recommended() if callable(recommended) else None
     return max(1, int(size)) if size else max(1, candidates)
 
 
-def _slicing_is_available(builder: Any, page_size: int) -> bool:
+def _slicing_is_available(builder: CandidateSliceBuilder, page_size: int) -> bool:
     """Whether this request can be both narrowed and verified.
 
     Both halves are required. Without the full-state verifier a narrowed scan
@@ -538,4 +592,8 @@ def _slicing_is_available(builder: Any, page_size: int) -> bool:
     )
 
 
-__all__ = ["SessionCandidateSlicePage", "read_candidate_slice_page"]
+__all__ = [
+    "CandidateSliceBuilder",
+    "SessionCandidateSlicePage",
+    "read_candidate_slice_page",
+]
