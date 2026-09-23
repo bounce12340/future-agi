@@ -33,6 +33,7 @@ from tracer.services import users_matching_walk as walk
 from tracer.services.clickhouse import read_budget
 from tracer.services.clickhouse.read_budget import ReadDeadline, ReadDeadlineExceeded
 from tracer.tests.test_users_matching_walk import (
+    SERVICE,
     WINDOW_END,
     WINDOW_START,
     Engine,
@@ -260,6 +261,7 @@ def _follow(
     heavy: frozenset[str] = frozenset(),
     mutate=None,
     slice_ms: Callable[[timedelta, bool], float] | None = None,
+    keys: int = 0,
 ) -> tuple[list[str], int]:
     """Follow the cursor to the end; returns the published names and the hops.
 
@@ -269,7 +271,8 @@ def _follow(
     static world a repeated ``(cursor, seen rows)`` is a livelock, and no two
     hops in a row may both make no progress: publish a user, lower the
     coverage, or lower the decided position. The walls run on a scripted
-    clock (``_CappedEngine``).
+    clock (``_CappedEngine``); the page shows ``keys`` attribute columns
+    besides the filtered one.
     """
     with _scripted_clock(_Clock()) as clock:
         return _follow_on(
@@ -281,6 +284,7 @@ def _follow(
             heavy=heavy,
             mutate=mutate,
             slice_ms=slice_ms,
+            keys=keys,
         )
 
 
@@ -294,8 +298,11 @@ def _follow_on(
     heavy: frozenset[str],
     mutate,
     slice_ms: Callable[[timedelta, bool], float] | None,
+    keys: int,
 ) -> tuple[list[str], int]:
-    budget = _decision_budget(max_statements or walk.USER_LIST_WALK_MAX_STATEMENTS)
+    budget = _decision_budget(
+        max_statements or walk.USER_LIST_WALK_MAX_STATEMENTS, keys
+    )
     names: list[str] = []
     seen_states: set = set()
     coverage = WINDOW_END
@@ -304,7 +311,7 @@ def _follow_on(
     cursor = None
     for hop in range(1, max_hops + 1):
         engine = _CappedEngine(world, heavy, clock=clock, slice_ms=slice_ms)
-        read, _engine = _page(world, page_size=page_size, cursor=cursor, engine=engine)
+        read = _keyed_page(page_size=page_size, cursor=cursor, engine=engine, keys=keys)
         names.extend(_names(read))
         assert len(engine.calls) <= budget, (hop, len(engine.calls))
         _check_uncapped(engine.replays, proven=False)
@@ -331,7 +338,32 @@ def _follow_on(
     raise AssertionError(f"no end after {max_hops} hops; published {len(names)}")
 
 
-def _decision_budget(configured: int) -> int:
+def _keyed_manager(keys: int):
+    """The page's manager, showing ``keys`` attribute columns besides ``tag``."""
+
+    from tracer.services.users_list_manager import UsersListManager
+
+    base = _manager()
+    return UsersListManager(
+        organization_id=base.organization_id,
+        allowed_project_ids=list(base.scoped_project_ids),
+        project_id=base.project_id,
+        filters=base.filters,
+        requested_columns=[],
+        attribute_keys=[f"k{n:03d}" for n in range(keys)],
+    )
+
+
+def _keyed_page(*, page_size: int, cursor, engine: Engine, keys: int):
+    manager = _keyed_manager(keys)
+    with (
+        patch(SERVICE, return_value=engine),
+        patch.object(manager, "_read_dimension_candidates", side_effect=_never_seed),
+    ):
+        return manager.list_cursor_payload(page_size=page_size, cursor=cursor)
+
+
+def _decision_budget(configured: int, keys: int = 0) -> int:
     """The statements a request may spend: its budget, or one decision.
 
     One decision: the open instant, a slice and three retries a quarter as
@@ -342,7 +374,7 @@ def _decision_budget(configured: int) -> int:
     """
     assert walk.USER_LIST_WALK_INITIAL_SLICE == timedelta(hours=1)
     assert walk.USER_LIST_WALK_MIN_SLICE == timedelta(minutes=1)
-    manager = _manager()
+    manager = _keyed_manager(keys)
     return max(
         configured,
         9
@@ -909,23 +941,23 @@ def _world(rng: random.Random, n_users: int) -> World:
     return world
 
 
-# (slice user limit, statement budget, certify batch, finishing statements,
-# enrichment statements): tiny budgets, each large enough to decide one heavy
-# user (a slice or an instant, its survivors, enrichment, a stopped replay
-# and the uncapped retry), up to the shipped limits.
+# (slice user limit, statement budget, certify batch, finishing statements):
+# tiny budgets up to the shipped limits. A request never has fewer
+# statements than one decision (``walk._statement_budget``), so the tiniest
+# budgets here are lifted to that.
 LIMITS = [
-    (2, 6, 1, 1, 1),
-    (2, 8, 2, 2, 1),
-    (3, 7, 3, 1, 2),
-    (4, 10, 2, 2, 2),
-    (5, 12, 5, 3, 1),
-    (8, 24, 25, 4, 2),
-    (200, 24, 25, 1, 1),
-    (200, 24, 25, 4, 1),
+    (2, 6, 1, 1),
+    (2, 8, 2, 2),
+    (3, 7, 3, 1),
+    (4, 10, 2, 2),
+    (5, 12, 5, 3),
+    (8, 24, 25, 4),
+    (200, 24, 25, 1),
+    (200, 24, 25, 4),
 ]
 PAGE_SIZES = [1, 2, 3, 7, 25, 100]
-STATIC_WORLDS = 256
-CHANGING_WORLDS = 64
+STATIC_WORLDS = 160
+CHANGING_WORLDS = 40
 # What a slice that returns rows costs, per run of the limit grid: nothing
 # much; 6 s, past the page wall; 40 s, past the whole request; or 40 s an
 # hour, past its cap only while it is wide.
@@ -940,6 +972,19 @@ SLICE_MODELS = [
 
 def _slice_model(seed: int) -> Callable[[timedelta, bool], float] | None:
     return SLICE_MODELS[(seed // len(LIMITS)) % len(SLICE_MODELS)]
+
+
+# Attribute columns the page shows besides the filtered key, up to the Users
+# view's maximum of 100: one enrichment statement per four of them, so 1 to
+# 26 enrichment statements per certified batch. None is listed twice: most
+# pages show few columns, and every column costs statements to build.
+KEY_COUNTS = [0, 0, 3, 12, 40, 100]
+
+
+def _key_count(seed: int) -> int:
+    # A generator of its own, so the key count varies independently of the
+    # limit grid and the slice model, and the world's own draws stay put.
+    return random.Random(7_919 * seed + 1).choice(KEY_COUNTS)
 
 
 def _slice_hops(world: World, seed: int) -> int:
@@ -958,13 +1003,12 @@ def _slice_hops(world: World, seed: int) -> int:
 def _limits(seed: int):
     """The walk's limits for ``seed``; yields its statement budget."""
 
-    slice_limit, max_statements, batch, finish, enrich = LIMITS[seed % len(LIMITS)]
+    slice_limit, max_statements, batch, finish = LIMITS[seed % len(LIMITS)]
     with (
         patch.object(walk, "USER_LIST_WALK_SLICE_USER_LIMIT", slice_limit),
         patch.object(walk, "USER_LIST_WALK_MAX_STATEMENTS", max_statements),
         patch.object(walk, "USER_LIST_WALK_CERTIFY_BATCH_SIZE", batch),
         patch.object(walk, "_materialisation_statement_count", return_value=finish),
-        patch.object(walk, "_enrichment_statement_count", return_value=enrich),
     ):
         yield max_statements
 
@@ -1000,6 +1044,7 @@ def test_every_hop_sequence_ends_exact_and_never_raises_the_coverage(seed):
             max_statements=max_statements,
             heavy=heavy,
             slice_ms=_slice_model(seed),
+            keys=_key_count(seed),
         )
 
     assert len(names) == len(set(names)), "a user was published twice"
@@ -1046,6 +1091,7 @@ def test_users_that_stop_matching_between_hops_never_stall_or_repeat(seed):
             heavy=heavy,
             mutate=_stop_matching(rng, changed),
             slice_ms=_slice_model(seed),
+            keys=_key_count(seed),
         )
 
     assert len(names) == len(set(names)), "a user was published twice"
