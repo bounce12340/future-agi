@@ -231,7 +231,13 @@ class DashboardMetricSerializer(StrictInputSerializer):
                 attrs.get("output_type", ""), attrs.get("aggregation", "avg")
             )
             if error:
-                raise serializers.ValidationError({"aggregation": error})
+                if getattr(
+                    self.root, "legacy_annotation_compatibility", False
+                ) and attrs.get("source", "traces") in ("traces", "both", "all", ""):
+                    # Base-era widgets served text annotations as counts.
+                    attrs["aggregation"] = "count"
+                else:
+                    raise serializers.ValidationError({"aggregation": error})
 
         property_id = attrs.get("property_id")
         if property_id:
@@ -516,7 +522,9 @@ class DashboardQuerySerializer(StrictInputSerializer):
         annotation_error = annotation_breakdown_error(
             metrics, attrs.get("breakdowns") or []
         )
-        if annotation_error:
+        if annotation_error and not getattr(
+            self, "legacy_annotation_compatibility", False
+        ):
             raise serializers.ValidationError({"breakdowns": annotation_error})
         dataset_metrics = [
             metric for metric in metrics if metric.get("source") == "datasets"

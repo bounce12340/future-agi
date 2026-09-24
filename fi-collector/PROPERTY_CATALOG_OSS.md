@@ -29,8 +29,10 @@ allow 16 KiB raw UTF-8, or 4 KiB for array members; objects keep discoverable ke
 without fabricated scalar values. Extraction defaults to 128 keys and 256 array
 members per span. `FI_OBSERVED_CATALOG_MAX_KEYS_PER_SPAN` and
 `FI_OBSERVED_CATALOG_MAX_ARRAY_MEMBERS_PER_SPAN` tune those per-span resource
-budgets (ceilings 4096/16384). Reaching a budget is logged as an extraction gap,
-not a complete index. There is no workspace/project allowlist or tenant cap.
+budgets (ceilings 4096/16384). Reaching a budget retains eligible observations
+and logs `observed_catalog_policy_exclusion`; it does not claim a complete index
+or request a repair that would repeat the same exclusion. There is no
+workspace/project allowlist or tenant cap.
 
 The UI uses the existing read-only POST contract for dashboard `metrics` and
 `filter_values`, keeping long names/cursors out of URLs. GET remains supported
@@ -80,8 +82,12 @@ New peers and mirrors use the flow HTTP API, not the PeerDB SQL server. Each new
 mirror explicitly enables nullable source columns and initial snapshotting,
 independent of worker environment defaults. The SQL server and optional UI remain
 available separately; a CREATE acknowledgement is not CDC readiness.
-The new initializer never includes the retired span mirror, regardless of legacy
-drop-flag settings; the collector remains the native span writer.
+The new initializer never creates the retired span mirror, regardless of legacy
+drop-flag settings; the collector remains the native span writer. Upgrades accept
+a retained `public.tracer_observation_span` → `tracer_observation_span` mapping
+only after the same endpoint, ownership, mapping and health checks as other
+mirrors. It is left untouched, not counted as a new bootstrap dependency.
+Unknown, transformed, foreign or duplicate mappings still block bootstrap.
 Failed jobs retain partial state and block dependants. Inspect their logs before
 explicitly resuming; do not remove volumes or use the legacy bulk-copy helper to
 hide a setup failure.
@@ -206,13 +212,24 @@ and mount an operator-owned writable directory at `/backfill`. The container
 runs as UID/GID 65532, so grant that identity access to the checkpoint directory.
 Keep the checkpoint across bounded invocations and resume the same scope.
 
-Like live ingestion, span backfill retains property keys and eligible values
-when individual values exceed suggestion-size limits. Progress reports
+Like live ingestion, span backfill retains eligible observations when keys,
+values or array members exceed the shared extraction budgets, or individual
+attributes have invalid names or scalars. Progress reports
 `policy_exclusion_spans` (affected spans, not omitted-value count). Applied
 checkpoints also retain `recorded_policy_exclusion_spans`; older checkpoints
 resume without this optional field. An older binary can drop that counter when
-rewriting progress, so it is not an audited lifetime total. All other extraction
-gaps remain fatal. No source values are truncated, converted or changed.
+rewriting progress, so it is not an audited lifetime total. Malformed source
+maps and unknown extraction gaps remain fatal. No source values are truncated,
+converted or changed.
+
+Rows with a missing or mismatched source organization are never published.
+Apply records their physical identities, without attributes, in the private
+`CHECKPOINT.quarantine.jsonl` file before advancing. Preserve this file with the
+checkpoint and investigate its records before claiming historical coverage.
+`quarantined_spans` reports each page; `recorded_quarantined_spans` counts rows
+in checkpointed pages. Retries can repeat audit entries. Ownership is rechecked
+before each publish, and a failed audit write or ownership change cannot advance
+progress. Preview reports exclusions but writes no audit or checkpoint.
 
 For historical catalog rows, select `--source legacy` with an explicit
 `--legacy-epoch`, `--legacy-revision`, and `--legacy-build`; omit time-range

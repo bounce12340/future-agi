@@ -280,6 +280,38 @@ def test_observed_keys_use_string_scope_grouped_history_not_current_types():
     assert "toUUID" not in sql and "catalog_epoch" not in sql
 
 
+@pytest.mark.parametrize("read", ["keys", "category_counts", "value_types", "values"])
+@pytest.mark.parametrize(
+    "field,predicate,expected",
+    [
+        ("organization_id", "k.organization_id = %(organization_id)s", ORG),
+        ("workspace_id", "k.workspace_id = %(workspace_id)s", WS),
+        ("project_ids", "k.project_id IN %(project_ids)s", (PROJECT,)),
+    ],
+)
+def test_observed_catalog_sql_enforces_each_tenant_boundary(
+    read, field, predicate, expected
+):
+    if read in {"keys", "category_counts"}:
+        executor = Executor([], [{"total": 0}])
+        native = Mock()
+        native.read_page.return_value = ()
+        native.category_counts.return_value = {"custom_attribute": 0}
+        PropertyCatalogReader(
+            executor, catalog_database="test_index", definition_source=native
+        ).read_page(scope=SCOPE, query=QUERY, page_size=1, include_counts=True)
+    else:
+        executor = Executor([{"attribute_type": "string"}], [])
+        PropertyCatalogValueReader(executor, catalog_database="test_index").read_page(
+            scope=SCOPE, query=VALUE_QUERY, page_size=1
+        )
+    sql, params, _ = executor.calls[read in {"category_counts", "values"}]
+    prewhere = " ".join(sql.split()).split("PREWHERE ", 1)[1]
+    prewhere = prewhere.split(" WHERE ", 1)[0].split(" ORDER BY ", 1)[0]
+    assert predicate in prewhere.split(" AND ")
+    assert params[field] == expected
+
+
 def test_catalog_counts_cover_search_not_page_or_selected_category():
     row = {
         "attribute_key": "call.key",
@@ -1424,17 +1456,29 @@ def test_real_clickhouse_grouped_observed_index_and_scoped_keysets():
 
         rows = [value_row("a"), value_row("b")]
         keys = [ORG, WS, PROJECT, "custom_attribute", "key", "string", "key"]
+        foreign_scopes = {
+            "organization": (str(uuid4()), WS, PROJECT),
+            "workspace": (ORG, str(uuid4()), PROJECT),
+            "project": (ORG, WS, str(uuid4())),
+        }
+        foreign_key_names = {f"foreign_{boundary}_key" for boundary in foreign_scopes}
         client.insert(
             "observed_attribute_keys",
             [
                 keys + [rows[0]["first_seen"], rows[0]["last_seen"]],
                 keys + [rows[0]["first_seen"], rows[0]["last_seen"]],
-                [str(uuid4()), *keys[1:]]
-                + [rows[0]["first_seen"], rows[0]["last_seen"]],
-                [ORG, str(uuid4()), *keys[2:]]
-                + [rows[0]["first_seen"], rows[0]["last_seen"]],
-                [ORG, WS, str(uuid4()), *keys[3:]]
-                + [rows[0]["first_seen"], rows[0]["last_seen"]],
+                *[
+                    [
+                        *scope,
+                        "custom_attribute",
+                        f"foreign_{boundary}_key",
+                        "string",
+                        f"foreign_{boundary}_key",
+                        rows[0]["first_seen"],
+                        rows[0]["last_seen"],
+                    ]
+                    for boundary, scope in foreign_scopes.items()
+                ],
                 [
                     ORG,
                     WS,
@@ -1477,10 +1521,20 @@ def test_real_clickhouse_grouped_observed_index_and_scoped_keysets():
             + [row[k] for k in value_columns[6:]]
             for row in rows
         ]
-        # Retry rows and foreign tenant rows cannot inflate/leak suggestions.
+        # Foreign values share the queried key, but cannot merge into its values.
+        foreign_values = []
+        foreign_value_names = {
+            f"foreign_{boundary}_value" for boundary in foreign_scopes
+        }
+        for boundary, scope in foreign_scopes.items():
+            row = value_row(f"foreign_{boundary}_value")
+            foreign_values.append(
+                [*scope, "custom_attribute", "key", "string"]
+                + [row[field] for field in value_columns[6:]]
+            )
         client.insert(
             "observed_attribute_values",
-            values + values + [[str(uuid4()), *values[0][1:]]],
+            values + values + foreign_values,
             column_names=value_columns,
         )
         populated_page = api_page("metrics")
@@ -1491,6 +1545,11 @@ def test_real_clickhouse_grouped_observed_index_and_scoped_keysets():
         assert value_page["values"] == [{"value": "a", "type": "string", "label": "a"}]
         assert value_page["has_more"] and value_page["next_cursor"]
         reader = PropertyCatalogValueReader(HTTPExecutor(), catalog_database=database)
+        all_values = reader.read_page(scope=SCOPE, query=VALUE_QUERY, page_size=10)
+        visible_values = {item.value for item in all_values.values}
+        assert len(all_values.values) == 2 and not all_values.has_more
+        assert visible_values == {"a", "b"}
+        assert visible_values.isdisjoint(foreign_value_names)
         first = reader.read_page(scope=SCOPE, query=VALUE_QUERY, page_size=1)
         assert len(first.values) == 1 and first.has_more
         second = reader.read_page(
@@ -1507,8 +1566,14 @@ def test_real_clickhouse_grouped_observed_index_and_scoped_keysets():
         )
         keypage = PropertyCatalogReader(
             HTTPExecutor(), catalog_database=database, definition_source=native
-        ).read_page(scope=SCOPE, query=QUERY, page_size=2)
-        assert len(keypage.metrics) == 1
+        ).read_page(scope=SCOPE, query=QUERY, page_size=10, include_counts=True)
+        visible_keys = {metric["name"] for metric in keypage.metrics}
+        assert len(keypage.metrics) == 1 and not keypage.has_more
+        assert visible_keys == {"key"}
+        assert visible_keys.isdisjoint(foreign_key_names)
+        assert keypage.category_counts_exact
+        assert keypage.category_counts["custom_attribute"] == 1
+        assert keypage.category_counts["all"] == 1
         client.insert(
             "observed_attribute_keys",
             [

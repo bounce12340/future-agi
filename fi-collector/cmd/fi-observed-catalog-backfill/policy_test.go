@@ -19,7 +19,7 @@ import (
 	"github.com/future-agi/future-agi/fi-collector/pkg/observedcatalog"
 )
 
-func TestExtractionPolicyOnlyAllowsSizeExclusions(t *testing.T) {
+func TestExtractionPolicyAllowsOnlyKnownExclusions(t *testing.T) {
 	for _, c := range []struct {
 		name   string
 		report observedcatalog.Report
@@ -39,7 +39,12 @@ func TestExtractionPolicyOnlyAllowsSizeExclusions(t *testing.T) {
 			}
 		})
 	}
-	for _, reason := range []string{"key_too_large", "invalid_attribute_key", "max_keys", "max_array_members", "invalid_scalar", "invalid_boolean", "max_encoded_bytes", "unknown"} {
+	for _, reason := range []string{"key_too_large", "invalid_attribute_key", "max_keys", "max_array_members", "invalid_scalar", "invalid_boolean"} {
+		if count, err := extractionPolicyExclusion(observedcatalog.Report{GapReasons: []string{"value_too_large", reason}}); err != nil || count != 1 {
+			t.Fatalf("documented policy exclusion stopped scan: %s: %v", reason, err)
+		}
+	}
+	for _, reason := range []string{"max_encoded_bytes", "unknown"} {
 		for _, reasons := range [][]string{{reason}, {"value_too_large", reason}} {
 			if count, err := extractionPolicyExclusion(observedcatalog.Report{GapReasons: reasons}); err == nil || count != 0 {
 				t.Fatalf("unsafe report accepted: %v", reasons)
@@ -86,8 +91,8 @@ func TestSizeExclusionRetainsExactLiveBatchAndSource(t *testing.T) {
 			}
 			start := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 			batch, excluded, err := buildPage([]map[string]any{row}, scope, start, start.Add(time.Hour), observedcatalog.DefaultLimits())
-			if err != nil || excluded != c.excluded || !reflect.DeepEqual(batch, observedcatalog.Merge(live)) {
-				t.Fatalf("live/backfill parity failed: exclusions=%d err=%v", excluded, err)
+			if err != nil || excluded.PolicyExclusions != c.excluded || len(excluded.Quarantined) != 0 || !reflect.DeepEqual(batch, observedcatalog.Merge(live)) {
+				t.Fatalf("live/backfill parity failed: exclusions=%+v err=%v", excluded, err)
 			}
 			after, _ := json.Marshal(row)
 			if !bytes.Equal(before, after) {
@@ -100,26 +105,19 @@ func TestSizeExclusionRetainsExactLiveBatchAndSource(t *testing.T) {
 	}
 }
 
-func TestOtherExtractionGapsRejectTheWholePage(t *testing.T) {
+func TestMalformedSourceRejectsTheWholePage(t *testing.T) {
 	for _, c := range []struct {
 		name   string
 		mutate func(map[string]any)
 		limits observedcatalog.Limits
 	}{
-		{"key-size", func(r map[string]any) { r["attrs_string"].(map[string]string)[strings.Repeat("k", 4097)] = "x" }, observedcatalog.DefaultLimits()},
-		{"empty-key", func(r map[string]any) { r["attrs_string"].(map[string]string)[""] = "x" }, observedcatalog.DefaultLimits()},
-		{"boolean", func(r map[string]any) { r["attrs_bool"] = map[string]uint8{"bad": 2} }, observedcatalog.DefaultLimits()},
 		{"null-number", func(r map[string]any) { r["attrs_number"] = map[string]any{"bad": nil} }, observedcatalog.DefaultLimits()},
 		{"null-string", func(r map[string]any) { r["attrs_string"] = map[string]any{"bad": nil} }, observedcatalog.DefaultLimits()},
 		{"missing-maps", func(r map[string]any) { delete(r, "attrs_bool") }, observedcatalog.DefaultLimits()},
 		{"overflow-json", func(r map[string]any) { r["attributes_extra"] = "{} trailing" }, observedcatalog.DefaultLimits()},
-		{"scope", func(r map[string]any) { r["org_id"] = "00000000-0000-4000-8000-000000000099" }, observedcatalog.DefaultLimits()},
+		{"project", func(r map[string]any) { r["project_id"] = "00000000-0000-4000-8000-000000000099" }, observedcatalog.DefaultLimits()},
 		{"tombstone", func(r map[string]any) { r["is_deleted"] = 2 }, observedcatalog.DefaultLimits()},
 		{"timestamp", func(r map[string]any) { r["start_time"] = "invalid" }, observedcatalog.DefaultLimits()},
-		{"key-cap", func(r map[string]any) {}, observedcatalog.Limits{MaxKeysPerSpan: 1, MaxArrayMembersPerSpan: 256}},
-		{"array-cap", func(r map[string]any) {
-			r["attributes_extra"] = map[string]any{"array": []any{strings.Repeat("x", 4097), "later"}}
-		}, observedcatalog.Limits{MaxKeysPerSpan: 128, MaxArrayMembersPerSpan: 1}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			good, bad := policyRow(), policyRow()
@@ -128,8 +126,43 @@ func TestOtherExtractionGapsRejectTheWholePage(t *testing.T) {
 			c.mutate(bad)
 			start := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 			batch, excluded, err := buildPage([]map[string]any{good, bad}, exampleScope(), start, start.Add(time.Hour), c.limits)
-			if err == nil || !batch.Empty() || excluded != 0 {
+			if err == nil || !batch.Empty() || excluded.PolicyExclusions != 0 || len(excluded.Quarantined) != 0 {
 				t.Fatal("fatal or mixed gap returned a partial page")
+			}
+		})
+	}
+}
+
+func TestKnownPolicyExclusionsRetainLiveBatch(t *testing.T) {
+	for _, scenario := range []string{"max_keys", "max_array_members", "key_too_large", "invalid_attribute_key", "invalid_boolean"} {
+		t.Run(scenario, func(t *testing.T) {
+			row := policyRow()
+			limits := observedcatalog.DefaultLimits()
+			switch scenario {
+			case "max_keys":
+				row["attrs_string"] = map[string]string{}
+				for i := 0; i < 129; i++ {
+					row["attrs_string"].(map[string]string)[fmt.Sprintf("key_%03d", i)] = "kept"
+				}
+			case "max_array_members":
+				limits.MaxArrayMembersPerSpan = 1
+				row["attributes_extra"] = map[string]any{"array": []any{"first", "second"}}
+			case "key_too_large":
+				row["attrs_string"].(map[string]string)[strings.Repeat("x", 4097)] = "omitted"
+			case "invalid_attribute_key":
+				row["attrs_string"].(map[string]string)[""] = "omitted"
+			case "invalid_boolean":
+				row["attrs_bool"] = map[string]uint8{"valid": 1, "bad": 2}
+			}
+			scope := exampleScope()
+			live, report, err := observedcatalog.Extract(observedcatalog.ScopedSpan{OrganizationID: scope.OrganizationID, WorkspaceID: scope.WorkspaceID, Row: row}, limits)
+			if err != nil || report.Complete || live.Empty() {
+				t.Fatalf("fixture must have eligible observations and exclusions: %v %+v", err, report)
+			}
+			start := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+			backfill, excluded, err := buildPage([]map[string]any{row}, scope, start, start.Add(time.Hour), limits)
+			if err != nil || excluded.PolicyExclusions != 1 || len(excluded.Quarantined) != 0 || !reflect.DeepEqual(backfill, observedcatalog.Merge(live)) {
+				t.Fatalf("live/backfill policy differs: excluded=%+v err=%v", excluded, err)
 			}
 		})
 	}

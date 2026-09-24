@@ -141,7 +141,7 @@ func TestHandoffGapReportsRealSpoolAndExtractionFailures(t *testing.T) {
 		reason string
 	}{
 		{"spool capacity", 1, DefaultLimits(), "spool capacity exceeded"},
-		{"extraction budget", 512 << 20, Limits{MaxKeysPerSpan: 1, MaxArrayMembersPerSpan: 256}, "incomplete extraction"},
+		{"invalid source", 512 << 20, DefaultLimits(), "expected canonical typed attribute maps"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			writer, err := NewWriter(SpoolConfig{Directory: t.TempDir(), MaxBytes: tc.bytes}, tc.limits)
@@ -150,6 +150,9 @@ func TestHandoffGapReportsRealSpoolAndExtractionFailures(t *testing.T) {
 			}
 			defer writer.Close()
 			spans := []ScopedSpan{testSpan()}
+			if tc.name == "invalid source" {
+				delete(spans[0].Row, "attrs_bool")
+			}
 			err = writer.EnqueueCanonicalSpans(spans)
 			if err == nil || !strings.Contains(err.Error(), tc.reason) {
 				t.Fatalf("expected real %s failure, got %v", tc.name, err)
@@ -161,5 +164,28 @@ func TestHandoffGapReportsRealSpoolAndExtractionFailures(t *testing.T) {
 				t.Fatalf("real failure lost repair scope: %+v", events)
 			}
 		})
+	}
+}
+
+func TestPolicyExclusionsRetainSpoolWithoutRepairAlarm(t *testing.T) {
+	var out bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&out, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	writer, err := NewWriter(SpoolConfig{Directory: t.TempDir()}, Limits{MaxKeysPerSpan: 1, MaxArrayMembersPerSpan: 256})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	spans := []ScopedSpan{testSpan()}
+	if err := writer.EnqueueCanonicalSpans(spans); err != nil {
+		t.Fatal(err)
+	}
+	if len(writer.files) == 0 {
+		t.Fatal("policy exclusion discarded eligible observations")
+	}
+	events := handoffEvents(t, out.Bytes())
+	if len(events) != 1 || events[0]["event"] != "observed_catalog_policy_exclusion" || strings.Contains(out.String(), "repair required") {
+		t.Fatalf("policy exclusion not distinguished from handoff loss: %s", out.String())
 	}
 }

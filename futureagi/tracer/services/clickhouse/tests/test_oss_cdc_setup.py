@@ -481,8 +481,11 @@ def test_create_failure_reports_only_validated_identity(harness, failure, kind, 
 
 
 @pytest.mark.parametrize("apply", [False, True])
-def test_retained_running_twenty_exactly_zero_creates(harness, apply):
+@pytest.mark.parametrize("legacy_span", [False, True])
+def test_retained_running_twenty_exactly_zero_creates(harness, apply, legacy_span):
     harness.retained()
+    if legacy_span:
+        harness.add_mirror("tracer_observation_span")
     before = deepcopy(
         (harness.peers, harness.mirrors, harness.statuses, harness.source.columns)
     )
@@ -496,6 +499,25 @@ def test_retained_running_twenty_exactly_zero_creates(harness, apply):
         harness.statuses,
         harness.source.columns,
     )
+
+
+@pytest.mark.parametrize("change", ["duplicate", "foreign_source", "transform"])
+def test_retained_legacy_span_is_still_validated(harness, change):
+    harness.retained()
+    harness.add_mirror("tracer_observation_span")
+    if change == "duplicate":
+        harness.add_mirror("tracer_observation_span", name="another_legacy_writer")
+    else:
+        mapping = harness.statuses["mirror_tracer_observation_span"]["cdcStatus"][
+            "config"
+        ]["tableMappings"][0]
+        if change == "foreign_source":
+            mapping["sourceTableIdentifier"] = "other.tracer_observation_span"
+        else:
+            mapping["exclude"] = ["id"]
+    with pytest.raises(setup.SetupError):
+        harness.run(apply=True)
+    assert harness.writes == []
 
 
 @pytest.mark.parametrize("table", TABLES)

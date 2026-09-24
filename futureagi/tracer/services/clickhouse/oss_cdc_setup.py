@@ -183,10 +183,17 @@ def _inspect_peers(request, config):
         for mirror_name, table in inventory.inspect_mappings(
             one_writer, source=src, destination=dst
         ):
-            if table not in landing or table in mappings:
+            if (
+                table not in landing and table not in core.RETAINED_LEGACY_LANDING
+            ) or table in mappings:
                 raise SetupError("unknown or duplicate destination mapping")
             mappings[table] = mirror_name
-    return missing_peers, mappings, pending, seen
+    return (
+        missing_peers,
+        {table: mirror for table, mirror in mappings.items() if table in landing},
+        pending,
+        seen,
+    )
 
 
 def _inspect_landing(client, config, definitions):

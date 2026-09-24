@@ -28,6 +28,7 @@ type checkpoint struct {
 	// Optional for old checkpoints. Counts only exclusions recorded by this
 	// checkpoint; an older binary can ignore and drop the field when rewriting.
 	PolicyExclusionSpans uint64 `json:"recorded_policy_exclusion_spans,omitempty"`
+	QuarantinedSpans     uint64 `json:"recorded_quarantined_spans,omitempty"`
 }
 
 func lockCheckpoint(path string) (*os.File, error) {

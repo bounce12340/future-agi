@@ -147,7 +147,9 @@ def test_text_builder_rejects_unsupported_operation(builder_class, aggregation):
 )
 @pytest.mark.parametrize("source", ["traces", "both", "datasets"])
 @pytest.mark.parametrize("aggregation", DASHBOARD_AGGREGATIONS)
-def test_text_read_and_write_validation_agree(serializer_class, source, aggregation):
+def test_text_legacy_read_compatibility_preserves_strict_writes(
+    serializer_class, source, aggregation
+):
     config = query(aggregation, source)
     # Tenant authority is injected by the endpoint, not caller-supplied.
     payload = {
@@ -157,7 +159,12 @@ def test_text_read_and_write_validation_agree(serializer_class, source, aggregat
     }
     before = deepcopy(payload)
     serializer = serializer_class(data=payload)
-    assert serializer.is_valid() is (aggregation in COUNT_OPERATIONS), serializer.errors
+    compatible_read = (
+        serializer_class is DashboardReadQuerySerializer and source != "datasets"
+    )
+    assert serializer.is_valid() is (
+        aggregation in COUNT_OPERATIONS or compatible_read
+    ), serializer.errors
     if aggregation in COUNT_OPERATIONS:
         assert serializer.validated_data["metrics"][0]["aggregation"] == aggregation
         assert (
@@ -167,7 +174,10 @@ def test_text_read_and_write_validation_agree(serializer_class, source, aggregat
             == aggregation
         )
     else:
-        assert "aggregation" in serializer.errors["metrics"][0]
+        if compatible_read:
+            assert serializer.validated_data["metrics"][0]["aggregation"] == "count"
+        else:
+            assert "aggregation" in serializer.errors["metrics"][0]
         with pytest.raises(ValidationError):
             DashboardWidgetSerializer().validate_query_config(payload)
     assert payload == before

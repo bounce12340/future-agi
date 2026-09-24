@@ -686,6 +686,10 @@ def test_existing_mirror_with_absent_destination_is_never_recreated(table):
         (("mirror_spans", "spans"),),
         (("mirror_model_hub_score", "model_hub_score"),) * 2,
         (("first_writer", "model_hub_score"), ("second_writer", "model_hub_score")),
+        (
+            ("first_legacy", "tracer_observation_span"),
+            ("second_legacy", "tracer_observation_span"),
+        ),
     ],
 )
 def test_unknown_or_duplicate_mirror_inventory_refuses(mappings):
@@ -702,6 +706,7 @@ def test_unknown_or_duplicate_mirror_inventory_refuses(mappings):
         (("custom_scores", "model_hub_score"),),
         (("application_cdc", "model_hub_score"), ("application_cdc", "tracer_trace")),
         tuple((f"existing_{i}", table) for i, table in enumerate(LANDING_NAMES)),
+        (("retained_legacy_span", "tracer_observation_span"),),
     ],
 )
 def test_verified_mapping_identity_does_not_depend_on_mirror_name(mappings):

@@ -98,9 +98,7 @@ _USAGE_EVAL_LATEST_COLUMNS = (
 
 def _usage_eval_latest_projection(alias: str, *, include_config: bool = False) -> str:
     columns = _USAGE_EVAL_LATEST_COLUMNS + (("config",) if include_config else ())
-    return ",\n                        ".join(
-        f"{alias}.{column}" for column in columns
-    )
+    return ",\n                        ".join(f"{alias}.{column}" for column in columns)
 
 
 def _sanitize_attr_key(key: str) -> str:
@@ -701,6 +699,7 @@ class DashboardQueryBuilder:
         self.metrics = query_config.get("metrics", [])
         self.global_filters = query_config.get("filters", [])
         self.breakdowns = query_config.get("breakdowns", [])
+        self._legacy_annotation_aggregations = {}
         raw_annotation_labels = query_config.get("annotation_label_ids_by_project")
         self.annotation_label_ids_by_project = (
             {
@@ -1788,7 +1787,11 @@ class DashboardQueryBuilder:
                     [
                         *all_where,
                         *joined_presence_predicates,
-                        *(b["row_predicate"] for b in bd_infos if b.get("row_predicate")),
+                        *(
+                            b["row_predicate"]
+                            for b in bd_infos
+                            if b.get("row_predicate")
+                        ),
                     ]
                 )
                 join_str = "\n".join(join_clauses)
@@ -2173,17 +2176,11 @@ class DashboardQueryBuilder:
                     else _coerce_filter_value(val, op)
                 )
 
-            elif (
-                f_type == "system_metric"
-                and f_name.lower() in EVAL_SOURCE_DIMENSIONS
-            ):
+            elif f_type == "system_metric" and f_name.lower() in EVAL_SOURCE_DIMENSIONS:
                 where_parts.append(f"e.source {op_symbol} %({val_key})s")
                 params[val_key] = _coerce_string_filter_value(val, op)
 
-            elif (
-                f_type == "system_metric"
-                and f_name.lower() == EVAL_DATASET_DIMENSION
-            ):
+            elif f_type == "system_metric" and f_name.lower() == EVAL_DATASET_DIMENSION:
                 positive_op = _NEGATED_TO_POSITIVE_OPERATORS.get(op, op)
                 membership = "IN" if positive_op == op else "NOT IN"
                 # Deleted datasets stay matchable: their eval rows outlive them.
@@ -2379,8 +2376,15 @@ class DashboardQueryBuilder:
         params: dict,
     ) -> tuple[str, dict]:
         breakdown_error = annotation_breakdown_error([metric], self.breakdowns)
-        if breakdown_error:
+        legacy = self.config.get("legacy_annotation_compatibility", False)
+        if breakdown_error and not legacy:
             raise InvalidMetricCombinationError(breakdown_error)
+        if breakdown_error:
+            logger.warning(
+                "Saved annotation metric %s retains its ungrouped series: %s",
+                metric.get("label_id") or metric.get("name"),
+                breakdown_error,
+            )
         if self.breakdowns and metric.get("source") in ("datasets", "simulation"):
             raise InvalidMetricCombinationError(
                 "Annotation grouping in this builder requires the trace adapter."
@@ -2410,7 +2414,13 @@ class DashboardQueryBuilder:
                 pass
         aggregation_error = text_annotation_aggregation_error(output_type, aggregation)
         if aggregation_error:
-            raise InvalidMetricCombinationError(aggregation_error)
+            if not legacy:
+                raise InvalidMetricCombinationError(aggregation_error)
+            logger.warning(
+                "Saved text annotation %s retains count aggregation", label_id
+            )
+            self._legacy_annotation_aggregations[(label_id, aggregation)] = "count"
+            aggregation = "count"
         if output_type in ("categorical", "choice"):
             # Categorical: count rows (each row = one annotation)
             agg_expr = "count()"
@@ -2439,7 +2449,7 @@ class DashboardQueryBuilder:
         order_parts = ["time_bucket"]
         select_parts.append(f"{agg_expr} AS value")
 
-        if self.breakdowns:
+        if self.breakdowns and not breakdown_error:
             # Own-label grouping reads the same latest Score, never a second
             # Score join that could multiply independent annotation contexts.
             if output_type in ("categorical", "choice"):
@@ -2964,7 +2974,13 @@ class DashboardQueryBuilder:
             or metric.get("displayName")
             or metric.get("name", ""),
             "type": metric.get("type", "system_metric"),
-            "aggregation": metric.get("aggregation", "avg"),
+            "aggregation": self._legacy_annotation_aggregations.get(
+                (
+                    metric.get("label_id") or metric.get("name", ""),
+                    metric.get("aggregation", "avg"),
+                ),
+                metric.get("aggregation", "avg"),
+            ),
         }
 
     # ------------------------------------------------------------------
@@ -3140,18 +3156,16 @@ class DashboardQueryBuilder:
     ) -> dict:
         """Latest, scoped trace memberships, not Score facts joined to spans.
 
-        The clock/population comes from the caller's spans source. Children of
-        those traces are resolved all-time. Candidate Score IDs bound an ALL
-        version replay: a sparse tombstone must win before label/org/live checks.
+        The clock/population comes from the caller's spans source. Only children
+        referenced by this label's Scores are resolved all-time. Score IDs bound
+        an ALL version replay: a sparse tombstone wins before label/org/live checks.
         Neither Score-created time nor a curated-trace liveness gate belongs here.
         """
         org_param = label_param.replace("label", "org")
         params[org_param] = str(self.organization_id or "")
         subject = f"{alias}_subject"
         if output_type in ("categorical", "choice"):
-            selected = (
-                f"arrayDistinct(JSONExtract({subject}.value, 'selected', 'Array(String)'))"
-            )
+            selected = f"arrayDistinct(JSONExtract({subject}.value, 'selected', 'Array(String)'))"
             # A live empty selection must match, then disappear; it must not
             # masquerade as an unannotated trace under either LEFT JOIN mode.
             key = (
@@ -3192,11 +3206,11 @@ class DashboardQueryBuilder:
                     FROM spans AS {alias}_span_scan
                     PREWHERE {alias}_span_scan.project_id IN %(project_ids)s
                     WHERE {alias}_span_scan.id IN (
-                        SELECT {alias}_span_candidate.id
-                        FROM spans AS {alias}_span_candidate
-                        PREWHERE {alias}_span_candidate.project_id IN %(project_ids)s
-                        WHERE ({alias}_span_candidate.project_id, {alias}_span_candidate.trace_id)
-                            IN (SELECT project_id, trace_id FROM {alias}_traces)
+                        SELECT {alias}_span_candidate.observation_span_id
+                        FROM model_hub_score AS {alias}_span_candidate
+                        PREWHERE {alias}_span_candidate.organization_id = toUUIDOrNull(%({org_param})s)
+                            AND {alias}_span_candidate.label_id = toUUID(%({label_param})s)
+                        WHERE notEmpty({alias}_span_candidate.observation_span_id)
                     )
                     GROUP BY {alias}_span_scan.id
                 ) AS {alias}_span_latest
@@ -3364,7 +3378,8 @@ class DashboardQueryBuilder:
                         alias,
                         param_key,
                         output_type,
-                        spans_source or self._spans_source(None, [], "s", params=params),
+                        spans_source
+                        or self._spans_source(None, [], "s", params=params),
                         params,
                     )
                 )

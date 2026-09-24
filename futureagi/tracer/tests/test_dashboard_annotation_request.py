@@ -1,4 +1,4 @@
-"""Own-label grouping has the same capability boundary on reads and writes."""
+"""Writes require own-label grouping; reads replay historical widget shapes."""
 
 from copy import deepcopy
 
@@ -83,7 +83,7 @@ def test_annotation_request_preserves_supported_grouping(serializer_class, group
 @pytest.mark.parametrize(
     "serializer_class", [DashboardQuerySerializer, DashboardReadQuerySerializer]
 )
-def test_annotation_request_rejects_ignored_breakdowns(serializer_class, kind):
+def test_annotation_breakdown_compatibility_is_read_only(serializer_class, kind):
     payload = _payload()
     breakdown = payload["breakdowns"][0]
     if kind == "different-label":
@@ -106,8 +106,16 @@ def test_annotation_request_rejects_ignored_breakdowns(serializer_class, kind):
         )
     before = deepcopy(payload)
     serializer = serializer_class(data=payload)
-    assert not serializer.is_valid()
-    assert "breakdowns" in serializer.errors
+    compatible_read = serializer_class is DashboardReadQuerySerializer
+    assert serializer.is_valid() is compatible_read
+    if compatible_read:
+        assert serializer.validated_data["legacy_annotation_compatibility"] is True
+        assert (
+            serializer.validated_data["breakdowns"][0]["name"]
+            == payload["breakdowns"][0]["name"]
+        )
+    else:
+        assert "breakdowns" in serializer.errors
     with pytest.raises(ValidationError):
         DashboardWidgetSerializer().validate_query_config(payload)
     assert payload == before

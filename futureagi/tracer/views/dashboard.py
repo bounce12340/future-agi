@@ -1918,13 +1918,25 @@ def _canonicalize_persisted_dashboard_query_filters_for_read(query_config):
 
 
 class DashboardReadQuerySerializer(DashboardQuerySerializer):
-    """Accept historical filter storage shapes on query/read endpoints only.
+    """Accept historical filters and annotation semantics on read endpoints only.
 
     Dashboard writes continue to use the strict canonical serializer.  The
     read-only query endpoint, however, must be able to replay a saved widget's
     historical flattened metric filters when the frontend submits that same
     config as an ad-hoc query.
     """
+
+    legacy_annotation_compatibility = True
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        if any(
+            metric.get("type") == "annotation_metric"
+            and metric.get("source", "traces") in ("traces", "both", "all", "")
+            for metric in attrs.get("metrics", [])
+        ):
+            attrs["legacy_annotation_compatibility"] = True
+        return attrs
 
     class Meta(DashboardQuerySerializer.Meta):
         # This adapter changes runtime read compatibility only. Keep the public
@@ -6073,6 +6085,10 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
         read_query_config = _canonicalize_persisted_dashboard_query_filters_for_read(
             query_config
         )
+        if isinstance(read_query_config, dict):
+            # Internal read state may return through the exact worker or the
+            # validated ad-hoc endpoint; the read serializer derives it again.
+            read_query_config.pop("legacy_annotation_compatibility", None)
         frozen_dataset_ids = serializers.empty
         frozen_annotation_label_ids_by_project = serializers.empty
         if _exact_worker and cache_identity_override is not None:
@@ -6084,7 +6100,7 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
             frozen_annotation_label_ids_by_project = read_query_config.pop(
                 "annotation_label_ids_by_project", serializers.empty
             )
-        serializer = DashboardQuerySerializer(data=read_query_config)
+        serializer = DashboardReadQuerySerializer(data=read_query_config)
         if not serializer.is_valid():
             logger.warning(
                 "dashboard_widget_query_config_invalid",

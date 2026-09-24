@@ -54,6 +54,9 @@ LANDING = {
     "model_hub_promptlabel": schema.CDC_MODEL_HUB_PROMPTLABEL,
     "tracer_enduser": schema.CDC_TRACER_ENDUSER,
 }
+# Pre-collector OSS installs may retain this independently validated mirror.
+# It is not a bootstrap dependency and must never be recreated or removed here.
+RETAINED_LEGACY_LANDING = frozenset({"tracer_observation_span"})
 DEPENDENT = {
     "prompt_dict": schema.PROMPT_DICT,
     "prompt_label_dict": schema.PROMPT_LABEL_DICT,
@@ -664,22 +667,28 @@ def inspect_bootstrap(
         raise BootstrapError("complete mirror inventory for exact database required")
     seen = set()
     for mirror, destination in inventory.mappings:
-        if destination not in landing or not mirror.strip() or destination in seen:
+        if (
+            destination not in landing | RETAINED_LEGACY_LANDING
+            or not mirror.strip()
+            or destination in seen
+        ):
             raise BootstrapError("unknown/duplicate mirror mapping")
+        seen.add(destination)
+        if destination in RETAINED_LEGACY_LANDING:
+            continue
         # The inventory verifies actual endpoints and public source mappings.
         # A mirror's display name is not identity; one mirror may own many tables.
         if destination not in tables:
             raise BootstrapError(
                 f"{destination}: mirror exists but destination is absent"
             )
-        seen.add(destination)
     if inspect_source is not None:
         source = inspect_source()
         if (
             not isinstance(source, SourceInventory)
             or inventory.source is None
             or source.source != inventory.source
-            or seen != landing
+            or seen - RETAINED_LEGACY_LANDING != landing
         ):
             raise BootstrapError("all source-owned mappings and exact PG peer required")
         source_definitions = _source_definitions(

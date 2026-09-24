@@ -169,62 +169,67 @@ func scanBinding(cfg options, scope observedcatalog.Scope) string {
 	return hex.EncodeToString(digest[:])
 }
 
-// Oversized values are intentionally ineligible suggestions, as in the live
-// writer. Keep their keys and eligible siblings; every other gap stays fatal.
+// Apply the live writer's eligibility policy; unknown failures stay fatal.
 func extractionPolicyExclusion(report observedcatalog.Report) (uint64, error) {
 	if report.Complete && len(report.GapReasons) == 0 {
 		return 0, nil
 	}
-	if !report.Complete && len(report.GapReasons) > 0 {
-		sizeOnly := true
-		for _, reason := range report.GapReasons {
-			sizeOnly = sizeOnly && reason == "value_too_large"
-		}
-		if sizeOnly {
-			return 1, nil // affected spans, not the number of omitted values
-		}
+	if report.PolicyExclusion() {
+		return 1, nil // affected spans, not the number of omitted values
 	}
 	return 0, fmt.Errorf("source page has extraction gaps %v; no checkpoint advanced", report.GapReasons)
 }
 
-func buildPage(rows []map[string]any, scope observedcatalog.Scope, since, until time.Time, limits observedcatalog.Limits) (observedcatalog.Batch, uint64, error) {
+func buildPage(rows []map[string]any, scope observedcatalog.Scope, since, until time.Time, limits observedcatalog.Limits) (observedcatalog.Batch, pageReport, error) {
 	var batches []observedcatalog.Batch
-	var excludedSpans uint64
+	var result pageReport
 	for _, row := range rows {
 		if fmt.Sprint(row["is_deleted"]) == "1" {
 			continue
 		}
 		if fmt.Sprint(row["is_deleted"]) != "0" {
-			return observedcatalog.Batch{}, 0, errors.New("invalid source tombstone")
+			return observedcatalog.Batch{}, pageReport{}, errors.New("invalid source tombstone")
 		}
 		seen, err := time.Parse(observedcatalog.TimeLayout, fmt.Sprint(row["start_time"]))
 		if err != nil {
-			return observedcatalog.Batch{}, 0, errors.New("invalid source timestamp")
+			return observedcatalog.Batch{}, pageReport{}, errors.New("invalid source timestamp")
 		}
 		if seen.Before(since) || !seen.Before(until) {
 			continue
 		}
 		if row["project_id"] != scope.ProjectID {
-			return observedcatalog.Batch{}, 0, errors.New("source project does not match authorized project")
+			return observedcatalog.Batch{}, pageReport{}, errors.New("source project does not match authorized project")
+		}
+		org, ok := row["org_id"].(string)
+		if !ok || org != scope.OrganizationID {
+			key, err := rowKey(row)
+			if err != nil {
+				return observedcatalog.Batch{}, pageReport{}, err
+			}
+			result.Quarantined = append(result.Quarantined, quarantinedSpan{
+				Project: scope.ProjectID, Seen: seen.Format(observedcatalog.TimeLayout), Key: key,
+				Reason: "source_organization_mismatch_or_missing",
+			})
+			continue
 		}
 		canonical, err := canonicalRow(row)
 		if err != nil {
-			return observedcatalog.Batch{}, 0, err
+			return observedcatalog.Batch{}, pageReport{}, err
 		}
 		batch, report, err := observedcatalog.Extract(observedcatalog.ScopedSpan{
 			OrganizationID: scope.OrganizationID, WorkspaceID: scope.WorkspaceID, Row: canonical,
 		}, limits)
 		if err != nil {
-			return observedcatalog.Batch{}, 0, err
+			return observedcatalog.Batch{}, pageReport{}, err
 		}
 		excluded, err := extractionPolicyExclusion(report)
 		if err != nil {
-			return observedcatalog.Batch{}, 0, err
+			return observedcatalog.Batch{}, pageReport{}, err
 		}
-		excludedSpans += excluded
+		result.PolicyExclusions += excluded
 		batches = append(batches, batch)
 	}
-	return observedcatalog.Merge(batches...), excludedSpans, nil
+	return observedcatalog.Merge(batches...), result, nil
 }
 
 // JSONEachRow represents typed ClickHouse Maps as objects. Rehydrate their Go
@@ -324,16 +329,21 @@ func runSpans(ctx context.Context, cfg options, scopes scopeReader, publisher ob
 		if err != nil {
 			return err
 		}
-		batch, excludedSpans, err := buildPage(rows, scope, cfg.since, cfg.until, cfg.limits)
+		batch, report, err := buildPage(rows, scope, cfg.since, cfg.until, cfg.limits)
 		if err != nil {
 			return err
 		}
-		if excludedSpans > ^uint64(0)-progress.PolicyExclusionSpans {
+		if report.PolicyExclusions > ^uint64(0)-progress.PolicyExclusionSpans || uint64(len(report.Quarantined)) > ^uint64(0)-progress.QuarantinedSpans {
 			return errors.New("checkpoint policy exclusion count would overflow; page not published")
 		}
 		current, err := scopes.Scope(ctx, cfg.project)
 		if err != nil || current != scope {
 			return errors.New("project ownership changed during scan; page not published")
+		}
+		if cfg.apply {
+			if err := recordQuarantine(cfg.checkpointPath+".quarantine.jsonl", report.Quarantined); err != nil {
+				return fmt.Errorf("record rejected source identities: %w", err)
+			}
 		}
 		if cfg.apply && !batch.Empty() {
 			if err := publisher.Publish(ctx, batch); err != nil {
@@ -342,7 +352,8 @@ func runSpans(ctx context.Context, cfg options, scopes scopeReader, publisher ob
 		}
 		progress.Pages++
 		progress.Rows += uint64(len(rows))
-		progress.PolicyExclusionSpans += excludedSpans
+		progress.PolicyExclusionSpans += report.PolicyExclusions
+		progress.QuarantinedSpans += uint64(len(report.Quarantined))
 		if len(keys) < cfg.pageSize {
 			progress.Hour = progress.Hour.Add(-time.Hour)
 			progress.After = physicalKey{}
@@ -355,9 +366,10 @@ func runSpans(ctx context.Context, cfg options, scopes scopeReader, publisher ob
 				return err
 			}
 		}
-		receipt := map[string]any{"preview": !cfg.apply, "source_rows": len(rows), "keys": len(batch.Keys), "values": len(batch.Values), "scan_complete": progress.Complete, "pages_read": progress.Pages, "consumer_visibility_verified": false, "policy_exclusion_spans": excludedSpans}
+		receipt := map[string]any{"preview": !cfg.apply, "source_rows": len(rows), "keys": len(batch.Keys), "values": len(batch.Values), "scan_complete": progress.Complete, "pages_read": progress.Pages, "consumer_visibility_verified": false, "policy_exclusion_spans": report.PolicyExclusions, "quarantined_spans": len(report.Quarantined)}
 		if cfg.apply {
 			receipt["recorded_policy_exclusion_spans"] = progress.PolicyExclusionSpans
+			receipt["recorded_quarantined_spans"] = progress.QuarantinedSpans
 		}
 		if err := encoder.Encode(receipt); err != nil {
 			return err
@@ -400,8 +412,12 @@ FI_OBSERVED_BACKFILL_CH_PASSWORD. Apply uses FI_OBSERVED_CATALOG_KAFKA_BROKERS
 and optional KAFKA_TOPIC/KAFKA_GROUP with the same FI_OBSERVED_CATALOG_ prefix.
 Live and backfill share FI_OBSERVED_CATALOG_MAX_KEYS_PER_SPAN and
 FI_OBSERVED_CATALOG_MAX_ARRAY_MEMBERS_PER_SPAN.
-Oversized suggestion values are omitted with keys and eligible values retained.
-Operator progress counts affected spans; all other extraction gaps remain fatal.
+Extraction policy limits omit ineligible suggestions, retaining eligible siblings.
+Operator progress counts affected spans; malformed source and unknown failures
+remain fatal. Increasing limits requires a new overlapping repair checkpoint.
+Rows with missing or conflicting source organization are never published.
+Apply records their identities in CHECKPOINT.quarantine.jsonl before advancing;
+the checkpoint and page receipts count them separately from indexed spans.
 
 Progress proves Kafka acknowledgement, not consumer visibility or complete
 source history. Re-run overlapping source ranges to repair late-arriving spans.

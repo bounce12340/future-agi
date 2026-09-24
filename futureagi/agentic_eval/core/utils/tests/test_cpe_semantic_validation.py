@@ -1,13 +1,12 @@
 """CPE result-contract tests using the existing provider-free evaluator fixture.
 
-Exercise the actual JSON parser/result boundary, not a stubbed validator. Enum
-labels are exact (including declared case/whitespace); numeric strings are not
-JSON numbers. Multi-choice requires one or more distinct declared strings,
-matching the judge instructions. Reject repeated picks instead of changing their
-weight in downstream scoring; preserve the order of distinct picks.
+Exercise the actual JSON parser/result boundary, not a stubbed validator.
+Recover unambiguous label/number drift while preserving exact declared labels,
+distinct multi-choice order and rejection of ambiguous or invalid results.
 """
 
 import json
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -78,9 +77,10 @@ def test_six_proven_semantic_invalid_results_raise(
         float("nan"),
         float("inf"),
         float("-inf"),
-        "0.5",
         "NaN",
         "Infinity",
+        "-Infinity",
+        "1e999",
         "",
         "not-a-number",
         [],
@@ -129,10 +129,6 @@ def test_finite_numeric_results_keep_clamp_metrics_and_verdict(
 @pytest.mark.parametrize(
     "value",
     [
-        "pass",
-        "fail",
-        " Pass",
-        "Fail ",
         "Passed",
         True,
         None,
@@ -141,24 +137,34 @@ def test_finite_numeric_results_keep_clamp_metrics_and_verdict(
         {"result": "Pass"},
     ],
 )
-def test_pass_fail_requires_exact_declared_string(value):
+def test_pass_fail_rejects_unknown_labels_and_wrong_types(value):
     with pytest.raises(ValueError, match="^Invalid evaluation result:"):
         _evaluate("Pass/Fail", value)
 
 
-@pytest.mark.parametrize("value,failed", [("Pass", False), ("Fail", True)])
-def test_pass_fail_retains_existing_verdict(value, failed):
+@pytest.mark.parametrize(
+    "value,expected,failed",
+    [
+        ("Pass", "Pass", False),
+        (" pass ", "Pass", False),
+        ("PASS", "Pass", False),
+        ("Fail", "Fail", True),
+        ("fail", "Fail", True),
+        (" FAIL ", "Fail", True),
+    ],
+)
+def test_pass_fail_normalizes_before_computing_verdict(value, expected, failed):
     result = _evaluate("Pass/Fail", value)
-    assert result["data"] == {"result": value}
+    assert result["data"] == {"result": expected}
     assert result["failure"] is failed
-    assert result["metrics"] == [{"id": "custom_eval_score", "value": value}]
+    assert result["metrics"] == [{"id": "custom_eval_score", "value": expected}]
 
 
 @pytest.mark.parametrize(
     "value",
-    [None, True, 1, [], ["Alpha"], {"result": "Alpha"}, "alpha", " Alpha", "Alpha "],
+    [None, True, 1, [], ["Alpha"], {"result": "Alpha"}],
 )
-def test_single_choice_requires_exact_string_and_shape(value):
+def test_single_choice_rejects_unknown_labels_and_wrong_shapes(value):
     with pytest.raises(ValueError, match="^Invalid evaluation result:"):
         _evaluate("choices", value, ["Alpha", "Beta"])
 
@@ -175,11 +181,9 @@ def test_single_choice_requires_exact_string_and_shape(value):
         [1],
         [None],
         [True],
-        ["alpha"],
-        ["Alpha "],
     ],
 )
-def test_multi_choice_requires_nonempty_list_of_exact_strings(value):
+def test_multi_choice_requires_nonempty_list_of_declared_labels(value):
     with pytest.raises(ValueError, match="^Invalid evaluation result:"):
         _evaluate("choices", value, ["Alpha", "Beta"], multi=True)
 
@@ -233,11 +237,11 @@ def test_distinct_declared_case_and_space_variants_keep_order(value):
 
 
 def test_membership_uses_declared_schema_not_score_mapping_fallback():
-    # The downstream mapper's case-insensitive fallback must not widen the enum.
+    # Scoring configuration cannot introduce a label absent from the vocabulary.
     with pytest.raises(ValueError, match="^Invalid evaluation result:"):
-        _evaluate("choices", "LOW", ["Low", "High"], scores={"LOW": 0.2, "High": 0.8})
+        _evaluate("choices", "Other", ["Low", "High"], scores={"Other": 0.2})
     result = _evaluate(
-        "choices", "Low", ["Low", "High"], scores={"LOW": 0.2, "High": 0.8}
+        "choices", "LOW", ["Low", "High"], scores={"LOW": 0.2, "High": 0.8}
     )
     assert result["data"] == {"result": "Low"}
 
@@ -256,8 +260,36 @@ def test_invalid_numeric_value_is_rejected_before_clamping():
         "agentic_eval.core_evals.fi_evals.llm.custom_prompt_evaluator.evaluator.clamp_unit_score"
     ) as clamp:
         with pytest.raises(ValueError, match="finite JSON number"):
-            _evaluate("score", "0.5")
+            _evaluate("score", True)
     clamp.assert_not_called()
+
+
+@pytest.mark.parametrize("output_type", ["score", "numeric"])
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (" 0.85 ", 0.85),
+        ("1e-1", 0.1),
+        ("0", 0.0),
+        ("1", 1.0),
+        ("3.5", 1.0),
+        ("-0.1", 0.0),
+    ],
+)
+def test_numeric_strings_normalize_then_use_existing_clamp(
+    output_type, value, expected
+):
+    with capture_logs() as captured:
+        result = _evaluate(output_type, value)
+    assert result["data"] == {"result": expected}
+    assert result["metrics"] == [{"id": "custom_eval_score", "value": expected}]
+    assert result["failure"] is False
+    warnings = [
+        entry
+        for entry in captured
+        if entry["event"] == "eval_score_out_of_range_clamped"
+    ]
+    assert len(warnings) == int(float(value) < 0 or float(value) > 1)
 
 
 def test_finite_out_of_range_value_still_emits_existing_warning():
@@ -267,3 +299,119 @@ def test_finite_out_of_range_value_still_emits_existing_warning():
     assert [entry["event"] for entry in captured].count(
         "eval_score_out_of_range_clamped"
     ) == 1
+
+
+@pytest.mark.parametrize(
+    "value,choices,multi,expected",
+    [
+        (" Always ", ["never", "always"], False, "always"),
+        ("STRASSE", ["Straße", "other"], False, "Straße"),
+        (3, ["1", "2", "3", "4", "5"], False, "3"),
+        (0.5, ["0.5", "1.0"], False, "0.5"),
+        ([" JOY ", "Sad"], ["joy", "sad"], True, ["joy", "sad"]),
+        ([3, " 1 "], ["1", "3"], True, ["3", "1"]),
+    ],
+)
+def test_unambiguous_choice_drift_returns_declared_labels(
+    value, choices, multi, expected
+):
+    result = _evaluate("choices", value, choices, multi)
+    assert result["data"] == {"result": expected}
+    assert result["metrics"] == [{"id": "custom_eval_score", "value": expected}]
+
+
+@pytest.mark.parametrize("multi", [False, True])
+@pytest.mark.parametrize(
+    "value,choices",
+    [
+        ("JOY", ["Joy", "joy"]),
+        (" joy ", ["joy", "joy "]),
+        ("STRASSE", ["Straße", "strasse"]),
+        (3, ["3", " 3 "]),
+    ],
+)
+def test_ambiguous_label_normalization_is_rejected(value, choices, multi):
+    with pytest.raises(ValueError, match="ambiguous"):
+        _evaluate("choices", [value] if multi else value, choices, multi)
+
+
+@pytest.mark.parametrize("value", [True, False, float("nan"), float("inf")])
+@pytest.mark.parametrize("multi", [False, True])
+def test_nonfinite_and_boolean_values_never_become_choice_labels(value, multi):
+    with pytest.raises(ValueError, match="^Invalid evaluation result:"):
+        _evaluate(
+            "choices",
+            [value] if multi else value,
+            ["True", "False", "nan", "inf"],
+            multi,
+        )
+
+
+def test_normalized_duplicate_choices_remain_invalid():
+    with pytest.raises(ValueError, match="duplicate choices"):
+        _evaluate("choices", ["Joy", " JOY "], ["Joy", "Sad"], multi=True)
+
+
+def test_normalized_failure_survives_formatting_and_error_feed_scoring():
+    from evaluations.engine.formatting import format_eval_value
+
+    # Importing the clustering module initializes its embedding manager. This
+    # regression exercises only its pure score predicate, never model serving.
+    with patch(
+        "agentic_eval.core.embeddings.serving_client.ModelServingClient.health_check",
+        return_value=True,
+    ):
+        from tracer.queries.eval_clustering import is_clusterable_eval_failure
+
+    template = SimpleNamespace(
+        choice_scores={"never": 0.0, "always": 1.0},
+        pass_threshold=0.5,
+        config={},
+        multi_choice=False,
+    )
+    result = _evaluate(
+        "choices", " Never ", ["never", "always"], scores=template.choice_scores
+    )
+    formatted = format_eval_value({**result, "output": "choices"}, template)
+    assert formatted == {"choice": "never", "score": 0.0}
+    entry = SimpleNamespace(
+        output_str=json.dumps(formatted),
+        output_float=None,
+        output_bool=None,
+        output_str_list=[],
+        eval_explanation=result["reason"],
+        custom_eval_config=SimpleNamespace(eval_template=template),
+    )
+    assert is_clusterable_eval_failure(entry) is True
+
+
+@pytest.mark.parametrize("valid", [False, True])
+def test_result_logs_never_include_judge_values_or_explanation(valid):
+    evaluator = _make_cpe(
+        "choices", choices=["private-label"] if valid else ["allowed"]
+    )
+    evaluator.api_key = "private-api-key"
+    response = json.dumps(
+        {"result": "private-label", "explanation": "private-explanation"}
+    )
+    with capture_logs() as captured:
+        if valid:
+            result = _patched_evaluate(evaluator, response)
+            assert result["reason"] == "private-explanation"
+        else:
+            with pytest.raises(ValueError, match="^Invalid evaluation result:"):
+                _patched_evaluate(evaluator, response)
+    serialized = json.dumps(captured)
+    for secret in ["private-label", "private-explanation", "private-api-key"]:
+        assert secret not in serialized
+    errors = [
+        entry for entry in captured if entry["event"] == "custom_prompt_eval_error"
+    ]
+    assert len(errors) == (0 if valid else 1)
+    if not valid:
+        assert errors[0]["phase"] == "result_validation"
+        assert errors[0]["model"] == "stub-model"
+        assert errors[0]["provider"] == "openai"
+        assert errors[0]["output_type"] == "choices"
+        assert errors[0]["result_type"] == "str"
+        assert "exc_info" not in errors[0]

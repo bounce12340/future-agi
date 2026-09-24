@@ -33,6 +33,24 @@ type Report struct {
 	GapReasons []string
 }
 
+// PolicyExclusion distinguishes deliberately unindexed suggestions from an
+// extraction failure. Both live ingestion and repair retain eligible siblings.
+func (r Report) PolicyExclusion() bool {
+	if r.Complete || len(r.GapReasons) == 0 {
+		return false
+	}
+	for _, reason := range r.GapReasons {
+		switch reason {
+		case "value_too_large", "key_too_large", attributecatalog.GapMaxKeys,
+			attributecatalog.GapMaxArrayMembers, attributecatalog.GapInvalidAttributeKey,
+			attributecatalog.GapInvalidScalar, attributecatalog.GapInvalidBoolean:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // Extract emits custom keys and selectable scalar values plus the code-owned
 // model observation. It never mutates canonical rows. Its value eligibility
 // limits are per row; the resulting batch is chunked, never byte-truncated.

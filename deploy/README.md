@@ -158,6 +158,10 @@ Upgrades re-run the same jobs with the same commands. They are idempotent — ev
 one is a no-op against current state — so a stalled upgrade can be resumed from the
 job that failed rather than restarted from step 1.
 
+A retained legacy span mirror from an older `--full` install is inspected but
+left untouched. Its source/destination identity, mapping and health must still
+pass validation; upgrading does not require deleting that mirror or its data.
+
 ### Upgrading an existing install: backfill before you cut over
 
 **This release changes where custom-attribute suggestions come from, and the change

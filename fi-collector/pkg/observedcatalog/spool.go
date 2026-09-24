@@ -180,6 +180,7 @@ func (w *Writer) save(raw []byte) error {
 func (w *Writer) EnqueueCanonicalSpans(spans []ScopedSpan) error {
 	var failures int
 	var last error
+	exclusions := map[string]int{}
 	// Coalesce a bounded number of source spans, then chunk by actual bytes.
 	// A large span is flushed independently; no total byte truncation is used.
 	batch := Batch{}
@@ -199,7 +200,11 @@ func (w *Writer) EnqueueCanonicalSpans(spans []ScopedSpan) error {
 			last = err
 			continue
 		}
-		if !report.Complete {
+		if report.PolicyExclusion() {
+			for _, reason := range report.GapReasons {
+				exclusions[reason]++
+			}
+		} else if !report.Complete || len(report.GapReasons) != 0 {
 			failures++
 			last = fmt.Errorf("observedcatalog: incomplete extraction: %s", strings.Join(report.GapReasons, ","))
 		}
@@ -211,6 +216,10 @@ func (w *Writer) EnqueueCanonicalSpans(spans []ScopedSpan) error {
 		}
 	}
 	flush()
+	if len(exclusions) != 0 {
+		slog.Warn("observed catalog policy exclusions; eligible suggestions retained",
+			"event", "observed_catalog_policy_exclusion", "spans_by_reason", exclusions)
+	}
 	if failures > 0 {
 		return fmt.Errorf("observedcatalog: %d catalog gaps; bounded backfill repair required: %w", failures, last)
 	}

@@ -110,7 +110,7 @@ func TestPersistedRowsUseTheLiveExtractor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if excluded != 0 {
+	if excluded.PolicyExclusions != 0 || len(excluded.Quarantined) != 0 {
 		t.Fatal("eligible fixture reported exclusions")
 	}
 	if len(direct.Keys) != len(backfilled.Keys) || len(direct.Values) != len(backfilled.Values) {

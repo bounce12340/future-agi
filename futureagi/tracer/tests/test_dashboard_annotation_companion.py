@@ -130,16 +130,23 @@ def test_score_replay_is_id_bounded_but_all_versions_before_live_scope_checks(mo
 
 
 @pytest.mark.parametrize("mode", MODES)
-def test_children_are_all_time_latest_unique_and_project_bounded(mode):
+def test_children_are_score_driven_all_time_latest_unique_and_project_bounded(mode):
     _, sql, params = compile_query(config_for(), mode)
     text = compact(sql)
     children = text.split("ann0_children AS (", 1)[1].split("), ann0_ids AS", 1)[0]
     assert "start_time" not in children and "created_at" not in children
-    assert "ann0_span_candidate.project_id IN %(project_ids)s" in children
+    assert "FROM spans AS ann0_span_candidate" not in children
     assert (
-        "(ann0_span_candidate.project_id, ann0_span_candidate.trace_id) IN (SELECT project_id, trace_id FROM ann0_traces)"
+        "SELECT ann0_span_candidate.observation_span_id FROM model_hub_score AS ann0_span_candidate"
         in children
     )
+    assert (
+        "ann0_span_candidate.organization_id = toUUIDOrNull(%(_ann_bd_org_0)s)"
+        in children
+    )
+    assert "ann0_span_candidate.label_id = toUUID(%(_ann_bd_label_0)s)" in children
+    assert "notEmpty(ann0_span_candidate.observation_span_id)" in children
+    assert "FROM ann0_traces" not in children
     assert "ann0_span_scan.project_id IN %(project_ids)s" in children
     assert (
         "uniqExact(tuple(ann0_span_scan.project_id, ann0_span_scan.trace_id)) AS identity_count"
