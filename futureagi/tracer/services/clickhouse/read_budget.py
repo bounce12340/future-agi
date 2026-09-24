@@ -142,6 +142,21 @@ def is_clickhouse_query_size_error(exc: Exception) -> bool:
     )
 
 
+def _is_clickhouse_eof_error(exc: Exception) -> bool:
+    """Return whether *exc* is or wraps an EOFError from mid-stream connection loss."""
+    if isinstance(exc, EOFError):
+        return True
+    if isinstance(exc, (ClickHouseError, ClickHouseConnectDatabaseError)):
+        curr: BaseException | None = getattr(exc, "__cause__", None) or getattr(exc, "__context__", None)
+        visited: set[int] = set()
+        while curr is not None and id(curr) not in visited:
+            if isinstance(curr, EOFError):
+                return True
+            visited.add(id(curr))
+            curr = getattr(curr, "__cause__", None) or getattr(curr, "__context__", None)
+    return False
+
+
 def is_clickhouse_query_error(exc: Exception) -> bool:
     """Return whether *exc* is a narrow, degradable ClickHouse failure.
 
@@ -153,7 +168,10 @@ def is_clickhouse_query_error(exc: Exception) -> bool:
     :func:`is_read_budget_error`.
     """
 
-    if isinstance(exc, (ClickHouseNetworkError, ClickHouseSocketTimeoutError)):
+    if (
+        isinstance(exc, (ClickHouseNetworkError, ClickHouseSocketTimeoutError))
+        or _is_clickhouse_eof_error(exc)
+    ):
         return True
     if isinstance(exc, ClickHouseError):
         return getattr(exc, "code", None) in _TRANSIENT_CLICKHOUSE_ERROR_CODES
