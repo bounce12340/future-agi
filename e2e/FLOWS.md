@@ -605,6 +605,26 @@
 - usage analytics grouped by application counts each application on its own
 - the filtered UI row set equals the API result for the same filter
 
+### GW-E2E-002 — custom provider keeps an explicitly empty API path prefix
+
+**Goal:** A user configures a custom OpenAI-compatible provider without an API version prefix  
+**Spec:** `flows/gateway/provider-path-prefix.spec.ts:30`  
+**Tags:** @smoke
+
+**User steps:**
+
+1. seed a custom provider for the current organization
+2. open Gateway provider configuration
+3. edit the provider and clear its API path prefix
+4. save and reopen the provider
+5. see that the empty prefix was preserved
+
+**Backend state verified:**
+
+- the provider credential API returns api_path_prefix as an explicit empty string
+- the Django gateway config returns api_path_prefix as an explicit empty string
+- the organization config pushed to the Go gateway retains api_path_prefix as an explicit empty string
+
 ## observe
 
 ### OBS-E2E-001 — SDK trace appears in Observe with coherent backend state
@@ -871,3 +891,25 @@
 - real mock output and the prompt evaluation binding retain exact parent, actor scope and model with terminal stored results
 - current prompt catalog identifies the exact binding and its two configured choices
 - mapping edit preserves binding ID/name, completes, and deletion removes it from UI and current discovery
+
+## settings
+
+### SET-E2E-001 — admin restricts MCP tool groups for connected clients
+
+**Goal:** An admin restricts which MCP tool groups are available to connected clients  
+**Spec:** `flows/settings/mcp-tool-groups.spec.ts:19`  
+**Tags:** @smoke
+
+**User steps:**
+
+1. open Settings MCP Server
+2. expand Tool Groups
+3. turn off Datasets & Knowledge Bases
+4. save the selection
+
+**Backend state verified:**
+
+- GET /mcp/config/tool-groups/ equals the initial group set minus datasets
+- PG mcp_server_mcptoolgroupconfig.enabled_groups equals that exact set for the actor connection
+- GET /mcp/internal/tools/ equals the initial tool set minus all dataset tools
+- POST /mcp/internal/tool-call/ list_datasets returns 403 while whoami and list_projects still succeed

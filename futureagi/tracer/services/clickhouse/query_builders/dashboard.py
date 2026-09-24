@@ -20,6 +20,8 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
+from django.conf import settings
+
 from tracer.constants.dashboard import (
     DASHBOARD_NUMERIC_ONLY_AGGREGATIONS,
     annotation_breakdown_error,
@@ -41,7 +43,14 @@ from tracer.services.clickhouse.eval_logger_table import (
 from tracer.services.clickhouse.query_builders.expressions import (
     annotation_numeric_value_expr,
 )
-from tracer.services.clickhouse.query_builders.filters import ClickHouseFilterBuilder
+from tracer.services.clickhouse.query_builders.filters import (
+    BooleanMetaFilterShapeError,
+    ClickHouseFilterBuilder,
+    boolean_meta_presence_condition,
+    resolve_annotation_label_output_type,
+    resolve_boolean_meta_value,
+    resolve_eval_filter_metadata,
+)
 from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
     _validate_attribute_key,
     compile_span_attribute_row_predicate,
@@ -106,11 +115,6 @@ def _sanitize_attr_key(key: str) -> str:
     if not key or not _SAFE_ATTR_KEY_RE.match(key):
         raise ValueError(f"Invalid attribute key: {key!r}")
     return key
-
-
-def _snap_to_hour(dt: datetime) -> datetime:
-    """Truncate a datetime to the hour (ClickHouse ``toStartOfHour``)."""
-    return dt.replace(minute=0, second=0, microsecond=0)
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +195,16 @@ PRESENCE_SYSTEM_METRIC_FILTERS = frozenset({"has_eval", "has_annotation"})
 EVAL_SOURCE_DIMENSIONS = frozenset({"source", "eval_source"})
 EVAL_DATASET_DIMENSION = "dataset"
 
+# Dashboard widgets carry their own operator vocabulary
+# (``DASHBOARD_FILTER_OP_TO_INTERNAL`` in ``tracer/views/dashboard.py``). Map it
+# onto the list vocabulary the shared boolean meta-filter parser speaks.
+_PRESENCE_FILTER_OP_ALIAS = {
+    "equal_to": "equals",
+    "not_equal_to": "not_equals",
+    "is_set": "is_not_null",
+    "is_not_set": "is_null",
+}
+
 METRIC_UNITS: dict[str, str] = {
     "latency": "ms",
     "error_rate": "%",
@@ -225,12 +239,6 @@ METRIC_UNITS: dict[str, str] = {
 # averaging aggregations get rescaled to a percentage at query time via
 # ``rescale_rate_to_percent`` so the result matches the ``%`` unit.
 _RATE_INDICATOR_METRICS = frozenset({"error_rate"})
-
-# Covered by dashboard_attr_rollup. Adding one: extend the MV's ARRAY JOIN list too.
-_ROLLUP_COVERED_ATTRS = frozenset({"final_status", "country"})
-
-# Rollup is hour-resolution; sub-hour granularities keep the spans scan.
-_ROLLUP_GRANULARITIES = frozenset({"hour", "day", "week", "month", "year"})
 
 # Metrics that are non-numeric identifiers — force count_distinct aggregation
 _COUNT_DISTINCT_METRICS = frozenset(
@@ -646,10 +654,6 @@ class DashboardQueryBuilder:
     project_ids and builds multiple queries (one per metric).
     """
 
-    # dashboard_attr_rollup lives only in the v2 schema; the v2 subclass flips
-    # this True. Base/v1 never routes to the rollup (fail-closed: missing table).
-    _attr_rollup_available: bool = False
-
     # The legacy dashboard can still run against the CDC schema, where curated
     # user labels are dictionary-backed. The v2 subclass flips this on because
     # the direct-write ``end_users`` table is authoritative there.
@@ -914,18 +918,40 @@ class DashboardQueryBuilder:
         return cls._presence_filter_name(payload) in PRESENCE_SYSTEM_METRIC_FILTERS
 
     @staticmethod
-    def _presence_filter_value(payload: dict, metric_name: str) -> bool:
+    def _presence_filter_operation(payload: dict) -> str:
         operation = str(payload.get("operator") or "")
-        if operation not in {"equal_to", "equals"}:
-            raise InvalidMetricCombinationError(
-                f"{metric_name} supports only the equals operation"
+        return _PRESENCE_FILTER_OP_ALIAS.get(operation, operation)
+
+    @classmethod
+    def _presence_filter_constant(cls, payload: dict) -> str | None:
+        """Compile a presence operator on one derived relational flag.
+
+        ``has_eval`` / ``has_annotation`` are computed for every row and are
+        never NULL, so ``is_not_null`` constrains nothing and ``is_null``
+        matches nothing. Returns ``None`` for a value comparison.
+        """
+
+        return boolean_meta_presence_condition(cls._presence_filter_operation(payload))
+
+    @classmethod
+    def _presence_filter_value(cls, payload: dict, metric_name: str) -> bool:
+        """Resolve the requested presence through the shared boolean rule.
+
+        The rule lives in :func:`resolve_boolean_meta_value` and is the same
+        one the list, graph and session compilers use; keeping a second copy
+        here is what let the dashboard and the list routes drift apart in the
+        first place. Only the error class differs, because this builder's
+        readers surface the message per widget.
+        """
+
+        try:
+            return resolve_boolean_meta_value(
+                metric_name,
+                payload.get("value"),
+                cls._presence_filter_operation(payload),
             )
-        value = payload.get("value")
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
-            return value.strip().lower() == "true"
-        raise InvalidMetricCombinationError(f"{metric_name} requires a boolean value")
+        except BooleanMetaFilterShapeError as exc:
+            raise InvalidMetricCombinationError(str(exc)) from exc
 
     def _eval_presence_relation(self) -> str:
         """Return exact project+trace identities with a latest-live eval row."""
@@ -1129,6 +1155,10 @@ class DashboardQueryBuilder:
                 continue
             metric_name = self._presence_filter_name(payload)
             if metric_name not in PRESENCE_SYSTEM_METRIC_FILTERS:
+                continue
+            constant = self._presence_filter_constant(payload)
+            if constant is not None:
+                predicates.append(constant)
                 continue
             required = self._presence_filter_value(payload, metric_name)
             relation = (
@@ -1602,47 +1632,6 @@ class DashboardQueryBuilder:
     # System metric
     # ------------------------------------------------------------------
 
-    def _attr_rollup_window_covered(self, start_date: datetime) -> bool:
-        """True only when the rollup flag is on AND the requested window starts
-        within the backfilled-and-covered range — fail-closed on a fresh deploy
-        (off until ops backfills the rollup and sets the coverage date)."""
-        from django.conf import settings
-
-        if not getattr(settings, "DASHBOARD_ATTR_ROLLUP_ENABLED", False):
-            return False
-        covered_since = getattr(settings, "DASHBOARD_ATTR_ROLLUP_COVERED_SINCE", None)
-        if covered_since is None:
-            return False
-        if covered_since.tzinfo is None:
-            covered_since = covered_since.replace(tzinfo=UTC)
-        if start_date.tzinfo is None:
-            start_date = start_date.replace(tzinfo=UTC)
-        return start_date >= covered_since
-
-    def _should_use_rollup(
-        self,
-        metric_name: str,
-        aggregation: str,
-        single_bd: dict | None,
-        per_metric_filters: list[dict],
-        start_date: datetime,
-    ) -> bool:
-        """True only for the covered latency-breakdown shape on a v2 build with the
-        rollup enabled and the window inside coverage — fail-closed everywhere else."""
-        return (
-            self._attr_rollup_available
-            and not self.config.get("require_versioned_snapshot", False)
-            and metric_name == "latency"
-            and aggregation == "avg"
-            and self.granularity in _ROLLUP_GRANULARITIES
-            and single_bd is not None
-            and single_bd.get("type") == "custom_attribute"
-            and single_bd.get("name") in _ROLLUP_COVERED_ATTRS
-            and not per_metric_filters
-            and not self.global_filters
-            and self._attr_rollup_window_covered(start_date)
-        )
-
     def _build_system_metric_query(
         self,
         metric_name: str,
@@ -1654,35 +1643,10 @@ class DashboardQueryBuilder:
         # Normalize: saved widgets may have capitalized names (e.g. "Latency")
         metric_name = metric_name.lower() if metric_name else metric_name
 
-        # Covered latency-breakdown shape → the pre-aggregated rollup; anything
-        # else falls through to the spans scan (fail-closed, see _should_use_rollup).
-        single_bd = self.breakdowns[0] if len(self.breakdowns) == 1 else None
-        if self._should_use_rollup(
-            metric_name,
-            aggregation,
-            single_bd,
-            per_metric_filters,
-            params["start_date"],
-        ):
-            params = dict(params)
-            params["attr_key"] = _sanitize_attr_key(single_bd["name"])
-            # Rollup is hourly — snap the window to whole hours so no partial bucket.
-            params["start_date"] = _snap_to_hour(params["start_date"])
-            params["end_date"] = _snap_to_hour(params["end_date"])
-            rollup_query = (
-                f"SELECT {bucket_fn}(hour) AS time_bucket,\n"
-                "       attr_value AS breakdown_value,\n"
-                "       sumMerge(latency_sum) / countMerge(n) AS value\n"
-                "FROM dashboard_attr_rollup\n"
-                "WHERE project_id IN %(project_ids)s\n"
-                "  AND attr_key = %(attr_key)s\n"
-                "  AND hour >= %(start_date)s\n"
-                "  AND hour < %(end_date)s\n"
-                "GROUP BY time_bucket, breakdown_value\n"
-                "ORDER BY time_bucket, breakdown_value"
-            )
-            return rollup_query, params
-
+        # Trace metrics read spans directly. A rollup is an independently
+        # refreshed aggregate and cannot establish latest physical span state,
+        # which is why `_read_dashboard_rollup_fast_path` already declines the
+        # hourly rollup for this metric class (views/dashboard.py).
         if metric_name not in SYSTEM_METRICS:
             # Fallback: treat unknown system metrics as custom span attributes
             # (handles widgets saved with wrong type, e.g. span attribute saved as system_metric)
@@ -3053,18 +3017,9 @@ class DashboardQueryBuilder:
             if not series_data:
                 series_data["total"] = {}
 
-            # Rank all returned series; presentation limits belong to the UI.
-            # The executor's throwing row/byte caps bound this result. Dropping
-            # series here would publish a truncated payload as an exact result.
-            if "total" not in series_data:
-                ranked = sorted(
-                    series_data.items(),
-                    key=lambda kv: sum(v for v in kv[1].values() if v is not None),
-                    reverse=True,
-                )
-                series_data = dict(ranked)
+            series_data, series_total = rank_and_cap_series(series_data)
 
-            # Preserve volume order from ``series_data``.
+            # Preserve the ranked order from ``series_data``.
             series = []
             for name, data_map in series_data.items():
                 filled = []
@@ -3085,6 +3040,8 @@ class DashboardQueryBuilder:
                 "aggregation": metric_info.get("aggregation", "avg"),
                 "unit": unit,
                 "series": series,
+                "series_total": series_total,
+                "series_truncated": len(series) < series_total,
             }
             for metadata_field in DASHBOARD_QUERY_METADATA_FIELDS:
                 if metadata_field in metric_info:
@@ -3657,6 +3614,7 @@ class DashboardQueryBuilder:
                 raise InvalidMetricCombinationError(
                     f"Unsupported {f_type} filter operation: {op}"
                 )
+            leaf_column, leaf_operator = _filter_leaf_identity(f)
 
             val_key = f"{prefix}{idx}_val"
             # Missing includes subjects with no matching Score/eval at all.
@@ -3695,7 +3653,22 @@ class DashboardQueryBuilder:
                     f, eval_template_id
                 )
 
-                output_type = (f.get("output_type") or "SCORE").upper()
+                # The eval template's configured output is the only
+                # authoritative statement of what ``eval_score`` /
+                # ``eval_output_str`` hold. Defaulting to SCORE compiled a
+                # Float64 comparison for every choice/pass-fail filter whose
+                # payload omitted the optional hint.
+                output_type = (
+                    f.get("output_type")
+                    or (
+                        resolve_eval_filter_metadata(
+                            eval_template_id, self.project_ids
+                        ).output_type
+                        if _leaf_carries_canonical_filter(f)
+                        else None
+                    )
+                    or "SCORE"
+                ).upper()
                 scope_key = f"{prefix}scope_id_{idx}"
                 scan_alias = f"usage_{prefix}eval_filter_scan_{idx}"
                 latest_alias = f"usage_{prefix}eval_filter_latest_{idx}"
@@ -3735,7 +3708,13 @@ class DashboardQueryBuilder:
                     filter_value = _coerce_string_filter_value(val, op)
                 elif output_type == "SCORE":
                     eval_col = f"{latest_alias}.eval_score"
-                    filter_value = _coerce_filter_value(val, op)
+                    filter_value = (
+                        None
+                        if is_presence or is_range
+                        else _coerce_numeric_filter_operand(
+                            val, op, leaf_column, leaf_operator
+                        )
+                    )
                 else:
                     raise InvalidMetricCombinationError(
                         f"Unsupported eval filter output type: {output_type}"
@@ -3790,13 +3769,31 @@ class DashboardQueryBuilder:
                 label_id = f.get("metric_name", "")
                 ann_org_key = f"{prefix}ann_org_id_{idx}"
                 annotation_alias = f"annotation_{prefix}filter_{idx}"
-                output_type = (f.get("output_type") or "numeric").lower()
+                # An annotation label's configured type is the only
+                # authoritative statement of what its Score payload holds.
+                # Defaulting to numeric compiled a Float64 predicate for every
+                # text/categorical/thumbs filter whose payload omitted the
+                # optional hint.
+                resolved_output_type = f.get("output_type")
+                if not resolved_output_type and _leaf_carries_canonical_filter(f):
+                    resolved_output_type = resolve_annotation_label_output_type(
+                        label_id, self.organization_id
+                    )
+                    if not resolved_output_type:
+                        raise InvalidMetricCombinationError(
+                            f"'{leaf_column}' is not a known annotation label, "
+                            "so it cannot be used as a dashboard filter."
+                        )
+                output_type = str(resolved_output_type or "numeric").lower()
                 filter_value = None
                 if output_type in ("numeric", "number", "score", "star", "rating"):
                     filter_expr = annotation_numeric_value_expr(
                         alias=annotation_alias, nullable=True
                     )
-                    filter_value = _coerce_filter_value(val, op)
+                    if not is_presence and not is_range:
+                        filter_value = _coerce_numeric_filter_operand(
+                            val, op, leaf_column, leaf_operator
+                        )
                     filter_condition = f"{filter_expr} IS NOT NULL"
                     if not is_presence:
                         comparison = (
@@ -3887,7 +3884,8 @@ class DashboardQueryBuilder:
                     )
                 else:
                     raise InvalidMetricCombinationError(
-                        f"Unsupported annotation filter output type: {output_type}"
+                        f"'{leaf_column}' annotations of type "
+                        f"'{output_type}' cannot be filtered on a dashboard."
                     )
                 # Keep FINAL for score-table latest/tombstone semantics and
                 # bound the candidate set before JSON extraction. Annotation
@@ -4063,6 +4061,35 @@ def _generate_time_buckets(
     return buckets
 
 
+def rank_and_cap_series(
+    series_data: dict[str, dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], int]:
+    """Order breakdown series by summed value, largest first, and cap the count.
+
+    A breakdown groups by an attribute whose distinct-value count the request
+    does not bound, and every returned series carries every time bucket, so the
+    response grows as ``series x buckets`` with nothing to stop it. Bound the
+    published series count here.
+
+    Returns the ordered mapping together with the number of distinct series
+    before the cap, so the response can say that it was truncated.
+    """
+    total = len(series_data)
+    # ``total`` is the key a read with no breakdown lands every row on, so an
+    # unbroken-down result is one series named exactly that and there is
+    # nothing to rank or cut. Test the whole key set, not membership: a
+    # breakdown whose values merely *include* the string "total" (or a project
+    # of that name) is a sentinel collision, and must still be capped.
+    if set(series_data) == {"total"}:
+        return series_data, total
+    ranked = sorted(
+        series_data.items(),
+        key=lambda kv: sum(v for v in kv[1].values() if v is not None),
+        reverse=True,
+    )
+    return dict(ranked[: settings.DASHBOARD_BREAKDOWN_MAX_SERIES]), total
+
+
 def _get_operator_symbol(op: str) -> str | None:
     """Return the SQL operator symbol for a filter operator name."""
     return _OPERATOR_SYMBOLS.get(op)
@@ -4119,6 +4146,79 @@ def _coerce_filter_value(val: Any, operator: str) -> Any:
         except ValueError:
             return val
     return val
+
+
+def _leaf_carries_canonical_filter(filter_item: dict) -> bool:
+    """True when this leaf reached the compiler through the canonical contract.
+
+    Every dashboard query, widget query and preview request is canonicalized
+    (``_canonicalize_persisted_dashboard_filter_for_read``), validated by the
+    strict serializer and then adapted by ``_dashboard_filter_to_internal``,
+    which attaches the validated object as ``canonical_filter``.  A leaf that
+    arrives without one was assembled in-process by an internal caller, never
+    by a client, so it keeps the builder's documented legacy defaults instead
+    of paying a PostgreSQL round-trip inside the query compiler.
+    """
+
+    return isinstance(filter_item.get("canonical_filter"), dict)
+
+
+def _filter_leaf_identity(filter_item: dict) -> tuple[str, str]:
+    """Return the client-facing (column, operator) identity of one filter leaf."""
+
+    canonical = filter_item.get("canonical_filter")
+    canonical = canonical if isinstance(canonical, dict) else {}
+    config = canonical.get("filter_config")
+    config = config if isinstance(config, dict) else {}
+    column = str(
+        canonical.get("display_name")
+        or filter_item.get("display_name")
+        or filter_item.get("metric_name")
+        or "filter"
+    )
+    operator = str(config.get("filter_op") or filter_item.get("operator") or "")
+    return column, operator
+
+
+def _coerce_numeric_filter_operand(
+    val: Any, operator: str, column: str, public_operator: str
+) -> Any:
+    """Coerce one operand for a Float64 column, or reject the combination.
+
+    ClickHouse compiles ``LIKE`` and string literals against Float64 into a
+    type error, not an empty result, so a numeric column must refuse a text
+    operator or a non-numeric operand while the query is still being built.
+    """
+
+    def number(value: Any) -> float:
+        if isinstance(value, bool):
+            raise InvalidMetricCombinationError(
+                f"'{column}' holds numbers, so '{public_operator}' needs a "
+                "numeric value."
+            )
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            raise InvalidMetricCombinationError(
+                f"'{column}' holds numbers, so '{public_operator}' needs a "
+                "numeric value."
+            ) from None
+        if not math.isfinite(result):
+            raise InvalidMetricCombinationError(
+                f"'{column}' holds numbers, so '{public_operator}' needs a "
+                "finite numeric value."
+            )
+        return result
+
+    if operator in ("str_contains", "str_not_contains"):
+        raise InvalidMetricCombinationError(
+            f"'{column}' holds numbers, so '{public_operator}' cannot be "
+            "applied to it. Use a comparison or a range operator."
+        )
+    if operator in ("contains", "not_contains"):
+        values = val if isinstance(val, list) else [val]
+        return [number(value) for value in values]
+    return number(val)
 
 
 def _coerce_string_filter_value(val: Any, operator: str) -> Any:

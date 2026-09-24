@@ -788,6 +788,15 @@ TEMPORAL_TEST_EXECUTION_ENABLED = os.getenv(
     "TEMPORAL_TEST_EXECUTION_ENABLED", "false"
 ).lower() in ("true", "1", "yes")
 
+# Let the eval-task recovery sweep restart FAILED tasks as well as pending and
+# running ones. Default OFF, deliberately: a failed task's undrained entries are
+# re-evaluated when it restarts, and that spends evaluation calls the owner did
+# not ask for. Resuming a failed task stays an explicit choice (the Resume
+# button) unless a deployment opts in here.
+EVAL_TASK_SWEEP_RECOVER_FAILED = os.getenv(
+    "EVAL_TASK_SWEEP_RECOVER_FAILED", "false"
+).lower() in ("true", "1", "yes")
+
 # Hosted simulation runner (plan §9): when enabled, eligible runs are dispatched
 # to the simulation-runner worker which executes the released SDK, instead of the
 # native in-backend simulation path. Default off — no regression.
@@ -1302,18 +1311,6 @@ PROPERTY_CATALOG_CH_USER = os.getenv(
 ).strip()
 PROPERTY_CATALOG_CH_PASSWORD = os.getenv("PROPERTY_CATALOG_CH_PASSWORD", "")
 del _runtime_numeric_settings
-
-# Fail-closed: rollup routing requires both flag=on and window >= coverage date.
-# Set COVERED_SINCE (ISO-8601) after running rebuild_dashboard_attr_rollup.
-DASHBOARD_ATTR_ROLLUP_ENABLED = (
-    os.getenv("DASHBOARD_ATTR_ROLLUP_ENABLED", "false").lower() == "true"
-)
-_dashboard_attr_rollup_covered_since = os.getenv("DASHBOARD_ATTR_ROLLUP_COVERED_SINCE")
-DASHBOARD_ATTR_ROLLUP_COVERED_SINCE = (
-    datetime.fromisoformat(_dashboard_attr_rollup_covered_since)
-    if _dashboard_attr_rollup_covered_since
-    else None
-)
 
 # Eval-logger table read by the trace/voice/user eval-config discovery queries.
 # The CH25 spans cutover intentionally kept the legacy peerdb CDC table

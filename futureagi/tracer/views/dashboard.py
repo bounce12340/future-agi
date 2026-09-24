@@ -71,6 +71,13 @@ from tracer.services.clickhouse.dashboard_action_deadline import (
     bounded_dashboard_action_request,
     start_dashboard_action_deadline,
 )
+from tracer.services.clickhouse.dashboard_read_density import (
+    density_scope_key,
+    estimated_rows_for,
+    exceeds_remaining_deadline,
+    observe_completed_read,
+    probe_candidate_estimates,
+)
 from tracer.services.clickhouse.filter_value_reads import (
     SYSTEM_FILTER_VALUE_METRICS,
     read_end_user_filter_value_cursor_page,
@@ -94,6 +101,10 @@ from tracer.services.clickhouse.query_builders.dataset_dashboard import (
     DATASET_FILTER_COLUMNS,
     DATASET_METRIC_UNITS,
     DatasetQueryBuilder,
+)
+from tracer.services.clickhouse.query_builders.hourly_aggregate_states import (
+    ERROR_RATE_MERGE_EXPRESSION,
+    hourly_aggregate_state_source,
 )
 from tracer.services.clickhouse.query_builders.simulation_dashboard import (
     _STRING_DIMENSION_METRICS,
@@ -225,6 +236,28 @@ class DashboardExactReadError(RuntimeError):
     def __init__(self, message: str, *, error_code: str = "query_failed") -> None:
         super().__init__(message)
         self.error_code = error_code
+
+
+def _invalid_metric_combination_cause(
+    exc: BaseException,
+) -> InvalidMetricCombinationError | None:
+    """Return the invalid metric/filter combination behind *exc*, if any.
+
+    The exact-read lane wraps a per-metric combination failure in a
+    ``DashboardExactReadError``, so the explicit ``raise ... from`` chain is
+    walked rather than the outermost type alone.  Only ``__cause__`` is
+    followed: an unrelated failure raised while one of these was being handled
+    is not this failure.
+    """
+
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, InvalidMetricCombinationError):
+            return current
+        seen.add(id(current))
+        current = current.__cause__
+    return None
 
 
 def _dashboard_api_read_unavailable(exc: Exception) -> bool:
@@ -1105,6 +1138,13 @@ _DASHBOARD_ROLLUP_READ_SETTINGS = {
     "timeout_overflow_mode": "throw",
 }
 
+# Token of the physical source that answers span metrics: ``spans``'s own
+# hourly aggregate states, merged from the projections maintained inside the
+# table. It replaced ``spans_hourly_rollup``, a separate materialized view
+# that counted insert deliveries the ReplacingMergeTree base had already
+# collapsed, so unfiltered widgets read a multiple of the filtered truth.
+_DASHBOARD_SPAN_STATE_SOURCE = "spans_hourly_states"
+
 _DASHBOARD_ROLLUP_SUM_COLUMNS = {
     "tokens": "total_tokens_sum",
     "total_tokens": "total_tokens_sum",
@@ -1128,6 +1168,7 @@ def _fetch_exact_dashboard_rows(
     params,
     timeout_ms,
     settings,
+    on_result=None,
 ):
     """Run one exact full-window statement without rewriting query semantics.
 
@@ -1145,6 +1186,8 @@ def _fetch_exact_dashboard_rows(
         timeout_ms=timeout_ms,
         settings=settings,
     )
+    if on_result is not None:
+        on_result(result)
     return list(result.data or [])
 
 
@@ -1189,7 +1232,7 @@ def _dashboard_rollup_expression(metric):
             else "hourly_tdigest"
         )
         return (
-            "spans_hourly_rollup",
+            _DASHBOARD_SPAN_STATE_SOURCE,
             f"(quantilesTDigestMerge(0.5, 0.95, 0.99)(latency_q))[{quantile_index}]",
             strategy,
         )
@@ -1204,30 +1247,44 @@ def _dashboard_rollup_expression(metric):
             expression = "countMerge(n)"
         else:
             return None
-        return "spans_hourly_rollup", expression, "hourly_aggregate_states"
+        return (
+            _DASHBOARD_SPAN_STATE_SOURCE,
+            expression,
+            "hourly_aggregate_states",
+        )
 
     if metric_name == "error_rate":
         if aggregation == "avg":
-            expression = (
-                "countIfMerge(error_count) * 100.0 / greatest(countMerge(n), 1)"
-            )
+            expression = ERROR_RATE_MERGE_EXPRESSION
         elif aggregation == "sum":
-            expression = "countIfMerge(error_count)"
+            expression = "countMergeIf(n, status = 'ERROR')"
         elif aggregation == "count":
             expression = "countMerge(n)"
         else:
             return None
-        return "spans_hourly_rollup", expression, "hourly_aggregate_states"
+        return (
+            _DASHBOARD_SPAN_STATE_SOURCE,
+            expression,
+            "hourly_aggregate_states",
+        )
 
     if metric_name in {"span_count", "traffic"} and aggregation in {
         "count",
         "count_distinct",
         "sum",
     }:
-        return "spans_hourly_rollup", "countMerge(n)", "hourly_aggregate_states"
+        return (
+            _DASHBOARD_SPAN_STATE_SOURCE,
+            "countMerge(n)",
+            "hourly_aggregate_states",
+        )
 
     if metric_name == "project" and aggregation in {"count", "count_distinct"}:
-        return "spans_hourly_rollup", "uniqExact(project_id)", "hourly_rollup_keys"
+        return (
+            _DASHBOARD_SPAN_STATE_SOURCE,
+            "uniqExact(project_id)",
+            "hourly_state_keys",
+        )
 
     if metric_name == "trace_count" and aggregation in {
         "count",
@@ -1324,11 +1381,25 @@ def _dashboard_degraded_payload(
     return payload
 
 
+def _dashboard_refresh_is_running(refresh_state):
+    """Report whether an exact refresh is actually computing this identity.
+
+    ``read_or_schedule_exact_snapshot`` answers every cold identity with the
+    pending envelope, including the ones whose refresh failed or was never
+    enqueued; only the decorated ``query_refreshing`` flag distinguishes them.
+    """
+
+    return (
+        isinstance(refresh_state, dict)
+        and refresh_state.get("query_refreshing") is True
+    )
+
+
 def _dashboard_refresh_or_degraded(query_config, *, refresh_state, error_code):
     """Keep polling an exact refresh; expose unavailability only without one."""
 
     if (
-        isinstance(refresh_state, dict)
+        _dashboard_refresh_is_running(refresh_state)
         and refresh_state.get("query_status") == "pending"
     ):
         return deepcopy(refresh_state)
@@ -1526,8 +1597,9 @@ def _read_dashboard_rollup_fast_path(
     query_count = 0
     rows_returned = 0
     try:
-        # These materialized views are fed by the direct-write CH25 spans table;
-        # bind the query to the same physical generation explicitly.
+        # Span metrics come from `spans`'s own hourly aggregate states and
+        # trace counts from a materialized view over the same direct-write
+        # table; bind both to that physical generation explicitly.
         analytics = V2AnalyticsQueryService()
         if not bool(getattr(analytics, "supports_per_query_read_settings", True)):
             return _dashboard_refresh_or_degraded(
@@ -1539,23 +1611,35 @@ def _read_dashboard_rollup_fast_path(
             select_values = ",\n       ".join(
                 f"{item['expression']} AS {item['alias']}" for item in items
             )
-            if source == "spans_hourly_rollup":
-                table = "spans_hourly_rollup"
+            if source == _DASHBOARD_SPAN_STATE_SOURCE:
+                # The inner source carries its own project and window scope:
+                # its predicates have to sit on the projection's own key
+                # expressions for the states to be readable at all.
+                from_clause = hourly_aggregate_state_source(
+                    "project_id IN %(project_ids)s"
+                )
+                query = (
+                    f"SELECT {bucket_fn}(hour) AS time_bucket,\n"
+                    f"       {select_values}\n"
+                    f"FROM {from_clause}\n"
+                    "GROUP BY time_bucket\n"
+                    "ORDER BY time_bucket\n"
+                    "LIMIT %(result_limit)s"
+                )
             elif source == "trace_count_rollup":
-                table = "trace_count_rollup"
+                query = (
+                    f"SELECT {bucket_fn}(hour) AS time_bucket,\n"
+                    f"       {select_values}\n"
+                    "FROM trace_count_rollup\n"
+                    "PREWHERE project_id IN %(project_ids)s\n"
+                    "WHERE hour >= %(start_date)s\n"
+                    "  AND hour < %(end_date)s\n"
+                    "GROUP BY time_bucket\n"
+                    "ORDER BY time_bucket\n"
+                    "LIMIT %(result_limit)s"
+                )
             else:  # Defensive fence; source values are code-owned above.
                 raise DashboardBoundedReadError("bounded_shape_unavailable")
-            query = (
-                f"SELECT {bucket_fn}(hour) AS time_bucket,\n"
-                f"       {select_values}\n"
-                f"FROM {table}\n"
-                "PREWHERE project_id IN %(project_ids)s\n"
-                "WHERE hour >= %(start_date)s\n"
-                "  AND hour < %(end_date)s\n"
-                "GROUP BY time_bucket\n"
-                "ORDER BY time_bucket\n"
-                "LIMIT %(result_limit)s"
-            )
             expected_columns = ["time_bucket", *(item["alias"] for item in items)]
             result = analytics.execute_ch_query(
                 query,
@@ -1630,6 +1714,10 @@ def _read_dashboard_rollup_fast_path(
             "query_complete": True,
             "query_status": "complete",
             "query_sampled": False,
+            # Neither source reduces to the latest live row version: the span
+            # states are built per physical part, so unmerged versions and
+            # retained ``is_deleted`` tombstones are counted, and trace counts
+            # come from an independently refreshed rollup.
             "query_exact": False,
             "query_provenance": "materialized_rollup",
             "query_count": query_count,
@@ -1693,6 +1781,12 @@ def _read_public_dashboard_query(
             )
         if _dashboard_snapshot_is_renderable(snapshot):
             return _decorate_dashboard_exact_payload(snapshot)
+        if isinstance(snapshot, dict) and snapshot.get("query_status") == "pending":
+            return _dashboard_refresh_or_degraded(
+                query_config,
+                refresh_state=snapshot,
+                error_code="read_budget_exceeded",
+            )
         return snapshot
     try:
         # Snapshot scheduling may spend up to two seconds in Redis/Temporal.
@@ -2098,6 +2192,9 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
     _gm = GeneralMethods()
     permission_classes = [IsAuthenticated]
     serializer_class = DashboardSerializer
+    # Every list-style action here returns its own unpaginated payload, so the
+    # contract must not advertise the default page/limit parameters.
+    pagination_class = None
     lookup_value_regex = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 
     def get_queryset(self):
@@ -2429,6 +2526,13 @@ class DashboardViewSet(BaseModelViewSetMixin, ModelViewSet):
                     "Dashboard data is temporarily unavailable. Please retry.",
                     code="service_unavailable",
                 )
+            invalid_combination = _invalid_metric_combination_cause(exc)
+            if invalid_combination is not None:
+                logger.warning(
+                    "dashboard_query_invalid_metric_combination",
+                    error_type=type(exc).__name__,
+                )
+                return self._gm.bad_request(str(invalid_combination))
             logger.exception(
                 "dashboard_query_execution_failed",
                 error_type=type(exc).__name__,
@@ -6204,7 +6308,7 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
                     return self._gm.success_response(
                         _decorate_dashboard_exact_payload(cached)
                     )
-            elif isinstance(cached, dict) and cached.get("query_refreshing") is True:
+            elif _dashboard_refresh_is_running(cached):
                 return self._gm.success_response(cached)
 
             # Independently refreshed rollups cannot establish latest physical
@@ -6252,6 +6356,8 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
         trace_builder = None
         trace_prepared = ()
         trace_query_groups = ()
+        trace_density_scope_key = None
+        trace_candidate_estimates = {}
         dataset_builder = None
         dataset_prepared = ()
         simulation_builder = None
@@ -6280,6 +6386,7 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
                 )
             trace_config["project_ids"] = [str(pid) for pid in project_ids]
             query_config["project_ids"] = trace_config["project_ids"]
+            trace_density_scope_key = density_scope_key(trace_config["project_ids"])
             trace_config["organization_id"] = str(workspace.organization_id)
             trace_config["workspace_id"] = str(workspace.id)
             trace_analytics = V2AnalyticsQueryService(
@@ -6343,6 +6450,48 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
             )
 
         if trace_prepared:
+            # Cost the read before the statement, on BOTH lanes. The probe
+            # reads part metadata only; charging its time to the same deadline
+            # keeps one request on one wall budget. The worker probes too, not
+            # to route - it is already the lane a heavy read was handed to -
+            # but so that its completed statement teaches the scope its bytes
+            # per estimated row. On the highest-volume tenant no filtered
+            # widget beyond a week completes inline, so a scope whose density
+            # only ever learned from inline completions never learned at all,
+            # and every request on it spent the interactive wall before the
+            # identical statement ran here.
+            trace_candidate_estimates = probe_candidate_estimates(
+                [
+                    (
+                        (trace_prepared[indices[0]][1], trace_prepared[indices[0]][2])
+                        if plan is None
+                        else (plan.sql, plan.params)
+                    )
+                    for indices, plan in trace_query_groups
+                ],
+                analytics=trace_analytics,
+                deadline=read_deadline,
+            )
+            if not _exact_worker:
+                try:
+                    remaining_ms = read_deadline.remaining_ms(statement_timeout_ms)
+                except ReadDeadlineExceeded:
+                    remaining_ms = 0
+                if exceeds_remaining_deadline(
+                    trace_candidate_estimates,
+                    scope_key=trace_density_scope_key,
+                    remaining_ms=remaining_ms,
+                ):
+                    # Nothing ran in the foreground, so the exact worker is
+                    # the first and only execution of this statement.
+                    return _schedule_heavy_dashboard_read()
+
+            def _observe_trace_read(sql, params, result):
+                observe_completed_read(
+                    trace_density_scope_key,
+                    estimated_rows_for(trace_candidate_estimates, sql, params),
+                    result,
+                )
 
             def _fetch_trace_rows(sql, params):
                 return _fetch_exact_dashboard_rows(
@@ -6351,6 +6500,7 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
                     params=params,
                     timeout_ms=read_deadline.remaining_ms(statement_timeout_ms),
                     settings=read_settings,
+                    on_result=lambda result: _observe_trace_read(sql, params, result),
                 )
 
             def _exec_trace_group(item):
@@ -6363,7 +6513,6 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
                         max_workers=1,
                         prepared_queries=(trace_prepared[indices[0]],),
                     )
-                grouped_started = monotonic()
                 try:
                     grouped_rows = _fetch_trace_rows(plan.sql, plan.params)
                     _complete, results = trace_builder.metric_group_results(
@@ -6378,13 +6527,6 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
                         "dashboard metric group exceeded its read budget",
                         error_code="read_budget_exceeded",
                     ) from exc
-                grouped_elapsed_ms = (monotonic() - grouped_started) * 1000
-                if grouped_elapsed_ms > 10_000:
-                    logger.info(
-                        "dashboard_trace_metric_group_slow",
-                        elapsed_ms=round(grouped_elapsed_ms, 3),
-                        normal_slo_met=(grouped_elapsed_ms <= statement_timeout_ms),
-                    )
                 return results
 
             try:
@@ -6499,11 +6641,7 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
             ) from exc
 
         # Format using DatasetQueryBuilder (compatible format_results)
-        formatter_config = {
-            **query_config,
-            "workspace_id": str(workspace.id),
-            "require_complete_series": True,
-        }
+        formatter_config = {**query_config, "workspace_id": str(workspace.id)}
         formatter = DatasetQueryBuilder(formatter_config)
 
         if trace_metrics and not dataset_metrics and not simulation_metrics:
@@ -6590,6 +6728,13 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
                     "Dashboard data is temporarily unavailable. Please retry.",
                     code="service_unavailable",
                 )
+            invalid_combination = _invalid_metric_combination_cause(exc)
+            if invalid_combination is not None:
+                logger.warning(
+                    "widget_query_invalid_metric_combination",
+                    error_type=type(exc).__name__,
+                )
+                return self._gm.bad_request(str(invalid_combination))
             logger.exception(
                 "widget_query_execution_failed",
                 error_type=type(exc).__name__,
@@ -6642,6 +6787,13 @@ class DashboardWidgetViewSet(BaseModelViewSetMixin, ModelViewSet):
                     "Dashboard data is temporarily unavailable. Please retry.",
                     code="service_unavailable",
                 )
+            invalid_combination = _invalid_metric_combination_cause(exc)
+            if invalid_combination is not None:
+                logger.warning(
+                    "query_preview_invalid_metric_combination",
+                    error_type=type(exc).__name__,
+                )
+                return self._gm.bad_request(str(invalid_combination))
             logger.exception(
                 "query_preview_failed",
                 error_type=type(exc).__name__,

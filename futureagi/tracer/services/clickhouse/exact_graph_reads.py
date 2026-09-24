@@ -21,7 +21,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from threading import Lock
 from time import monotonic
@@ -297,6 +297,16 @@ EXACT_GRAPH_READ_SETTINGS = {
 EXACT_GRAPH_TRACE_CLASSIFIER_READ_SETTINGS = {
     **EXACT_GRAPH_READ_SETTINGS,
     "max_threads": settings.EXACT_GRAPH_TRACE_CLASSIFIER_MAX_THREADS,
+}
+# The aggregate user graph is one ordered latest-state pass over a whole
+# window, not a filter-selector probe. It inherited the selector's single
+# thread from the shared dict, which a FINAL merge could not have used anyway;
+# an in-order argMax reduction can. Give it the same budget the dashboard
+# trace reader already runs at — an existing runtime setting, changed nowhere
+# — and leave every byte, memory, result and deadline ceiling untouched.
+EXACT_GRAPH_USER_READ_SETTINGS = {
+    **EXACT_GRAPH_READ_SETTINGS,
+    "max_threads": settings.DASHBOARD_TRACE_READ_MAX_THREADS,
 }
 EXACT_GRAPH_SPAN_PARTITION_READ_SETTINGS = {
     **EXACT_GRAPH_READ_SETTINGS,
@@ -2123,17 +2133,39 @@ def _row_value(row: Any, columns: list[str], key: str, default: Any = 0) -> Any:
     return row[index] if index < len(row) else default
 
 
+def _bucket_key(value: Any) -> datetime | None:
+    """Reduce an output bucket to the zero-fill range's naive-UTC ``datetime``.
+
+    The native driver returns ``DateTime('UTC')`` buckets tz-aware, untyped
+    ``DateTime`` buckets naive and ``toMonday``/``toStartOfMonth``/
+    ``toStartOfYear`` buckets as ``date``, while
+    ``BaseQueryBuilder._generate_timestamp_range`` yields naive UTC values.
+    Both sides of a bucket lookup go through this one key. An aware value is
+    converted to UTC before its tzinfo is dropped.
+    """
+
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            return value.astimezone(UTC).replace(tzinfo=None)
+        return value
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day)
+    return None
+
+
 def _add_primary_traffic(
     series: dict[str, Any], rows: list[Any], columns: list[str]
 ) -> dict[str, Any]:
-    traffic: dict[str, int] = {}
+    traffic: dict[datetime, int] = {}
     for row in rows:
-        timestamp = _row_value(row, columns, "time_bucket", None)
-        if timestamp is None:
+        key = _bucket_key(_row_value(row, columns, "time_bucket", None))
+        if key is None:
             continue
-        key = (
-            timestamp.isoformat() if hasattr(timestamp, "isoformat") else str(timestamp)
-        )
         traffic[key] = int(
             _row_value(
                 row,
@@ -2145,7 +2177,10 @@ def _add_primary_traffic(
         )
     copied = {**series}
     copied["data"] = [
-        {**point, "primary_traffic": traffic.get(point.get("timestamp"), 0)}
+        {
+            **point,
+            "primary_traffic": traffic.get(_bucket_key(point.get("timestamp")), 0),
+        }
         for point in series.get("data", [])
     ]
     return copied
@@ -4611,7 +4646,7 @@ def read_exact_user_system_graph(
         query=query,
         params=params,
         started=started,
-        settings=EXACT_GRAPH_READ_SETTINGS,
+        settings=EXACT_GRAPH_USER_READ_SETTINGS,
     )
     rows = list(result.data or [])
     columns = list(result.columns or [])
@@ -4830,14 +4865,11 @@ def read_exact_session_system_graph(
         )
     rows = list(result.data or [])
     columns = list(result.columns or [])
-    values: dict[str, tuple[float, int]] = {}
+    values: dict[datetime, tuple[float, int]] = {}
     for row in rows:
-        timestamp = _row_value(row, columns, "time_bucket", None)
-        if timestamp is None:
+        key = _bucket_key(_row_value(row, columns, "time_bucket", None))
+        if key is None:
             continue
-        key = (
-            timestamp.isoformat() if hasattr(timestamp, "isoformat") else str(timestamp)
-        )
         values[key] = (
             float(_row_value(row, columns, "value", 0) or 0),
             int(_row_value(row, columns, "primary_traffic", 0) or 0),
@@ -4846,7 +4878,7 @@ def read_exact_session_system_graph(
     for timestamp in BaseQueryBuilder._generate_timestamp_range(
         start_date, end_date, interval
     ):
-        value, traffic = values.get(timestamp.isoformat(), (0.0, 0))
+        value, traffic = values.get(_bucket_key(timestamp), (0.0, 0))
         points.append(
             {
                 "timestamp": timestamp.isoformat(),

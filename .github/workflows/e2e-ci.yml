@@ -78,7 +78,11 @@ jobs:
       # Always from source: specs land with the frontend behavior they assert,
       # so the released frontend image can be too old for them (TH-7733).
       BUILD_FRONTEND: "true"
-      BUILD_GATEWAY: ${{ needs.changes.outputs.gateway }}
+      # Always from source for the same reason: gateway flows (GW-E2E-002)
+      # land with the gateway behavior they assert, so a PR that does not
+      # touch agentcc-gateway/ would otherwise run them against a released
+      # :latest that predates that behavior.
+      BUILD_GATEWAY: "true"
     steps:
       - uses: actions/checkout@v4
 
