@@ -376,3 +376,28 @@ class TestDashboardRequestFromFalcon:
         assert result["completion_card"] is None
         listed = await sync_to_async(auth_client.get)("/tracer/dashboard/")
         assert listed.json()["result"] == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "ask",
+        [
+            "Create a dashboard for my dataset",
+            "Create a dashboard for my data",
+            "Create a dashboard of my costs",
+            "Create a dashboard for my evaluation results",
+        ],
+    )
+    async def test_dashboard_ask_naming_another_domain_still_saves_it(
+        self, falcon_context, conversation, ask
+    ):
+        agent = AgentLoop(falcon_context, conversation)
+        offered = []
+        agent.llm_client.stream_completion = _model_that_calls_when_offered(
+            "create_dashboard", {"name": "Domain Ask"}, offered
+        )
+
+        result = await agent.run(ask, [], AsyncMock(), context_page="general")
+
+        assert "create_dashboard" in offered[0]
+        [call] = result["tool_calls"]
+        assert (call["tool_name"], call["status"]) == ("create_dashboard", "completed")
