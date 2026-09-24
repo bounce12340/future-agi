@@ -56,14 +56,10 @@ from unittest import mock
 
 import pytest
 
+from conftest import _open_ch_test_http_client
 from tracer.services.clickhouse.query_builders.time_series import (
     TimeSeriesQueryBuilder,
 )
-
-# Ports the operator forwards a remote ClickHouse onto. A read-only EXPLAIN is
-# harmless, but a live test must never silently adopt one as its target.
-_FORWARDED_PORTS = frozenset({19010, 19000, 19001, 19002, 18230, 18231, 18232})
-_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]"})
 
 # ``EXPLAIN`` names the chosen read target in parentheses: a projection name
 # when one answers the query, otherwise ``<database>.<table>``.
@@ -77,34 +73,18 @@ _PROJECTION_NOT_USED = "Code: 584."
 
 
 def _client():
-    clickhouse_connect = pytest.importorskip("clickhouse_connect")
-    host = os.getenv("CH25_HOST") or os.getenv("CH_HOST") or ""
+    # conftest resolves the HTTP port (no default; a forwarded one is refused
+    # with an exception, not an ``assert``), keeps the host to loopback and, on
+    # CI's opted-in sidecar, proves the server is the test sidecar.
+    pytest.importorskip("clickhouse_connect")
     database = os.getenv("CH25_DATABASE") or os.getenv("CH_DATABASE") or ""
-    port_text = os.getenv("CH25_HTTP_PORT") or os.getenv("CH_HTTP_PORT") or ""
-    if not host or not database or not port_text:
+    if not database:
         pytest.skip("no test ClickHouse configured")
-    if host.strip().lower() not in _LOOPBACK_HOSTS:
-        pytest.skip("test ClickHouse is not a loopback target")
     if not database.lower().lstrip("_").startswith("test_"):
         pytest.skip("test ClickHouse database is not a test_* database")
-    port = int(port_text)
-    assert port not in _FORWARDED_PORTS, (
-        f"refusing to probe ClickHouse on forwarded port {port}"
+    return _open_ch_test_http_client(
+        database=database, connect_timeout=5, send_receive_timeout=30
     )
-    try:
-        client = clickhouse_connect.get_client(
-            host=host,
-            port=port,
-            database=database,
-            username=os.getenv("CH25_USER") or os.getenv("CH_USERNAME") or "default",
-            password=os.getenv("CH25_PASSWORD") or os.getenv("CH_PASSWORD") or "",
-            connect_timeout=5,
-            send_receive_timeout=30,
-        )
-        client.query("SELECT 1")
-    except Exception:  # noqa: BLE001 - any connection failure means "not available"
-        pytest.skip("test ClickHouse is not reachable")
-    return client
 
 
 def _aggregate_projection_names(client) -> frozenset[str]:
