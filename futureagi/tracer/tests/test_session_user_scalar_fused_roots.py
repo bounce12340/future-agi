@@ -26,6 +26,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from conftest import _open_ch_test_native_client
 from tracer.services.clickhouse.v2.query_builders.session_list import (
     SessionListQueryBuilderV2,
 )
@@ -188,24 +189,10 @@ def test_org_scope_user_scalar_page_keeps_its_collision_guard_path():
 
 
 def _ch25_client():
-    host = os.getenv("CH25_HOST")
-    port = int(
-        os.getenv("CH25_NATIVE_PORT")
-        or os.getenv("CH25_TCP_PORT")
-        or os.getenv("CH_PORT")
-        or "9000"
-    )
+    # conftest resolves the port (no default; a forwarded one is refused) and,
+    # on CI's opted-in sidecar, proves it before the INSERT below.
     database = os.getenv("CH25_DATABASE") or os.getenv("CH_DATABASE") or "test_tfc"
-    if not host:
-        pytest.skip("CH25_HOST is not configured")
-    try:
-        from clickhouse_driver import Client
-
-        client = Client(host=host, port=port, database=database)
-        client.execute("SELECT 1")
-        return client
-    except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"disposable ClickHouse 25 is unavailable: {type(exc).__name__}")
+    return _open_ch_test_native_client(database=database)
 
 
 _COLUMNS = (
