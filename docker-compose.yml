@@ -62,10 +62,13 @@ x-backend-env: &backend-env
   # accepted as hosted from silently falling back to the local sandbox path.
   HARNESS_PUBLIC_BASE_URL: ${HARNESS_PUBLIC_BASE_URL:-}
   HARNESS_PROVIDER: ${HARNESS_PROVIDER:-daytona}
+  HOSTED_SANDBOX_PROVIDER: ${HOSTED_SANDBOX_PROVIDER:-daytona}
   ALK_HOSTED_BASE_EGRESS_DOMAINS: ${ALK_HOSTED_BASE_EGRESS_DOMAINS:-}
   ALK_HOSTED_EGRESS_UNRESTRICTED: ${ALK_HOSTED_EGRESS_UNRESTRICTED:-false}
   ALK_HOSTED_AUTHORING_MAX_DURATION_SECONDS: ${ALK_HOSTED_AUTHORING_MAX_DURATION_SECONDS:-3600}
+  ALK_HOSTED_AUTHORING_TIMEOUT: ${ALK_HOSTED_AUTHORING_TIMEOUT:-}
   ALK_HOSTED_SANDBOX_TTL_SECONDS: ${ALK_HOSTED_SANDBOX_TTL_SECONDS:-7200}
+  ALK_HOSTED_CHAT_TTL_SECONDS: ${ALK_HOSTED_CHAT_TTL_SECONDS:-1800}
   ALK_HOSTED_WEBRTC_EGRESS_CIDRS: ${ALK_HOSTED_WEBRTC_EGRESS_CIDRS:-}
   ALK_HOSTED_BUNDLE_DIR: ${ALK_HOSTED_BUNDLE_DIR:-}
   # Environment authoring is independent from the simulated caller. Hosted
@@ -73,12 +76,24 @@ x-backend-env: &backend-env
   # platform-owned caller on Vertex Gemini.
   ALK_HARNESS: ${ALK_HARNESS:-}
   ALK_HARNESS_MODEL: ${ALK_HARNESS_MODEL:-}
+  ALK_HOSTED_AGENTCC_BASE_URL: ${ALK_HOSTED_AGENTCC_BASE_URL:-}
+  ALK_HOSTED_AGENTCC_MODEL: ${ALK_HOSTED_AGENTCC_MODEL:-vertex_ai/gemini-3.7-flash}
+  SIMULATOR_LLM_PROVIDER: ${SIMULATOR_LLM_PROVIDER:-vertex}
+  SIMULATOR_LLM_MODEL: ${SIMULATOR_LLM_MODEL:-gemini-3.7-flash}
   DAYTONA_API_KEY: ${DAYTONA_API_KEY:-}
   DAYTONA_API_URL: ${DAYTONA_API_URL:-}
   DAYTONA_TARGET: ${DAYTONA_TARGET:-}
   DAYTONA_ORGANIZATION_ID: ${DAYTONA_ORGANIZATION_ID:-}
   ALK_DAYTONA_SNAPSHOT: ${ALK_DAYTONA_SNAPSHOT:-}
   ALK_DAYTONA_SNAPSHOT_DIGEST: ${ALK_DAYTONA_SNAPSHOT_DIGEST:-}
+  ALK_DAYTONA_DOCKERFILE: ${ALK_DAYTONA_DOCKERFILE:-}
+  E2B_API_KEY: ${E2B_API_KEY:-}
+  ALK_E2B_TEMPLATE_REFERENCE: ${ALK_E2B_TEMPLATE_REFERENCE:-}
+  ALK_E2B_TEMPLATE_BUILD_ID: ${ALK_E2B_TEMPLATE_BUILD_ID:-}
+  ALK_E2B_TEMPLATE_CPU_UNITS: ${ALK_E2B_TEMPLATE_CPU_UNITS:-4}
+  ALK_E2B_TEMPLATE_MEMORY_MB: ${ALK_E2B_TEMPLATE_MEMORY_MB:-8192}
+  ALK_E2B_TEMPLATE_DISK_GB: ${ALK_E2B_TEMPLATE_DISK_GB:-10}
+  ALK_E2B_MAX_TTL_SECONDS: ${ALK_E2B_MAX_TTL_SECONDS:-0}
 
   # LLM gateway + code sandbox + embedding service
   AGENTCC_INTERNAL_URL: ${AGENTCC_INTERNAL_URL:-http://agentcc-gateway:8080}
@@ -649,11 +664,13 @@ services:
       PROPERTY_CATALOG_ORDERED_KAFKA_TOPIC: ${PROPERTY_CATALOG_ORDERED_KAFKA_TOPIC:-${PROPERTY_CATALOG_KAFKA_TOPIC:-futureagi.oss.property-catalog.ordered.v1}}
       PROPERTY_CATALOG_KAFKA_PARTITIONS: ${PROPERTY_CATALOG_KAFKA_PARTITIONS:-6}
       PROPERTY_CATALOG_KAFKA_RETENTION_MS: ${PROPERTY_CATALOG_KAFKA_RETENTION_MS:-259200000}
+      ERROR_FEED_KAFKA_TOPIC: ${ERROR_FEED_KAFKA_TOPIC:-error-feed.trace-available.v1}
     command:
       - |
         candidate="$${PROPERTY_CATALOG_CANDIDATE_KAFKA_TOPIC}"
         ordered="$${PROPERTY_CATALOG_ORDERED_KAFKA_TOPIC}"
-        for topic in "$${candidate}" "$${ordered}"; do
+        error_feed="$${ERROR_FEED_KAFKA_TOPIC}"
+        for topic in "$${candidate}" "$${ordered}" "$${error_feed}"; do
           case "$${topic}" in
             ''|*[!A-Za-z0-9._-]*) echo >&2 "invalid unified property catalog topic"; exit 64 ;;
           esac
@@ -665,7 +682,7 @@ services:
         case "$${PROPERTY_CATALOG_KAFKA_PARTITIONS}" in
           ''|*[!0-9]*) echo >&2 "invalid property catalog partition count"; exit 64 ;;
         esac
-        for topic in "$${candidate}" "$${ordered}"; do
+        for topic in "$${candidate}" "$${ordered}" "$${error_feed}"; do
           /opt/kafka/bin/kafka-topics.sh \
             --bootstrap-server property-catalog-kafka:9092 \
             --create \
@@ -707,6 +724,8 @@ services:
       FI_PROPERTY_CATALOG_REVISION_FENCE_FILE: /var/lib/fi-collector/property-catalog/revision-fence-v2.json
       FI_PROPERTY_CATALOG_KAFKA_BROKERS: property-catalog-kafka:9092
       FI_PROPERTY_CATALOG_KAFKA_TOPIC: ${PROPERTY_CATALOG_CANDIDATE_KAFKA_TOPIC:-futureagi.oss.property-catalog.candidates.v1}
+      FI_ERROR_FEED_KAFKA_BROKERS: property-catalog-kafka:9092
+      FI_ERROR_FEED_KAFKA_TOPIC: ${ERROR_FEED_KAFKA_TOPIC:-error-feed.trace-available.v1}
       # Point at the same ClickHouse the backend uses (HTTP port 8123).
       FI_CH_URL: http://clickhouse:8123
       FI_CH_DATABASE: ${FI_CH_DATABASE:-${CH25_DATABASE:-${CH_DATABASE:-default}}}
