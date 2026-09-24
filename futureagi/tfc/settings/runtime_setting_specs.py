@@ -185,6 +185,67 @@ DATASET_READ_SETTING_SPECS = {
     ),
 }
 
+# Out-of-band recovery for eval tasks whose per-task workflow stopped.
+#
+# These two constants mirror ``_RUN_ENTRY_TIMEOUT`` and
+# ``RUN_ENTRY_RETRY_POLICY.maximum_attempts`` in
+# ``tfc.temporal.eval_tasks.workflows``, which cannot be imported at
+# settings-load time. ``test_the_mirrored_run_entry_ceiling_matches_the_workflow``
+# pins them against the real values, so a change there fails a test here
+# rather than silently loosening the bounds below.
+RUN_ENTRY_CEILING_SECONDS = 1_800
+RUN_ENTRY_MAX_ATTEMPTS = 3
+# The longest a run the sweep can still meet may legitimately last. The sweep
+# asks Temporal before it reaps and skips a task whose workflow is progressing,
+# so the only run it can overlap belongs to an execution that has since closed:
+# one activity attempt already in flight on a worker, bounded by the run-entry
+# start-to-close ceiling, with no retries because a closed execution dispatches
+# none. The retry count is kept in the product as headroom rather than as the
+# bound it models, so the floor stays conservative if that gate ever moves.
+#
+# This deliberately does NOT model a claim waiting in the queue. An entry is
+# ``RUNNING`` from the moment ``claim_pending_batch`` stamps its batch, and the
+# drain runs ``max_concurrent`` of a ``batch_size`` batch at a time, so a batch
+# tail can hold a frozen claim stamp for several waves — a span no threshold in
+# this range would cover. The describe-first gate is what makes that safe: a
+# task with a queued tail has a progressing workflow, so the sweep never reaps
+# it. See ``tracer.services.eval_tasks.recovery.recover_task``.
+LONGEST_RUNNING_ENTRY_SECONDS = RUN_ENTRY_CEILING_SECONDS * RUN_ENTRY_MAX_ATTEMPTS
+
+# ``SWEEP_STALE_RUNNING_SECONDS`` is the threshold of the sweep's *own* reap,
+# and stays above that bound at every value an operator can configure, so that
+# reap never requeues an entry whose run is still in flight from a closed
+# execution. It does not bound the recovery as a whole. The workflow the sweep
+# then restarts reaps first at ``ReapInput``'s 600 s, on the evidence of the
+# same describe, which the sweep hands to the starter rather than letting it
+# describe again (``RESTART_REAP_SECONDS`` in
+# ``tracer.services.eval_tasks.recovery``), so a claim older than ten minutes
+# is reclaimed as soon as that run starts, whatever this is set to — and a run
+# of the closed execution can still be in flight under it. What keeps the row
+# correct there is the claim-epoch fence, which refuses that run's write; the
+# cost is one evaluation paid for twice and one of the entry's three reclaims.
+# Raising this setting does not prevent that. It only moves which reap
+# reclaims a row, and so what the tick's ``entries_requeued`` counts.
+EVAL_EXECUTION_SETTING_SPECS = {
+    **_specs(
+        (
+            (
+                "SWEEP_STALE_RUNNING_SECONDS",
+                7_200,
+                LONGEST_RUNNING_ENTRY_SECONDS + 1,
+                86_400,
+            ),
+            # 0 is the off switch. A Temporal pause is the immediate lever,
+            # but ``register_temporal_schedules`` runs on every backend
+            # container start and re-registers the schedule with
+            # ``ScheduleState`` rebuilt from config, so a manual pause does not
+            # survive the next deploy, restart or scale-up. A setting does.
+            ("SWEEP_MAX_TASKS", 25, 0, 500),
+        ),
+        prefix="EVAL_TASK_",
+    ),
+}
+
 INTERACTIVE_READ_SETTING_SPECS = {
     **_specs(
         (
@@ -756,6 +817,7 @@ RUNTIME_NUMERIC_SETTING_SPECS = {
     **PROPERTY_CATALOG_RUNTIME_SETTING_SPECS,
     **DATASET_READ_SETTING_SPECS,
     **INTERACTIVE_READ_SETTING_SPECS,
+    **EVAL_EXECUTION_SETTING_SPECS,
 }
 
 if len(RUNTIME_NUMERIC_SETTING_SPECS) != sum(
@@ -765,6 +827,7 @@ if len(RUNTIME_NUMERIC_SETTING_SPECS) != sum(
             PROPERTY_CATALOG_RUNTIME_SETTING_SPECS,
             DATASET_READ_SETTING_SPECS,
             INTERACTIVE_READ_SETTING_SPECS,
+            EVAL_EXECUTION_SETTING_SPECS,
         ),
     )
 ):
@@ -1234,10 +1297,28 @@ def validate_interactive_read_settings(values: Mapping[str, Numeric]) -> None:
     )
 
 
+def validate_eval_execution_settings(values: Mapping[str, Numeric]) -> None:
+    """Validate the eval-execution knobs against the workflow's own ceilings.
+
+    The spec bound already carries this relation, but it carries it as a
+    literal a future edit can loosen. This checks the *resolved* value against
+    the mirrored constants, so loosening the bound alone is not enough to ship
+    a configuration that lets the sweep race a live worker.
+    """
+
+    _require_at_least(
+        values["EVAL_TASK_SWEEP_STALE_RUNNING_SECONDS"],
+        LONGEST_RUNNING_ENTRY_SECONDS + 1,
+        "the eval-task sweep's stale threshold must exceed a running entry's "
+        "longest legitimate life",
+    )
+
+
 def validate_runtime_numeric_settings(values: Mapping[str, Numeric]) -> None:
     validate_property_catalog_settings(values)
     validate_dataset_read_settings(values)
     validate_interactive_read_settings(values)
+    validate_eval_execution_settings(values)
     _require_at_most(
         values["PROPERTY_CATALOG_MAX_PAGE_SIZE"],
         values["DASHBOARD_METRICS_CATALOG_MAX_PAGE_SIZE"],
@@ -1247,6 +1328,11 @@ def validate_runtime_numeric_settings(values: Mapping[str, Numeric]) -> None:
 
 def _require_at_most(left: Numeric, right: Numeric, message: str) -> None:
     if left > right:
+        raise ValueError(message)
+
+
+def _require_at_least(left: Numeric, right: Numeric, message: str) -> None:
+    if left < right:
         raise ValueError(message)
 
 
