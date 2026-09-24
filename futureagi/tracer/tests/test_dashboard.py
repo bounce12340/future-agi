@@ -4911,7 +4911,6 @@ class TestDashboardQueryBuilder:
         self, sample_query_config, settings
     ):
         """Custom metrics and raw attribute breakdowns share the v2 bound."""
-        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
 
         custom_metric_config = {
             **sample_query_config,
@@ -4966,7 +4965,6 @@ class TestDashboardQueryBuilder:
     def test_obsolete_raw_attribute_sampling_is_absent_from_both_builders(
         self, sample_query_config, settings
     ):
-        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
         custom_metric = {
             "id": "final_status",
             "name": "final_status",
@@ -4991,7 +4989,6 @@ class TestDashboardQueryBuilder:
     def test_raw_attribute_exact_read_is_the_strict_default(
         self, sample_query_config, settings
     ):
-        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
         config = {
             **sample_query_config,
             "allow_sampled": False,
@@ -5023,7 +5020,6 @@ class TestDashboardQueryBuilder:
     def test_strict_raw_attribute_breakdown_and_filter_are_exact(
         self, sample_query_config, settings
     ):
-        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
         canonical_filter = {
             "column_id": "final_status",
             "filter_config": {
@@ -5071,7 +5067,6 @@ class TestDashboardQueryBuilder:
     def test_raw_attribute_exact_reads_cover_legacy_metric_and_scalar_filter_gaps(
         self, sample_query_config, settings
     ):
-        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
         canonical_filter = {
             "column_id": "final_status",
             "filter_config": {
@@ -5124,8 +5119,8 @@ class TestDashboardQueryBuilder:
         assert "tupleElement(latest_metric_state, 3) = 1" in unknown_sql
         assert "dashboard_filter_candidate_identities AS" in filtered_sql
         assert "FROM spans FINAL" not in filtered_sql
-        assert "LIMIT 1 BY" in filtered_sql
-        assert "dashboard_replay_source._version DESC" in filtered_sql
+        assert "LIMIT 1 BY" not in filtered_sql
+        assert "HAVING max(dashboard_replay_source._version)" in filtered_sql
         assert "tuple(" in filtered_sql
         assert "IN (" in filtered_sql
         assert "attrs_number" in unknown_sql
@@ -5142,7 +5137,6 @@ class TestDashboardQueryBuilder:
     def test_numeric_custom_metric_final_replay_keeps_key_removals_and_tombstones(
         self, sample_query_config, settings, attribute_key
     ):
-        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
         metric = {
             "id": "call.total_turns", "name": "call.total_turns",
             "type": "custom_attribute", "attribute_key": attribute_key,
@@ -5170,7 +5164,6 @@ class TestDashboardQueryBuilder:
     def test_time_to_first_token_exact_read_uses_metric_key(
         self, sample_query_config, settings
     ):
-        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
         metric = {
             "id": "time_to_first_token",
             "name": "time_to_first_token",
@@ -5192,7 +5185,6 @@ class TestDashboardQueryBuilder:
     def test_canonical_boolean_array_and_map_filters_compile_together(
         self, sample_query_config, settings
     ):
-        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
         canonical_filters = [
             {
                 "column_id": "is_final",
@@ -5240,7 +5232,11 @@ class TestDashboardQueryBuilder:
         # applied exactly after every candidate identity resolves to latest.
         assert "dashboard_filter_candidate_identities AS" in sql
         assert "FROM spans FINAL" not in sql
-        assert "LIMIT 1 BY" in sql
+        assert "LIMIT 1 BY" not in sql
+        assert "HAVING max(dashboard_replay_source._version)" in sql
+        # Overflow-JSON attribute filters read attributes_extra after replay,
+        # so the winner tuple must carry that column for this shape alone.
+        assert "dashboard_candidate_source.attributes_extra" in sql
         assert not any(key.startswith("_raw_attr_") for key in params)
         assert "query_status" not in metric_info
         assert "True" not in sql
@@ -5249,7 +5245,6 @@ class TestDashboardQueryBuilder:
     def test_legacy_is_not_set_filter_does_not_require_candidate_key_presence(
         self, sample_query_config, settings
     ):
-        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
         legacy_filter = {
             "metric_type": "custom_attribute",
             "metric_name": "optional_status",
@@ -5272,7 +5267,6 @@ class TestDashboardQueryBuilder:
     def test_negative_canonical_attribute_filter_keeps_full_exact_source(
         self, sample_query_config, settings
     ):
-        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
         config = _normalize_dashboard_query_filters(
             {
                 **sample_query_config,
@@ -5304,7 +5298,6 @@ class TestDashboardQueryBuilder:
     def test_positive_text_candidate_replays_latest_then_reapplies_exact_filter(
         self, sample_query_config, settings
     ):
-        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
         key = "conversation.recording.mono.combined"
         value = "https://storage.example.test/a/very/long/recording.wav"
         config = _normalize_dashboard_query_filters(
@@ -5332,14 +5325,23 @@ class TestDashboardQueryBuilder:
 
         assert "dashboard_filter_candidate_identities AS" in sql
         assert "FROM spans FINAL" not in sql
-        assert "dashboard_replay_source._version DESC" in sql
-        assert "LIMIT 1 BY" in sql
+        assert "dashboard_replay_source._version DESC" not in sql
+        assert "LIMIT 1 BY" not in sql
         assert (
-            "tuple( dashboard_replay_source.project_id, "
-            "dashboard_replay_source.observation_type, "
-            "dashboard_replay_source.service_name, "
-            "toStartOfHour(dashboard_replay_source.start_time), "
-            "dashboard_replay_source.trace_id, dashboard_replay_source.id ) IN ("
+            "FROM spans AS dashboard_replay_source "
+            "INNER JOIN dashboard_filter_candidate_identities "
+            "AS dashboard_candidate_state "
+            "ON dashboard_replay_source.project_id "
+            "= dashboard_candidate_state.project_id "
+            "AND dashboard_replay_source.observation_type "
+            "= dashboard_candidate_state.observation_type "
+            "AND dashboard_replay_source.service_name "
+            "= dashboard_candidate_state.service_name "
+            "AND toStartOfHour(dashboard_replay_source.start_time) "
+            "= dashboard_candidate_state.identity_hour "
+            "AND dashboard_replay_source.trace_id "
+            "= dashboard_candidate_state.trace_id "
+            "AND dashboard_replay_source.id = dashboard_candidate_state.id"
             in compact_sql
         )
         # The candidate witness and outer exact predicate have separate
@@ -5359,7 +5361,6 @@ class TestDashboardQueryBuilder:
     def test_legacy_boolean_filter_uses_boolean_map_in_exact_read(
         self, sample_query_config, settings
     ):
-        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
         legacy_filter = {
             "metric_type": "custom_attribute",
             "metric_name": "is_final",
@@ -5384,7 +5385,6 @@ class TestDashboardQueryBuilder:
     def test_long_minute_window_is_exact_without_candidate_truncation(
         self, sample_query_config, settings
     ):
-        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
         custom_metric = {
             "id": "final_status",
             "name": "final_status",
@@ -5408,8 +5408,8 @@ class TestDashboardQueryBuilder:
             latest_state=True,
         )
 
-        assert "dashboard_replay_source._version DESC" in sql
-        assert "LIMIT 1 BY" in sql
+        assert "HAVING max(dashboard_replay_source._version)" in sql
+        assert "LIMIT 1 BY" not in sql
         assert "UNION ALL" not in sql
         assert "LIMIT %(_raw_attr_" not in sql
         assert not any(key.startswith("_raw_attr_") for key in params)
@@ -5418,13 +5418,12 @@ class TestDashboardQueryBuilder:
         assert "query_status" not in metric_info
         stripped = without_query_settings(sql)
         assert "SETTINGS" not in stripped
-        assert "dashboard_replay_source._version DESC" in stripped
-        assert "LIMIT 1 BY" in stripped
+        assert "HAVING max(dashboard_replay_source._version)" in stripped
+        assert "LIMIT 1 BY" not in stripped
 
     def test_raw_attribute_exact_source_keeps_latest_state_inside_id_remap(
         self, sample_query_config, settings
     ):
-        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
         config = {
             **sample_query_config,
             "metrics": [
@@ -5462,7 +5461,6 @@ class TestDashboardQueryBuilder:
     def test_exact_raw_read_ignores_non_trace_filter_and_breakdown_sources(
         self, sample_query_config, settings
     ):
-        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
         config = {
             **sample_query_config,
             "filters": [
@@ -5497,7 +5495,6 @@ class TestDashboardQueryBuilder:
     def test_exact_builder_never_emits_obsolete_sampling_metadata(
         self, sample_query_config, settings
     ):
-        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
         config = {
             **sample_query_config,
             "metrics": [
@@ -5835,8 +5832,10 @@ class TestDashboardQueryBuilder:
         assert "dashboard_filter_candidate_identities AS" in sql
         assert "FROM spans FINAL" not in sql
         assert ") AS s" in sql
-        assert "dashboard_replay_source._version DESC" in sql
-        assert "LIMIT 1 BY" in sql
+        assert "HAVING max(dashboard_replay_source._version)" in sql
+        # The legacy usage scan keeps its own LIMIT 1 BY; the spans replay has
+        # none.
+        assert "ORDER BY dashboard_replay_source" not in sql
         assert "usage_span_trace_candidates" in sql
         assert "s.project_id IN %(project_ids)s" in sql
         assert "s.trace_id IN (SELECT toString(trace_id) AS trace_id" in sql
@@ -6671,264 +6670,6 @@ class TestDashboardQueryBuilder:
         assert "mapContains(attrs_string, %(_custom_bd_key_0)s)" in sql
         assert params["_custom_bd_key_0"] == attribute_key
         assert attribute_key not in sql
-
-
-class TestDashboardAttrRollupRouting:
-    """Routing for the latency-avg × covered-attribute breakdown.
-
-    Drives the real build_all_queries() call-path. [FIX] tests go RED if the
-    routing branch is removed; [FALLBACK] tests prove the spans path is kept.
-
-    The rollup is fail-closed behind three gates: v2 schema only
-    (``_attr_rollup_available``), DASHBOARD_ATTR_ROLLUP_ENABLED, and the window
-    starting at/after DASHBOARD_ATTR_ROLLUP_COVERED_SINCE. ``_v2``+``_enable``
-    open all three so a [FALLBACK] test isolates the one condition it names.
-    """
-
-    # Far enough in the past that the 30D-preset window always starts after it.
-    _COVERED_SINCE = datetime(2000, 1, 1, tzinfo=UTC)
-
-    @staticmethod
-    def _config(
-        metric_name="latency",
-        aggregation="avg",
-        breakdowns=None,
-        metric_filters=None,
-        global_filters=None,
-        granularity="day",
-    ):
-        metric = {
-            "id": metric_name,
-            "name": metric_name,
-            "type": "system_metric",
-            "aggregation": aggregation,
-        }
-        if metric_filters is not None:
-            metric["filters"] = metric_filters
-        return {
-            "project_ids": [str(uuid.uuid4())],
-            "allow_sampled": True,
-            "granularity": granularity,
-            "time_range": {"preset": "30D"},
-            "metrics": [metric],
-            "filters": global_filters or [],
-            "breakdowns": breakdowns if breakdowns is not None else [],
-        }
-
-    @staticmethod
-    def _bd(name):
-        return {
-            "type": "custom_attribute",
-            "name": name,
-            "source": "traces",
-            "display_name": name,
-            "attribute_type": "string",
-        }
-
-    @staticmethod
-    def _v2(config):
-        return DashboardQueryBuilderV2(config)
-
-    def _enable(self, settings, covered_since=None):
-        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = True
-        settings.DASHBOARD_ATTR_ROLLUP_COVERED_SINCE = (
-            self._COVERED_SINCE if covered_since is None else covered_since
-        )
-
-    def test_covered_breakdown_final_status_routes_to_rollup(self, settings):
-        # [FIX] final_status → rollup. RED without the routing branch.
-        self._enable(settings)
-        config = self._config(breakdowns=[self._bd("final_status")])
-        sql, params, metric_info = self._v2(config).build_all_queries()[0]
-        # Targets the rollup, reads merged state, and does NOT scan the Map.
-        assert "dashboard_attr_rollup" in sql
-        assert "sumMerge(latency_sum)" in sql
-        assert "countMerge(n)" in sql
-        assert "span_attr_str" not in sql
-        assert "FROM spans" not in sql
-        # Output contract unchanged: time_bucket / breakdown_value / value.
-        assert "time_bucket" in sql
-        assert "breakdown_value" in sql
-        # attr_key is passed as a param, filtered on in the rollup.
-        assert params["attr_key"] == "final_status"
-        assert "attr_key = %(attr_key)s" in sql
-        assert "query_status" not in metric_info
-
-    def test_covered_breakdown_country_routes_to_rollup(self, settings):
-        # [FIX] country → rollup too.
-        self._enable(settings)
-        config = self._config(breakdowns=[self._bd("country")])
-        sql, params, _ = self._v2(config).build_all_queries()[0]
-        assert "dashboard_attr_rollup" in sql
-        assert "sumMerge(latency_sum) / countMerge(n)" in sql
-        assert "span_attr_str" not in sql
-        assert params["attr_key"] == "country"
-
-    def test_v1_builder_never_routes_to_rollup(self, settings):
-        # [FALLBACK] FIX 1 — base/v1 builder lacks the rollup table; even with
-        # the flag on and the window covered it must emit the spans scan.
-        self._enable(settings)
-        config = self._config(breakdowns=[self._bd("final_status")])
-        sql, _, _ = DashboardQueryBuilder(config).build_all_queries()[0]
-        assert "dashboard_attr_rollup" not in sql
-        assert "FROM spans" in sql
-
-    def test_flag_disabled_falls_back_to_spans(self, settings):
-        # [FALLBACK] FIX 2 — flag off (fresh deploy) → spans path.
-        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = False
-        settings.DASHBOARD_ATTR_ROLLUP_COVERED_SINCE = self._COVERED_SINCE
-        config = self._config(breakdowns=[self._bd("final_status")])
-        sql, _, metric_info = self._v2(config).build_all_queries()[0]
-        assert "dashboard_attr_rollup" not in sql
-        assert "FROM spans" in sql
-        assert "FINAL" not in without_query_settings(sql)
-        assert "query_status" not in metric_info
-
-    def test_coverage_unset_falls_back_to_spans(self, settings):
-        # [FALLBACK] FIX 2 — flag on but no coverage date set → spans path.
-        settings.DASHBOARD_ATTR_ROLLUP_ENABLED = True
-        settings.DASHBOARD_ATTR_ROLLUP_COVERED_SINCE = None
-        config = self._config(breakdowns=[self._bd("final_status")])
-        sql, _, _ = self._v2(config).build_all_queries()[0]
-        assert "dashboard_attr_rollup" not in sql
-        assert "FROM spans" in sql
-
-    def test_window_before_coverage_falls_back_to_spans(self, settings):
-        # [FALLBACK] boundary (a) — a window starting before COVERED_SINCE is
-        # not backfilled; route must fall back, never return a partial rollup.
-        self._enable(settings, covered_since=datetime.now(UTC) + timedelta(days=1))
-        config = self._config(breakdowns=[self._bd("final_status")])
-        sql, _, _ = self._v2(config).build_all_queries()[0]
-        assert "dashboard_attr_rollup" not in sql
-        assert "FROM spans" in sql
-
-    def test_per_metric_filter_falls_back_to_spans(self, settings):
-        # [FALLBACK] per-metric filter → spans path.
-        self._enable(settings)
-        config = self._config(
-            breakdowns=[self._bd("final_status")],
-            metric_filters=[
-                {
-                    "metric_type": "system_metric",
-                    "metric_name": "status",
-                    "operator": "equal_to",
-                    "value": "OK",
-                }
-            ],
-        )
-        sql, _, _ = self._v2(config).build_all_queries()[0]
-        assert "dashboard_attr_rollup" not in sql
-        assert "FROM spans" in sql
-
-    def test_global_filter_falls_back_to_spans(self, settings):
-        # [FALLBACK] a global filter present → spans path.
-        self._enable(settings)
-        config = self._config(
-            breakdowns=[self._bd("final_status")],
-            global_filters=[
-                {
-                    "metric_type": "custom_attribute",
-                    "metric_name": "env",
-                    "operator": "equal_to",
-                    "value": "prod",
-                    "attribute_type": "string",
-                }
-            ],
-        )
-        sql, _, _ = self._v2(config).build_all_queries()[0]
-        assert "dashboard_attr_rollup" not in sql
-        assert "FROM spans" in sql
-
-    def test_uncovered_attribute_falls_back_to_spans(self, settings):
-        # [FALLBACK] an attribute outside the covered set (user_id) → spans path.
-        self._enable(settings)
-        config = self._config(breakdowns=[self._bd("user_id")])
-        sql, _, _ = self._v2(config).build_all_queries()[0]
-        assert "dashboard_attr_rollup" not in sql
-        assert "FROM spans" in sql
-
-    def test_non_avg_aggregation_falls_back_to_spans(self, settings):
-        # [FALLBACK] non-avg (p95) → spans path.
-        self._enable(settings)
-        config = self._config(aggregation="p95", breakdowns=[self._bd("final_status")])
-        sql, _, _ = self._v2(config).build_all_queries()[0]
-        assert "dashboard_attr_rollup" not in sql
-        assert "FROM spans" in sql
-
-    def test_non_latency_metric_falls_back_to_spans(self, settings):
-        # [FALLBACK] non-latency (cost) → spans path.
-        self._enable(settings)
-        config = self._config(metric_name="cost", breakdowns=[self._bd("final_status")])
-        sql, _, _ = self._v2(config).build_all_queries()[0]
-        assert "dashboard_attr_rollup" not in sql
-        assert "cost" in sql.lower()
-        assert "breakdown_value" in sql
-
-    def test_two_breakdowns_fall_back_to_spans(self, settings):
-        # [FALLBACK] >1 breakdown → spans path.
-        self._enable(settings)
-        config = self._config(
-            breakdowns=[self._bd("final_status"), self._bd("country")]
-        )
-        sql, _, _ = self._v2(config).build_all_queries()[0]
-        assert "dashboard_attr_rollup" not in sql
-
-    def test_no_breakdown_latency_avg_falls_back_to_spans(self, settings):
-        # [FALLBACK] plain latency avg with no breakdown → spans path unchanged.
-        self._enable(settings)
-        config = self._config(breakdowns=[])
-        sql, _, _ = self._v2(config).build_all_queries()[0]
-        assert "dashboard_attr_rollup" not in sql
-        assert "latency_ms" in sql
-
-    def test_sub_hour_granularity_falls_back_to_spans(self, settings):
-        # [FALLBACK] sub-hour granularity → spans path (rollup is hourly).
-        self._enable(settings)
-        config = self._config(
-            breakdowns=[self._bd("final_status")], granularity="minute"
-        )
-        sql, _, _ = self._v2(config).build_all_queries()[0]
-        assert "dashboard_attr_rollup" not in sql
-        assert "FROM spans" in sql
-
-    def test_hour_granularity_routes_to_rollup(self, settings):
-        # [FIX] hour granularity is covered (>= the rollup's hour resolution).
-        self._enable(settings)
-        config = self._config(breakdowns=[self._bd("final_status")], granularity="hour")
-        sql, _, _ = self._v2(config).build_all_queries()[0]
-        assert "dashboard_attr_rollup" in sql
-
-    def test_rollup_params_carry_window_bounds(self, settings):
-        # [FIX] rollup is window-bounded, never all-history.
-        self._enable(settings)
-        config = self._config(breakdowns=[self._bd("final_status")])
-        sql, params, _ = self._v2(config).build_all_queries()[0]
-        assert "hour >= %(start_date)s" in sql
-        assert "hour < %(end_date)s" in sql
-        assert "start_date" in params and "end_date" in params
-        assert "project_id IN %(project_ids)s" in sql
-
-    def test_rollup_window_snapped_to_hour(self, settings):
-        # [FIX] FIX 3 — the rollup window is floored to whole hours so no
-        # partial bucket is read.
-        self._enable(settings)
-        config = self._config(breakdowns=[self._bd("final_status")])
-        _, params, _ = self._v2(config).build_all_queries()[0]
-        for key in ("start_date", "end_date"):
-            dt = params[key]
-            assert dt.minute == 0 and dt.second == 0 and dt.microsecond == 0
-
-    def test_weighted_mean_equals_raw_avg(self):
-        # sumMerge/countMerge == flat avg of raw latencies; avg-of-avgs would not.
-        hour_a = [100, 200, 300]
-        hour_b = [1000]
-        raw = hour_a + hour_b
-        flat_avg = sum(raw) / len(raw)
-        states = [(sum(hour_a), len(hour_a)), (sum(hour_b), len(hour_b))]
-        weighted = sum(s for s, _ in states) / sum(c for _, c in states)
-        assert weighted == pytest.approx(flat_avg)
-        avg_of_avgs = ((sum(hour_a) / len(hour_a)) + (sum(hour_b) / len(hour_b))) / 2
-        assert avg_of_avgs != pytest.approx(flat_avg)
 
 
 class TestDashboardQueryBuilderTimeRanges:
@@ -8233,10 +7974,16 @@ class TestWidgetQueryExecution:
         self, mock_get_client, mock_enabled, auth_client, dashboard, observe_project
     ):
         mock_client = MagicMock()
-        mock_client.execute_read.return_value = (
+        # Preview reads go through the measured transport, which reports native
+        # rows/bytes progress alongside the rows; this double leaves both
+        # unmeasured because the preview assertion is about the response, not
+        # about what the statement cost.
+        mock_client.execute_read_with_progress.return_value = (
             [(datetime(2025, 1, 1), 50.0)],
             [("time_bucket", "DateTime"), ("value", "Float64")],
             3.0,
+            None,
+            None,
         )
         mock_get_client.return_value = mock_client
 
@@ -8971,8 +8718,10 @@ class TestQueryBuilderEdgeCases:
         assert "breakdown_value" not in sql
         assert info["name"] == "latency"
 
-    def test_all_series_are_retained_above_former_cap(self, sample_query_config):
-        """UI visibility limits must never truncate exact backend results."""
+    def test_breakdown_series_are_capped_and_the_total_is_declared(
+        self, sample_query_config
+    ):
+        """A wide breakdown is cut at the ceiling and says how wide it was."""
         sample_query_config["time_range"] = {
             "custom_start": "2025-01-01T00:00:00",
             "custom_end": "2025-01-02T00:00:00",
@@ -8991,12 +8740,16 @@ class TestQueryBuilderEdgeCases:
         result = builder.format_results(
             [({"id": "latency", "name": "latency", "aggregation": "avg"}, rows)]
         )
-        series = result["metrics"][0]["series"]
-        assert len(series) == 150
+        metric = result["metrics"][0]
+        series = metric["series"]
+        ceiling = settings.DASHBOARD_BREAKDOWN_MAX_SERIES
+        assert len(series) == ceiling
         assert [item["name"] for item in series] == [
-            f"model-{i}" for i in reversed(range(150))
+            f"model-{i}" for i in range(149, 149 - ceiling, -1)
         ]
-        assert series[-1]["data"][0]["value"] == 0
+        assert metric["series_total"] == 150
+        assert metric["series_truncated"] is True
+        assert series[-1]["data"][0]["value"] == float(150 - ceiling)
 
     def test_zero_total_in_pie_data(self, sample_query_config):
         """Verify no division by zero when all values are zero."""
@@ -10131,8 +9884,8 @@ class TestDashboardV2RewriteRouting:
         assert "SELECT DISTINCT s.trace_id FROM spans AS s FINAL" not in compact_sql
         assert "LEFT JOIN ( SELECT * FROM spans AS s FINAL" not in compact_sql
         assert ") AS s PREWHERE s.project_id IN %(project_ids)s" in compact_sql
-        assert "dashboard_replay_source._version DESC" in compact_sql
-        assert "LIMIT 1 BY" in compact_sql
+        assert "HAVING max(dashboard_replay_source._version)" in compact_sql
+        assert "LIMIT 1 BY" not in compact_sql
         assert "PREWHERE s.project_id IN %(project_ids)s" in compact_sql
         assert "s.trace_id IN (" in compact_sql
         assert "(s.parent_span_id IS NULL OR s.parent_span_id = '')" in compact_sql

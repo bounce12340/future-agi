@@ -22157,6 +22157,9 @@ export interface DashboardQueryMetricResultApi {
   aggregation: DashboardQueryMetricResultApiAggregation;
   unit: string;
   series: DashboardQuerySeriesApi[];
+  /** @minimum 0 */
+  series_total?: number;
+  series_truncated?: boolean;
   query_complete?: boolean;
   query_sampled?: boolean;
   query_status?: DashboardQueryMetricResultApiQueryStatus;
@@ -24937,6 +24940,8 @@ export interface SpanListMetadataApi {
   query_applied_filter_sha256?: string;
   /** @minimum 0 */
   query_applied_filter_count?: number;
+  query_exact?: boolean;
+  ordering_exact?: boolean;
 }
 
 export type SpanPrototypeListResultApiTableItem = {
@@ -26579,8 +26584,8 @@ export interface TraceSessionListMetadataApi {
   /** @minimum 0 */
   query_applied_filter_count?: number;
   query_exact?: boolean;
-  query_provenance?: TraceSessionListMetadataApiQueryProvenance;
   ordering_exact?: boolean;
+  query_provenance?: TraceSessionListMetadataApiQueryProvenance;
 }
 
 /**
@@ -26944,6 +26949,8 @@ export interface TraceObserveListMetadataApi {
   query_applied_filter_sha256?: string;
   /** @minimum 0 */
   query_applied_filter_count?: number;
+  query_exact?: boolean;
+  ordering_exact?: boolean;
 }
 
 export type TracePrototypeListResultApiTableItem = {
@@ -27079,8 +27086,12 @@ export interface TraceVoiceCallListResponseApi {
   next_cursor_fingerprint?: string | null;
   query_complete: boolean;
   query_status: TraceVoiceCallListResponseApiQueryStatus;
+  query_exact?: boolean;
+  ordering_exact?: boolean;
   /** @minLength 1 */
   query_error_code?: string;
+  /** @minimum 0 */
+  query_count?: number;
   query_applied_filter_version?: TraceVoiceCallListResponseApiQueryAppliedFilterVersion;
   /**
    * @minLength 1
@@ -27654,6 +27665,14 @@ export type UsersResultApiQueryProvenance =
 export const UsersResultApiQueryProvenance = {
   span_user_rollup_end_users_candidate: "span_user_rollup_end_users_candidate",
   physical_latest_users: "physical_latest_users",
+  matching_activity_walk: "matching_activity_walk",
+} as const;
+
+export type UsersResultApiOrdering =
+  (typeof UsersResultApiOrdering)[keyof typeof UsersResultApiOrdering];
+
+export const UsersResultApiOrdering = {
+  latest_matching_activity: "latest_matching_activity",
 } as const;
 
 export type UsersResultApiApproximateFieldsItem =
@@ -27681,6 +27700,7 @@ export interface UsersResultApi {
   query_exact?: boolean;
   query_provenance?: UsersResultApiQueryProvenance;
   ordering_exact?: boolean;
+  ordering?: UsersResultApiOrdering;
   approximate_fields?: UsersResultApiApproximateFieldsItem[];
 }
 

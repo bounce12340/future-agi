@@ -46609,6 +46609,7 @@ export const TracerDashboardQueryBody = zod.object({
 });
 
 export const tracerDashboardQueryResponseStatusDefault = true;
+export const tracerDashboardQueryResponseResultMetricsItemSeriesTotalMin = 0;
 
 export const tracerDashboardQueryResponseResultQueryCountMin = 0;
 export const tracerDashboardQueryResponseResultQueryCountMax = 256;
@@ -46660,6 +46661,11 @@ export const TracerDashboardQueryResponse = zod.object({
             ),
           }),
         ),
+        series_total: zod
+          .number()
+          .min(tracerDashboardQueryResponseResultMetricsItemSeriesTotalMin)
+          .optional(),
+        series_truncated: zod.boolean().optional(),
         query_complete: zod.boolean().optional(),
         query_sampled: zod.boolean().optional(),
         query_status: zod.enum(["complete", "degraded"]).optional(),
@@ -47434,6 +47440,7 @@ export const TracerDashboardWidgetsPreviewQueryBody = zod.object({
 });
 
 export const tracerDashboardWidgetsPreviewQueryResponseStatusDefault = true;
+export const tracerDashboardWidgetsPreviewQueryResponseResultMetricsItemSeriesTotalMin = 0;
 
 export const tracerDashboardWidgetsPreviewQueryResponseResultQueryCountMin = 0;
 export const tracerDashboardWidgetsPreviewQueryResponseResultQueryCountMax = 256;
@@ -47487,6 +47494,13 @@ export const TracerDashboardWidgetsPreviewQueryResponse = zod.object({
             ),
           }),
         ),
+        series_total: zod
+          .number()
+          .min(
+            tracerDashboardWidgetsPreviewQueryResponseResultMetricsItemSeriesTotalMin,
+          )
+          .optional(),
+        series_truncated: zod.boolean().optional(),
         query_complete: zod.boolean().optional(),
         query_sampled: zod.boolean().optional(),
         query_status: zod.enum(["complete", "degraded"]).optional(),
@@ -47995,6 +48009,7 @@ export const TracerDashboardWidgetsExecuteQueryBody = zod.object({
 });
 
 export const tracerDashboardWidgetsExecuteQueryResponseStatusDefault = true;
+export const tracerDashboardWidgetsExecuteQueryResponseResultMetricsItemSeriesTotalMin = 0;
 
 export const tracerDashboardWidgetsExecuteQueryResponseResultQueryCountMin = 0;
 export const tracerDashboardWidgetsExecuteQueryResponseResultQueryCountMax = 256;
@@ -48048,6 +48063,13 @@ export const TracerDashboardWidgetsExecuteQueryResponse = zod.object({
             ),
           }),
         ),
+        series_total: zod
+          .number()
+          .min(
+            tracerDashboardWidgetsExecuteQueryResponseResultMetricsItemSeriesTotalMin,
+          )
+          .optional(),
+        series_truncated: zod.boolean().optional(),
         query_complete: zod.boolean().optional(),
         query_sampled: zod.boolean().optional(),
         query_status: zod.enum(["complete", "degraded"]).optional(),
@@ -55388,6 +55410,8 @@ export const TracerObservationSpanListSpansResponse = zod.object({
           tracerObservationSpanListSpansResponseResultMetadataQueryAppliedFilterCountMin,
         )
         .optional(),
+      query_exact: zod.boolean().optional(),
+      ordering_exact: zod.boolean().optional(),
     }),
     table: zod.array(
       zod.record(
@@ -55598,6 +55622,8 @@ export const TracerObservationSpanListSpansObserveResponse = zod.object({
           tracerObservationSpanListSpansObserveResponseResultMetadataQueryAppliedFilterCountMin,
         )
         .optional(),
+      query_exact: zod.boolean().optional(),
+      ordering_exact: zod.boolean().optional(),
     }),
     table: zod.array(
       zod.record(
@@ -60261,8 +60287,8 @@ export const TracerTraceSessionListSessionsResponse = zod.object({
         )
         .optional(),
       query_exact: zod.boolean().optional(),
-      query_provenance: zod.enum(["spans_per_session_candidate"]).optional(),
       ordering_exact: zod.boolean().optional(),
+      query_provenance: zod.enum(["spans_per_session_candidate"]).optional(),
     }),
     table: zod.array(
       zod
@@ -61498,6 +61524,8 @@ export const TracerTraceListTracesResponse = zod.object({
           tracerTraceListTracesResponseResultMetadataQueryAppliedFilterCountMin,
         )
         .optional(),
+      query_exact: zod.boolean().optional(),
+      ordering_exact: zod.boolean().optional(),
     }),
     table: zod.array(
       zod.record(
@@ -61698,6 +61726,8 @@ export const TracerTraceListTracesOfSessionResponse = zod.object({
           tracerTraceListTracesOfSessionResponseResultMetadataQueryAppliedFilterCountMin,
         )
         .optional(),
+      query_exact: zod.boolean().optional(),
+      ordering_exact: zod.boolean().optional(),
     }),
     table: zod.array(
       zod.record(
@@ -61878,6 +61908,8 @@ export const tracerTraceListVoiceCallsResponseTotalPagesMin = 0;
 export const tracerTraceListVoiceCallsResponseNextCursorFingerprintRegExp =
   new RegExp("^[0-9a-f]{64}$");
 
+export const tracerTraceListVoiceCallsResponseQueryCountMin = 0;
+
 export const tracerTraceListVoiceCallsResponseQueryAppliedFilterSha256RegExp =
   new RegExp("^[0-9a-f]{64}$");
 export const tracerTraceListVoiceCallsResponseQueryAppliedFilterCountMin = 0;
@@ -61922,7 +61954,13 @@ export const TracerTraceListVoiceCallsResponse = zod.object({
     .nullish(),
   query_complete: zod.boolean(),
   query_status: zod.enum(["complete", "degraded"]),
+  query_exact: zod.boolean().optional(),
+  ordering_exact: zod.boolean().optional(),
   query_error_code: zod.string().min(1).optional(),
+  query_count: zod
+    .number()
+    .min(tracerTraceListVoiceCallsResponseQueryCountMin)
+    .optional(),
   query_applied_filter_version: zod
     .enum(["canonical-json-sha256-v1"])
     .optional(),
@@ -62012,6 +62050,8 @@ export const tracerTraceListVoiceCallsCreateResponseTotalPagesMin = 0;
 
 export const tracerTraceListVoiceCallsCreateResponseNextCursorFingerprintRegExp =
   new RegExp("^[0-9a-f]{64}$");
+
+export const tracerTraceListVoiceCallsCreateResponseQueryCountMin = 0;
 
 export const tracerTraceListVoiceCallsCreateResponseQueryAppliedFilterSha256RegExp =
   new RegExp("^[0-9a-f]{64}$");
@@ -64394,9 +64434,14 @@ export const TracerUsersListResponse = zod.object({
     query_status: zod.enum(["complete", "degraded"]).optional(),
     query_exact: zod.boolean().optional(),
     query_provenance: zod
-      .enum(["span_user_rollup_end_users_candidate", "physical_latest_users"])
+      .enum([
+        "span_user_rollup_end_users_candidate",
+        "physical_latest_users",
+        "matching_activity_walk",
+      ])
       .optional(),
     ordering_exact: zod.boolean().optional(),
+    ordering: zod.enum(["latest_matching_activity"]).optional(),
     approximate_fields: zod.array(zod.enum(["num_sessions"])).optional(),
   }),
 });
