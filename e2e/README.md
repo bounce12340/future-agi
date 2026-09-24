@@ -94,7 +94,7 @@ Ports come from `e2e/stack/e2e.env` and are chosen to collide with neither a nor
 | backend                       | 8100          | ClickHouse HTTP / native | 28123 / 29000 |
 | agentcc-gateway               | 28090         | Redis                    | 26379         |
 | fi-collector OTLP HTTP / gRPC | 24318 / 24317 | MinIO API / console      | 29005 / 29006 |
-| observation Kafka             | 29093         |                          |                 |
+| observation Kafka             | 29093         |                          |               |
 | fi-collector admin            | 29464         | Temporal                 | 27233         |
 | peerdb-server                 | 29900         | peerdb-ui (not started)  | 23001         |
 
@@ -134,18 +134,26 @@ E2E_COLLECTOR_URL=http://localhost:4318 \
 bin/e2e test flows/observe/trace-ingestion.spec.ts
 ```
 
-| Variable                   | Default                                                      | Needed for                              |
-| -------------------------- | ------------------------------------------------------------ | --------------------------------------- |
-| `E2E_APP_URL`              | `http://localhost:3100`                                      | every browser step (`baseURL`)          |
-| `E2E_API_URL`              | `http://localhost:8100`                                      | provisioning and the API assertion lane |
-| `E2E_COLLECTOR_URL`        | `http://localhost:24318`                                     | OTLP trace seeding                      |
-| `E2E_GATEWAY_URL`          | `http://localhost:28090`                                     | the mock-LLM harness self-test          |
-| `E2E_CH_URL` / `E2E_CH_DB` | `http://localhost:28123` / `default`                         | storage-lane ClickHouse assertions      |
-| `E2E_PG_URL`               | `postgresql://futureagi:futureagi@localhost:25432/futureagi` | storage-lane Postgres assertions        |
+| Variable                   | Default                                                      | Needed for                                |
+| -------------------------- | ------------------------------------------------------------ | ----------------------------------------- |
+| `E2E_APP_URL`              | `http://localhost:3100`                                      | every browser step (`baseURL`)            |
+| `E2E_API_URL`              | `http://localhost:8100`                                      | provisioning and the API assertion lane   |
+| `E2E_COLLECTOR_URL`        | `http://localhost:24318`                                     | OTLP trace seeding                        |
+| `E2E_GATEWAY_URL`          | `http://localhost:28090`                                     | the mock-LLM harness self-test            |
+| `E2E_CH_URL` / `E2E_CH_DB` | `http://localhost:28123` / `default`                         | storage-lane ClickHouse assertions        |
+| `E2E_CATALOG_CH_URL`       | `E2E_CH_URL` (or its default above)                          | optional separate catalog ClickHouse host |
+| `E2E_CATALOG_CH_DB`        | `property_catalog`                                           | optional catalog database override        |
+| `E2E_PG_URL`               | `postgresql://futureagi:futureagi@localhost:25432/futureagi` | storage-lane Postgres assertions          |
 
 Any flow with storage-lane assertions needs `E2E_CH_URL` and `E2E_PG_URL` as well — pointed at the
 attached stack's stores. If you omit them the probe hits the managed stack's ports and the spec
 fails at the probe, by design: there is no silent skip.
+
+For split-store attachments, set `E2E_CATALOG_CH_URL` and/or `E2E_CATALOG_CH_DB`
+for catalog assertions (`probe.catalogCh()`). Source assertions (`probe.ch()`)
+continue to use `E2E_CH_URL` / `E2E_CH_DB`. Catalog queries use unqualified table
+names so the selected catalog database applies; neither override is required for
+the managed stack.
 
 Attach mode is for **iteration**, not for verdicts. It never exercises the nginx artifact or the
 runtime `window.__FUTURE_AGI_CONFIG__` injection that the shipped frontend image performs, and the
@@ -207,16 +215,16 @@ builds `:e2e-ci` images from the PR's own code.
 stack. Because it starts containers, it refuses to run against anything it was not explicitly
 pointed at: nothing here has a default, and every guard fails closed.
 
-| Variable                    | Required for            | Meaning                                                                             |
-| --------------------------- | ----------------------- | ----------------------------------------------------------------------------------- |
-| `E2E_H5_LIVE`               | the live run            | Must be `1`. Without it only the offline `@h5-guard` assertions run.                  |
-| `E2E_H5_DOCKER_CONTEXT`     | the live run            | The Docker context of your approved local runtime. `DOCKER_CONTEXT` must equal it.    |
-| `E2E_H5_DOCKER_SOCKET`      | the live run            | That context's `unix:///` socket. The manifest and the live context must both match it. |
-| `E2E_H5_RUNTIME_MANIFEST`   | the live run            | Absolute path to a run manifest **outside the checkout** holding the machine pins.    |
-| `E2E_H5_CH_USER`            | the live run            | A SELECT-only ClickHouse user. `default`/`admin`/the catalog writer are rejected.     |
-| `E2E_H5_CH_PASSWORD`        | the live run            | That user's password. There is no credential fallback.                                |
-| `E2E_H5_AUDIT_CONTAINER`    | Kafka images without CLIs | `1` to allow the task-owned audit container when the broker lacks the shell tools.  |
-| `E2E_H5_EXPECT_WRONG`       | fallibility proofs only | Injects one deliberate defect so a passing assertion can be shown to fail. One of `source-id`, `preview-count`, `checkpoint`, `index-value`, `api-type`, `late-time`; unset for a real run. |
+| Variable                  | Required for              | Meaning                                                                                                                                                                                     |
+| ------------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `E2E_H5_LIVE`             | the live run              | Must be `1`. Without it only the offline `@h5-guard` assertions run.                                                                                                                        |
+| `E2E_H5_DOCKER_CONTEXT`   | the live run              | The Docker context of your approved local runtime. `DOCKER_CONTEXT` must equal it.                                                                                                          |
+| `E2E_H5_DOCKER_SOCKET`    | the live run              | That context's `unix:///` socket. The manifest and the live context must both match it.                                                                                                     |
+| `E2E_H5_RUNTIME_MANIFEST` | the live run              | Absolute path to a run manifest **outside the checkout** holding the machine pins.                                                                                                          |
+| `E2E_H5_CH_USER`          | the live run              | A SELECT-only ClickHouse user. `default`/`admin`/the catalog writer are rejected.                                                                                                           |
+| `E2E_H5_CH_PASSWORD`      | the live run              | That user's password. There is no credential fallback.                                                                                                                                      |
+| `E2E_H5_AUDIT_CONTAINER`  | Kafka images without CLIs | `1` to allow the task-owned audit container when the broker lacks the shell tools.                                                                                                          |
+| `E2E_H5_EXPECT_WRONG`     | fallibility proofs only   | Injects one deliberate defect so a passing assertion can be shown to fail. One of `source-id`, `preview-count`, `checkpoint`, `index-value`, `api-type`, `late-time`; unset for a real run. |
 
 `E2E_H5_DOCKER_CONTEXT` names the context; it does not create one. Declare the context you actually
 run this stack under, and export the same value as `DOCKER_CONTEXT` so the harness and the `docker`

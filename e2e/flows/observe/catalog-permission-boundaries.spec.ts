@@ -234,10 +234,10 @@ test('OBS-E2E-009: catalog permissions follow explicit scope and membership remo
           .toEqual(s.traces.flatMap(t => t.spanIds).sort().map(id => ({ id, project_id: s.projectId, org_id: s.owner.organizationId })));
         // observed_catalog/schema.sql: AggregatingMergeTree, NOT FINAL and not
         // physical counts. Full canonical identity includes fingerprint + bytes.
-        const catalog = await probe.ch<{ organization_id: string; workspace_id: string; project_id: string;
+        const catalog = await probe.catalogCh<{ organization_id: string; workspace_id: string; project_id: string;
           source_kind: string; attribute_key: string; attribute_type: string; value_fingerprint: string; value_json: string }>(
           `SELECT organization_id, workspace_id, project_id, source_kind, attribute_key, attribute_type, value_fingerprint, value_json
-           FROM property_catalog.observed_attribute_values
+           FROM observed_attribute_values
            WHERE project_id = {p:String} AND attribute_key IN ({a:String}, {b:String})
            GROUP BY organization_id, workspace_id, project_id, source_kind, attribute_key, attribute_type, value_fingerprint, value_json
            ORDER BY attribute_key, value_json`, { p: s.projectId, a: customKeys[0], b: customKeys[1] });

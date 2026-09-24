@@ -409,9 +409,9 @@ test('OBS-E2E-007: Users discovery selects only authorized user activity', {
       const expected = [{ type: 'string', value: '7' }, { type: 'number', value: 7 },
         { type: 'string', value: '007' }, { type: 'boolean', value: false }];
       await expect.poll(async () => {
-        const rows = await probe.ch<{ attribute_type: string; value_json: string; value_fingerprint: string }>(
+        const rows = await probe.catalogCh<{ attribute_type: string; value_json: string; value_fingerprint: string }>(
           `SELECT organization_id, workspace_id, project_id, source_kind, attribute_key, attribute_type, value_fingerprint, value_json
-           FROM property_catalog.observed_attribute_values WHERE organization_id={o:String} AND workspace_id={w:String}
+           FROM observed_attribute_values WHERE organization_id={o:String} AND workspace_id={w:String}
            AND project_id={p:String} AND source_kind='custom_attribute' AND attribute_key={k:String}
            GROUP BY organization_id, workspace_id, project_id, source_kind, attribute_key, attribute_type, value_fingerprint, value_json`,
           { o: a1.organizationId, w: a1.workspaceId, p: p1.id, k: key.mixed });
