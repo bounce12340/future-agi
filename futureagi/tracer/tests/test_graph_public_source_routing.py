@@ -229,7 +229,9 @@ def test_public_dispatch_admitted_seed_prunes_with_a_plain_trace_set(key):
     assert "FROM spans AS graph_seed_spans" in query
     assert "GLOBAL IN" not in query
     assert "cluster(" not in query
-    assert f"attrs_string['{key}']" in query
+    assert "attrs_string[%(graph_filter_1_attr_key_1)s]" in query
+    assert params["graph_filter_1_attr_key_1"] == key
+    assert params["graph_seed_1_latest_filter_key_0"] == key
     assert "spans_hourly_rollup" not in query
     assert "tracer_eval_logger" not in query
     assert "model_hub_score" not in query

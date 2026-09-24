@@ -28,6 +28,7 @@ from typing import Any
 from tracer.services.clickhouse.query_builders.dashboard import (
     AGGREGATIONS,
     DashboardQueryBuilder,
+    _sanitize_attr_key,
 )
 from tracer.services.clickhouse.query_builders.latest_filter_predicates import (
     LatestFilterPredicate,
@@ -570,7 +571,13 @@ class DashboardQueryBuilderV2(V2RewriteMixin, DashboardQueryBuilder):
         metric_presence = getattr(self, "_exact_metric_presence", None)
         if metric_presence is not None:
             keys.append(metric_presence[1])
-        return tuple(dict.fromkeys(keys))
+        try:
+            # This optimized source inlines keys into a Map expression below.
+            # Arbitrary UTF-8 keys remain supported by the untouched FINAL
+            # source, but cannot be safely inlined here.
+            return tuple(dict.fromkeys(_sanitize_attr_key(key) for key in keys))
+        except ValueError:
+            return None
 
     def _exact_replay_reads_overflow_json(
         self,

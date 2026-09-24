@@ -256,9 +256,13 @@ def test_custom_metric_exact_data_keys_in_raw_scalar_and_fallback_paths(
         aggregate = "avg" if kind == "number" else "uniqExact"
         assert f"{aggregate}({attr_map}[%(custom_metric_attr_key)s]) AS value" in sql
         if latest:
-            assert_bound(sql, params, key, "dashboard_candidate_metric_key")
-            assert "dashboard_filter_candidate_identities" in sql
-            assert "mapContains(dashboard_candidate_source." + attr_map in sql
+            if re.fullmatch(r"[A-Za-z0-9._-]+", key):
+                assert_bound(sql, params, key, "dashboard_candidate_metric_key")
+                assert "dashboard_filter_candidate_identities" in sql
+                assert "mapContains(dashboard_candidate_source." + attr_map in sql
+            else:
+                assert " FINAL" in sql
+                assert "dashboard_replay_source" not in sql
 
 
 @pytest.mark.parametrize("key", [*KEYS, "latency", "model"])
@@ -295,26 +299,27 @@ def test_latest_fallback_multiple_keys_and_candidate_namespaces_remain_distinct(
         DashboardQueryBuilderV2,
         "custom_attribute",
         latest_state=True,
-        metric_options=custom_metric("metric.客户"),
+        metric_options=custom_metric("metric.customer"),
         breakdowns=[
-            breakdown("Customer.客户\u200b"),
+            breakdown("Customer.customer"),
             {**breakdown("model"), "attribute_type": "boolean"},
         ],
-        filters=[canonical_filter("filter.客户"), custom_filter("legacy.客户")],
+        filters=[canonical_filter("filter.customer"), custom_filter("legacy.customer")],
     )
     for name, key in {
-        "custom_metric_attr_key": "metric.客户",
-        "dashboard_candidate_metric_key": "metric.客户",
-        "_custom_bd_key_0": "Customer.客户\u200b",
-        "dashboard_candidate_breakdown_key_0": "Customer.客户\u200b",
+        "custom_metric_attr_key": "metric.customer",
+        "dashboard_candidate_metric_key": "metric.customer",
+        "_custom_bd_key_0": "Customer.customer",
+        "dashboard_candidate_breakdown_key_0": "Customer.customer",
         "_custom_bd_key_1": "model",
         "dashboard_candidate_breakdown_key_1": "model",
-        "latest_filter_key_0": "filter.客户",
-        "_legacy_attr_key_1": "legacy.客户",
+        "latest_filter_key_0": "filter.customer",
+        "_legacy_attr_key_1": "legacy.customer",
     }.items():
         assert_bound(sql, params, key, name)
     assert params["f_1_val"] == "00123"
-    assert "LIMIT 1 BY" in sql and "dashboard_replay_source" in sql
+    assert "dashboard_replay_source" in sql
+    assert "HAVING max(dashboard_replay_source._version)" in sql
     # Only the existing first custom-metric breakdown is selected; all presence
     # predicates and candidate key witnesses still participate, unchanged.
     assert "attrs_string[%(_custom_bd_key_0)s] AS breakdown_value" in sql
@@ -323,6 +328,22 @@ def test_latest_fallback_multiple_keys_and_candidate_namespaces_remain_distinct(
         "mapContains(dashboard_candidate_source.attrs_bool, %(dashboard_candidate_breakdown_key_1)s)"
         in sql
     )
+
+
+def test_latest_fallback_preserves_unicode_keys_without_inlining_them():
+    sql, params = build(
+        DashboardQueryBuilderV2,
+        "custom_attribute",
+        latest_state=True,
+        metric_options=custom_metric("metric.客户"),
+        breakdowns=[breakdown("Customer.客户\u200b")],
+        filters=[canonical_filter("filter.客户")],
+    )
+    assert "dashboard_replay_source" not in sql
+    assert " FINAL" in sql
+    assert_bound(sql, params, "metric.客户", "custom_metric_attr_key")
+    assert_bound(sql, params, "Customer.客户\u200b", "_custom_bd_key_0")
+    assert_bound(sql, params, "filter.客户", "latest_filter_key_0")
 
 
 @pytest.mark.parametrize(
