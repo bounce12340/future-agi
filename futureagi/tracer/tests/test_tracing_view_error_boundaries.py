@@ -428,7 +428,7 @@ def _graph_call(monkeypatch, view_kind, outcome, *, allow_sampled=False):
         ServerException("private bytes and stack", code=307),
         ServerException("private type and stack", code=386),
         NetworkError("private graph network host"),
-        EOFError("Unexpected EOF while reading bytes"),
+        EOFError("private graph stream closed mid-response"),
     ],
     ids=["code-159", "code-241", "code-307", "code-386", "network", "eof"],
 )
