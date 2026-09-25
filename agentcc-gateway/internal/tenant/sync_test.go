@@ -25,9 +25,9 @@ func TestSyncFromControlPlane_Success(t *testing.T) {
 				"org-1": map[string]interface{}{
 					"providers": map[string]interface{}{
 						"openai": map[string]interface{}{
-							"api_key": "sk-org1",
-							"enabled": true,
-						"api_path_prefix": "",
+							"api_key":         "sk-org1",
+							"enabled":         true,
+							"api_path_prefix": "",
 						},
 					},
 				},
