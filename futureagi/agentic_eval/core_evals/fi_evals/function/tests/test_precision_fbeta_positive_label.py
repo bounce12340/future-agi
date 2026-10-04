@@ -7,125 +7,18 @@ resolves to the *negative* member of every common binary convention (no, false,
 
 from __future__ import annotations
 
-import importlib.util
-import os
 import math
-import sys
-import types
-from pathlib import Path
 
 import pytest
 
-# Prefer the normal package import; fall back to loading functions.py directly
-# when heavy package deps are missing on the box (same idea as #2554 isolation).
-try:
-    from agentic_eval.core_evals.fi_evals.function.functions import (
-        calculate_f_beta_score,
-        calculate_precision_score,
-    )
-except (ModuleNotFoundError, ImportError):
-    _FUNCTIONS_PATH = Path(__file__).resolve().parents[1] / "functions.py"
-    _env_path = os.environ.get("FI_FUNCTIONS_PY")
-    if _env_path:
-        _FUNCTIONS_PATH = Path(_env_path)
-
-    def _ensure_stub(name: str, **attrs):
-        if name in sys.modules:
-            mod = sys.modules[name]
-        else:
-            mod = types.ModuleType(name)
-            sys.modules[name] = mod
-        for key, value in attrs.items():
-            if not hasattr(mod, key):
-                setattr(mod, key, value)
-        return mod
-
-    # Only stub names that are not already importable.
-    _REQUIRED = [
-        "Levenshtein",
-        "numpy",
-        "requests",
-        "jinja2",
-        "nltk",
-        "nltk.translate",
-        "nltk.translate.bleu_score",
-        "rouge_score",
-        "scipy",
-        "scipy.spatial",
-        "scipy.spatial.distance",
-        "agentic_eval",
-        "agentic_eval.core_evals",
-        "agentic_eval.core_evals.fi_evals",
-        "agentic_eval.core_evals.fi_evals.grounded",
-        "agentic_eval.core_evals.fi_evals.grounded.similarity",
-        "agentic_eval.core_evals.fi_utils",
-        "agentic_eval.core_evals.fi_utils.exceptions",
-        "agentic_eval.core_evals.fi_utils.fi_code_execution",
-        "agentic_eval.core_evals.fi_utils.json",
-        "agentic_eval.core_evals.fi_utils.logging",
-        "agentic_eval.core_evals.fi_utils.utils",
-        "agentic_eval.core_evals.keys",
-        "agentic_eval.core_evals.keys.openai_api",
-        "agentic_eval.core_evals.llm_services",
-        "agentic_eval.core_evals.llm_services.openai_api",
-    ]
-    for _name in _REQUIRED:
-        try:
-            if _name not in sys.modules:
-                __import__(_name)
-        except Exception:
-            _ensure_stub(_name)
-
-    # Attribute fillers for stubs we created (no-ops on real modules).
-    _ensure_stub("numpy", array=lambda *a, **k: a, isscalar=lambda x: isinstance(x, (int, float, bool)))
-    _ensure_stub("jinja2", Environment=object)
-    _ensure_stub(
-        "nltk.translate.bleu_score",
-        SmoothingFunction=object,
-        sentence_bleu=lambda *a, **k: 0.0,
-    )
-    _ensure_stub("rouge_score", rouge_scorer=types.SimpleNamespace(RougeScorer=object))
-    for _fn in ("cityblock", "cosine", "euclidean"):
-        _ensure_stub("scipy.spatial.distance", **{_fn: lambda *a, **k: 0.0})
-    _ensure_stub(
-        "agentic_eval.core_evals.fi_evals.grounded.similarity",
-        CosineSimilarity=object,
-    )
-    _ensure_stub(
-        "agentic_eval.core_evals.fi_utils.exceptions",
-        NoOpenAiApiKeyException=type("NoOpenAiApiKeyException", (Exception,), {}),
-    )
-    _ensure_stub("agentic_eval.core_evals.fi_utils.fi_code_execution", CodeExecution=object)
-    _ensure_stub(
-        "agentic_eval.core_evals.fi_utils.json",
-        extract_json_path=None,
-        validate_json=None,
-    )
-    _ensure_stub(
-        "agentic_eval.core_evals.fi_utils.logging",
-        logger=types.SimpleNamespace(
-            info=lambda *a, **k: None,
-            warning=lambda *a, **k: None,
-            error=lambda *a, **k: None,
-            debug=lambda *a, **k: None,
-        ),
-    )
-    _ensure_stub("agentic_eval.core_evals.fi_utils.utils", PreserveUndefined=object)
-    _ensure_stub("agentic_eval.core_evals.keys.openai_api", OpenAiApiKey=object)
-    _ensure_stub("agentic_eval.core_evals.llm_services.openai_api", OpenAiService=object)
-
-    _spec = importlib.util.spec_from_file_location(
-        "_fi_functions_under_test", _FUNCTIONS_PATH
-    )
-    _mod = importlib.util.module_from_spec(_spec)
-    assert _spec.loader is not None
-    _spec.loader.exec_module(_mod)
-    calculate_precision_score = _mod.calculate_precision_score
-    calculate_f_beta_score = _mod.calculate_f_beta_score
+from agentic_eval.core_evals.fi_evals.function.functions import (
+    calculate_f_beta_score,
+    calculate_precision_score,
+)
 
 
 def _approx(actual, expected, rel=1e-9, abs_=1e-12):
-    """Float comparison that does not depend on a working numpy install."""
+    """Float comparison with tight tolerances."""
     assert math.isclose(actual, expected, rel_tol=rel, abs_tol=abs_), (
         f"{actual!r} != {expected!r}"
     )
