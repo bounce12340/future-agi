@@ -352,28 +352,7 @@ export default function GraphView() {
       }
 
       positionDebounceRef.current[debounceKey] = setTimeout(async () => {
-        const { currentAgent, _isDraftCreating } =
-          useAgentPlaygroundStore.getState();
-
-        // Don't persist positions if not a draft, or if a draft creation is
-        // in-flight (the version ID hasn't switched to the new draft yet).
-        if (!currentAgent?.is_draft || _isDraftCreating) {
-          delete positionDebounceRef.current[debounceKey];
-          return;
-        }
-
-        // Already a draft — fire individual PATCH for each node position
-        Promise.all(
-          nodes.map((n) =>
-            updateNodeApi({
-              graphId: currentAgent?.id,
-              versionId: currentAgent?.version_id,
-              nodeId: n.id,
-              data: { position: n.position },
-            }),
-          ),
-        ).catch((error) => {
-          logger.error("[GraphView] updateNodeApi position failed", error);
+        const rollbackPositions = () => {
           onNodesChange(
             nodes.map((n) => ({
               type: "position",
@@ -381,12 +360,53 @@ export default function GraphView() {
               position: dragStartPositionRef.current[n.id],
             })),
           );
+        };
+
+        // Always ensure the edit is backed by a draft before persisting it.
+        // For an active version, the moved node is already in the store, so
+        // draft creation includes its new position in the POST payload.
+        const draftResult = await ensureDraft();
+
+        if (draftResult === false) {
+          rollbackPositions();
+          delete positionDebounceRef.current[debounceKey];
+          return;
+        }
+
+        // The position was included in the draft creation payload.
+        if (draftResult === "created") {
+          delete positionDebounceRef.current[debounceKey];
+          return;
+        }
+
+        const { currentAgent } = useAgentPlaygroundStore.getState();
+        if (!currentAgent?.is_draft) {
+          rollbackPositions();
+          delete positionDebounceRef.current[debounceKey];
+          return;
+        }
+
+        // Already a draft — fire individual PATCH for each node position.
+        try {
+          await Promise.all(
+            nodes.map((n) =>
+              updateNodeApi({
+                graphId: currentAgent.id,
+                versionId: currentAgent.version_id,
+                nodeId: n.id,
+                data: { position: n.position },
+              }),
+            ),
+          );
+        } catch (error) {
+          logger.error("[GraphView] updateNodeApi position failed", error);
+          rollbackPositions();
           enqueueSnackbar("Failed to save positions", { variant: "error" });
-        });
+        }
         delete positionDebounceRef.current[debounceKey];
       }, 500);
     },
-    [onNodesChange],
+    [ensureDraft, onNodesChange],
   );
 
   const onDragOver = useCallback((event) => {
