@@ -2266,7 +2266,7 @@ class HostedHarnessGateway:
 
         # The export decision needs the selected snapshot, so capacity comes first.
         try:
-            capacity = configured_capacity(payload)
+            capacity = configured_capacity(scope_dispatch_to_rerun(payload))
         except ValueError as exc:
             raise HostedHarnessError(
                 "sandbox_capacity_unavailable",

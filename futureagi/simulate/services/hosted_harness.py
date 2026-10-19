@@ -724,7 +724,8 @@ def _apply_parallelism_admission(
     admitted, clamped = clamp_parallelism(requested, snapshot_digest)
     from simulate.services.harness_capacity import configured_capacity
 
-    capacity = configured_capacity(job.payload)
+    # An in-run re-run executes only its chosen calls, so W is bounded by those.
+    capacity = configured_capacity(scope_dispatch_to_rerun(job.payload))
     admitted = min(admitted, capacity.parallelism)
     clamped = admitted != requested
     metadata = dict(job.payload.get("metadata") or {})
