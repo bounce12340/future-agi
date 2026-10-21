@@ -350,6 +350,38 @@ func TestOTLPHTTPInvalidProjectHeaderIs400(t *testing.T) {
 	}
 }
 
+// traceAI's Java and C# exporters already send FI-Project-Name.
+func TestOTLPHTTPFIProjectNameAliasIsRead(t *testing.T) {
+	httpAddr, _, sawCH, stop := startServerWithHTTP(t)
+	defer stop()
+
+	pb := protoBody(t, makeTraces("alias-header-span", "17171717-1717-4717-8717-171717171717"))
+	resp, body := postOTLP(t, "http://"+httpAddr+"/v1/traces", "application/x-protobuf",
+		map[string]string{"FI-Project-Name": "alias-project"}, pb)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d (want 200): %s", resp.StatusCode, body)
+	}
+	if ch := waitForCH(t, sawCH); !strings.Contains(ch, `"project_name":"alias-project"`) {
+		t.Errorf("stored resource_attrs missing the FI-Project-Name project: %q", ch)
+	}
+}
+
+// When every resource names its project the header is not read at all, so a
+// malformed one cannot break a request that works today.
+func TestOTLPHTTPBadProjectHeaderIgnoredWhenResourceNamesProject(t *testing.T) {
+	traces := makeTraces("ignored-header-span", "18181818-1818-4818-8818-181818181818")
+	traces.ResourceSpans().At(0).Resource().Attributes().PutStr("project_name", "attr-project")
+	req := httptest.NewRequest(http.MethodPost, "/v1/traces", bytes.NewReader(protoBody(t, traces)))
+	req.Header.Set("Content-Type", "application/x-protobuf")
+	req.Header.Add("X-Project-Name", "alpha")
+	req.Header.Add("FI-Project-Name", "beta")
+	rec := httptest.NewRecorder()
+	New(Config{BatchMaxRows: 1 << 20, BatchMaxAge: time.Hour}, nil, nil, nil, nil).handleHTTPTraces(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+}
+
 // ── gRPC: gzip compressor and x-project-name metadata ──────────────────────
 
 // startGRPCOnly boots a gRPC-only server against a stub CH and returns its

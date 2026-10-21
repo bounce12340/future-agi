@@ -3,11 +3,13 @@ package auth
 import (
 	"context"
 	"log/slog"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 
 	"go.opentelemetry.io/collector/pdata/ptrace"
+	"google.golang.org/grpc/metadata"
 )
 
 func TestProjectNameFromHeaderValues(t *testing.T) {
@@ -28,7 +30,7 @@ func TestProjectNameFromHeaderValues(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := ProjectNameFromHeaderValues(tc.values)
+			got, err := projectNameFromHeaderValues(tc.values)
 			if tc.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 					t.Fatalf("err = %v, want it to mention %q", err, tc.wantErr)
@@ -48,7 +50,20 @@ func TestProjectNameFromHeaderValues(t *testing.T) {
 	}
 }
 
-func TestApplyProjectNameDefaultFillsOnlyMissingNames(t *testing.T) {
+func TestProjectNameValuesReadCanonicalAndAliasHeaders(t *testing.T) {
+	h := http.Header{}
+	h.Add("x-project-name", "a")
+	h.Add("Fi-Project-Name", "b")
+	if got := ProjectNameHTTPValues(h); len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Errorf("HTTP values = %v, want [a b] (canonical first)", got)
+	}
+	md := metadata.Pairs("fi-project-name", "b", "x-project-name", "a")
+	if got := ProjectNameMetadataValues(md); len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Errorf("metadata values = %v, want [a b] (canonical first)", got)
+	}
+}
+
+func TestApplyProjectNameHeaderFillsOnlyMissingNames(t *testing.T) {
 	traces := ptrace.NewTraces()
 	named := traces.ResourceSpans().AppendEmpty()
 	named.Resource().Attributes().PutStr("project_name", "from-attr")
@@ -59,7 +74,11 @@ func TestApplyProjectNameDefaultFillsOnlyMissingNames(t *testing.T) {
 	wrongType := traces.ResourceSpans().AppendEmpty()
 	wrongType.Resource().Attributes().PutInt("project_name", 7)
 
-	if n := ApplyProjectNameDefault(traces, "from-header"); n != 3 {
+	n, err := ApplyProjectNameHeader(traces, []string{" from-header "})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
 		t.Fatalf("applied = %d, want 3 (absent, empty, non-string)", n)
 	}
 	want := []string{"from-attr", "from-header", "from-header", "from-header"}
@@ -73,14 +92,32 @@ func TestApplyProjectNameDefaultFillsOnlyMissingNames(t *testing.T) {
 	}
 }
 
-func TestApplyProjectNameDefaultEmptyNameIsNoOp(t *testing.T) {
-	traces := ptrace.NewTraces()
-	traces.ResourceSpans().AppendEmpty()
-	if n := ApplyProjectNameDefault(traces, ""); n != 0 {
-		t.Fatalf("applied = %d, want 0", n)
+func TestApplyProjectNameHeaderNoValuesIsNoOp(t *testing.T) {
+	for _, values := range [][]string{nil, {""}, {"  "}} {
+		traces := ptrace.NewTraces()
+		traces.ResourceSpans().AppendEmpty()
+		n, err := ApplyProjectNameHeader(traces, values)
+		if err != nil || n != 0 {
+			t.Fatalf("values %q: applied = %d, err = %v; want 0, nil", values, n, err)
+		}
+		if _, ok := traces.ResourceSpans().At(0).Resource().Attributes().Get("project_name"); ok {
+			t.Errorf("values %q must not add project_name", values)
+		}
 	}
-	if _, ok := traces.ResourceSpans().At(0).Resource().Attributes().Get("project_name"); ok {
-		t.Error("an empty default must not add project_name")
+}
+
+// A bad header is only an error when the request needs it: requests whose
+// resources all name their project behave exactly as before.
+func TestApplyProjectNameHeaderIgnoresBadHeaderWhenNotNeeded(t *testing.T) {
+	traces := ptrace.NewTraces()
+	traces.ResourceSpans().AppendEmpty().Resource().Attributes().PutStr("project_name", "from-attr")
+	if n, err := ApplyProjectNameHeader(traces, []string{"a", "b", "bad\xff"}); err != nil || n != 0 {
+		t.Fatalf("applied = %d, err = %v; want 0, nil when every resource names a project", n, err)
+	}
+
+	traces.ResourceSpans().AppendEmpty()
+	if _, err := ApplyProjectNameHeader(traces, []string{"a", "b"}); err == nil {
+		t.Fatal("conflicting values must be an error once a resource needs the header")
 	}
 }
 
@@ -132,8 +169,8 @@ func TestStampResolvesHeaderProjectLikeAttributeProject(t *testing.T) {
 		t.Fatal("a ResourceSpans with no project_name and no header must still be rejected")
 	}
 
-	if n := ApplyProjectNameDefault(traces, "header-project"); n != 1 {
-		t.Fatalf("applied = %d, want 1", n)
+	if n, err := ApplyProjectNameHeader(traces, []string{"header-project"}); err != nil || n != 1 {
+		t.Fatalf("applied = %d, err = %v; want 1, nil", n, err)
 	}
 	dropped, err := StampResourceAttrs(context.Background(), a, ck, traces, result)
 	if err != nil {

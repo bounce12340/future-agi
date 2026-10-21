@@ -32,8 +32,8 @@ server:
   # Accepts POST /v1/traces with application/x-protobuf or application/json,
   # uncompressed or Content-Encoding: gzip (16 MiB cap after decompression),
   # per https://opentelemetry.io/docs/specs/otlp/#otlphttp. X-Project-Name
-  # (gRPC metadata x-project-name) names the project for ResourceSpans that
-  # carry no project_name resource attribute.
+  # (alias FI-Project-Name; the same keys as gRPC metadata) names the project
+  # for ResourceSpans that carry no project_name resource attribute.
   # Set "" (or FI_HTTP_ADDR=disable) to turn the listener off.
   http_addr: ":4318"
   batch_max_rows: 5000

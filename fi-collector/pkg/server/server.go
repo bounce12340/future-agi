@@ -353,18 +353,16 @@ type otlpHandler struct {
 }
 
 func (h *otlpHandler) Export(ctx context.Context, req ptraceotlp.ExportRequest) (ptraceotlp.ExportResponse, error) {
+	// x-project-name metadata only fills ResourceSpans that do not name a
+	// project (auth.ProjectNameHeader).
 	md, _ := metadata.FromIncomingContext(ctx)
-	headerProject, err := auth.ProjectNameFromHeaderValues(md.Get(auth.ProjectNameMetadataKey))
-	if err != nil {
+	if _, err := auth.ApplyProjectNameHeader(req.Traces(), auth.ProjectNameMetadataValues(md)); err != nil {
 		return ptraceotlp.NewExportResponse(), status.Error(codes.InvalidArgument, err.Error())
 	}
 
 	if check, ok := h.s.checkUsage(ctx); !ok {
 		return ptraceotlp.NewExportResponse(), status.Errorf(codes.ResourceExhausted, "quota exceeded: %s", check.Reason)
 	}
-
-	// x-project-name only fills ResourceSpans that do not name a project.
-	auth.ApplyProjectNameDefault(req.Traces(), headerProject)
 
 	// Keep the authenticated workspace out-of-band. StampResourceAttrs retains
 	// the existing org/project behavior but deliberately does not add a
@@ -414,9 +412,10 @@ const maxOTLPHTTPBodyBytes = 16 << 20
 // Any other method, content type or content coding is rejected with the
 // canonical status code.
 //
-// The project may also come from the X-Project-Name header, for exporters
-// that can set headers but not resource attributes; a resource attribute
-// `project_name` still wins (see auth.ProjectNameHeader).
+// The project may also come from the X-Project-Name header (alias
+// FI-Project-Name), for exporters that can set headers but not resource
+// attributes; a resource attribute `project_name` still wins (see
+// auth.ProjectNameHeader).
 //
 // Success is HTTP 200 + an empty (or near-empty) ExportTraceServiceResponse
 // in the response media type that matches the request — the spec requires
@@ -454,12 +453,6 @@ func (s *Server) handleHTTPTraces(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	headerProject, err := auth.ProjectNameFromHeaderValues(r.Header.Values(auth.ProjectNameHeader))
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
 	body, err := readOTLPHTTPBody(w, r, gzipped, maxOTLPHTTPBodyBytes)
 	if err != nil {
 		var tooLarge *http.MaxBytesError
@@ -490,7 +483,10 @@ func (s *Server) handleHTTPTraces(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// X-Project-Name only fills ResourceSpans that do not name a project.
-	auth.ApplyProjectNameDefault(req.Traces(), headerProject)
+	if _, err := auth.ApplyProjectNameHeader(req.Traces(), auth.ProjectNameHTTPValues(r.Header)); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	if check, ok := s.checkUsage(r.Context()); !ok {
 		http.Error(w, check.Reason, http.StatusTooManyRequests)
