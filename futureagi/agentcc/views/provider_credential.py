@@ -400,7 +400,14 @@ class AgentccProviderCredentialViewSet(BaseModelViewSetMixinWithUserOrg, ModelVi
             "gemini",
             "google",
         ):
-            base = (base_url or "https://generativelanguage.googleapis.com").rstrip("/")
+            # base_url is a Gemini-protocol host only in the google/gemini
+            # formats. The Google preset can also be saved in the openai format
+            # against Google's OpenAI-compatible base (".../v1beta/openai"); its
+            # key is still a Google key, so it is listed at Google's own host.
+            gemini_base_url = base_url if api_format in ("gemini", "google") else ""
+            base = (
+                gemini_base_url or "https://generativelanguage.googleapis.com"
+            ).rstrip("/")
             url = (
                 f"{base}/models"
                 if base.endswith("/v1beta")

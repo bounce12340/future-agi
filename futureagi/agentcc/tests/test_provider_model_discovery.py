@@ -119,3 +119,33 @@ class TestAgentccProviderCredentialModelDiscovery:
             params={"key": "google-api-key"},
             timeout=15,
         )
+
+    def test_google_preset_on_openai_format_lists_models_at_google(self):
+        # The Google preset saved in the openai format points at Google's
+        # OpenAI-compatible base; the edit dialog's fetch-by-name lands here
+        # and must still reach Google's real models route.
+        safe_session = Mock()
+        safe_session.get.return_value = _mock_response(
+            {"models": [{"name": "models/gemini-2.5-flash"}]}
+        )
+
+        with (
+            patch("agentcc.views.provider_credential.ensure_public_http_url"),
+            patch(
+                "agentcc.views.provider_credential.build_ssrf_safe_session",
+                return_value=safe_session,
+            ),
+        ):
+            models = AgentccProviderCredentialViewSet()._fetch_models_from_provider(
+                "google",
+                "https://generativelanguage.googleapis.com/v1beta/openai",
+                "google-api-key",
+                "openai",
+            )
+
+        assert models == ["gemini-2.5-flash"]
+        safe_session.get.assert_called_once_with(
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            params={"key": "google-api-key"},
+            timeout=15,
+        )
