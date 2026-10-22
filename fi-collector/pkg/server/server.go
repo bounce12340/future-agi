@@ -216,17 +216,14 @@ func (s *Server) Run(ctx context.Context) error {
 			return fmt.Errorf("listen grpc %s: %w", s.cfg.GRPCAddr, err)
 		}
 		s.log.Info("grpc listener", "addr", s.cfg.GRPCAddr, "max_recv_mib", s.cfg.GRPCMaxRecvMiB)
-		// No gzip decompressor is registered, on purpose. grpc-go inflates and
-		// unmarshals a message before any interceptor, auth included, runs.
-		// A custom "gzip" compressor could charge the inflate budget, but it
-		// never sees the call, so the message would still be inflated and
-		// decoded before its key is checked: an unauthenticated caller could
-		// make the collector inflate up to MaxRecvMsgSize per call for a few
-		// KiB of upload. Enabling gzip needs the key checked first, in a tap
-		// handle on the call's metadata. Until then a gzip call gets
-		// UNIMPLEMENTED before its message is read, and OTLP/HTTP accepts
-		// gzip. TestGRPCGzipDecompressorIsNotRegistered (cmd/fi-collector)
-		// fails if any import registers one.
+		// No gzip decompressor is registered, on purpose: gRPC stays
+		// uncompressed-only. A grpc-go decompressor is handed only the
+		// compressed bytes, not the call, so it cannot wait on the call for a
+		// share of the inflate budget or hold that share until the handler
+		// returns, as OTLP/HTTP gzip requests do. A gzip call gets
+		// UNIMPLEMENTED before its message is read.
+		// TestGRPCGzipDecompressorIsNotRegistered (cmd/fi-collector) fails if
+		// any import registers one.
 		grpcOpts := []grpc.ServerOption{
 			grpc.MaxRecvMsgSize(s.cfg.GRPCMaxRecvMiB << 20),
 			grpc.StatsHandler(&grpcErrLogger{log: s.log}),
@@ -470,7 +467,7 @@ func (s *Server) handleHTTPTraces(w http.ResponseWriter, r *http.Request) {
 	// decompression. A gzip body is read in full, then reserves 16 MiB for the
 	// count pass. On success that shrinks to the exact decompressed size and
 	// remains leased until the handler returns. The lease covers decompressed
-	// body bytes only, not what decoding allocates.
+	// body bytes only.
 	body, release, err := readOTLPHTTPBody(w, r, gzipped, maxOTLPHTTPBodyBytes, s.inflate)
 	defer release()
 	if err != nil {

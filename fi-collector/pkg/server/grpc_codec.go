@@ -13,11 +13,12 @@ const traceExportRequestName protoreflect.FullName = "opentelemetry.proto.collec
 
 // nestingCheckedCodec is the gRPC server's codec: grpc-go's proto codec, plus
 // the nesting limit (checkProtoNesting) on an ExportTraceServiceRequest before
-// it is decoded, as the OTLP/HTTP handler does. grpc-go decodes a request
-// before any interceptor runs, auth included, so the codec is the only place
-// that sees the bytes first. A refused request fails with INTERNAL ("error
-// unmarshalling request"), which is what grpc-go returns for any request its
-// codec cannot decode. Other message types are decoded unchecked.
+// pdata decodes it, as the OTLP/HTTP handler does. The check is in the codec
+// because the service handler only ever sees the decoded request. A refused
+// request fails with INTERNAL ("error unmarshalling request"), which is what
+// grpc-go returns for any request its codec cannot decode. Only the trace
+// service is registered; any other message type is passed to the proto codec
+// unchanged.
 type nestingCheckedCodec struct {
 	encoding.CodecV2
 }

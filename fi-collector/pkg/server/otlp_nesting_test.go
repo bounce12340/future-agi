@@ -154,10 +154,10 @@ func (rawProtoCodec) Unmarshal(b []byte, v any) error {
 func (rawProtoCodec) Name() string { return "proto" }
 
 // gRPC requests get the same nesting limit, checked by the server's codec
-// before the request is decoded, because grpc-go decodes before any
-// interceptor runs. On dev, the 1.5M-array request (14.5 MiB, under the 16 MiB
-// receive cap) overflows the decoder's stack: "goroutine stack exceeds
-// 1000000000-byte limit", a fatal error that ends this test binary.
+// before pdata decodes the request. On dev, the 1.5M-array request (14.5 MiB,
+// under the 16 MiB receive cap) overflows the decoder's stack: "goroutine
+// stack exceeds 1000000000-byte limit", a fatal error that ends this test
+// binary.
 func TestGRPCDeeplyNestedProtobufIsRefused(t *testing.T) {
 	addr, _ := startGRPCOnly(t, Config{})
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
