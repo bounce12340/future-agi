@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"go.opentelemetry.io/collector/pdata/ptrace"
@@ -35,6 +36,12 @@ const (
 // resourceProjectNameKey is the resource attribute StampResourceAttrs reads.
 const resourceProjectNameKey = "project_name"
 
+// maxProjectNameChars is the longest name the header may carry: the project
+// table's name column holds 255 characters, so a longer name could never be
+// matched or created, and its spans would be dropped without an error the
+// sender sees.
+const maxProjectNameChars = 255
+
 // ProjectNameHTTPValues returns every value of the project headers on an
 // OTLP/HTTP request, canonical header first.
 func ProjectNameHTTPValues(h http.Header) []string {
@@ -55,8 +62,9 @@ func ProjectNameMetadataValues(md metadata.MD) []string {
 // The header is only read when some ResourceSpans needs it, so a request whose
 // resources all name a project is unaffected by the header, whatever it holds.
 // When it is needed, values are trimmed and blank ones ignored; values that
-// disagree, or that are not valid UTF-8, are an error. It returns how many
-// ResourceSpans took the header's project.
+// disagree, are not valid UTF-8, are longer than 255 characters or contain a
+// control character are an error. It returns how many ResourceSpans took the
+// header's project.
 func ApplyProjectNameHeader(traces ptrace.Traces, values []string) (int, error) {
 	rss := traces.ResourceSpans()
 	need := false
@@ -91,6 +99,12 @@ func projectNameFromHeaderValues(values []string) (string, error) {
 		}
 		if !utf8.ValidString(v) {
 			return "", fmt.Errorf("%s is not valid UTF-8", ProjectNameHeader)
+		}
+		if utf8.RuneCountInString(v) > maxProjectNameChars {
+			return "", fmt.Errorf("%s is longer than %d characters", ProjectNameHeader, maxProjectNameChars)
+		}
+		if strings.IndexFunc(v, unicode.IsControl) >= 0 {
+			return "", fmt.Errorf("%s contains a control character", ProjectNameHeader)
 		}
 		if name != "" && v != name {
 			return "", fmt.Errorf("conflicting project names in %s / %s", ProjectNameHeader, ProjectNameHeaderAlias)

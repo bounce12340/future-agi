@@ -27,6 +27,12 @@ func TestProjectNameFromHeaderValues(t *testing.T) {
 		{name: "unicode", values: []string{"проект-ü"}, want: "проект-ü"},
 		{name: "conflicting", values: []string{"a", "b"}, wantErr: "conflicting"},
 		{name: "invalid utf-8", values: []string{"bad\xff"}, wantErr: "UTF-8"},
+		// The project name column holds 255 characters (not bytes).
+		{name: "255 characters", values: []string{strings.Repeat("é", 255)}, want: strings.Repeat("é", 255)},
+		{name: "256 characters", values: []string{strings.Repeat("é", 256)}, wantErr: "255 characters"},
+		{name: "tab inside", values: []string{"a\tb"}, wantErr: "control character"},
+		{name: "newline inside", values: []string{"a\nb"}, wantErr: "control character"},
+		{name: "DEL inside", values: []string{"a\x7fb"}, wantErr: "control character"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

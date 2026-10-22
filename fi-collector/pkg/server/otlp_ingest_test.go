@@ -314,8 +314,10 @@ func TestOTLPHTTPProjectHeaderWithGzipBody(t *testing.T) {
 
 func TestOTLPHTTPInvalidProjectHeaderIs400(t *testing.T) {
 	cases := map[string][]string{
-		"conflicting values": {"alpha", "beta"},
-		"invalid utf-8":      {"bad\xffname"},
+		"conflicting values":         {"alpha", "beta"},
+		"invalid utf-8":              {"bad\xffname"},
+		"longer than 255 characters": {strings.Repeat("p", 256)},
+		"control character":          {"a\tb"},
 	}
 	for name, values := range cases {
 		t.Run(name, func(t *testing.T) {
