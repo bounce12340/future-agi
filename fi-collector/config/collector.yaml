@@ -41,12 +41,13 @@ server:
   # Max gRPC receive message size in MiB (FI_GRPC_MAX_RECV_MIB); 16 matches
   # the OTLP/HTTP body cap. gRPC accepts uncompressed calls only.
   grpc_max_recv_mib: 16
-  # Memory that all gzip OTLP/HTTP requests may hold at once, in MiB
-  # (FI_GZIP_INFLIGHT_MIB): each leases its decompressed body plus an estimate
-  # of what decoding it allocates, counted before decoding. Unset: 128, or
-  # GOMEMLIMIT/8 when that is lower; never below 64. A request that does not
-  # fit right now gets 503 + Retry-After and the exporter retries; one that
-  # could never fit gets 413.
+  # Decompressed bytes that all gzip OTLP/HTTP requests may hold at once, in
+  # MiB (FI_GZIP_INFLIGHT_MIB). Each gzip request leases its decompressed size
+  # (at most 16 MiB) until it is answered. It covers decompressed bytes only,
+  # not what decoding them allocates. Unset: 128, or GOMEMLIMIT/8 when that is
+  # lower; never below 16, so one full-size body always fits. A request waits
+  # up to 2 s for its share, in arrival order, then gets 503 + Retry-After and
+  # the exporter retries.
   # gzip_inflight_mib: 128
 
 auth:

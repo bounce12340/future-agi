@@ -1,8 +1,11 @@
 package server
 
 import (
+	"context"
+	"errors"
 	"math"
 	"runtime/debug"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -13,45 +16,50 @@ import (
 // an eighth of GOMEMLIMIT when that is lower).
 const defaultGzipInflightBytes = 128 << 20
 
-// minGzipInflightBytes is the smallest budget: a full-size body of ordinary
-// spans (16 MiB decompressed, a few thousand spans with large attributes)
-// leases about 60 MiB, and must always be able to fit.
-const minGzipInflightBytes = 4 * maxOTLPHTTPBodyBytes
+// minGzipInflightBytes is the smallest budget: one body at the 16 MiB cap must
+// always fit, or it could never be decompressed.
+const minGzipInflightBytes = maxOTLPHTTPBodyBytes
 
-// inflateBudget caps the memory that all in-flight gzip OTLP/HTTP requests
-// hold at once. The per-request cap alone does not bound memory once gzip is
-// accepted: a few KiB on the wire can become a 16 MiB body, and a 16 MiB body
-// of small elements can decode into gigabytes. So each gzip request leases
-// budget as its inflate buffer grows, then leases the estimated cost of
-// decoding and converting the body (decode_cost.go) before decoding it, and
-// gives it all back when the handler returns. A request that cannot get its
-// lease is answered 503 with Retry-After, which OTLP exporters retry, or 413
-// when its lease alone would be larger than the whole budget.
+// gzipInflightWait is how long a gzip request waits for its share of the
+// budget before it gets 503 + Retry-After.
+const gzipInflightWait = 2 * time.Second
+
+// inflateBudget caps the decompressed bytes that all in-flight gzip OTLP/HTTP
+// requests hold at once. The 16 MiB cap bounds one request, but a few KiB of
+// gzip can become a 16 MiB body, so many small uploads could otherwise hold
+// many such bodies. Each gzip request leases its decompressed size before the
+// buffer is allocated and gives it back when the handler returns.
 //
-// Uncompressed bodies are not counted. They cost the sender one byte of
-// upload for every byte decoded, exactly as before gzip was accepted.
+// The lease covers the decompressed bytes only, not what decoding them
+// allocates: the decoded request and its rows can take several times the body
+// size, for gzip and plain bodies alike (TH-8745). Uncompressed bodies are not
+// counted; they cost the sender one byte of upload per body byte, as before
+// gzip was accepted.
+//
+// Waiters are served in order (golang.org/x/sync/semaphore is FIFO), so a large
+// body is not starved by a stream of small ones. A request that does not get
+// its lease within wait is answered 503 with Retry-After, which OTLP exporters
+// retry.
 type inflateBudget struct {
 	sem  *semaphore.Weighted
 	size int64
+	wait time.Duration
 
 	inUse atomic.Int64 // bytes leased right now
 	peak  atomic.Int64 // most bytes ever leased at once
 
 	// One log line per second per rejection reason, so a flood of cheap
 	// rejected requests is not also a flood of log lines.
-	overCapLog, busyLog, decodeCostLog logSample
+	overCapLog, busyLog logSample
 }
 
 func newInflateBudget(size int64) *inflateBudget {
-	return &inflateBudget{sem: semaphore.NewWeighted(size), size: size}
+	return &inflateBudget{sem: semaphore.NewWeighted(size), size: size, wait: gzipInflightWait}
 }
 
 // gzipInflightBytes turns the gzip_inflight_mib setting into bytes. Unset
 // means 128 MiB, or an eighth of GOMEMLIMIT when that is lower. The result is
-// never below minGzipInflightBytes, or a full-size body could never be
-// decoded. Peak heap under a flood of gzip requests measured up to about 5x
-// the budget (the Go GC lets garbage build up between cycles), so an eighth
-// keeps it under GOMEMLIMIT.
+// never below minGzipInflightBytes, so one full-size body always fits.
 func gzipInflightBytes(mib int) int64 {
 	n := int64(defaultGzipInflightBytes)
 	switch {
@@ -65,36 +73,29 @@ func gzipInflightBytes(mib int) int64 {
 	return max(n, minGzipInflightBytes)
 }
 
-// inflateLease is one request's share of an inflateBudget. The zero lease of
-// a budget holds nothing; release returns whatever it grew to.
-type inflateLease struct {
-	b    *inflateBudget
-	held int64
-}
+// errInflateBudgetBusy reports a gzip request that did not get its share of
+// the budget in time.
+var errInflateBudgetBusy = errors.New("inflate budget busy")
 
-// grow takes n more bytes of budget without waiting, and reports whether it
-// could.
-func (l *inflateLease) grow(n int64) bool {
-	if n <= 0 {
-		return true
+// acquire leases n bytes, waiting up to b.wait (or until ctx ends) behind
+// earlier waiters. release gives them back and may be called more than once.
+// n is at most the 16 MiB cap, which never exceeds b.size.
+func (b *inflateBudget) acquire(ctx context.Context, n int64) (release func(), err error) {
+	ctx, cancel := context.WithTimeout(ctx, b.wait)
+	defer cancel()
+	if err := b.sem.Acquire(ctx, n); err != nil {
+		return nil, errInflateBudgetBusy
 	}
-	if !l.b.sem.TryAcquire(n) {
-		return false
+	now := b.inUse.Add(n)
+	for p := b.peak.Load(); now > p && !b.peak.CompareAndSwap(p, now); p = b.peak.Load() {
 	}
-	l.held += n
-	now := l.b.inUse.Add(n)
-	for p := l.b.peak.Load(); now > p && !l.b.peak.CompareAndSwap(p, now); p = l.b.peak.Load() {
-	}
-	return true
-}
-
-func (l *inflateLease) release() {
-	if l.held == 0 {
-		return
-	}
-	l.b.inUse.Add(-l.held)
-	l.b.sem.Release(l.held)
-	l.held = 0
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			b.inUse.Add(-n)
+			b.sem.Release(n)
+		})
+	}, nil
 }
 
 // logSample lets one log line through per second and counts the others.
