@@ -1,5 +1,7 @@
 from unittest.mock import Mock, patch
 
+import pytest
+
 from agentcc.services.url_safety import PROVIDER_PRIVATE_URL_ERROR, PROVIDER_URL_ERROR
 from agentcc.views.provider_credential import AgentccProviderCredentialViewSet
 
@@ -52,7 +54,22 @@ class TestAgentccProviderCredentialModelDiscovery:
             timeout=15,
         )
 
-    def test_custom_google_format_does_not_duplicate_v1beta_path(self):
+    @pytest.mark.parametrize(
+        "base_url,expected",
+        [
+            ("https://models.example.com/", "https://models.example.com/v1beta/models"),
+            # The gateway's Gemini provider calls {base}/v1beta/models/... with
+            # no de-duplication, so discovery must not list models for a base
+            # whose every runtime call would hit /v1beta/v1beta.
+            (
+                "https://models.example.com/v1beta",
+                "https://models.example.com/v1beta/v1beta/models",
+            ),
+        ],
+    )
+    def test_custom_google_format_probes_the_path_the_gateway_calls(
+        self, base_url, expected
+    ):
         safe_session = Mock()
         safe_session.get.return_value = _mock_response()
 
@@ -65,13 +82,13 @@ class TestAgentccProviderCredentialModelDiscovery:
         ):
             AgentccProviderCredentialViewSet()._fetch_models_from_provider(
                 None,
-                "https://models.example.com/v1beta",
+                base_url,
                 "custom-api-key",
                 "google",
             )
 
         safe_session.get.assert_called_once_with(
-            "https://models.example.com/v1beta/models",
+            expected,
             params={"key": "custom-api-key"},
             timeout=15,
         )

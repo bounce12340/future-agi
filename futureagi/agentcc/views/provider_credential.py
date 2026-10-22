@@ -405,13 +405,13 @@ class AgentccProviderCredentialViewSet(BaseModelViewSetMixinWithUserOrg, ModelVi
             # against Google's OpenAI-compatible base (".../v1beta/openai"); its
             # key is still a Google key, so it is listed at Google's own host.
             gemini_base_url = base_url if api_format in ("gemini", "google") else ""
-            base = (
-                gemini_base_url or "https://generativelanguage.googleapis.com"
-            ).rstrip("/")
-            url = (
-                f"{base}/models"
-                if base.endswith("/v1beta")
-                else f"{base}/v1beta/models"
+            # No prefix to de-duplicate: the gateway's Gemini provider always
+            # appends "/v1beta" to the base URL (gemini/translate.go buildURL),
+            # so a base already ending in it fails there and must fail here.
+            url = _join_api_endpoint(
+                gemini_base_url or "https://generativelanguage.googleapis.com",
+                "",
+                "/v1beta/models",
             )
             resp = http.get(
                 url,
