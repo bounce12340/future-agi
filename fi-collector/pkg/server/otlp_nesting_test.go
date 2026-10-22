@@ -93,21 +93,28 @@ func TestCheckProtoNesting(t *testing.T) {
 }
 
 // A protobuf body nested past the limit is a 400, compressed or not, and one
-// at the limit still decodes. Without the check, a ~14 MiB body of ~1.5M
-// levels crashes the process; a body past the limit by one level must be
-// refused in the same way, before decoding.
+// at the limit still decodes. On dev, the 1.5M-array body (3M levels, 13.8
+// MiB) overflows the decoder's stack: "goroutine stack exceeds
+// 1000000000-byte limit", a fatal error that ends this test binary. (On
+// darwin/arm64 the decoder overflows between 1.1M and 1.2M nested arrays.)
 func TestOTLPHTTPDeeplyNestedProtobufIs400(t *testing.T) {
 	cases := []struct {
 		name   string
 		arrays int
 		want   int
+		gzip   bool // also send it gzipped (slow for the 13.8 MiB body under -race)
 	}{
-		{"at the limit", arraysAtLimit, http.StatusOK},
-		{"one level past the limit", arraysAtLimit + 1, http.StatusBadRequest},
+		{"at the limit", arraysAtLimit, http.StatusOK, true},
+		{"one level past the limit", arraysAtLimit + 1, http.StatusBadRequest, true},
+		{"deep enough to overflow the decoder's stack", 1_500_000, http.StatusBadRequest, false},
 	}
 	for _, tc := range cases {
 		raw := pbDeepAttr(tc.arrays)
-		for _, gz := range []bool{false, true} {
+		variants := []bool{false}
+		if tc.gzip {
+			variants = append(variants, true)
+		}
+		for _, gz := range variants {
 			t.Run(tc.name+map[bool]string{false: "", true: " gzip"}[gz], func(t *testing.T) {
 				body := raw
 				if gz {

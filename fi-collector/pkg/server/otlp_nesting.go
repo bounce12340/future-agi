@@ -18,8 +18,9 @@ var errNestingTooDeep = fmt.Errorf("nesting deeper than %d levels", maxDecodeNes
 
 // checkProtoNesting refuses an ExportTraceServiceRequest body nested deeper
 // than maxDecodeNesting, before it is decoded. pdata's protobuf decoder
-// recurses once per level with no limit, so about 1.5M levels (a 14 MiB body)
-// overflow the goroutine stack, a fatal error that kills the process.
+// recurses once per level with no limit, so about 1.2M nested arrays (2.4M
+// levels, an 11 MiB body) overflow the 1 GB goroutine stack: a fatal error
+// that kills the process.
 //
 // The walk follows the OTLP trace schema with protowire and allocates nothing.
 // Malformed protobuf is an error too: the walk cannot see past it, and the
