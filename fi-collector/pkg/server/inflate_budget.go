@@ -49,9 +49,9 @@ func newInflateBudget(size int64) *inflateBudget {
 // gzipInflightBytes turns the gzip_inflight_mib setting into bytes. Unset
 // means 128 MiB, or an eighth of GOMEMLIMIT when that is lower. The result is
 // never below minGzipInflightBytes, or a full-size body could never be
-// decoded. Peak heap under a flood of gzip requests is about 2-4x the budget
-// (the Go GC lets garbage build up between cycles), so an eighth keeps it
-// well under GOMEMLIMIT.
+// decoded. Peak heap under a flood of gzip requests measured up to about 5x
+// the budget (the Go GC lets garbage build up between cycles), so an eighth
+// keeps it under GOMEMLIMIT.
 func gzipInflightBytes(mib int) int64 {
 	n := int64(defaultGzipInflightBytes)
 	switch {
