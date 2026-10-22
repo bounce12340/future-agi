@@ -12,27 +12,55 @@ import (
 	"google.golang.org/grpc/metadata"
 )
 
+// oneLine is a single field line of X-Project-Name.
+func oneLine(v string) ProjectNameValues { return ProjectNameValues{Canonical: []string{v}} }
+
 func TestProjectNameFromHeaderValues(t *testing.T) {
 	cases := []struct {
 		name    string
-		values  []string
+		values  ProjectNameValues
 		want    string
-		wantErr string
+		wantErr string // and the error names wantHdr
+		wantHdr string
 	}{
-		{name: "absent", values: nil, want: ""},
-		{name: "single", values: []string{"checkout-bot"}, want: "checkout-bot"},
-		{name: "trimmed", values: []string{"  checkout-bot\t"}, want: "checkout-bot"},
-		{name: "blank is absent", values: []string{"   "}, want: ""},
-		{name: "repeats that agree", values: []string{"a", " a ", ""}, want: "a"},
-		{name: "unicode", values: []string{"проект-ü"}, want: "проект-ü"},
-		{name: "conflicting", values: []string{"a", "b"}, wantErr: "conflicting"},
-		{name: "invalid utf-8", values: []string{"bad\xff"}, wantErr: "UTF-8"},
+		{name: "absent", values: ProjectNameValues{}, want: ""},
+		{name: "single", values: oneLine("checkout-bot"), want: "checkout-bot"},
+		{name: "trimmed", values: oneLine("  checkout-bot\t"), want: "checkout-bot"},
+		{name: "blank is absent", values: oneLine("   "), want: ""},
+		{name: "unicode", values: oneLine("проект-ü"), want: "проект-ü"},
+		{name: "alias only", values: ProjectNameValues{Alias: []string{"from-alias"}}, want: "from-alias"},
+		{name: "both spellings agree", values: ProjectNameValues{[]string{"a"}, []string{" a "}}, want: "a"},
+		{name: "blank canonical, alias set", values: ProjectNameValues{[]string{" "}, []string{"b"}}, want: "b"},
+		{name: "both spellings disagree", values: ProjectNameValues{[]string{"a"}, []string{"b"}},
+			wantErr: "conflicting", wantHdr: ProjectNameHeaderAlias},
+		// RFC 9110 section 5.3: repeated lines and a comma-joined value are
+		// the same list once a proxy joins them, so both are refused.
+		{name: "sent twice, disagreeing", values: ProjectNameValues{Canonical: []string{"a", "b"}},
+			wantErr: "sent 2 times", wantHdr: ProjectNameHeader},
+		{name: "sent twice, agreeing", values: ProjectNameValues{Canonical: []string{"a", "a"}},
+			wantErr: "sent 2 times", wantHdr: ProjectNameHeader},
+		{name: "sent twice, one blank", values: ProjectNameValues{Canonical: []string{"a", ""}},
+			wantErr: "sent 2 times", wantHdr: ProjectNameHeader},
+		{name: "alias sent twice", values: ProjectNameValues{Alias: []string{"a", "a"}},
+			wantErr: "sent 2 times", wantHdr: ProjectNameHeaderAlias},
+		{name: "comma-joined list", values: oneLine("a, b"), wantErr: "comma", wantHdr: ProjectNameHeader},
+		{name: "comma-joined repeat", values: oneLine("a,a"), wantErr: "comma", wantHdr: ProjectNameHeader},
+		{name: "comma in alias", values: ProjectNameValues{Alias: []string{"a,b"}}, wantErr: "comma", wantHdr: ProjectNameHeaderAlias},
+		{name: "invalid utf-8", values: oneLine("bad\xff"), wantErr: "UTF-8", wantHdr: ProjectNameHeader},
 		// The project name column holds 255 characters (not bytes).
-		{name: "255 characters", values: []string{strings.Repeat("é", 255)}, want: strings.Repeat("é", 255)},
-		{name: "256 characters", values: []string{strings.Repeat("é", 256)}, wantErr: "255 characters"},
-		{name: "tab inside", values: []string{"a\tb"}, wantErr: "control character"},
-		{name: "newline inside", values: []string{"a\nb"}, wantErr: "control character"},
-		{name: "DEL inside", values: []string{"a\x7fb"}, wantErr: "control character"},
+		{name: "255 characters", values: oneLine(strings.Repeat("é", 255)), want: strings.Repeat("é", 255)},
+		{name: "256 characters", values: oneLine(strings.Repeat("é", 256)), wantErr: "255 characters", wantHdr: ProjectNameHeader},
+		{name: "tab inside", values: oneLine("a\tb"), wantErr: "control character", wantHdr: ProjectNameHeader},
+		{name: "newline inside", values: oneLine("a\nb"), wantErr: "control character", wantHdr: ProjectNameHeader},
+		{name: "DEL inside", values: oneLine("a\x7fb"), wantErr: "control character", wantHdr: ProjectNameHeader},
+		{name: "C1 control inside", values: oneLine("a\u0085b"), wantErr: "control character", wantHdr: ProjectNameHeader},
+		// Unicode format characters (category Cf) are invisible: a name with
+		// one looks like another project's name but is a different one.
+		{name: "zero width space", values: oneLine("check\u200bout"), wantErr: "U+200B", wantHdr: ProjectNameHeader},
+		{name: "byte order mark", values: oneLine("\ufeffcheckout"), wantErr: "U+FEFF", wantHdr: ProjectNameHeader},
+		{name: "right-to-left override", values: oneLine("checkout\u202e"), wantErr: "U+202E", wantHdr: ProjectNameHeader},
+		{name: "soft hyphen", values: oneLine("check\u00adout"), wantErr: "format character", wantHdr: ProjectNameHeader},
+		{name: "Cf in alias", values: ProjectNameValues{Alias: []string{"a\u2060b"}}, wantErr: "format character", wantHdr: ProjectNameHeaderAlias},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -41,8 +69,8 @@ func TestProjectNameFromHeaderValues(t *testing.T) {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 					t.Fatalf("err = %v, want it to mention %q", err, tc.wantErr)
 				}
-				if !strings.Contains(err.Error(), ProjectNameHeader) {
-					t.Errorf("err %q should name the header", err)
+				if !strings.Contains(err.Error(), tc.wantHdr) {
+					t.Errorf("err %q should name the header %s", err, tc.wantHdr)
 				}
 				return
 			}
@@ -60,12 +88,15 @@ func TestProjectNameValuesReadCanonicalAndAliasHeaders(t *testing.T) {
 	h := http.Header{}
 	h.Add("x-project-name", "a")
 	h.Add("Fi-Project-Name", "b")
-	if got := ProjectNameHTTPValues(h); len(got) != 2 || got[0] != "a" || got[1] != "b" {
-		t.Errorf("HTTP values = %v, want [a b] (canonical first)", got)
+	h.Add("Fi-Project-Name", "c")
+	got := ProjectNameHTTPValues(h)
+	if len(got.Canonical) != 1 || got.Canonical[0] != "a" || len(got.Alias) != 2 || got.Alias[1] != "c" {
+		t.Errorf("HTTP values = %+v, want {[a] [b c]} (each line kept)", got)
 	}
-	md := metadata.Pairs("fi-project-name", "b", "x-project-name", "a")
-	if got := ProjectNameMetadataValues(md); len(got) != 2 || got[0] != "a" || got[1] != "b" {
-		t.Errorf("metadata values = %v, want [a b] (canonical first)", got)
+	md := metadata.Pairs("fi-project-name", "b", "x-project-name", "a", "x-project-name", "a")
+	got = ProjectNameMetadataValues(md)
+	if len(got.Canonical) != 2 || got.Canonical[0] != "a" || len(got.Alias) != 1 || got.Alias[0] != "b" {
+		t.Errorf("metadata values = %+v, want {[a a] [b]}", got)
 	}
 }
 
@@ -80,7 +111,7 @@ func TestApplyProjectNameHeaderFillsOnlyMissingNames(t *testing.T) {
 	wrongType := traces.ResourceSpans().AppendEmpty()
 	wrongType.Resource().Attributes().PutInt("project_name", 7)
 
-	n, err := ApplyProjectNameHeader(traces, []string{" from-header "})
+	n, err := ApplyProjectNameHeader(traces, oneLine(" from-header "))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,15 +130,15 @@ func TestApplyProjectNameHeaderFillsOnlyMissingNames(t *testing.T) {
 }
 
 func TestApplyProjectNameHeaderNoValuesIsNoOp(t *testing.T) {
-	for _, values := range [][]string{nil, {""}, {"  "}} {
+	for _, values := range []ProjectNameValues{{}, oneLine(""), oneLine("  "), {Alias: []string{" "}}} {
 		traces := ptrace.NewTraces()
 		traces.ResourceSpans().AppendEmpty()
 		n, err := ApplyProjectNameHeader(traces, values)
 		if err != nil || n != 0 {
-			t.Fatalf("values %q: applied = %d, err = %v; want 0, nil", values, n, err)
+			t.Fatalf("values %+v: applied = %d, err = %v; want 0, nil", values, n, err)
 		}
 		if _, ok := traces.ResourceSpans().At(0).Resource().Attributes().Get("project_name"); ok {
-			t.Errorf("values %q must not add project_name", values)
+			t.Errorf("values %+v must not add project_name", values)
 		}
 	}
 }
@@ -117,13 +148,14 @@ func TestApplyProjectNameHeaderNoValuesIsNoOp(t *testing.T) {
 func TestApplyProjectNameHeaderIgnoresBadHeaderWhenNotNeeded(t *testing.T) {
 	traces := ptrace.NewTraces()
 	traces.ResourceSpans().AppendEmpty().Resource().Attributes().PutStr("project_name", "from-attr")
-	if n, err := ApplyProjectNameHeader(traces, []string{"a", "b", "bad\xff"}); err != nil || n != 0 {
+	bad := ProjectNameValues{[]string{"a", "b,c", "bad\xff\u200b"}, []string{"d"}}
+	if n, err := ApplyProjectNameHeader(traces, bad); err != nil || n != 0 {
 		t.Fatalf("applied = %d, err = %v; want 0, nil when every resource names a project", n, err)
 	}
 
 	traces.ResourceSpans().AppendEmpty()
-	if _, err := ApplyProjectNameHeader(traces, []string{"a", "b"}); err == nil {
-		t.Fatal("conflicting values must be an error once a resource needs the header")
+	if _, err := ApplyProjectNameHeader(traces, bad); err == nil {
+		t.Fatal("a bad header must be an error once a resource needs it")
 	}
 }
 
@@ -175,7 +207,7 @@ func TestStampResolvesHeaderProjectLikeAttributeProject(t *testing.T) {
 		t.Fatal("a ResourceSpans with no project_name and no header must still be rejected")
 	}
 
-	if n, err := ApplyProjectNameHeader(traces, []string{"header-project"}); err != nil || n != 1 {
+	if n, err := ApplyProjectNameHeader(traces, oneLine("header-project")); err != nil || n != 1 {
 		t.Fatalf("applied = %d, err = %v; want 1, nil", n, err)
 	}
 	dropped, err := StampResourceAttrs(context.Background(), a, ck, traces, result)

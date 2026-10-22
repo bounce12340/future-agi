@@ -313,29 +313,54 @@ func TestOTLPHTTPProjectHeaderWithGzipBody(t *testing.T) {
 }
 
 func TestOTLPHTTPInvalidProjectHeaderIs400(t *testing.T) {
-	cases := map[string][]string{
-		"conflicting values":         {"alpha", "beta"},
-		"invalid utf-8":              {"bad\xffname"},
-		"longer than 255 characters": {strings.Repeat("p", 256)},
-		"control character":          {"a\tb"},
+	cases := map[string]struct {
+		header string
+		values []string
+	}{
+		"conflicting lines":                   {"X-Project-Name", []string{"alpha", "beta"}},
+		"repeated lines that agree":           {"X-Project-Name", []string{"alpha", "alpha"}},
+		"comma-separated list":                {"X-Project-Name", []string{"alpha, beta"}},
+		"comma-joined repeat":                 {"X-Project-Name", []string{"alpha,alpha"}},
+		"alias repeated":                      {"FI-Project-Name", []string{"alpha", "alpha"}},
+		"invalid utf-8":                       {"X-Project-Name", []string{"bad\xffname"}},
+		"longer than 255 characters":          {"X-Project-Name", []string{strings.Repeat("p", 256)}},
+		"control character":                   {"X-Project-Name", []string{"a\tb"}},
+		"zero width space (Unicode Cf)":       {"X-Project-Name", []string{"check\u200bout"}},
+		"bidi override in alias (Unicode Cf)": {"FI-Project-Name", []string{"checkout\u202e"}},
 	}
-	for name, values := range cases {
+	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			pb := protoBody(t, makeTraces("bad-header-span", "ffffffff-ffff-4fff-8fff-ffffffffffff"))
 			req := httptest.NewRequest(http.MethodPost, "/v1/traces", bytes.NewReader(pb))
 			req.Header.Set("Content-Type", "application/x-protobuf")
-			for _, v := range values {
-				req.Header.Add("X-Project-Name", v)
+			for _, v := range tc.values {
+				req.Header.Add(tc.header, v)
 			}
 			rec := httptest.NewRecorder()
 			directServer().handleHTTPTraces(rec, req)
 			if rec.Code != http.StatusBadRequest {
 				t.Fatalf("status %d, want 400 (%s)", rec.Code, rec.Body.String())
 			}
-			if !strings.Contains(rec.Body.String(), "X-Project-Name") {
-				t.Errorf("400 body should name the header, got %q", rec.Body.String())
+			if !strings.Contains(rec.Body.String(), tc.header) {
+				t.Errorf("400 body should name %s, got %q", tc.header, rec.Body.String())
 			}
 		})
+	}
+}
+
+// Both spellings may be sent together when they name the same project.
+func TestOTLPHTTPBothProjectHeadersAgreeing(t *testing.T) {
+	httpAddr, _, sawCH, stop := startServerWithHTTP(t)
+	defer stop()
+
+	pb := protoBody(t, makeTraces("both-headers-span", "19191919-1919-4919-8919-191919191919"))
+	resp, body := postOTLP(t, "http://"+httpAddr+"/v1/traces", "application/x-protobuf",
+		map[string]string{"X-Project-Name": "same-project", "FI-Project-Name": " same-project "}, pb)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d (want 200): %s", resp.StatusCode, body)
+	}
+	if ch := waitForCH(t, sawCH); !strings.Contains(ch, `"project_name":"same-project"`) {
+		t.Errorf("stored resource_attrs missing the header project: %q", ch)
 	}
 }
 
@@ -363,7 +388,8 @@ func TestOTLPHTTPBadProjectHeaderIgnoredWhenResourceNamesProject(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/traces", bytes.NewReader(protoBody(t, traces)))
 	req.Header.Set("Content-Type", "application/x-protobuf")
 	req.Header.Add("X-Project-Name", "alpha")
-	req.Header.Add("FI-Project-Name", "beta")
+	req.Header.Add("X-Project-Name", "alpha, gamma")
+	req.Header.Add("FI-Project-Name", "beta\u200b")
 	rec := httptest.NewRecorder()
 	New(Config{BatchMaxRows: 1 << 20, BatchMaxAge: time.Hour}, nil, nil, nil, nil).handleHTTPTraces(rec, req)
 	if rec.Code != http.StatusOK {
@@ -463,15 +489,26 @@ func TestGRPCResourceProjectNameBeatsMetadata(t *testing.T) {
 	}
 }
 
-func TestGRPCConflictingProjectMetadataIsInvalidArgument(t *testing.T) {
+func TestGRPCInvalidProjectMetadataIsInvalidArgument(t *testing.T) {
 	addr, _ := startGRPCOnly(t, Config{})
 	client := grpcClient(t, addr)
 
-	ctx := metadata.AppendToOutgoingContext(context.Background(),
-		"x-project-name", "alpha", "x-project-name", "beta")
-	req := ptraceotlp.NewExportRequestFromTraces(makeTraces("grpc-conflict-span", "16161616-1616-4616-8616-161616161616"))
-	_, err := client.Export(ctx, req)
-	if status.Code(err) != codes.InvalidArgument {
-		t.Fatalf("want InvalidArgument for conflicting x-project-name, got %v", err)
+	cases := map[string][]string{
+		"conflicting values":   {"x-project-name", "alpha", "x-project-name", "beta"},
+		"repeated values":      {"x-project-name", "alpha", "x-project-name", "alpha"},
+		"comma-separated list": {"x-project-name", "alpha,beta"},
+		"spellings disagree":   {"x-project-name", "alpha", "fi-project-name", "beta"},
+		// Format characters (Cf) are not ASCII, which grpc-go refuses to send
+		// in a metadata value, so that check is covered in pkg/auth.
+	}
+	for name, kv := range cases {
+		t.Run(name, func(t *testing.T) {
+			ctx := metadata.AppendToOutgoingContext(context.Background(), kv...)
+			req := ptraceotlp.NewExportRequestFromTraces(makeTraces("grpc-conflict-span", "16161616-1616-4616-8616-161616161616"))
+			_, err := client.Export(ctx, req)
+			if status.Code(err) != codes.InvalidArgument {
+				t.Fatalf("want InvalidArgument, got %v", err)
+			}
+		})
 	}
 }
