@@ -285,10 +285,10 @@ class AgentccProviderCredentialViewSet(BaseModelViewSetMixinWithUserOrg, ModelVi
 
         # The saved key only ever goes where it was saved for: a caller who can
         # use the credential but not read it must not be able to redirect it.
+        uses_saved_key = saved_base_url is not None and not request.data.get("api_key")
         requested_base_url = (request.data.get("base_url") or "").rstrip("/")
         if (
-            saved_base_url is not None
-            and not request.data.get("api_key")
+            uses_saved_key
             and requested_base_url
             and requested_base_url != saved_base_url
         ):
@@ -300,7 +300,12 @@ class AgentccProviderCredentialViewSet(BaseModelViewSetMixinWithUserOrg, ModelVi
         # Raw values from request body override or fill gaps.
         base_url = (requested_base_url or base_url or "").rstrip("/")
         api_key = request.data.get("api_key") or api_key or ""
-        api_format = request.data.get("api_format") or api_format or "openai"
+        # The format decides the discovery URL and how the key is sent (the
+        # google branch puts it in the query string), so a saved key keeps the
+        # format it was saved with.
+        if not uses_saved_key:
+            api_format = request.data.get("api_format") or api_format
+        api_format = api_format or "openai"
         # Presence, not truthiness: "" is an explicit "no version segment", and
         # an `or` chain would silently swap it for the stored value.
         if "api_path_prefix" in request.data:
