@@ -219,12 +219,16 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 		s.log.Info("grpc listener", "addr", s.cfg.GRPCAddr, "max_recv_mib", s.cfg.GRPCMaxRecvMiB)
 		// No gzip decompressor is registered, on purpose. grpc-go inflates and
-		// unmarshals a message before any interceptor (auth included) runs,
-		// and its decompressor never sees the call's context, so neither auth
-		// nor the inflate budget could stop an unauthenticated caller from
-		// making the collector inflate up to MaxRecvMsgSize per call for a
-		// few KiB upload. A gzip call gets UNIMPLEMENTED before its message is
-		// read; OTLP/HTTP accepts gzip under the budget.
+		// unmarshals a message before any interceptor, auth included, runs.
+		// A custom "gzip" compressor could charge the inflate budget, but it
+		// never sees the call, so the message would still be inflated and
+		// decoded before its key is checked: an unauthenticated caller could
+		// make the collector inflate up to MaxRecvMsgSize per call for a few
+		// KiB of upload. Enabling gzip needs the key checked first, in a tap
+		// handle on the call's metadata. Until then a gzip call gets
+		// UNIMPLEMENTED before its message is read, and OTLP/HTTP accepts gzip
+		// under the budget. TestGRPCGzipDecompressorIsNotRegistered
+		// (cmd/fi-collector) fails if any import registers one.
 		grpcOpts := []grpc.ServerOption{
 			grpc.MaxRecvMsgSize(s.cfg.GRPCMaxRecvMiB << 20),
 			grpc.StatsHandler(&grpcErrLogger{log: s.log}),
@@ -461,8 +465,9 @@ func (s *Server) handleHTTPTraces(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The decompressed body counts against the process-wide inflate budget
-	// until the handler returns, since the decoded request lives that long.
+	// A gzip request leases its decompressed bytes, then the estimated cost of
+	// decoding them, from the process-wide inflate budget until the handler
+	// returns, since the decoded request lives that long.
 	lease := inflateLease{b: s.inflate}
 	defer lease.release()
 	body, err := readOTLPHTTPBody(w, r, gzipped, maxOTLPHTTPBodyBytes, &lease)
@@ -472,18 +477,44 @@ func (s *Server) handleHTTPTraces(w http.ResponseWriter, r *http.Request) {
 		case errors.As(err, &tooLarge) || errors.Is(err, errInflatedBodyTooLarge):
 			// Mirror the gRPC-side over-cap log so an HTTP exporter's drop is
 			// equally visible server-side.
-			s.log.Error("http body over size cap, request rejected",
-				"path", r.URL.Path, "max_bytes", maxOTLPHTTPBodyBytes, "gzip", gzipped)
+			if ok, held := s.inflate.overCapLog.allow(time.Now()); ok {
+				s.log.Error("http body over size cap, request rejected",
+					"path", r.URL.Path, "max_bytes", maxOTLPHTTPBodyBytes, "gzip", gzipped, "suppressed", held)
+			}
 			http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
 		case errors.Is(err, errInflateBudgetExhausted):
-			// Retryable per the OTLP spec; exporters honour Retry-After.
-			s.log.Warn("gzip inflate budget full, request rejected",
-				"path", r.URL.Path, "budget_bytes", s.inflate.size)
-			w.Header().Set("Retry-After", "1")
-			http.Error(w, "server busy decoding compressed requests, retry later", http.StatusServiceUnavailable)
+			s.rejectBusy(w, r)
 		default:
 			http.Error(w, err.Error(), http.StatusBadRequest)
 		}
+		return
+	}
+
+	// Count what decoding will allocate before decoding (decode_cost.go).
+	// Every body is checked for nesting the decoder cannot survive; a gzip
+	// body also leases the estimate, because it cost the sender so little.
+	decodeErr := "decode protobuf: "
+	if ct == "application/json" {
+		decodeErr = "decode json: "
+	}
+	cost, err := estimateDecodeCost(body, ct == "application/json")
+	if err != nil {
+		http.Error(w, decodeErr+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if gzipped && !lease.grow(cost) {
+		if lease.held+cost <= s.inflate.size {
+			s.rejectBusy(w, r)
+			return
+		}
+		// It could never fit, so a retry would fail the same way.
+		if ok, held := s.inflate.decodeCostLog.allow(time.Now()); ok {
+			s.log.Error("gzip request would decode past the inflate budget, request rejected",
+				"path", r.URL.Path, "inflated_bytes", len(body), "decode_cost_bytes", cost,
+				"budget_bytes", s.inflate.size, "suppressed", held)
+		}
+		http.Error(w, "payload too large once decoded: send smaller batches, or send them uncompressed",
+			http.StatusRequestEntityTooLarge)
 		return
 	}
 
@@ -491,12 +522,12 @@ func (s *Server) handleHTTPTraces(w http.ResponseWriter, r *http.Request) {
 	switch ct {
 	case "application/x-protobuf":
 		if err := req.UnmarshalProto(body); err != nil {
-			http.Error(w, "decode protobuf: "+err.Error(), http.StatusBadRequest)
+			http.Error(w, decodeErr+err.Error(), http.StatusBadRequest)
 			return
 		}
 	case "application/json":
 		if err := req.UnmarshalJSON(body); err != nil {
-			http.Error(w, "decode json: "+err.Error(), http.StatusBadRequest)
+			http.Error(w, decodeErr+err.Error(), http.StatusBadRequest)
 			return
 		}
 	}
@@ -586,6 +617,17 @@ func trimSpace(s string) string {
 	return s
 }
 
+// rejectBusy answers a gzip request the inflate budget cannot take right now
+// with 503 + Retry-After, which the OTLP spec makes retryable.
+func (s *Server) rejectBusy(w http.ResponseWriter, r *http.Request) {
+	if ok, held := s.inflate.busyLog.allow(time.Now()); ok {
+		s.log.Warn("gzip inflate budget full, request rejected",
+			"path", r.URL.Path, "budget_bytes", s.inflate.size, "suppressed", held)
+	}
+	w.Header().Set("Retry-After", "1")
+	http.Error(w, "server busy decoding compressed requests, retry later", http.StatusServiceUnavailable)
+}
+
 // otlpContentCoding reports whether the body is gzip-compressed, and false
 // for ok when it carries a coding we do not decode. Tokens are
 // case-insensitive (RFC 9110 section 8.4.1); `identity` is a no-op and
@@ -618,10 +660,15 @@ var errInflatedBodyTooLarge = errors.New("decompressed body over size cap")
 // process-wide inflate budget past its size (see inflateBudget).
 var errInflateBudgetExhausted = errors.New("inflate budget exhausted")
 
-// minInflateBuf is the smallest first inflate buffer. The first buffer is
-// sized at four times the compressed body (OTLP payloads typically compress
-// 3-10x), so most bodies need at most one regrowth.
-const minInflateBuf = 64 << 10
+// minInflateBuf is the smallest inflate buffer.
+const minInflateBuf = 4 << 10
+
+// maxTrustedGzipRatio is the most a gzip body may declare it inflates (per
+// its trailer, against its wire size) for the handler to allocate that much
+// before inflating it. OTLP batches compress 3-20x, highly repetitive ones a
+// few hundred times; a body declaring more is inflated once without keeping
+// the bytes, to learn its real size, before anything is allocated for it.
+const maxTrustedGzipRatio = 64
 
 // readOTLPHTTPBody reads at most limit bytes from the wire and, for a gzip
 // body, at most limit bytes after decompression.
@@ -630,10 +677,10 @@ const minInflateBuf = 64 << 10
 // slow or stalled upload only ever holds the compressed bytes it has sent (one
 // byte held per byte uploaded, as for an uncompressed body). The wire limit
 // also bounds gzip input that inflates to little or nothing (e.g. empty
-// deflate blocks). Inflation then writes into a buffer whose capacity is
-// leased from the process-wide inflate budget and stops at the cap, so
-// neither a decompression bomb nor many of them at once are held past their
-// limits.
+// deflate blocks). Inflation then writes into one buffer of the body's exact
+// size, leased from the process-wide inflate budget before it is allocated
+// (inflateGzip), so neither a decompression bomb nor many of them at once
+// are held past their limits.
 //
 // Errors: *http.MaxBytesError (wire over the cap), errInflatedBodyTooLarge
 // (decompressed over the cap), errInflateBudgetExhausted (the budget is
@@ -650,55 +697,100 @@ func readOTLPHTTPBody(w http.ResponseWriter, r *http.Request, gzipped bool, limi
 	if !gzipped {
 		return wire, nil
 	}
-
-	zr, err := gzip.NewReader(bytes.NewReader(wire))
-	if err != nil {
-		return nil, gzipBodyError(err)
-	}
-	defer zr.Close()
-	return inflateWithin(zr, limit, lease, int64(len(wire)))
+	return inflateGzip(wire, limit, lease)
 }
 
-// inflateWithin reads zr to the end into a buffer of at most limit bytes,
-// growing the lease with the buffer's capacity before each allocation.
-func inflateWithin(zr io.Reader, limit int64, lease *inflateLease, wireLen int64) ([]byte, error) {
-	size := min(max(4*wireLen, minInflateBuf), limit)
-	if !lease.grow(size) {
-		return nil, errInflateBudgetExhausted
-	}
-	buf := make([]byte, 0, size)
-	for {
-		if len(buf) == cap(buf) {
-			if int64(len(buf)) >= limit {
-				// Full at the cap: any further byte is one too many.
-				var probe [1]byte
-				n, err := io.ReadFull(zr, probe[:])
-				switch {
-				case n > 0:
-					return nil, errInflatedBodyTooLarge
-				case errors.Is(err, io.EOF):
-					return buf, nil
-				default:
-					return nil, gzipBodyError(err)
-				}
-			}
-			next := min(2*int64(cap(buf)), limit)
-			if !lease.grow(next - int64(cap(buf))) {
-				return nil, errInflateBudgetExhausted
-			}
-			grown := make([]byte, len(buf), next)
-			copy(grown, buf)
-			buf = grown
+// inflateGzip decompresses wire into a buffer of exactly the decompressed
+// size, at most limit bytes, leasing that size before allocating it.
+//
+// The size comes from the gzip trailer (ISIZE, gzipSizeHint) when it is
+// plausible, so an honest body is inflated once into one allocation. A
+// trailer is only a hint: a sender can write any value, a multi-member body
+// declares only its last member, and a corrupt body has none. So a body
+// whose trailer declares more than the cap or more than maxTrustedGzipRatio
+// times its wire size, or that turns out longer than its trailer said, is
+// first inflated without keeping the bytes, to learn its real size. A bomb
+// is then refused having cost CPU but no buffer, a corrupt body is a 400,
+// and anything else is inflated again into a buffer of its real size.
+func inflateGzip(wire []byte, limit int64, lease *inflateLease) ([]byte, error) {
+	size := gzipSizeHint(wire)
+	if size > limit || size > maxTrustedGzipRatio*int64(len(wire)) {
+		n, err := inflatedSize(wire, limit)
+		if err != nil {
+			return nil, err
 		}
+		size = n
+	}
+	for attempt := 0; ; attempt++ {
+		size = max(size, minInflateBuf)
+		if !lease.grow(size - lease.held) {
+			return nil, errInflateBudgetExhausted
+		}
+		buf, complete, err := inflateInto(wire, size)
+		if err != nil || complete {
+			return buf, err
+		}
+		if attempt > 0 { // the real size was measured: unreachable
+			return nil, gzipBodyError(io.ErrUnexpectedEOF)
+		}
+		// Longer than the hint said: learn its real size, then inflate it
+		// again. This buffer is garbage from here.
+		n, err := inflatedSize(wire, limit)
+		if err != nil {
+			return nil, err
+		}
+		size = n
+	}
+}
+
+// inflateInto inflates wire into a new buffer of size bytes. complete reports
+// that the body fitted, and is false when there is more of it than fits.
+func inflateInto(wire []byte, size int64) (out []byte, complete bool, err error) {
+	zr, err := gzip.NewReader(bytes.NewReader(wire)) // a bad header fails before the allocation
+	if err != nil {
+		return nil, false, gzipBodyError(err)
+	}
+	defer zr.Close()
+	buf := make([]byte, 0, size)
+	for len(buf) < cap(buf) {
 		n, err := zr.Read(buf[len(buf):cap(buf)])
 		buf = buf[:len(buf)+n]
 		if errors.Is(err, io.EOF) {
-			return buf, nil
+			return buf, true, nil
 		}
 		if err != nil {
-			return nil, gzipBodyError(err)
+			return nil, false, gzipBodyError(err)
 		}
 	}
+	// Full: the body fits only if nothing is left.
+	var probe [1]byte
+	n, err := io.ReadFull(zr, probe[:])
+	switch {
+	case n > 0:
+		return nil, false, nil
+	case errors.Is(err, io.EOF):
+		return buf, true, nil
+	default:
+		return nil, false, gzipBodyError(err)
+	}
+}
+
+// inflatedSize inflates wire without keeping the bytes and returns its
+// decompressed size, or errInflatedBodyTooLarge once it passes limit.
+func inflatedSize(wire []byte, limit int64) (int64, error) {
+	zr, err := gzip.NewReader(bytes.NewReader(wire))
+	if err != nil {
+		return 0, gzipBodyError(err)
+	}
+	defer zr.Close()
+	n, err := io.Copy(io.Discard, io.LimitReader(zr, limit+1))
+	switch {
+	case err != nil:
+		return 0, gzipBodyError(err)
+	case n > limit:
+		return 0, errInflatedBodyTooLarge
+	}
+	return n, nil
 }
 
 // gzipBodyError labels a corrupt or truncated gzip stream (a 400).

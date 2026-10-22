@@ -68,7 +68,7 @@ func TestOTLPHTTPGzipOverInflateBudgetIs503(t *testing.T) {
 // Concurrent gzip bombs share one budget: none of them can hold more than it,
 // each is turned away once it would pass it, and every lease is returned.
 func TestOTLPHTTPConcurrentGzipBombsStayWithinBudget(t *testing.T) {
-	const budget = 4 << 20 // below the 16 MiB per-request cap, so no bomb reaches 413
+	const budget = 4 << 20 // below the 16 MiB per-request cap
 	s := directServer()
 	s.inflate = newInflateBudget(budget)
 	bomb := zeroGzipMembers(t, 64) // 64 MiB inflated, ~64 KiB on the wire
@@ -86,8 +86,10 @@ func TestOTLPHTTPConcurrentGzipBombsStayWithinBudget(t *testing.T) {
 	wg.Wait()
 
 	for i, c := range codes {
-		if c != http.StatusServiceUnavailable {
-			t.Errorf("request %d: status %d, want 503 once the shared budget is spent", i, c)
+		// 413 once a bomb is measured over the cap, 503 when even its first
+		// buffer does not fit what the others hold.
+		if c != http.StatusRequestEntityTooLarge && c != http.StatusServiceUnavailable {
+			t.Errorf("request %d: status %d, want 413 or 503", i, c)
 		}
 	}
 	if p := s.inflate.peak.Load(); p > budget {
@@ -159,16 +161,20 @@ func TestGzipInflightBytes(t *testing.T) {
 	if got := gzipInflightBytes(0); got != defaultGzipInflightBytes {
 		t.Errorf("unset: %d, want the %d default", got, defaultGzipInflightBytes)
 	}
-	if got := gzipInflightBytes(64); got != 64<<20 {
-		t.Errorf("64 MiB configured: %d", got)
+	if got := gzipInflightBytes(100); got != 100<<20 {
+		t.Errorf("100 MiB configured: %d", got)
 	}
-	if got := gzipInflightBytes(1); got != maxOTLPHTTPBodyBytes {
-		t.Errorf("1 MiB configured: %d, want the %d floor (one full request)", got, maxOTLPHTTPBodyBytes)
+	if got := gzipInflightBytes(1); got != minGzipInflightBytes {
+		t.Errorf("1 MiB configured: %d, want the %d floor (one full-size body and its decode cost)", got, minGzipInflightBytes)
 	}
 
-	debug.SetMemoryLimit(384 << 20) // a GOMEMLIMIT of 384MiB
-	if got := gzipInflightBytes(0); got != 48<<20 {
-		t.Errorf("unset under GOMEMLIMIT=384MiB: %d, want an eighth (48 MiB)", got)
+	debug.SetMemoryLimit(900 << 20) // the Helm chart's GOMEMLIMIT
+	if got := gzipInflightBytes(0); got != 900<<20/8 {
+		t.Errorf("unset under GOMEMLIMIT=900MiB: %d, want an eighth (112.5 MiB)", got)
+	}
+	debug.SetMemoryLimit(384 << 20)
+	if got := gzipInflightBytes(0); got != minGzipInflightBytes {
+		t.Errorf("unset under GOMEMLIMIT=384MiB: %d, want the floor (an eighth is below it)", got)
 	}
 	if got := gzipInflightBytes(200); got != 200<<20 {
 		t.Errorf("an explicit setting wins over GOMEMLIMIT: %d", got)
