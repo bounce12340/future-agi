@@ -21,7 +21,9 @@ func TestReadOTLPHTTPBodyCapsCompressedWireBytes(t *testing.T) {
 		body.Write(emptyStoredBlock)
 	}
 	req := httptest.NewRequest(http.MethodPost, "/v1/traces", bytes.NewReader(body.Bytes()))
-	_, err := readOTLPHTTPBody(httptest.NewRecorder(), req, true, limit)
+	lease := inflateLease{b: newInflateBudget(1 << 20)}
+	defer lease.release()
+	_, err := readOTLPHTTPBody(httptest.NewRecorder(), req, true, limit, &lease)
 	var tooLarge *http.MaxBytesError
 	if !errors.As(err, &tooLarge) {
 		t.Fatalf("err = %v, want *http.MaxBytesError from the wire cap", err)

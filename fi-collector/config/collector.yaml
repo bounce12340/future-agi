@@ -39,8 +39,13 @@ server:
   batch_max_rows: 5000
   batch_max_age: 5s
   # Max gRPC receive message size in MiB (FI_GRPC_MAX_RECV_MIB); 16 matches
-  # the OTLP/HTTP body cap.
+  # the OTLP/HTTP body cap. gRPC accepts uncompressed calls only.
   grpc_max_recv_mib: 16
+  # Decompressed bytes that all gzip OTLP/HTTP requests may hold at once, in
+  # MiB (FI_GZIP_INFLIGHT_MIB). Unset: 128, or GOMEMLIMIT/8 when that is lower;
+  # never below 16. A request that would pass it gets 503 + Retry-After and
+  # the exporter retries.
+  # gzip_inflight_mib: 128
 
 auth:
   # Auth is active when pg_write is set. Without it, spans land with

@@ -22,7 +22,7 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// Tests for TH-8743 (OTLP gzip on both transports) and TH-8744 (the project
+// Tests for TH-8743 (gzip on OTLP/HTTP) and TH-8744 (the project
 // named by a request header / gRPC metadata when the resource carries no
 // project_name). They drive the real listeners with auth disabled, so the
 // header's effect is observed where the converter stores it: the row's
@@ -193,45 +193,32 @@ func TestOTLPHTTPCorruptGzipIs400(t *testing.T) {
 	}
 }
 
-// countingReader counts bytes the handler pulled from the request body.
-type countingReader struct {
-	r io.Reader
-	n atomic.Int64
-}
-
-func (c *countingReader) Read(p []byte) (int, error) {
-	n, err := c.r.Read(p)
-	c.n.Add(int64(n))
-	return n, err
-}
-
 // A small gzip body that inflates past the cap is a 413, and the handler
 // stops inflating at the cap instead of expanding the whole bomb.
-func TestOTLPHTTPGzipBombIs413AndStreamsToTheCap(t *testing.T) {
+func TestOTLPHTTPGzipBombIs413AndStopsAtTheCap(t *testing.T) {
 	// 256 concatenated gzip members of 1 MiB of zeros each: 256 MiB (16x the
 	// cap) once inflated, about 256 KiB on the wire. Gzip readers must accept
 	// multi-member streams (RFC 1952 section 2.2), so this is a valid body.
 	member := gzipBytes(t, make([]byte, 1<<20))
-	var compressed bytes.Buffer
-	for i := 0; i < 256; i++ {
-		compressed.Write(member)
-	}
-	total := int64(compressed.Len())
+	compressed := bytes.Repeat(member, 256)
 
-	body := &countingReader{r: bytes.NewReader(compressed.Bytes())}
-	req := httptest.NewRequest(http.MethodPost, "/v1/traces", body)
+	s := directServer()
+	req := httptest.NewRequest(http.MethodPost, "/v1/traces", bytes.NewReader(compressed))
 	req.Header.Set("Content-Type", "application/x-protobuf")
 	req.Header.Set("Content-Encoding", "gzip")
 	rec := httptest.NewRecorder()
-	directServer().handleHTTPTraces(rec, req)
+	s.handleHTTPTraces(rec, req)
 
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status %d, want 413 (%s)", rec.Code, rec.Body.String())
 	}
-	// Inflating 16 MiB of a 256 MiB stream consumes about 1/16 of the input.
-	// Allow generous slack for buffering; reading most of it means no limit.
-	if read := body.n.Load(); read > total/4 {
-		t.Errorf("handler read %d of %d compressed bytes; the cap must stop inflation early", read, total)
+	// The inflate buffer is leased before it is allocated, so the lease's
+	// peak is the most the handler ever held.
+	if p := s.inflate.peak.Load(); p > maxOTLPHTTPBodyBytes {
+		t.Errorf("handler held %d inflated bytes; inflation must stop at the %d byte cap", p, maxOTLPHTTPBodyBytes)
+	}
+	if u := s.inflate.inUse.Load(); u != 0 {
+		t.Errorf("%d budget bytes still leased after the request returned", u)
 	}
 }
 
@@ -382,7 +369,7 @@ func TestOTLPHTTPBadProjectHeaderIgnoredWhenResourceNamesProject(t *testing.T) {
 	}
 }
 
-// ── gRPC: gzip compressor and x-project-name metadata ──────────────────────
+// ── gRPC: x-project-name metadata ──────────────────────────────────────────
 
 // startGRPCOnly boots a gRPC-only server against a stub CH and returns its
 // address plus an accessor for the first `spans` insert body.
@@ -442,38 +429,6 @@ func grpcClient(t *testing.T, addr string) ptraceotlp.GRPCClient {
 	}
 	t.Cleanup(func() { conn.Close() })
 	return ptraceotlp.NewGRPCClient(conn)
-}
-
-// OTel Collector's otlp exporter (and every SDK with
-// OTEL_EXPORTER_OTLP_COMPRESSION=gzip) sends grpc-encoding: gzip. The server
-// must have the gzip compressor registered or the call fails Unimplemented.
-// The test registers nothing itself, so it only passes if the server does.
-func TestGRPCAcceptsGzipCompressedExport(t *testing.T) {
-	addr, sawCH := startGRPCOnly(t, Config{})
-	client := grpcClient(t, addr)
-
-	req := ptraceotlp.NewExportRequestFromTraces(makeTraces("grpc-gzip-span", "12121212-1212-4212-8212-121212121212"))
-	if _, err := client.Export(context.Background(), req, grpc.UseCompressor("gzip")); err != nil {
-		t.Fatalf("gzip-compressed Export: %v", err)
-	}
-	if ch := waitForCH(t, sawCH); !strings.Contains(ch, "grpc-gzip-span") {
-		t.Errorf("CH body missing span name: %q", ch)
-	}
-}
-
-// The gRPC receive cap applies to the inflated message, so a gzip bomb is
-// RESOURCE_EXHAUSTED rather than an allocation of its full size.
-func TestGRPCGzipInflatedOverCapIsResourceExhausted(t *testing.T) {
-	addr, _ := startGRPCOnly(t, Config{GRPCMaxRecvMiB: 1})
-	client := grpcClient(t, addr)
-
-	traces := makeTraces("grpc-bomb-span", "13131313-1313-4313-8313-131313131313")
-	sp := traces.ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0)
-	sp.Attributes().PutStr("raw_log", strings.Repeat("x", 2<<20)) // ~2 KiB compressed
-	_, err := client.Export(context.Background(), ptraceotlp.NewExportRequestFromTraces(traces), grpc.UseCompressor("gzip"))
-	if status.Code(err) != codes.ResourceExhausted {
-		t.Fatalf("want ResourceExhausted for an inflated message over the cap, got %v", err)
-	}
 }
 
 func TestGRPCProjectMetadataNamesProjectWhenResourceHasNone(t *testing.T) {
