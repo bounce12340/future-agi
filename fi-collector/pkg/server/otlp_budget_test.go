@@ -18,9 +18,21 @@ import (
 
 // Tests for the process-wide budget on decompressed gzip bytes (inflateBudget).
 // The per-request 16 MiB cap bounds one request; these check that many
-// concurrent or stalled gzip requests cannot add up past the budget, that a
-// request waits a bounded time for its share in arrival order, and that the
-// lease is exactly the decompressed size, held until the handler returns.
+// concurrent gzip requests cannot add up past the budget, that stalled uploads
+// hold none of it, that a request waits a bounded time for its share in
+// arrival order, and that the lease is exactly the decompressed size, held
+// until the handler returns.
+
+// holdBudget leases n bytes, standing in for in-flight requests; the returned
+// func releases them and may be called more than once.
+func holdBudget(t *testing.T, b *inflateBudget, n int64) func() {
+	t.Helper()
+	lease, err := b.reserve(context.Background(), n)
+	if err != nil {
+		t.Fatalf("hold %d of %d budget bytes: %v", n, b.size, err)
+	}
+	return lease.release
+}
 
 func postGzipTo(s *Server, body []byte) *httptest.ResponseRecorder {
 	return postBody(s, "application/x-protobuf", true, nil, body)
@@ -53,10 +65,7 @@ func TestOTLPHTTPGzipOverInflateBudgetIs503(t *testing.T) {
 
 	s := acceptingServer()
 	s.inflate.wait = 200 * time.Millisecond
-	hold, err := s.inflate.acquire(context.Background(), s.inflate.size-1<<20) // in-flight requests holding all but 1 MiB
-	if err != nil {
-		t.Fatal(err)
-	}
+	hold := holdBudget(t, s.inflate, s.inflate.size-1<<20) // in-flight requests holding all but 1 MiB
 
 	start := time.Now()
 	rec := postGzipTo(s, body)
@@ -89,10 +98,7 @@ func TestOTLPHTTPGzipOverInflateBudgetIs503(t *testing.T) {
 func TestOTLPHTTPGzipWaitsForBudget(t *testing.T) {
 	body := gzipBytes(t, tracesOfSize(t, "wait-span", 2<<20))
 	s := acceptingServer()
-	hold, err := s.inflate.acquire(context.Background(), s.inflate.size)
-	if err != nil {
-		t.Fatal(err)
-	}
+	hold := holdBudget(t, s.inflate, s.inflate.size)
 	time.AfterFunc(200*time.Millisecond, hold)
 	if rec := postGzipTo(s, body); rec.Code != http.StatusOK {
 		t.Fatalf("status %d, want 200 once the budget frees up within the %v wait (%s)", rec.Code, s.inflate.wait, rec.Body.String())
@@ -101,7 +107,7 @@ func TestOTLPHTTPGzipWaitsForBudget(t *testing.T) {
 
 // Waiters are served in arrival order, so a large body waiting for its share
 // is not starved by small bodies that arrive after it. Each gzip request
-// reserves the 16 MiB maximum while streaming, then shrinks to its actual size.
+// leases its decompressed size: about 12 MiB for the large one here.
 func TestOTLPHTTPLargeGzipNotStarvedBySmallOnes(t *testing.T) {
 	s := acceptingServer()
 	s.inflate = newInflateBudget(minGzipInflightBytes) // 16 MiB
@@ -109,11 +115,8 @@ func TestOTLPHTTPLargeGzipNotStarvedBySmallOnes(t *testing.T) {
 	large := gzipBytes(t, tracesOfSize(t, "large-span", 12<<20))
 	small := gzipBytes(t, tracesOfSize(t, "small-span", 1<<20))
 
-	// Other requests hold 8 MiB, so the 16 MiB reservation must wait.
-	hold, err := s.inflate.acquire(context.Background(), 8<<20)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Other requests hold 8 MiB, so the large request's 12 MiB must wait.
+	hold := holdBudget(t, s.inflate, 8<<20)
 	largeCode := make(chan int, 1)
 	go func() { largeCode <- postGzipTo(s, large).Code }()
 	// Wait until the large request is queued: a queued waiter makes
@@ -239,41 +242,72 @@ func TestOTLPHTTPConcurrentGzipBombsStayWithinBudget(t *testing.T) {
 	}
 }
 
-// A gzip upload that stalls part way can hold a reservation while the gzip
-// reader waits for more wire bytes. The reservation is the single-request cap,
-// so it can never pin more than 16 MiB or exceed the process-wide budget.
-func TestOTLPHTTPStalledGzipUploadHoldsAtMostOneBodyReservation(t *testing.T) {
+// A gzip upload that stalls part way holds a connection and its compressed
+// bytes, as a plain upload does, but none of the inflate budget: the body is
+// read off the wire before it leases anything. So uploads that stall forever
+// cannot starve other gzip requests, however many there are. (Leasing before
+// reading let budget/16 MiB stalled uploads, two at GOMEMLIMIT=256MiB, turn
+// every other gzip request away with 503.)
+func TestOTLPHTTPStalledGzipUploadsHoldNoBudget(t *testing.T) {
+	s := acceptingServer()
+	s.inflate = newInflateBudget(32 << 20) // GOMEMLIMIT=256MiB: an eighth
+	s.inflate.wait = 200 * time.Millisecond
 	prefix := zeroGzipMembers(t, 12) // ~12 KiB that inflates to 12 MiB
-	pr, pw := io.Pipe()
-	req := httptest.NewRequest(http.MethodPost, "/v1/traces", pr)
-	req.Header.Set("Content-Type", "application/x-protobuf")
-	req.Header.Set("Content-Encoding", "gzip")
-	rec := httptest.NewRecorder()
-	s := directServer()
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		s.handleHTTPTraces(rec, req)
+	const stalled = 3 // one more than the budget fits at 16 MiB each
+	pipes := make([]*io.PipeWriter, stalled)
+	codes := make([]chan int, stalled)
+	for i := range pipes {
+		pr, pw := io.Pipe()
+		pipes[i] = pw
+		codes[i] = make(chan int, 1)
+		req := httptest.NewRequest(http.MethodPost, "/v1/traces", pr)
+		req.Header.Set("Content-Type", "application/x-protobuf")
+		req.Header.Set("Content-Encoding", "gzip")
+		go func(c chan int) {
+			rec := httptest.NewRecorder()
+			s.handleHTTPTraces(rec, req)
+			c <- rec.Code
+		}(codes[i])
+		// io.Pipe returns from Write once the handler has read all of it.
+		wrote := make(chan error, 1)
+		go func() { _, err := pw.Write(prefix); wrote <- err }()
+		select {
+		case err := <-wrote:
+			if err != nil {
+				t.Fatalf("upload %d: write prefix: %v", i, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Errorf("upload %d: the handler stopped reading the body", i)
+		}
+	}
+	defer func() {
+		for _, pw := range pipes {
+			_ = pw.CloseWithError(io.ErrUnexpectedEOF)
+		}
 	}()
-	// io.Pipe returns from Write only once the handler has read all of it.
-	if _, err := pw.Write(prefix); err != nil {
-		t.Fatalf("write prefix: %v", err)
-	}
-	if held := s.inflate.inUse.Load(); held != maxOTLPHTTPBodyBytes {
-		t.Errorf("stalled request holds %d bytes; want its %d-byte maximum reservation", held, maxOTLPHTTPBodyBytes)
-	}
-	if p := s.inflate.peak.Load(); p > maxOTLPHTTPBodyBytes {
-		t.Errorf("stalled request reserved %d bytes, over the per-body cap", p)
-	}
-	_ = pw.CloseWithError(io.ErrUnexpectedEOF) // the sender gives up
-	<-done
 
-	if rec.Code != http.StatusBadRequest {
-		t.Errorf("status %d after the sender gave up, want 400", rec.Code)
+	if held := s.inflate.inUse.Load(); held != 0 {
+		t.Errorf("%d stalled uploads hold %d budget bytes, want 0", stalled, held)
+	}
+	body := gzipBytes(t, tracesOfSize(t, "during-stall", 1<<20))
+	if rec := postGzipTo(s, body); rec.Code != http.StatusOK {
+		t.Fatalf("gzip request while %d uploads stall: status %d, want 200 (%s)", stalled, rec.Code, rec.Body.String())
+	}
+
+	for i, pw := range pipes {
+		_ = pw.CloseWithError(io.ErrUnexpectedEOF) // the sender gives up
+		select {
+		case code := <-codes[i]:
+			if code != http.StatusBadRequest {
+				t.Errorf("upload %d: status %d after the sender gave up, want 400", i, code)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("upload %d: handler did not return after the sender gave up", i)
+		}
 	}
 	if u := s.inflate.inUse.Load(); u != 0 {
-		t.Errorf("%d budget bytes still leased after the request returned", u)
+		t.Errorf("%d budget bytes still leased after every request returned", u)
 	}
 }
 

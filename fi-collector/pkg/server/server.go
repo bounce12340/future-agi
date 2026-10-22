@@ -46,9 +46,9 @@ type Config struct {
 	BatchMaxRows   int           `yaml:"batch_max_rows"`    // flush after N rows
 	BatchMaxAge    time.Duration `yaml:"batch_max_age"`     // flush after X time
 	GRPCMaxRecvMiB int           `yaml:"grpc_max_recv_mib"` // max gRPC message size in MiB; default + rationale in New()
-	// GzipInflightMiB caps the decompressed bytes all gzip OTLP/HTTP requests
-	// hold at once (see inflateBudget). 0 = 128, or GOMEMLIMIT/8 when lower;
-	// never below 16.
+	// GzipInflightMiB caps the decompressed body bytes all gzip OTLP/HTTP
+	// requests hold at once (see inflateBudget). 0 = 128, or GOMEMLIMIT/8
+	// when lower; never below 16.
 	GzipInflightMiB int `yaml:"gzip_inflight_mib"`
 }
 
@@ -224,9 +224,9 @@ func (s *Server) Run(ctx context.Context) error {
 		// make the collector inflate up to MaxRecvMsgSize per call for a few
 		// KiB of upload. Enabling gzip needs the key checked first, in a tap
 		// handle on the call's metadata. Until then a gzip call gets
-		// UNIMPLEMENTED before its message is read, and OTLP/HTTP accepts gzip
-		// under the budget. TestGRPCGzipDecompressorIsNotRegistered
-		// (cmd/fi-collector) fails if any import registers one.
+		// UNIMPLEMENTED before its message is read, and OTLP/HTTP accepts
+		// gzip. TestGRPCGzipDecompressorIsNotRegistered (cmd/fi-collector)
+		// fails if any import registers one.
 		grpcOpts := []grpc.ServerOption{
 			grpc.MaxRecvMsgSize(s.cfg.GRPCMaxRecvMiB << 20),
 			grpc.StatsHandler(&grpcErrLogger{log: s.log}),
@@ -466,10 +466,11 @@ func (s *Server) handleHTTPTraces(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A gzip request reserves its maximum decompressed size from the
-	// process-wide inflate budget before streaming, then shrinks the lease to
-	// its exact decompressed size and holds it until the handler returns. The
-	// lease covers decompressed bytes only, not decoding allocations (TH-8745).
+	// The 16 MiB cap applies to the body as sent and, for gzip, again after
+	// decompression. A gzip body is read in full, then leases exactly its
+	// decompressed size from the process-wide inflate budget until the
+	// handler returns. The lease covers the decompressed body only, not
+	// decoding allocations (TH-8745).
 	body, release, err := readOTLPHTTPBody(w, r, gzipped, maxOTLPHTTPBodyBytes, s.inflate)
 	defer release()
 	if err != nil {
@@ -602,7 +603,7 @@ func trimSpace(s string) string {
 func (s *Server) rejectBusy(w http.ResponseWriter, r *http.Request) {
 	if ok, held := s.inflate.busyLog.allow(time.Now()); ok {
 		s.log.Warn("gzip inflate budget busy, request rejected",
-			"path", r.URL.Path, "budget_bytes", s.inflate.size, "suppressed", held)
+			"path", r.URL.Path, "budget_bytes", s.inflate.size, "in_use_bytes", s.inflate.inUse.Load(), "suppressed", held)
 	}
 	w.Header().Set("Retry-After", "1")
 	http.Error(w, "server busy decompressing other requests, retry later", http.StatusServiceUnavailable)

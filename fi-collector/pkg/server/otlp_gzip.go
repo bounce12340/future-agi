@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"errors"
@@ -38,58 +39,82 @@ func otlpContentCoding(h http.Header) (gzipped, ok bool) {
 // 16 MiB OTLP/HTTP cap.
 var errInflatedBodyTooLarge = errors.New("decompressed body over size cap")
 
-// readOTLPHTTPBody reads at most limit bytes from an uncompressed body, or
-// streams a gzip body through a decompressed-size limit. Gzip requests reserve
-// limit bytes before inflation so the buffer's maximum output is accounted for
-// while it grows; once the exact decompressed size is known, the reservation is
-// shrunk to that size. The caller holds the returned lease until the handler
-// returns. The gzip wire stream is not capped or retained in memory; the OTLP
-// body limit applies after decompression, like the upstream Collector.
+// readOTLPHTTPBody reads the request body with limit applied twice, as the
+// upstream Collector's confighttp applies max_request_body_size: to the body
+// as sent (http.MaxBytesReader, a 413), and for gzip to the decompressed body
+// too (errInflatedBodyTooLarge, a 413).
+//
+// A gzip body is read off the wire in full before it touches the inflate
+// budget, so a slow or stalled upload holds a connection and its compressed
+// bytes, as a plain body does, but no lease. The lease is held from inflation
+// until the handler returns; the caller calls release.
 func readOTLPHTTPBody(w http.ResponseWriter, r *http.Request, gzipped bool, limit int64, budget *inflateBudget) (body []byte, release func(), err error) {
-	if !gzipped {
-		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
-		return body, noRelease, err
+	wire, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
+	if err != nil || !gzipped {
+		return wire, noRelease, err
 	}
-	return inflateGzip(r.Context(), r.Body, limit, budget)
+	return inflateGzip(r.Context(), wire, limit, budget)
 }
 
 func noRelease() {}
 
-// inflateGzip streams the gzip body through a limit of limit+1 decompressed
-// bytes. It reserves the maximum body size before inflating, then shrinks the
-// lease to the actual decompressed length. The lease is released on errors and
-// returned to the caller on success.
+// inflateGzip decompresses a gzip body that is already in memory into a
+// buffer of exactly its decompressed size, leased from budget.
 //
-// The request body is not buffered on the wire. A slow upload does not hold an
-// inflated buffer; once the gzip reader consumes bytes, it writes no more than
-// limit+1 decompressed bytes. A body with more than limit decompressed bytes
-// returns errInflatedBodyTooLarge (413). Any gzip header, trailer, checksum,
-// or stream error before that limit is reached is malformed (400).
-func inflateGzip(ctx context.Context, wire io.Reader, limit int64, budget *inflateBudget) ([]byte, func(), error) {
-	lease, err := budget.reserve(ctx, limit)
+// It inflates twice. The first pass only counts the output, stopping at
+// limit+1 bytes, and allocates nothing but the gzip reader: a corrupt stream
+// is a 400 and an over-cap one a 413 before any lease is taken. The second
+// pass, under a lease of exactly that size, inflates into a buffer of that
+// size, so the lease equals both what is allocated and what is kept. The
+// price is decompressing an accepted body twice.
+//
+// The lease counts the decompressed body only. Decoding it into a request and
+// rows allocates more, for gzip and plain bodies alike.
+func inflateGzip(ctx context.Context, wire []byte, limit int64, budget *inflateBudget) ([]byte, func(), error) {
+	zr, err := gzip.NewReader(bytes.NewReader(wire))
+	if err != nil {
+		return nil, noRelease, gzipBodyError(err)
+	}
+	n, err := io.Copy(io.Discard, io.LimitReader(zr, limit+1))
+	if err == nil {
+		err = zr.Close()
+	}
+	switch {
+	case err != nil:
+		return nil, noRelease, gzipBodyError(err)
+	case n > limit:
+		return nil, noRelease, errInflatedBodyTooLarge
+	case n == 0:
+		return []byte{}, noRelease, nil
+	}
+
+	lease, err := budget.reserve(ctx, n)
 	if err != nil {
 		return nil, noRelease, errInflateBudgetBusy
 	}
-	zr, err := gzip.NewReader(wire)
-	if err != nil {
+	body := make([]byte, n)
+	if err := gunzipExactly(zr, wire, body); err != nil {
 		lease.release()
 		return nil, noRelease, gzipBodyError(err)
 	}
-	body, err := io.ReadAll(io.LimitReader(zr, limit+1))
-	closeErr := zr.Close()
-	if err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		lease.release()
-		return nil, noRelease, gzipBodyError(err)
-	}
-	if int64(len(body)) > limit {
-		lease.release()
-		return nil, noRelease, errInflatedBodyTooLarge
-	}
-	lease.shrink(int64(len(body)))
 	return body, lease.release, nil
+}
+
+// gunzipExactly inflates wire into body, which must be exactly its
+// decompressed size. The first pass already checked that size and the
+// checksums, so an error here means the two passes disagree.
+func gunzipExactly(zr *gzip.Reader, wire, body []byte) error {
+	if err := zr.Reset(bytes.NewReader(wire)); err != nil {
+		return err
+	}
+	if _, err := io.ReadFull(zr, body); err != nil {
+		return err
+	}
+	var extra [1]byte
+	if m, err := zr.Read(extra[:]); m != 0 || err != io.EOF {
+		return errors.New("decompressed size changed between passes")
+	}
+	return zr.Close()
 }
 
 // gzipBodyError labels a corrupt or truncated gzip stream (a 400).

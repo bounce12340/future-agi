@@ -227,10 +227,10 @@ func TestOTLPHTTPGzipBombIs413AndStopsAtTheCap(t *testing.T) {
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status %d, want 413 (%s)", rec.Code, rec.Body.String())
 	}
-	// The inflate buffer is leased before it is allocated, so the lease's
-	// peak is the most the handler ever held.
-	if p := s.inflate.peak.Load(); p > maxOTLPHTTPBodyBytes {
-		t.Errorf("handler held %d inflated bytes; inflation must stop at the %d byte cap", p, maxOTLPHTTPBodyBytes)
+	// The body is measured before anything is leased or allocated for it, so
+	// a bomb never leases any budget.
+	if p := s.inflate.peak.Load(); p != 0 {
+		t.Errorf("an over-cap body leased %d budget bytes, want none", p)
 	}
 	if u := s.inflate.inUse.Load(); u != 0 {
 		t.Errorf("%d budget bytes still leased after the request returned", u)

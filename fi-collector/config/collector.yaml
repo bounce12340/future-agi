@@ -30,8 +30,9 @@ server:
   grpc_addr: ":4317"
   # OTLP/HTTP receiver (browser SDKs + lightweight clients).
   # Accepts POST /v1/traces with application/x-protobuf or application/json,
-  # uncompressed or Content-Encoding: gzip (16 MiB cap after decompression),
-  # per https://opentelemetry.io/docs/specs/otlp/#otlphttp. X-Project-Name
+  # uncompressed or Content-Encoding: gzip (16 MiB cap as sent and, for gzip,
+  # after decompression), per
+  # https://opentelemetry.io/docs/specs/otlp/#otlphttp. X-Project-Name
   # (alias FI-Project-Name; the same keys as gRPC metadata) names the project
   # for ResourceSpans that carry no project_name resource attribute.
   # Set "" (or FI_HTTP_ADDR=disable) to turn the listener off.
@@ -41,13 +42,15 @@ server:
   # Max gRPC receive message size in MiB (FI_GRPC_MAX_RECV_MIB); 16 matches
   # the OTLP/HTTP body cap. gRPC accepts uncompressed calls only.
   grpc_max_recv_mib: 16
-  # Decompressed bytes that all gzip OTLP/HTTP requests may hold at once, in
-  # MiB (FI_GZIP_INFLIGHT_MIB). Each gzip request reserves at most 16 MiB
-  # while streaming, then leases its exact decompressed size until the handler
-  # returns. This covers decompressed bytes only, not what decoding allocates.
-  # Unset: 128, or GOMEMLIMIT/8 when that is lower; never below 16, so one
-  # full-size body always fits. A request waits up to 2 s for a reservation in
-  # arrival order, then gets 503 + Retry-After and the exporter retries.
+  # Decompressed body bytes that all gzip OTLP/HTTP requests may hold at
+  # once, in MiB (FI_GZIP_INFLIGHT_MIB). A gzip request is read in full and
+  # measured first, then leases exactly its decompressed size (at most 16 MiB)
+  # until the handler returns; so a 32 MiB budget decodes at most two
+  # full-size gzip bodies at a time. The lease counts the decompressed body
+  # only, not the compressed bytes or what decoding allocates. Unset: 128, or
+  # GOMEMLIMIT/8 when that is lower; never below 16, so one full-size body
+  # always fits. A request waits up to 2 s for its lease in arrival order,
+  # then gets 503 + Retry-After and the exporter retries.
   # gzip_inflight_mib: 128
 
 auth:

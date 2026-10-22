@@ -25,27 +25,28 @@ const minGzipInflightBytes = maxOTLPHTTPBodyBytes
 const gzipInflightWait = 2 * time.Second
 
 // inflateBudget caps the decompressed bytes that all in-flight gzip OTLP/HTTP
-// requests hold at once. The 16 MiB cap bounds one request. Before streaming
-// decompression, a request reserves that maximum (so it can safely allocate
-// up to the cap without holding a partial lease); when decompression finishes,
-// the reservation is shrunk to the exact decompressed size. It holds that
-// lease until the handler returns.
+// requests hold at once. The 16 MiB cap bounds one request. A gzip request is
+// read off the wire and measured (see inflateGzip) before it leases anything;
+// it then leases exactly its decompressed size, inflates into a buffer of that
+// size, and holds the lease until the handler returns. A body that is corrupt
+// or over the cap never takes a lease.
 //
-// The lease covers decompressed bytes only, not what decoding them allocates:
-// the decoded request and its rows can take several times the body size, for
-// gzip and plain bodies alike (TH-8745). Uncompressed bodies are not counted.
+// The lease counts decompressed body bytes only. It does not count the
+// compressed bytes read off the wire, or what decoding the body allocates: the
+// decoded request and its rows can take several times the body size, for gzip
+// and plain bodies alike (TH-8745). Uncompressed bodies are not counted.
 //
 // Waiters are served in order (golang.org/x/sync/semaphore is FIFO), so a large
 // body is not starved by a stream of small ones. A request that does not get
-// its reservation within wait is answered 503 with Retry-After, which OTLP
-// exporters retry.
+// its lease within wait is answered 503 with Retry-After, which OTLP exporters
+// retry.
 type inflateBudget struct {
 	sem  *semaphore.Weighted
 	size int64
 	wait time.Duration
 
-	inUse atomic.Int64 // bytes leased right now
-	peak  atomic.Int64 // most bytes ever leased at once
+	inUse atomic.Int64 // bytes leased right now; logged when a request is turned away
+	peak  atomic.Int64 // most bytes ever leased at once; read by tests
 
 	// One log line per second per rejection reason, so a flood of cheap
 	// rejected requests is not also a flood of log lines.
@@ -77,9 +78,8 @@ func gzipInflightBytes(mib int) int64 {
 var errInflateBudgetBusy = errors.New("inflate budget busy")
 
 // reserve leases n bytes, waiting up to b.wait (or until ctx ends) behind
-// earlier waiters. n is normally the 16 MiB per-body cap. The returned lease
-// can be shrunk after the decompressed size is known, and released on error or
-// after the handler returns.
+// earlier waiters. n is a body's decompressed size, at most the 16 MiB cap.
+// The caller releases the lease when the handler returns, or on error.
 func (b *inflateBudget) reserve(ctx context.Context, n int64) (*inflateLease, error) {
 	if n < 0 || n > b.size {
 		return nil, errInflateBudgetBusy
@@ -95,16 +95,6 @@ func (b *inflateBudget) reserve(ctx context.Context, n int64) (*inflateLease, er
 	return &inflateLease{b: b, held: n}, nil
 }
 
-// acquire is a test helper for an outstanding reservation; release returns it
-// and may be called more than once.
-func (b *inflateBudget) acquire(ctx context.Context, n int64) (func(), error) {
-	lease, err := b.reserve(ctx, n)
-	if err != nil {
-		return nil, err
-	}
-	return lease.release, nil
-}
-
 // inflateLease is a request's in-flight share of a budget.
 type inflateLease struct {
 	b    *inflateBudget
@@ -112,27 +102,11 @@ type inflateLease struct {
 	once sync.Once
 }
 
-// shrink releases the unused reservation after the exact decompressed size is
-// known. It must be called before release and with 0 <= n <= held.
-func (l *inflateLease) shrink(n int64) {
-	if n < 0 || n > l.held {
-		panic("inflate lease shrink outside reservation")
-	}
-	unused := l.held - n
-	if unused == 0 {
-		return
-	}
-	l.held = n
-	l.b.inUse.Add(-unused)
-	l.b.sem.Release(unused)
-}
-
 // release returns the lease and may be called more than once.
 func (l *inflateLease) release() {
 	l.once.Do(func() {
 		l.b.inUse.Add(-l.held)
 		l.b.sem.Release(l.held)
-		l.held = 0
 	})
 }
 
