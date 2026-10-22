@@ -6,8 +6,9 @@ import (
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
-// maxDecodeNesting is the deepest message nesting accepted in an OTLP/HTTP
-// protobuf body, counted from the ExportTraceServiceRequest (depth 0). An
+// maxDecodeNesting is the deepest message nesting accepted in an OTLP
+// protobuf request, over HTTP or gRPC, counted from the
+// ExportTraceServiceRequest (depth 0). An
 // attribute value sits 5 levels down, and each nested array adds 2 (AnyValue,
 // ArrayValue), so this allows about 5,000 nested arrays. It matches
 // protobuf-go's default recursion limit and jsoniter's maxDepth, which already
@@ -19,8 +20,9 @@ var errNestingTooDeep = fmt.Errorf("nesting deeper than %d levels", maxDecodeNes
 // checkProtoNesting refuses an ExportTraceServiceRequest body nested deeper
 // than maxDecodeNesting, before it is decoded. pdata's protobuf decoder
 // recurses once per level with no limit, so about 1.2M nested arrays (2.4M
-// levels, an 11 MiB body) overflow the 1 GB goroutine stack: a fatal error
-// that kills the process.
+// levels, an 11 MiB body) would overflow the 1 GB goroutine stack: a fatal
+// error that no recover catches. The OTLP/HTTP handler calls it, and so does
+// the gRPC server's codec (nestingCheckedCodec).
 //
 // The walk follows the OTLP trace schema with protowire and allocates nothing.
 // Malformed protobuf is an error too: the walk cannot see past it, and the

@@ -230,6 +230,9 @@ func (s *Server) Run(ctx context.Context) error {
 		grpcOpts := []grpc.ServerOption{
 			grpc.MaxRecvMsgSize(s.cfg.GRPCMaxRecvMiB << 20),
 			grpc.StatsHandler(&grpcErrLogger{log: s.log}),
+			// The nesting limit, checked before a request is decoded
+			// (nestingCheckedCodec).
+			grpc.ForceServerCodecV2(newNestingCheckedCodec()),
 		}
 		if s.auth != nil {
 			grpcOpts = append(grpcOpts, grpc.UnaryInterceptor(s.auth.GRPCInterceptor()))

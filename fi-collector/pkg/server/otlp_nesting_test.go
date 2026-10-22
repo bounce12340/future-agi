@@ -2,19 +2,29 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/mem"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protowire"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
-// Tests for the nesting limit on OTLP/HTTP bodies (otlp_nesting.go). pdata's
-// protobuf decoder recurses once per nested message with no limit, so a deep
-// enough body overflows the goroutine stack: a fatal error that no recover
-// catches, which kills the process. The handler refuses such a body first.
+// Tests for the nesting limit on OTLP protobuf requests (otlp_nesting.go).
+// pdata's protobuf decoder recurses once per nested message with no limit, so
+// a deep enough body overflows the goroutine stack: a fatal error that no
+// recover catches, which kills the process. The HTTP handler and the gRPC
+// server's codec refuse such a body first.
 
 // pbField is one length-delimited field: tag, length, payload.
 func pbField(field protowire.Number, payload []byte) []byte {
@@ -129,6 +139,74 @@ func TestOTLPHTTPDeeplyNestedProtobufIs400(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// rawProtoCodec sends and receives already-encoded protobuf bytes, so a test
+// can put any bytes on the gRPC wire.
+type rawProtoCodec struct{}
+
+func (rawProtoCodec) Marshal(v any) ([]byte, error) { return *v.(*[]byte), nil }
+func (rawProtoCodec) Unmarshal(b []byte, v any) error {
+	*v.(*[]byte) = append([]byte(nil), b...)
+	return nil
+}
+func (rawProtoCodec) Name() string { return "proto" }
+
+// gRPC requests get the same nesting limit, checked by the server's codec
+// before the request is decoded, because grpc-go decodes before any
+// interceptor runs. On dev, the 1.5M-array request (14.5 MiB, under the 16 MiB
+// receive cap) overflows the decoder's stack: "goroutine stack exceeds
+// 1000000000-byte limit", a fatal error that ends this test binary.
+func TestGRPCDeeplyNestedProtobufIsRefused(t *testing.T) {
+	addr, _ := startGRPCOnly(t, Config{})
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	export := func(body []byte) error {
+		var resp []byte
+		return conn.Invoke(context.Background(), "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
+			&body, &resp, grpc.ForceCodec(rawProtoCodec{}))
+	}
+
+	if err := export(pbDeepAttr(arraysAtLimit)); err != nil {
+		t.Errorf("%d nested arrays (at the limit): %v, want OK", arraysAtLimit, err)
+	}
+	for _, arrays := range []int{arraysAtLimit + 1, 1_500_000} {
+		err := export(pbDeepAttr(arrays))
+		if status.Code(err) != codes.Internal || !strings.Contains(err.Error(), "nesting") {
+			t.Errorf("%d nested arrays: %v, want INTERNAL naming the nesting", arrays, err)
+		}
+	}
+	// The server is still up and decodes ordinary requests.
+	req := ptraceotlp.NewExportRequestFromTraces(makeTraces("after-deep", "17171717-1717-4717-8717-171717171717"))
+	if _, err := ptraceotlp.NewGRPCClient(conn).Export(context.Background(), req); err != nil {
+		t.Errorf("ordinary Export after the deep ones: %v", err)
+	}
+}
+
+// The codec checks only ExportTraceServiceRequest, whose schema the walk
+// follows; any other message decodes as grpc-go's proto codec decodes it.
+func TestNestingCheckedCodecChecksOnlyTraceExports(t *testing.T) {
+	codec := newNestingCheckedCodec()
+	// As an ExportTraceServiceRequest, field 1 would be a truncated
+	// ResourceSpans; as a BytesValue it is plain bytes.
+	payload := []byte{0x0a, 0x05, 0x00}
+	wire, err := proto.Marshal(wrapperspb.Bytes(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got wrapperspb.BytesValue
+	if err := codec.Unmarshal(mem.BufferSlice{mem.SliceBuffer(wire)}, &got); err != nil {
+		t.Fatalf("BytesValue: %v, want it decoded unchecked", err)
+	}
+	if !bytes.Equal(got.GetValue(), payload) {
+		t.Errorf("BytesValue decoded to %x, want %x", got.GetValue(), payload)
+	}
+	if isTraceExportRequest(&got) || isTraceExportRequest(struct{}{}) {
+		t.Error("only an ExportTraceServiceRequest is a trace export")
 	}
 }
 
