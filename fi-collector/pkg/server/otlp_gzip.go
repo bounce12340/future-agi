@@ -61,18 +61,25 @@ func noRelease() {}
 // inflateGzip decompresses a gzip body that is already in memory into a
 // buffer of exactly its decompressed size, leased from budget.
 //
-// It inflates twice. The first pass only counts the output, stopping at
-// limit+1 bytes, and allocates nothing but the gzip reader: a corrupt stream
-// is a 400 and an over-cap one a 413 before any lease is taken. The second
-// pass, under a lease of exactly that size, inflates into a buffer of that
-// size, so the lease equals both what is allocated and what is kept. The
-// price is decompressing an accepted body twice.
+// It reserves limit bytes before either inflate pass, but only after the
+// complete wire body has arrived. The first pass only counts the output,
+// stopping at limit+1 bytes; it allocates no decompressed buffer. A corrupt
+// stream is a 400 and an over-cap one a 413, and either error releases the
+// reservation. For a valid body, the lease shrinks to the exact decompressed
+// size, and the second pass inflates into a buffer of exactly that size. Thus
+// all decompression is under a lease, while the wire upload is not. The price
+// is decompressing an accepted body twice.
 //
 // The lease counts the decompressed body only. Decoding it into a request and
 // rows allocates more, for gzip and plain bodies alike.
 func inflateGzip(ctx context.Context, wire []byte, limit int64, budget *inflateBudget) ([]byte, func(), error) {
+	lease, err := budget.reserve(ctx, limit)
+	if err != nil {
+		return nil, noRelease, errInflateBudgetBusy
+	}
 	zr, err := gzip.NewReader(bytes.NewReader(wire))
 	if err != nil {
+		lease.release()
 		return nil, noRelease, gzipBodyError(err)
 	}
 	n, err := io.Copy(io.Discard, io.LimitReader(zr, limit+1))
@@ -81,17 +88,17 @@ func inflateGzip(ctx context.Context, wire []byte, limit int64, budget *inflateB
 	}
 	switch {
 	case err != nil:
+		lease.release()
 		return nil, noRelease, gzipBodyError(err)
 	case n > limit:
+		lease.release()
 		return nil, noRelease, errInflatedBodyTooLarge
 	case n == 0:
+		lease.release()
 		return []byte{}, noRelease, nil
 	}
 
-	lease, err := budget.reserve(ctx, n)
-	if err != nil {
-		return nil, noRelease, errInflateBudgetBusy
-	}
+	lease.shrink(n)
 	body := make([]byte, n)
 	if err := gunzipExactly(zr, wire, body); err != nil {
 		lease.release()

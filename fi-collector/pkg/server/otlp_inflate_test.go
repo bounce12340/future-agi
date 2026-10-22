@@ -12,17 +12,17 @@ import (
 )
 
 // Tests for gzip inflation (otlp_gzip.go). A gzip body is read off the wire,
-// measured, and only then leases exactly its decompressed size, inflating into
-// a buffer of that size; a corrupt or over-cap body takes no lease.
+// reserves the per-body maximum before either inflate pass, then shrinks to
+// exactly its decompressed size and inflates into a buffer of that size.
 
 // acceptingServer enqueues accepted rows and never flushes them.
 func acceptingServer() *Server {
 	return New(Config{BatchMaxRows: 1 << 30, BatchMaxAge: time.Hour}, nil, nil, nil, nil)
 }
 
-// A request leases exactly its decompressed size, and the buffer it gets is
-// that size too (capacity included), so the lease is what the body holds.
-// It keeps the lease until the handler releases it.
+// A request reserves the 16 MiB maximum for the count pass, then shrinks the
+// lease to its exact decompressed size. The buffer is that size too (capacity
+// included), so the lease is what the body holds. It stays until handler return.
 func TestInflateGzipLeasesExactlyTheDecompressedSize(t *testing.T) {
 	cases := map[string][]byte{
 		"random body":         bytes.Repeat([]byte("0123456789abcdef"), 1<<14),
@@ -41,8 +41,8 @@ func TestInflateGzipLeasesExactlyTheDecompressedSize(t *testing.T) {
 			if c := cap(out); c != len(raw) {
 				t.Errorf("buffer capacity %d for a %d byte body; want exactly the body size", c, len(raw))
 			}
-			if p := b.peak.Load(); p != int64(len(raw)) {
-				t.Errorf("leased at most %d bytes, want exactly the decompressed size %d", p, len(raw))
+			if p := b.peak.Load(); p != maxOTLPHTTPBodyBytes {
+				t.Errorf("first inflate pass leased %d bytes, want the per-body maximum %d", p, maxOTLPHTTPBodyBytes)
 			}
 			if held := b.inUse.Load(); held != int64(len(raw)) {
 				t.Errorf("leased %d bytes after inflate, want exact decompressed size %d", held, len(raw))
@@ -72,9 +72,9 @@ func TestInflateGzipReadsAllMembers(t *testing.T) {
 	}
 }
 
-// A gzip bomb is stopped as soon as it expands past 16 MiB, before it leases
-// any budget. This checks the decompressed stream limit, not the gzip trailer
-// or compressed wire size.
+// A gzip bomb is stopped as soon as it expands past 16 MiB. It holds the
+// per-body maximum reservation during that count pass, then releases it; this
+// checks the decompressed stream limit, not the gzip trailer or wire size.
 func TestOTLPHTTPGzipBombIs413WithinDecompressedCap(t *testing.T) {
 	zeros := gzipBytes(t, make([]byte, 64<<20))
 	cases := map[string][]byte{
@@ -90,8 +90,8 @@ func TestOTLPHTTPGzipBombIs413WithinDecompressedCap(t *testing.T) {
 			if rec.Code != http.StatusRequestEntityTooLarge {
 				t.Fatalf("status %d, want 413 (%s)", rec.Code, rec.Body.String())
 			}
-			if p := s.inflate.peak.Load(); p != 0 {
-				t.Errorf("an over-cap body leased %d budget bytes, want none", p)
+			if p := s.inflate.peak.Load(); p != maxOTLPHTTPBodyBytes {
+				t.Errorf("over-cap body reserved %d bytes during the count pass, want %d", p, maxOTLPHTTPBodyBytes)
 			}
 			if u := s.inflate.inUse.Load(); u != 0 {
 				t.Errorf("%d budget bytes still leased after the request returned", u)

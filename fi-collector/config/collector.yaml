@@ -43,13 +43,14 @@ server:
   # the OTLP/HTTP body cap. gRPC accepts uncompressed calls only.
   grpc_max_recv_mib: 16
   # Decompressed body bytes that all gzip OTLP/HTTP requests may hold at
-  # once, in MiB (FI_GZIP_INFLIGHT_MIB). A gzip request is read in full and
-  # measured first, then leases exactly its decompressed size (at most 16 MiB)
-  # until the handler returns; so a 32 MiB budget decodes at most two
-  # full-size gzip bodies at a time. The lease counts the decompressed body
-  # only, not the compressed bytes or what decoding allocates. Unset: 128, or
-  # GOMEMLIMIT/8 when that is lower; never below 16, so one full-size body
-  # always fits. A request waits up to 2 s for its lease in arrival order,
+  # once, in MiB (FI_GZIP_INFLIGHT_MIB). After the gzip request is read in
+  # full, it reserves 16 MiB for the count/inflate pass, then shrinks to its
+  # exact decompressed size (at most 16 MiB) until the handler returns. A
+  # 32 MiB budget can inflate at most two full-size bodies at a time; smaller
+  # bodies use their exact size after the count pass. The lease counts
+  # decompressed body bytes only, not compressed bytes or decoded data. Unset:
+  # 128, or GOMEMLIMIT/8 when that is lower; never below 16, so one full-size
+  # body always fits. A request waits up to 2 s for a lease in arrival order,
   # then gets 503 + Retry-After and the exporter retries.
   # gzip_inflight_mib: 128
 

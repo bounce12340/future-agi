@@ -93,6 +93,27 @@ func TestOTLPHTTPGzipOverInflateBudgetIs503(t *testing.T) {
 	}
 }
 
+// The count-only inflate pass also consumes the budget. While the budget is
+// held, even a corrupt gzip body waits and gets the budget's 503 before the
+// decoder can inspect it; once the budget is free, that same body is a 400.
+func TestOTLPHTTPGzipBudgetCoversTheFirstInflatePass(t *testing.T) {
+	s := acceptingServer()
+	s.inflate.wait = 50 * time.Millisecond
+	bad := []byte("not gzip")
+	hold := holdBudget(t, s.inflate, s.inflate.size)
+	start := time.Now()
+	if rec := postGzipTo(s, bad); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("with the budget held, got %d, want 503 before gzip is inspected (%s)", rec.Code, rec.Body.String())
+	}
+	if waited := time.Since(start); waited < s.inflate.wait {
+		t.Errorf("waited %v, want to wait for the budget before inspecting the body", waited)
+	}
+	hold()
+	if rec := postGzipTo(s, bad); rec.Code != http.StatusBadRequest {
+		t.Fatalf("with the budget free, got %d, want 400 for corrupt gzip (%s)", rec.Code, rec.Body.String())
+	}
+}
+
 // A request that finds the budget full waits for it instead of failing at
 // once, and gets 200 when the budget frees up within the wait.
 func TestOTLPHTTPGzipWaitsForBudget(t *testing.T) {

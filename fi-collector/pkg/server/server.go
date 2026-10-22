@@ -467,10 +467,10 @@ func (s *Server) handleHTTPTraces(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// The 16 MiB cap applies to the body as sent and, for gzip, again after
-	// decompression. A gzip body is read in full, then leases exactly its
-	// decompressed size from the process-wide inflate budget until the
-	// handler returns. The lease covers the decompressed body only, not
-	// decoding allocations (TH-8745).
+	// decompression. A gzip body is read in full, then reserves 16 MiB for the
+	// count pass. On success that shrinks to the exact decompressed size and
+	// remains leased until the handler returns. The lease covers decompressed
+	// body bytes only, not decoding allocations (TH-8745).
 	body, release, err := readOTLPHTTPBody(w, r, gzipped, maxOTLPHTTPBodyBytes, s.inflate)
 	defer release()
 	if err != nil {

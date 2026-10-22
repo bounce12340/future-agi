@@ -26,10 +26,11 @@ const gzipInflightWait = 2 * time.Second
 
 // inflateBudget caps the decompressed bytes that all in-flight gzip OTLP/HTTP
 // requests hold at once. The 16 MiB cap bounds one request. A gzip request is
-// read off the wire and measured (see inflateGzip) before it leases anything;
-// it then leases exactly its decompressed size, inflates into a buffer of that
-// size, and holds the lease until the handler returns. A body that is corrupt
-// or over the cap never takes a lease.
+// read off the wire before it leases anything. It then reserves the per-body
+// maximum for the first inflate/count pass, shrinks to the exact decompressed
+// size and inflates into a buffer of that size. A corrupt or over-cap body
+// releases the reservation. Valid requests hold their lease until the handler
+// returns.
 //
 // The lease counts decompressed body bytes only. It does not count the
 // compressed bytes read off the wire, or what decoding the body allocates: the
@@ -78,8 +79,9 @@ func gzipInflightBytes(mib int) int64 {
 var errInflateBudgetBusy = errors.New("inflate budget busy")
 
 // reserve leases n bytes, waiting up to b.wait (or until ctx ends) behind
-// earlier waiters. n is a body's decompressed size, at most the 16 MiB cap.
-// The caller releases the lease when the handler returns, or on error.
+// earlier waiters. n is normally the 16 MiB per-body cap; the caller shrinks
+// it to the decompressed size after measuring, then releases it when the
+// handler returns or on error.
 func (b *inflateBudget) reserve(ctx context.Context, n int64) (*inflateLease, error) {
 	if n < 0 || n > b.size {
 		return nil, errInflateBudgetBusy
@@ -93,6 +95,21 @@ func (b *inflateBudget) reserve(ctx context.Context, n int64) (*inflateLease, er
 	for p := b.peak.Load(); now > p && !b.peak.CompareAndSwap(p, now); p = b.peak.Load() {
 	}
 	return &inflateLease{b: b, held: n}, nil
+}
+
+// shrink releases unused bytes after the exact decompressed size is known.
+// It must be called before release and with 0 <= n <= held.
+func (l *inflateLease) shrink(n int64) {
+	if n < 0 || n > l.held {
+		panic("inflate lease shrink outside reservation")
+	}
+	unused := l.held - n
+	if unused == 0 {
+		return
+	}
+	l.held = n
+	l.b.inUse.Add(-unused)
+	l.b.sem.Release(unused)
 }
 
 // inflateLease is a request's in-flight share of a budget.

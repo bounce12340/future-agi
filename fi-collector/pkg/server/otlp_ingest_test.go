@@ -227,10 +227,10 @@ func TestOTLPHTTPGzipBombIs413AndStopsAtTheCap(t *testing.T) {
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status %d, want 413 (%s)", rec.Code, rec.Body.String())
 	}
-	// The body is measured before anything is leased or allocated for it, so
-	// a bomb never leases any budget.
-	if p := s.inflate.peak.Load(); p != 0 {
-		t.Errorf("an over-cap body leased %d budget bytes, want none", p)
+	// The body is reserved during the count pass; an over-cap bomb releases
+	// the reservation before returning.
+	if p := s.inflate.peak.Load(); p != maxOTLPHTTPBodyBytes {
+		t.Errorf("over-cap body reserved %d bytes, want %d", p, maxOTLPHTTPBodyBytes)
 	}
 	if u := s.inflate.inUse.Load(); u != 0 {
 		t.Errorf("%d budget bytes still leased after the request returned", u)
