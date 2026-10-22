@@ -251,7 +251,7 @@ func TestOTLPHTTPGzipAtCapIsNot413(t *testing.T) {
 	}
 }
 
-// Without gzip the wire cap is the only cap; the handler maps it to 413.
+// The uncompressed body cap maps to 413.
 func TestOTLPHTTPUncompressedOverCapIs413(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/traces", bytes.NewReader(make([]byte, maxOTLPHTTPBodyBytes+1)))
 	req.Header.Set("Content-Type", "application/x-protobuf")
@@ -264,11 +264,16 @@ func TestOTLPHTTPUncompressedOverCapIs413(t *testing.T) {
 
 // ── TH-8744: project from X-Project-Name on OTLP/HTTP ──────────────────────
 
+// This listener has auth disabled, as in the unit test harness: the header
+// fills the stored resource attribute but does not resolve or auto-create a
+// project identity.
 func TestOTLPHTTPProjectHeaderNamesProjectWhenResourceHasNone(t *testing.T) {
 	httpAddr, _, sawCH, stop := startServerWithHTTP(t)
 	defer stop()
 
-	pb := protoBody(t, makeTraces("header-project-span", "cccccccc-cccc-4ccc-8ccc-cccccccccccc"))
+	traces := makeTraces("header-project-span", "cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+	traces.ResourceSpans().At(0).Resource().Attributes().Remove("fi.project_id")
+	pb := protoBody(t, traces)
 	resp, body := postOTLP(t, "http://"+httpAddr+"/v1/traces", "application/x-protobuf",
 		map[string]string{"X-Project-Name": "  header-project  "}, pb)
 	if resp.StatusCode != http.StatusOK {
@@ -277,6 +282,9 @@ func TestOTLPHTTPProjectHeaderNamesProjectWhenResourceHasNone(t *testing.T) {
 	ch := waitForCH(t, sawCH)
 	if !strings.Contains(ch, `"project_name":"header-project"`) {
 		t.Errorf("stored resource_attrs should carry project_name from the header (trimmed): %q", ch)
+	}
+	if strings.Contains(ch, `"fi.project_id"`) {
+		t.Errorf("auth-disabled test listener must not resolve or stamp a project id: %q", ch)
 	}
 }
 

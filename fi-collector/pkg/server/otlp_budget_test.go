@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"runtime"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -101,8 +100,8 @@ func TestOTLPHTTPGzipWaitsForBudget(t *testing.T) {
 }
 
 // Waiters are served in arrival order, so a large body waiting for its share
-// is not starved by small bodies that arrive after it and would each fit in
-// what is free.
+// is not starved by small bodies that arrive after it. Each gzip request
+// reserves the 16 MiB maximum while streaming, then shrinks to its actual size.
 func TestOTLPHTTPLargeGzipNotStarvedBySmallOnes(t *testing.T) {
 	s := acceptingServer()
 	s.inflate = newInflateBudget(minGzipInflightBytes) // 16 MiB
@@ -110,8 +109,7 @@ func TestOTLPHTTPLargeGzipNotStarvedBySmallOnes(t *testing.T) {
 	large := gzipBytes(t, tracesOfSize(t, "large-span", 12<<20))
 	small := gzipBytes(t, tracesOfSize(t, "small-span", 1<<20))
 
-	// Other requests hold 8 MiB, so 8 MiB is free: room for small bodies, not
-	// for the large one.
+	// Other requests hold 8 MiB, so the 16 MiB reservation must wait.
 	hold, err := s.inflate.acquire(context.Background(), 8<<20)
 	if err != nil {
 		t.Fatal(err)
@@ -134,7 +132,7 @@ func TestOTLPHTTPLargeGzipNotStarvedBySmallOnes(t *testing.T) {
 		}
 	}
 
-	// A stream of small requests, each of which would fit in the free 8 MiB.
+	// A stream of small requests arrives after the large waiter.
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 	var smallOK atomic.Int32
@@ -229,8 +227,8 @@ func TestOTLPHTTPConcurrentGzipBombsStayWithinBudget(t *testing.T) {
 	wg.Wait()
 
 	for i, c := range codes {
-		if c != http.StatusRequestEntityTooLarge {
-			t.Errorf("request %d: status %d, want 413", i, c)
+		if c != http.StatusRequestEntityTooLarge && c != http.StatusServiceUnavailable {
+			t.Errorf("request %d: status %d, want 413 or bounded-wait 503", i, c)
 		}
 	}
 	if p := s.inflate.peak.Load(); p > s.inflate.size {
@@ -241,19 +239,10 @@ func TestOTLPHTTPConcurrentGzipBombsStayWithinBudget(t *testing.T) {
 	}
 }
 
-// liveHeap is the heap still reachable after a full GC.
-func liveHeap() uint64 {
-	runtime.GC()
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	return m.HeapAlloc
-}
-
-// A gzip upload that stalls part way must not hold its inflated bytes: the
-// body is inflated only once it has fully arrived, so a stalled request holds
-// just the compressed bytes it sent. Otherwise a sender can pin about 1000x
-// what it uploads, for as long as it keeps the connection open.
-func TestOTLPHTTPStalledGzipUploadHoldsOnlyItsWireBytes(t *testing.T) {
+// A gzip upload that stalls part way can hold a reservation while the gzip
+// reader waits for more wire bytes. The reservation is the single-request cap,
+// so it can never pin more than 16 MiB or exceed the process-wide budget.
+func TestOTLPHTTPStalledGzipUploadHoldsAtMostOneBodyReservation(t *testing.T) {
 	prefix := zeroGzipMembers(t, 12) // ~12 KiB that inflates to 12 MiB
 	pr, pw := io.Pipe()
 	req := httptest.NewRequest(http.MethodPost, "/v1/traces", pr)
@@ -262,7 +251,6 @@ func TestOTLPHTTPStalledGzipUploadHoldsOnlyItsWireBytes(t *testing.T) {
 	rec := httptest.NewRecorder()
 	s := directServer()
 
-	before := liveHeap()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -272,20 +260,15 @@ func TestOTLPHTTPStalledGzipUploadHoldsOnlyItsWireBytes(t *testing.T) {
 	if _, err := pw.Write(prefix); err != nil {
 		t.Fatalf("write prefix: %v", err)
 	}
-
-	var grew uint64
-	for deadline := time.Now().Add(300 * time.Millisecond); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
-		if h := liveHeap(); h > before {
-			grew = max(grew, h-before)
-		}
+	if held := s.inflate.inUse.Load(); held != maxOTLPHTTPBodyBytes {
+		t.Errorf("stalled request holds %d bytes; want its %d-byte maximum reservation", held, maxOTLPHTTPBodyBytes)
+	}
+	if p := s.inflate.peak.Load(); p > maxOTLPHTTPBodyBytes {
+		t.Errorf("stalled request reserved %d bytes, over the per-body cap", p)
 	}
 	_ = pw.CloseWithError(io.ErrUnexpectedEOF) // the sender gives up
 	<-done
 
-	if grew > 4<<20 {
-		t.Errorf("a stalled upload of %d compressed bytes held %d more live heap bytes; want only its wire bytes",
-			len(prefix), grew)
-	}
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("status %d after the sender gave up, want 400", rec.Code)
 	}

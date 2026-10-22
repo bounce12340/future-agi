@@ -2,29 +2,45 @@ package server
 
 import (
 	"bytes"
-	"errors"
+	"compress/gzip"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 )
 
-// The compressed bytes on the wire are capped too. Empty deflate stored
-// blocks inflate to nothing, so a stream of them is never caught by the
-// decompressed-size cap; only the wire cap can stop it. A small limit keeps
-// the stream short; the handler passes maxOTLPHTTPBodyBytes.
-func TestReadOTLPHTTPBodyCapsCompressedWireBytes(t *testing.T) {
-	const limit = 4 << 10
-	var body bytes.Buffer
-	body.Write([]byte{0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff}) // gzip header, deflate
-	emptyStoredBlock := []byte{0x00, 0x00, 0x00, 0xff, 0xff}  // BFINAL=0 BTYPE=00 LEN=0 NLEN=0xffff
-	for body.Len() <= 2*limit {
-		body.Write(emptyStoredBlock)
+// Upstream confighttp applies max_request_body_size after decompression. A
+// gzip body may therefore be over 16 MiB on the wire if it inflates to no more
+// than 16 MiB. Keep the wire streaming; the decompressed size is the cap.
+func TestReadOTLPHTTPGzipWireMayExceedLimitWhenInflatedSizeFits(t *testing.T) {
+	const limit = maxOTLPHTTPBodyBytes
+	raw := make([]byte, limit-1024)
+	if _, err := rand.New(rand.NewSource(42)).Read(raw); err != nil {
+		t.Fatal(err)
 	}
-	req := httptest.NewRequest(http.MethodPost, "/v1/traces", bytes.NewReader(body.Bytes()))
-	_, release, err := readOTLPHTTPBody(httptest.NewRecorder(), req, true, limit, newInflateBudget(1<<20))
+	var wire bytes.Buffer
+	zw := gzip.NewWriter(&wire)
+	if _, err := zw.Write(raw); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if wire.Len() <= limit {
+		t.Fatalf("test setup: compressed wire body is %d bytes, want more than %d", wire.Len(), limit)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/traces", bytes.NewReader(wire.Bytes()))
+	budget := newInflateBudget(limit)
+	body, release, err := readOTLPHTTPBody(httptest.NewRecorder(), req, true, limit, budget)
 	defer release()
-	var tooLarge *http.MaxBytesError
-	if !errors.As(err, &tooLarge) {
-		t.Fatalf("err = %v, want *http.MaxBytesError from the wire cap", err)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if !bytes.Equal(body, raw) {
+		t.Fatalf("got %d decompressed bytes, want %d", len(body), len(raw))
+	}
+	if got := budget.inUse.Load(); got != int64(len(raw)) {
+		t.Errorf("leased %d bytes, want exact decompressed size %d", got, len(raw))
 	}
 }

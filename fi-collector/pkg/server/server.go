@@ -463,10 +463,10 @@ func (s *Server) handleHTTPTraces(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A gzip request leases its decompressed size from the process-wide
-	// inflate budget before the buffer is allocated, and holds it until the
-	// handler returns. The lease covers the decompressed bytes only, not what
-	// decoding them allocates (TH-8745).
+	// A gzip request reserves its maximum decompressed size from the
+	// process-wide inflate budget before streaming, then shrinks the lease to
+	// its exact decompressed size and holds it until the handler returns. The
+	// lease covers decompressed bytes only, not decoding allocations (TH-8745).
 	body, release, err := readOTLPHTTPBody(w, r, gzipped, maxOTLPHTTPBodyBytes, s.inflate)
 	defer release()
 	if err != nil {
