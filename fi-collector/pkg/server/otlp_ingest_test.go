@@ -109,6 +109,21 @@ func TestOTLPHTTPGzipProtobuf(t *testing.T) {
 	}
 }
 
+func TestOTLPHTTPXGzipAlias(t *testing.T) {
+	httpAddr, _, sawCH, stop := startServerWithHTTP(t)
+	defer stop()
+
+	pb := protoBody(t, makeTraces("x-gzip-span", "7a7a7a7a-7a7a-4a7a-8a7a-7a7a7a7a7a7a"))
+	resp, body := postOTLP(t, "http://"+httpAddr+"/v1/traces", "application/x-protobuf",
+		map[string]string{"Content-Encoding": "X-GZip"}, gzipBytes(t, pb))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d (want 200): %s", resp.StatusCode, body)
+	}
+	if ch := waitForCH(t, sawCH); !strings.Contains(ch, "x-gzip-span") {
+		t.Errorf("CH body missing span name: %q", ch)
+	}
+}
+
 func TestOTLPHTTPGzipJSONOnLegacyPath(t *testing.T) {
 	httpAddr, _, sawCH, stop := startServerWithHTTP(t)
 	defer stop()
@@ -146,7 +161,7 @@ func TestOTLPHTTPIdentityEncodingAccepted(t *testing.T) {
 }
 
 func TestOTLPHTTPUnknownContentEncodingIs415(t *testing.T) {
-	for _, enc := range []string{"br", "zstd", "deflate", "gzip, br"} {
+	for _, enc := range []string{"br", "zstd", "deflate", "gzip, br", "gzip, gzip"} {
 		t.Run(enc, func(t *testing.T) {
 			pb := protoBody(t, makeTraces("br-span", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"))
 			req := httptest.NewRequest(http.MethodPost, "/v1/traces", bytes.NewReader(pb))
