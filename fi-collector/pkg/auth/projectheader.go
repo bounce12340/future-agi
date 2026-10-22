@@ -78,8 +78,9 @@ func ProjectNameMetadataValues(md metadata.MD) ProjectNameValues {
 // longer than 255 characters, or to contain a control character, a line or
 // paragraph separator (U+2028, U+2029), or an invisible character: a format
 // character (Unicode category Cf, such as U+200B) or another default-ignorable
-// code point (such as the Hangul filler U+3164 or a variation selector). It
-// returns how many ResourceSpans took the header's project.
+// code point (such as the Hangul filler U+3164 or a variation selector), or to
+// have no visible character at all (only combining marks and blank symbols
+// such as U+2800). It returns how many ResourceSpans took the header's project.
 func ApplyProjectNameHeader(traces ptrace.Traces, values ProjectNameValues) (int, error) {
 	rss := traces.ResourceSpans()
 	need := false
@@ -155,5 +156,23 @@ func projectNameFromHeader(header string, lines []string) (string, error) {
 			return "", fmt.Errorf("%s contains an invisible character (%U)", header, r)
 		}
 	}
+	if !hasVisibleRune(v) {
+		return "", fmt.Errorf("%s has no visible character", header)
+	}
 	return v, nil
+}
+
+// hasVisibleRune reports whether v has a character that is drawn as something:
+// not a space, not a combining mark (which needs a base character to sit on),
+// and not a symbol drawn as empty space. Inside a visible name those are kept,
+// like an inner space.
+func hasVisibleRune(v string) bool {
+	for _, r := range v {
+		blank := unicode.IsSpace(r) || unicode.Is(unicode.M, r) ||
+			r == '\u2800' || r == '\U0001D159' // BRAILLE PATTERN BLANK, MUSICAL SYMBOL NULL NOTEHEAD
+		if !blank {
+			return true
+		}
+	}
+	return false
 }

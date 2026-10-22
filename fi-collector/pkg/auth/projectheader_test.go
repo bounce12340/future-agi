@@ -71,6 +71,18 @@ func TestProjectNameFromHeaderValues(t *testing.T) {
 		{name: "combining grapheme joiner", values: oneLine("pro\u034fj"), wantErr: "U+034F", wantHdr: ProjectNameHeader},
 		{name: "variation selector", values: oneLine("pro\ufe0fj"), wantErr: "U+FE0F", wantHdr: ProjectNameHeader},
 		{name: "invisible character in alias", values: ProjectNameValues{Alias: []string{"a\u3164"}}, wantErr: "invisible character", wantHdr: ProjectNameHeaderAlias},
+		// A name must show at least one character. Combining marks with no
+		// base, and symbols drawn as empty space (U+2800 BRAILLE PATTERN
+		// BLANK, U+1D159 MUSICAL SYMBOL NULL NOTEHEAD), render blank on their
+		// own. Inside a visible name they are kept, like an inner space.
+		{name: "only a braille blank", values: oneLine("\u2800"), wantErr: "no visible character", wantHdr: ProjectNameHeader},
+		{name: "only blank symbols", values: oneLine(" \u2800\u2800\U0001D159 "), wantErr: "no visible character", wantHdr: ProjectNameHeader},
+		{name: "only a combining mark", values: oneLine("\u0301"), wantErr: "no visible character", wantHdr: ProjectNameHeader},
+		{name: "combining marks and blank symbols", values: oneLine("\u0301\u2800\u20dd"), wantErr: "no visible character", wantHdr: ProjectNameHeader},
+		{name: "blank name in alias", values: ProjectNameValues{Alias: []string{"\u2800"}}, wantErr: "no visible character", wantHdr: ProjectNameHeaderAlias},
+		{name: "braille blank inside a name", values: oneLine("pro\u2800j"), want: "pro\u2800j"},
+		{name: "decomposed accent", values: oneLine("cafe\u0301"), want: "cafe\u0301"},
+		{name: "symbol only", values: oneLine("\U0001F680"), want: "\U0001F680"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -350,6 +350,8 @@ func TestOTLPHTTPInvalidProjectHeaderIs400(t *testing.T) {
 		"control character":                   {"X-Project-Name", []string{"a\tb"}},
 		"zero width space (Unicode Cf)":       {"X-Project-Name", []string{"check\u200bout"}},
 		"bidi override in alias (Unicode Cf)": {"FI-Project-Name", []string{"checkout\u202e"}},
+		"only a braille blank (U+2800)":       {"X-Project-Name", []string{"\u2800"}},
+		"only a combining mark":               {"X-Project-Name", []string{"\u0301"}},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
