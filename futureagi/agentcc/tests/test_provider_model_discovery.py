@@ -1,5 +1,6 @@
 from unittest.mock import Mock, patch
 
+from agentcc.services.url_safety import PROVIDER_PRIVATE_URL_ERROR, PROVIDER_URL_ERROR
 from agentcc.views.provider_credential import AgentccProviderCredentialViewSet
 
 
@@ -17,6 +18,10 @@ class TestAgentccProviderCredentialModelDiscovery:
 
         with (
             patch(
+                "agentcc.views.provider_credential.private_provider_urls_allowed",
+                return_value=False,
+            ),
+            patch(
                 "agentcc.views.provider_credential.ensure_public_http_url"
             ) as mock_validate_url,
             patch(
@@ -33,10 +38,13 @@ class TestAgentccProviderCredentialModelDiscovery:
 
         assert models == ["gemini-custom"]
         mock_validate_url.assert_called_once_with(
-            "https://models.example.com", "Invalid base URL"
+            "https://models.example.com",
+            PROVIDER_URL_ERROR,
+            allow_private=False,
+            private_message=PROVIDER_PRIVATE_URL_ERROR,
         )
         mock_safe_session.assert_called_once_with(
-            "Connection to private address blocked"
+            "Connection to private address blocked", allow_private=False
         )
         safe_session.get.assert_called_once_with(
             "https://models.example.com/v1beta/models",
