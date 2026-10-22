@@ -470,7 +470,7 @@ func (s *Server) handleHTTPTraces(w http.ResponseWriter, r *http.Request) {
 	// decompression. A gzip body is read in full, then reserves 16 MiB for the
 	// count pass. On success that shrinks to the exact decompressed size and
 	// remains leased until the handler returns. The lease covers decompressed
-	// body bytes only, not decoding allocations (TH-8745).
+	// body bytes only, not what decoding allocates.
 	body, release, err := readOTLPHTTPBody(w, r, gzipped, maxOTLPHTTPBodyBytes, s.inflate)
 	defer release()
 	if err != nil {

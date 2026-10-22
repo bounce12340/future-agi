@@ -32,10 +32,9 @@ const gzipInflightWait = 2 * time.Second
 // releases the reservation. Valid requests hold their lease until the handler
 // returns.
 //
-// The lease counts decompressed body bytes only. It does not count the
-// compressed bytes read off the wire, or what decoding the body allocates: the
-// decoded request and its rows can take several times the body size, for gzip
-// and plain bodies alike (TH-8745). Uncompressed bodies are not counted.
+// The lease counts decompressed body bytes only: not the compressed bytes read
+// off the wire, and not the memory used to decode the body, which is the same
+// for gzip and plain bodies. Uncompressed bodies are not counted.
 //
 // Waiters are served in order (golang.org/x/sync/semaphore is FIFO), so a large
 // body is not starved by a stream of small ones. A request that does not get
