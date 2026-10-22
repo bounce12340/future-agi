@@ -75,9 +75,11 @@ func ProjectNameMetadataValues(md metadata.MD) ProjectNameValues {
 // When it is needed, the value is trimmed and a blank one is ignored. It is an
 // error for a header to be sent more than once or to hold a comma (a list),
 // for the two headers to disagree, or for the value to be invalid UTF-8,
-// longer than 255 characters, or to contain a control character or an
-// invisible format character (Unicode category Cf, such as U+200B). It returns
-// how many ResourceSpans took the header's project.
+// longer than 255 characters, or to contain a control character, a line or
+// paragraph separator (U+2028, U+2029), or an invisible character: a format
+// character (Unicode category Cf, such as U+200B) or another default-ignorable
+// code point (such as the Hangul filler U+3164 or a variation selector). It
+// returns how many ResourceSpans took the header's project.
 func ApplyProjectNameHeader(traces ptrace.Traces, values ProjectNameValues) (int, error) {
 	rss := traces.ResourceSpans()
 	need := false
@@ -147,6 +149,10 @@ func projectNameFromHeader(header string, lines []string) (string, error) {
 			return "", fmt.Errorf("%s contains a control character (%U)", header, r)
 		case unicode.Is(unicode.Cf, r):
 			return "", fmt.Errorf("%s contains an invisible format character (%U)", header, r)
+		case unicode.In(r, unicode.Zl, unicode.Zp):
+			return "", fmt.Errorf("%s contains a line or paragraph separator (%U)", header, r)
+		case unicode.In(r, unicode.Other_Default_Ignorable_Code_Point, unicode.Variation_Selector):
+			return "", fmt.Errorf("%s contains an invisible character (%U)", header, r)
 		}
 	}
 	return v, nil

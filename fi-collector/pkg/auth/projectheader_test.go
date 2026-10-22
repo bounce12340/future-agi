@@ -61,6 +61,16 @@ func TestProjectNameFromHeaderValues(t *testing.T) {
 		{name: "right-to-left override", values: oneLine("checkout\u202e"), wantErr: "U+202E", wantHdr: ProjectNameHeader},
 		{name: "soft hyphen", values: oneLine("check\u00adout"), wantErr: "format character", wantHdr: ProjectNameHeader},
 		{name: "Cf in alias", values: ProjectNameValues{Alias: []string{"a\u2060b"}}, wantErr: "format character", wantHdr: ProjectNameHeaderAlias},
+		// Line and paragraph separators break lines; the other
+		// default-ignorable code points render as nothing, so a name made of
+		// them looks blank.
+		{name: "line separator", values: oneLine("pro\u2028j"), wantErr: "U+2028", wantHdr: ProjectNameHeader},
+		{name: "paragraph separator", values: oneLine("pro\u2029j"), wantErr: "U+2029", wantHdr: ProjectNameHeader},
+		{name: "only a Hangul filler", values: oneLine("\u3164"), wantErr: "U+3164", wantHdr: ProjectNameHeader},
+		{name: "Hangul choseong filler", values: oneLine("pro\u115fj"), wantErr: "invisible character", wantHdr: ProjectNameHeader},
+		{name: "combining grapheme joiner", values: oneLine("pro\u034fj"), wantErr: "U+034F", wantHdr: ProjectNameHeader},
+		{name: "variation selector", values: oneLine("pro\ufe0fj"), wantErr: "U+FE0F", wantHdr: ProjectNameHeader},
+		{name: "invisible character in alias", values: ProjectNameValues{Alias: []string{"a\u3164"}}, wantErr: "invisible character", wantHdr: ProjectNameHeaderAlias},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
