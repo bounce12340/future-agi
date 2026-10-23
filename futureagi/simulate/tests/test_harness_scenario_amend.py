@@ -194,7 +194,10 @@ class TestScenarioNumbersSurviveADeletion:
         from simulate.models import HostedHarnessScenario
         from simulate.services.harness_scenarios import index_scenarios
 
-        suite = [{"name": name, "scenario_key": name, "tests": "t"} for name in ("one", "two")]
+        suite = [
+            {"name": name, "scenario_key": name, "tests": "t"}
+            for name in ("one", "two")
+        ]
         job = _job(user, workspace, suite)
         index_scenarios(job, suite)
         renamed = {"name": "second", "scenario_key": "two", "tests": "t"}
@@ -213,6 +216,17 @@ class TestScenarioNumbersSurviveADeletion:
             for row in HostedHarnessScenario.no_workspace_objects.filter(job=job)
         }
         assert again == rows
+
+    def test_an_older_suite_that_repeats_a_name_still_saves_onto_its_row(
+        self, user, workspace
+    ):
+        from simulate.services.harness_scenarios import index_scenarios
+
+        suite = [{"name": name, "tests": "t"} for name in ("one", "two")]
+        job = _job(user, workspace, suite)
+        index_scenarios(job, suite)
+        index_scenarios(job, [suite[0], {"name": "one", "tests": "u"}], prune=True)
+        assert self._numbers(job) == {"one": 1}
 
     def test_a_number_means_the_row_the_table_shows(self, user, workspace):
         from simulate.services.harness_provider import scenarios_meant
