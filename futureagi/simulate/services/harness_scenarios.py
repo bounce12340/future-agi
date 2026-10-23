@@ -408,15 +408,26 @@ def index_scenarios(
     )
     written = 0
     seen: set[str] = set()
+    # A scenario takes the row holding its key first; only scenarios left over fall back to a row
+    # their key or name spells, and never to one already taken (a renamed scenario keeps its key).
+    by_key = {_scenario_token(row.scenario_key): row for row in rows if row.scenario_key}
+    rows_of = [by_key.get(_scenario_token(doc.get("scenario_key"))) for doc in docs]
+    taken_rows = {id(row) for row in rows_of if row is not None}
+    for index, doc in enumerate(docs):
+        if rows_of[index] is None:
+            rows_of[index] = next(
+                (
+                    by_token[token]
+                    for value in (doc.get("scenario_key"), doc.get("name"))
+                    if (token := _scenario_token(value)) in by_token
+                    and id(by_token[token]) not in taken_rows
+                ),
+                None,
+            )
+            if rows_of[index] is not None:
+                taken_rows.add(id(rows_of[index]))
     for position, doc in enumerate(docs, start=1):
-        held = next(
-            (
-                by_token[token]
-                for value in (doc.get("scenario_key"), doc.get("name"))
-                if (token := _scenario_token(value)) in by_token
-            ),
-            None,
-        )
+        held = rows_of[position - 1]
         key = (
             held.scenario_key
             if held is not None
