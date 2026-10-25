@@ -288,7 +288,11 @@ func spanToRow(
 	// Cost — Django _convert_single_span parity: a user-supplied
 	// gen_ai.cost.*/llm.cost.* value (already promoted onto hot.Cost, even an
 	// explicit 0) wins; otherwise price from tokens (litellm table → per-org
-	// CustomAIModel via the injected Pricer).
+	// CustomAIModel via the injected Pricer). A sender's billed
+	// gen_ai.usage.*_cost (OpenRouter Broadcast) counts as user-supplied when
+	// no gen_ai.cost.*/llm.cost.* key is present. Each span is priced on its
+	// own attributes only, so a root that carries no cost or usage keys adds
+	// nothing to the trace total.
 	cost := hot.Cost
 	if !hot.CostUserSet && pricer != nil {
 		if c, ok := pricer.TokenCost(ctx, orgID, hot.Model, hot.PromptTokens, hot.CompletionTokens); ok {

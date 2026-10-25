@@ -27,7 +27,9 @@
                 { "key": "trace.metadata.openrouter.api_key_name", "value": { "stringValue": "prod-key" } },
                 { "key": "trace.metadata.openrouter.provider_slug", "value": { "stringValue": "openai" } },
                 { "key": "trace.metadata.openrouter_generation.usage", "value": { "doubleValue": 0.0001275 } },
-                { "key": "trace.metadata.openrouter_generation.usage_is_estimated", "value": { "boolValue": false } }
+                { "key": "trace.metadata.openrouter_generation.usage_is_estimated", "value": { "boolValue": false } },
+                { "key": "trace.metadata.openrouter_cost_allocation.cost_status", "value": { "stringValue": "reconciled" } },
+                { "key": "trace.metadata.openrouter_cost_allocation.output_cost", "value": { "stringValue": "0.00009" } }
               ],
               "status": { "code": 1 }
             },

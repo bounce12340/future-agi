@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/future-agi/future-agi/fi-collector/pkg/chwriter"
+	"github.com/future-agi/future-agi/fi-collector/pkg/pricing"
 )
 
 // The OpenRouter Broadcast fixture shared with the converter tests.
@@ -22,8 +23,9 @@ const openRouterBroadcastFixture = "../../exporter/clickhouse25exporter/testdata
 
 // TestOTLPHTTPJSONOpenRouterBroadcast posts OpenRouter Broadcast's OTLP/HTTP
 // JSON body unchanged and checks the `spans` rows ClickHouse receives: the
-// generation span's input/output come from span.input / span.output, and the
-// root and attempt spans stay empty.
+// generation span's input/output come from span.input / span.output, its cost
+// is OpenRouter's gen_ai.usage.total_cost even with the production pricer
+// wired in, and the root and attempt spans stay empty and cost nothing.
 func TestOTLPHTTPJSONOpenRouterBroadcast(t *testing.T) {
 	body, err := os.ReadFile(openRouterBroadcastFixture)
 	if err != nil {
@@ -65,13 +67,17 @@ func TestOTLPHTTPJSONOpenRouterBroadcast(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	priceTable, err := pricing.LoadTable("")
+	if err != nil {
+		t.Fatal(err)
+	}
 	httpAddr := testTCPAddr(t)
 	s := New(Config{
 		GRPCAddr:     testTCPAddr(t),
 		HTTPAddr:     httpAddr,
 		BatchMaxRows: 10,
 		BatchMaxAge:  50 * time.Millisecond,
-	}, writer, nil, nil, nil)
+	}, writer, nil, nil, nil, WithPricer(pricing.New(priceTable, nil)))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() { _ = s.Run(ctx) }()
@@ -117,6 +123,7 @@ func TestOTLPHTTPJSONOpenRouterBroadcast(t *testing.T) {
 		"model":            "openai/gpt-4o",
 		"service_name":     "openrouter",
 		"parent_span_id":   "00f067aa0ba902b7",
+		"cost":             0.0001275, // gen_ai.usage.total_cost
 	} {
 		if gen[k] != want {
 			t.Errorf("generation %s = %#v, want %#v", k, gen[k], want)
@@ -130,6 +137,9 @@ func TestOTLPHTTPJSONOpenRouterBroadcast(t *testing.T) {
 	for _, id := range []string{"00f067aa0ba902b7", "1a2b3c4d5e6f7081", "2b3c4d5e6f708192"} {
 		if r := rows[id]; r["input"] != "" || r["output"] != "" {
 			t.Errorf("span %s input/output = %q/%q, want empty", id, r["input"], r["output"])
+		}
+		if r := rows[id]; r["cost"] != float64(0) {
+			t.Errorf("span %s cost = %v, want 0 (only the generation span is charged)", id, r["cost"])
 		}
 	}
 }
