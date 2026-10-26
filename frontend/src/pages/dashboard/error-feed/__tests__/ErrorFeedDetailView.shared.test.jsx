@@ -27,7 +27,7 @@ vi.mock("../components/TracesTab", () => ({ default: () => null }));
 vi.mock("../components/TrendsTab", () => ({ default: () => null }));
 vi.mock("../components/ClusterHeadlineCard", () => ({ default: () => null }));
 vi.mock("../components/AnalyzeTab", () => ({
-  default: () => <div>live analysis</div>,
+  default: () => <div>analysis tab</div>,
 }));
 
 const row = {
@@ -83,37 +83,17 @@ describe("ErrorFeedDetailView on a shared issue", () => {
     for (const [, options] of mocks.useErrorFeedDetail.mock.calls) {
       expect(options?.enabled).toBe(false);
     }
-    for (const [clusterId] of mocks.useAnalyzeRunner.mock.calls) {
-      expect(clusterId).toBeFalsy();
+    // Called only to seed the saved analysis; it must never run.
+    for (const [, , options] of mocks.useAnalyzeRunner.mock.calls) {
+      expect(options).toEqual({ enabled: false });
     }
   });
 
-  it("shows the saved analysis on the Fix tab without run controls", async () => {
-    renderShared({
-      synthesis: "The prompt says refunds are usually allowed.",
-      fix: "State the 30 day rule.",
-      confidence: "H",
-    });
-
-    await userEvent.click(screen.getByRole("tab", { name: /fix/i }));
-
-    expect(
-      screen.getByText("The prompt says refunds are usually allowed."),
-    ).toBeInTheDocument();
-    expect(screen.getByText("State the 30 day rule.")).toBeInTheDocument();
-    expect(screen.queryByText("live analysis")).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: /analy|re-run|ask/i }),
-    ).not.toBeInTheDocument();
-  });
-
-  it("says when no analysis was saved", async () => {
+  it("opens the Fix tab as the read-only analysis tab", async () => {
     renderShared();
 
     await userEvent.click(screen.getByRole("tab", { name: /fix/i }));
 
-    expect(
-      screen.getByText("No analysis saved for this issue."),
-    ).toBeInTheDocument();
+    expect(screen.getByText("analysis tab")).toBeInTheDocument();
   });
 });
