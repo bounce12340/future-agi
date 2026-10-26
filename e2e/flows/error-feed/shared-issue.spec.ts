@@ -60,6 +60,21 @@ base(
       contentType: "application/json",
     });
 
+    // Record every toast as it appears: they hide themselves, so a check
+    // after the fact could miss one.
+    await page.addInitScript(() => {
+      const seen: string[] = [];
+      (window as unknown as { __toasts: string[] }).__toasts = seen;
+      new MutationObserver(() => {
+        document.querySelectorAll(".notistack-MuiContent").forEach((el) => {
+          if (!el.hasAttribute("data-e2e-seen")) {
+            el.setAttribute("data-e2e-seen", "");
+            seen.push(el.textContent ?? "");
+          }
+        });
+      }).observe(document, { childList: true, subtree: true });
+    });
+
     const feedRequests: string[] = [];
     const traceRequests: string[] = [];
     const sidebarRequests: (string | null)[] = [];
@@ -112,10 +127,15 @@ base(
       (route: Route) =>
         route.fulfill({
           status: 401,
+          // The real 401 body, captured from GET /tracer/shared/<token>/.
           json: {
             status: false,
+            type: "authentication_error",
             code: "not_authenticated",
+            detail: "Authentication required to access this link",
             message: "Authentication required to access this link",
+            error: "Authentication required to access this link",
+            result: "Authentication required to access this link",
           },
         }),
     );
@@ -203,9 +223,14 @@ base(
           page.getByRole("heading", { name: "Sign in required" }),
         ).toBeVisible({ timeout: UI_READY });
         expect(new URL(page.url()).pathname).toBe(`/shared/${restrictedToken}`);
-        // The page's own screen is the whole answer: no generic error toast.
-        await page.waitForLoadState("networkidle");
-        await expect(page.getByText("Something went wrong")).toHaveCount(0);
+        // The page's own screen is the whole answer: no error toast. One from
+        // the global query error handler lands within a moment of the 401.
+        await page.waitForTimeout(2_000);
+        expect(
+          await page.evaluate(
+            () => (window as unknown as { __toasts: string[] }).__toasts,
+          ),
+        ).toEqual([]);
       },
       { timeout: UI_READY * 2 },
     );
