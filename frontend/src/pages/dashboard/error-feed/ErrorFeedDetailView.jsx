@@ -14,8 +14,10 @@ import {
 } from "@mui/material";
 import PropTypes from "prop-types";
 import { useNavigate, useParams } from "react-router-dom";
+import { enqueueSnackbar } from "notistack";
 import Iconify from "src/components/iconify";
 import { useSnackbar } from "src/components/snackbar";
+import { copyToClipboard } from "src/utils/utils";
 import {
   useErrorFeedDetail,
   useErrorFeedRedirect,
@@ -184,6 +186,15 @@ export default function ErrorFeedDetailView() {
   // to drive the MUI <Tabs> indicator.
   const activeTabKey = TABS[safeTabIndex].key;
 
+  const handleCopyClusterId = async () => {
+    const copied = await copyToClipboard(currentError.cluster_id);
+    if (copied) {
+      enqueueSnackbar("Cluster ID copied", { variant: "success" });
+    } else {
+      enqueueSnackbar("Couldn't copy the cluster ID", { variant: "error" });
+    }
+  };
+
   return (
     <Box
       sx={{
@@ -340,6 +351,7 @@ export default function ErrorFeedDetailView() {
               <Tooltip title="Copy cluster ID" arrow>
                 <IconButton
                   size="small"
+                  onClick={handleCopyClusterId}
                   sx={{
                     borderRadius: 1,
                     border: "1px solid",
