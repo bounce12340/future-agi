@@ -55,6 +55,8 @@ export const useResolveSharedLink = (token) => {
     select: (d) => d.data,
     enabled: !!token,
     retry: false,
+    // The shared page shows its own screen per status; no global toast.
+    meta: { errorHandled: true },
   });
 };
 

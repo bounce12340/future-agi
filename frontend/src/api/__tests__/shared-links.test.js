@@ -14,6 +14,7 @@ import {
   useAddSharedLinkAccess,
   useCreateSharedLink,
   useGetSharedLinks,
+  useResolveSharedLink,
   useSharedIssueSidebar,
   useSharedIssueTrace,
   useUpdateSharedLink,
@@ -28,6 +29,7 @@ vi.mock("src/utils/axios", () => ({
       create: "/tracer/shared-links/",
       update: (id) => `/tracer/shared-links/${id}/`,
       addAccess: (id) => `/tracer/shared-links/${id}/access/`,
+      resolve: (token) => `/tracer/shared/${token}/`,
       issueSidebar: (token) => `/tracer/shared/${token}/sidebar/`,
       issueTrace: (token, traceId) =>
         `/tracer/shared/${token}/traces/${traceId}/`,
@@ -61,6 +63,20 @@ describe("shared-links error reporting", () => {
     axios.get.mockRejectedValueOnce(serverError);
     const { queryClient, Wrapper } = makeWrapper();
     const { result } = renderHook(() => useGetSharedLinks("trace", "trace-1"), {
+      wrapper: Wrapper,
+    });
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(queryClient.getQueryCache().getAll().at(-1)?.options.meta).toEqual({
+      errorHandled: true,
+    });
+    expect(enqueueSnackbar).not.toHaveBeenCalled();
+  });
+
+  it("leaves a failed link resolve to the shared page's own error screen", async () => {
+    axios.get.mockRejectedValueOnce({ statusCode: 401, message: "Sign in" });
+    const { queryClient, Wrapper } = makeWrapper();
+    const { result } = renderHook(() => useResolveSharedLink("tok"), {
       wrapper: Wrapper,
     });
 
