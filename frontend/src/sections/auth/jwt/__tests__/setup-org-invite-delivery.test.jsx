@@ -2,7 +2,7 @@
 import React from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, userEvent, waitFor } from "src/utils/test-utils";
+import { act, render, screen, userEvent, waitFor } from "src/utils/test-utils";
 import SetupOrganization from "../setup-org";
 
 const mocks = vi.hoisted(() => ({
@@ -51,33 +51,60 @@ vi.mock("src/components/FormTextField/FormTextFieldV2", async () => {
     )} />
   ) };
 });
-vi.mock("src/components/FromSearchSelectField", () => ({
-  FormSearchSelectFieldState: ({ label, value, onChange, options, disabled }) => (
-    <label>{label}
-      <select value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)}>
-        {options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-      </select>
-    </label>
-  ),
-}));
+vi.mock("src/components/FromSearchSelectField", async () => {
+  const { forwardRef } = await import("react");
+  return {
+    FormSearchSelectFieldState: forwardRef(function MockRoleSelect(
+      { label, value, onChange, onBlur, name, options, disabled },
+      ref,
+    ) {
+      return (
+        <label>
+          {label}
+          <select
+            ref={ref}
+            name={name}
+            value={value}
+            disabled={disabled}
+            onBlur={onBlur}
+            onChange={(event) => onChange(event.target.value)}
+          >
+            {options.map((option, index) => (
+              <option key={`${option.value}-${index}`} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      );
+    }),
+  };
+});
 
 const email = "newhire@example.com";
 const warning = "Member added, but the invitation email could not be sent. Open Members to resend the invite or copy an invite link if available.";
 const createdMember = { id: "member-1", email, name: "Newhire" };
 
-function renderSetup(getStarted = true) {
+async function renderSetup(getStarted = true) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(
-    <QueryClientProvider client={client}>
-      <SetupOrganization getStarted={getStarted} />
-    </QueryClientProvider>,
-  );
+  // Flush the resolved GET -> initialData -> form.reset effect chain before
+  // interacting. A synchronous render leaves the blank placeholder on screen.
+  await act(async () => {
+    render(
+      <QueryClientProvider client={client}>
+        <SetupOrganization getStarted={getStarted} />
+      </QueryClientProvider>,
+    );
+  });
+  await waitFor(() => {
+    expect(mocks.get).toHaveBeenCalledWith("/accounts/team/users/");
+    expect(screen.getByDisplayValue("owner@example.com")).toBeDisabled();
+  }, { timeout: 5000 });
 }
 
 async function addMember(user, address = email, getStarted = true) {
-  await screen.findByDisplayValue("owner@example.com");
   await user.click(screen.getByText(getStarted ? "Add members" : "Add", { exact: true }));
   const input = screen.getAllByRole("textbox", { name: "Email" }).find((field) => !field.disabled && !field.value);
   await user.type(input, address);
@@ -115,7 +142,7 @@ describe("organization setup invitation delivery", () => {
   it("reports a healthy invite as sent", async () => {
     respondWith([createdMember]);
     const user = userEvent.setup();
-    renderSetup();
+    await renderSetup();
     await addMember(user);
     await submit(user);
 
@@ -132,7 +159,7 @@ describe("organization setup invitation delivery", () => {
   it("shows recovery guidance, not sent-success, and acknowledges without inviting twice", async () => {
     respondWith([{ ...createdMember, invite_email_warning: warning }]);
     const user = userEvent.setup();
-    renderSetup();
+    await renderSetup();
     await addMember(user);
     await submit(user);
 
@@ -150,7 +177,7 @@ describe("organization setup invitation delivery", () => {
   it("keeps onboarding warnings visible until the user continues to the dashboard", async () => {
     respondWith([{ ...createdMember, invite_email_warning: warning }]);
     const user = userEvent.setup();
-    renderSetup(false);
+    await renderSetup(false);
     await addMember(user, email, false);
     await submit(user);
 
@@ -167,7 +194,7 @@ describe("organization setup invitation delivery", () => {
       { id: "member-2", email: "failed@example.com", invite_email_warning: warning },
     ]);
     const user = userEvent.setup();
-    renderSetup();
+    await renderSetup();
     await addMember(user);
     await addMember(user, "failed@example.com");
     await submit(user);
@@ -184,8 +211,7 @@ describe("organization setup invitation delivery", () => {
   it("keeps the organization-only success message when no member was invited", async () => {
     respondWith([]);
     const user = userEvent.setup();
-    renderSetup();
-    await screen.findByDisplayValue("owner@example.com");
+    await renderSetup();
     await submit(user);
 
     await waitFor(() => expect(mocks.enqueueSnackbar).toHaveBeenCalledWith(
@@ -198,7 +224,7 @@ describe("organization setup invitation delivery", () => {
   it("still reports member-creation failures as errors", async () => {
     mocks.post.mockRejectedValue({ result: "Error in managing users" });
     const user = userEvent.setup();
-    renderSetup();
+    await renderSetup();
     await addMember(user);
     await submit(user);
 
