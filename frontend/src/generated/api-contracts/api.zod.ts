@@ -64109,6 +64109,58 @@ export const TracerSharedReadResponse = zod.object({
 });
 
 /**
+ * Mirrors the issue page: AI metadata and evaluations follow the trace
+picked in Traces affected (``?trace_id=``).
+ * @summary A shared Error Feed issue's sidebar, scoped to one of its traces.
+ */
+export const TracerSharedSidebarListParams = zod.object({
+  token: zod.string(),
+});
+
+export const TracerSharedSidebarListQueryParams = zod.object({
+  trace_id: zod.string().min(1).optional(),
+});
+
+export const tracerSharedSidebarListResponseStatusDefault = true;
+
+export const TracerSharedSidebarListResponse = zod.object({
+  status: zod.boolean().default(tracerSharedSidebarListResponseStatusDefault),
+  result: zod.object({
+    timeline: zod.object({
+      first_seen: zod.string().datetime({ offset: true }),
+      last_seen: zod.string().datetime({ offset: true }),
+      age_days: zod.number(),
+    }),
+    ai_metadata: zod.object({
+      model: zod.string().min(1),
+      model_version: zod.string().min(1),
+      project: zod.string().min(1),
+      eval_score: zod.number(),
+      trace_id: zod.string().min(1),
+    }),
+    evaluations: zod.array(
+      zod.object({
+        label: zod.string().min(1),
+        type: zod.string().min(1),
+        result: zod.string().min(1),
+        score: zod.number(),
+        value: zod.string().min(1),
+      }),
+    ),
+    co_occurring_issues: zod.array(
+      zod.object({
+        id: zod.string().min(1),
+        title: zod.string().min(1),
+        type: zod.string(),
+        co_occurrence: zod.number(),
+        count: zod.number(),
+        severity: zod.string().min(1),
+      }),
+    ),
+  }),
+});
+
+/**
  * Only traces linked to the shared issue are readable through its token.
  * @summary One trace of a shared Error Feed issue, under the issue link's rules.
  */

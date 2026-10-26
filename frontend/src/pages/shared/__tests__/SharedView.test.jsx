@@ -24,6 +24,22 @@ vi.mock("src/api/shared-links", () => ({
   useResolveSharedLink: mocks.useResolveSharedLink,
 }));
 
+vi.mock("src/pages/dashboard/error-feed/ErrorFeedDetailView", async () => {
+  const { useSharedIssue } = await import(
+    "src/pages/dashboard/error-feed/sharedIssueContext"
+  );
+  return {
+    default: () => {
+      const shared = useSharedIssue();
+      return (
+        <div data-testid="issue-page" data-token={shared?.token}>
+          {shared?.issue?.row?.error?.name}
+        </div>
+      );
+    },
+  };
+});
+
 vi.mock("src/components/traceDetail/TraceTreeV2", () => ({
   default: () => <div>trace tree</div>,
 }));
@@ -255,5 +271,42 @@ describe("SharedView simulation call rendering", () => {
     expect(
       screen.queryByRole("button", { name: /annotate|rerun|edit/i }),
     ).not.toBeInTheDocument();
+  });
+});
+
+describe("SharedView Error Feed issue", () => {
+  beforeEach(() => {
+    mocks.useResolveSharedLink.mockReset();
+  });
+
+  it("renders a shared issue as the read-only issue page", () => {
+    mocks.useResolveSharedLink.mockReturnValue({
+      data: {
+        resource_type: "error_feed_issue",
+        resource_id: "E-LOCAL01",
+        data: {
+          issue: {
+            row: {
+              cluster_id: "E-LOCAL01",
+              error: { name: "Agent promises refunds", type: "Policy" },
+            },
+          },
+          overview: null,
+          traces: null,
+          trends: null,
+          sidebar: null,
+        },
+      },
+      isLoading: false,
+      isError: false,
+    });
+
+    render(<SharedView />);
+
+    const page = screen.getByTestId("issue-page");
+    expect(page).toHaveTextContent("Agent promises refunds");
+    expect(page).toHaveAttribute("data-token", "share-token");
+    expect(screen.getByText("Shared issue")).toBeInTheDocument();
+    expect(screen.getByText("View only")).toBeInTheDocument();
   });
 });

@@ -68537,6 +68537,71 @@
                 }
             ]
         },
+        "/tracer/shared/{token}/sidebar/": {
+            "get": {
+                "operationId": "tracer_shared_sidebar_list",
+                "summary": "A shared Error Feed issue's sidebar, scoped to one of its traces.",
+                "description": "Mirrors the issue page: AI metadata and evaluations follow the trace\npicked in Traces affected (``?trace_id=``).",
+                "parameters": [
+                    {
+                        "name": "trace_id",
+                        "in": "query",
+                        "required": false,
+                        "type": "string",
+                        "minLength": 1
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "",
+                        "schema": {
+                            "$ref": "#/definitions/FeedSidebarApiResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "",
+                        "schema": {
+                            "$ref": "#/definitions/SharedLinkResolveError"
+                        }
+                    },
+                    "403": {
+                        "description": "",
+                        "schema": {
+                            "$ref": "#/definitions/SharedLinkResolveError"
+                        }
+                    },
+                    "404": {
+                        "description": "",
+                        "schema": {
+                            "$ref": "#/definitions/SharedLinkResolveError"
+                        }
+                    },
+                    "410": {
+                        "description": "",
+                        "schema": {
+                            "$ref": "#/definitions/SharedLinkResolveError"
+                        }
+                    },
+                    "default": {
+                        "description": "Default error response",
+                        "schema": {
+                            "$ref": "#/definitions/ManagementAPIErrorResponse"
+                        }
+                    }
+                },
+                "tags": [
+                    "tracer"
+                ]
+            },
+            "parameters": [
+                {
+                    "name": "token",
+                    "in": "path",
+                    "required": true,
+                    "type": "string"
+                }
+            ]
+        },
         "/tracer/shared/{token}/traces/{trace_id}/": {
             "get": {
                 "operationId": "tracer_shared_traces_read",

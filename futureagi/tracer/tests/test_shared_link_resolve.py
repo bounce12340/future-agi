@@ -1364,3 +1364,75 @@ def test_shared_issue_trace_410_after_revoke(
     )
 
     assert response.status_code == status.HTTP_410_GONE
+
+
+@pytest.mark.django_db
+def test_error_issue_shared_traces_match_the_issue_page_page_size(
+    api_client, auth_client, error_issue, error_feed_licensed
+):
+    from unittest.mock import patch
+
+    from tracer.utils import feed as feed_service
+
+    token = _share_error_issue(auth_client, "E-SHARE01").json()["result"]["token"]
+    with patch(
+        "tracer.utils.feed.get_traces_tab", wraps=feed_service.get_traces_tab
+    ) as traces_tab:
+        api_client.get(f"/tracer/shared/{token}/")
+
+    assert traces_tab.call_args.kwargs["limit"] == 200
+
+
+@pytest.mark.django_db
+def test_shared_issue_sidebar_follows_the_picked_trace(
+    api_client, auth_client, error_issue, error_feed_licensed
+):
+    from unittest.mock import patch
+
+    from tracer.utils import feed as feed_service
+
+    token = _share_error_issue(auth_client, "E-SHARE01").json()["result"]["token"]
+    trace_id = _member_trace_id(error_issue)
+    with patch(
+        "tracer.utils.feed.get_sidebar", wraps=feed_service.get_sidebar
+    ) as sidebar:
+        response = api_client.get(
+            f"/tracer/shared/{token}/sidebar/", {"trace_id": trace_id}
+        )
+
+    assert response.status_code == status.HTTP_200_OK, response.json()
+    assert "timeline" in response.json()["result"]
+    assert sidebar.call_args.kwargs["trace_id"] == trace_id
+    assert sidebar.call_args.args[0] == "E-SHARE01"
+
+
+@pytest.mark.django_db
+def test_shared_issue_sidebar_404_for_trace_outside_cluster(
+    api_client, auth_client, error_issue, error_feed_licensed
+):
+    token = _share_error_issue(auth_client, "E-SHARE01").json()["result"]["token"]
+
+    response = api_client.get(
+        f"/tracer/shared/{token}/sidebar/", {"trace_id": str(uuid.uuid4())}
+    )
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+
+
+@pytest.mark.django_db
+def test_shared_issue_sidebar_enforces_restricted_acl(
+    api_client, auth_client, error_issue, error_feed_licensed
+):
+    token = _share_error_issue(
+        auth_client,
+        "E-SHARE01",
+        access_type="restricted",
+        emails=["sidebar-viewer@example.com"],
+    ).json()["result"]["token"]
+
+    response = api_client.get(
+        f"/tracer/shared/{token}/sidebar/",
+        {"trace_id": _member_trace_id(error_issue)},
+    )
+
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED

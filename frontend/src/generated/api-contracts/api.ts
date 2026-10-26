@@ -1366,6 +1366,7 @@ import type {
   TracerSavedViewsListParams,
   TracerSharedLinksList200,
   TracerSharedLinksListParams,
+  TracerSharedSidebarListParams,
   TracerTraceAgentGraphParams,
   TracerTraceAnnotationGetAnnotationValuesParams,
   TracerTraceGetEvalNames200,
@@ -79034,6 +79035,96 @@ export const tracerSharedRead = async (
     ...options,
     method: "GET",
   });
+};
+
+export type tracerSharedSidebarListResponse200 = {
+  data: FeedSidebarApiResponseApi;
+  status: 200;
+};
+
+export type tracerSharedSidebarListResponse401 = {
+  data: SharedLinkResolveErrorApi;
+  status: 401;
+};
+
+export type tracerSharedSidebarListResponse403 = {
+  data: SharedLinkResolveErrorApi;
+  status: 403;
+};
+
+export type tracerSharedSidebarListResponse404 = {
+  data: SharedLinkResolveErrorApi;
+  status: 404;
+};
+
+export type tracerSharedSidebarListResponse410 = {
+  data: SharedLinkResolveErrorApi;
+  status: 410;
+};
+
+export type tracerSharedSidebarListResponseDefault = {
+  data: ManagementAPIErrorResponseApi;
+  status: Exclude<HTTPStatusCodes, 200 | 401 | 403 | 404 | 410>;
+};
+
+export type tracerSharedSidebarListResponseSuccess =
+  tracerSharedSidebarListResponse200 & {
+    headers: Headers;
+  };
+export type tracerSharedSidebarListResponseError = (
+  | tracerSharedSidebarListResponse401
+  | tracerSharedSidebarListResponse403
+  | tracerSharedSidebarListResponse404
+  | tracerSharedSidebarListResponse410
+  | tracerSharedSidebarListResponseDefault
+) & {
+  headers: Headers;
+};
+
+export type tracerSharedSidebarListResponse =
+  | tracerSharedSidebarListResponseSuccess
+  | tracerSharedSidebarListResponseError;
+
+export const getTracerSharedSidebarListUrl = (
+  token: string,
+  params?: TracerSharedSidebarListParams,
+) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+    if (Array.isArray(value)) {
+      value
+        .filter((item) => item !== undefined && item !== null)
+        .forEach((item) => normalizedParams.append(key, item.toString()));
+    } else if (value !== undefined && value !== null) {
+      normalizedParams.append(key, value.toString());
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0
+    ? `/tracer/shared/${token}/sidebar/?${stringifiedParams}`
+    : `/tracer/shared/${token}/sidebar/`;
+};
+
+/**
+ * Mirrors the issue page: AI metadata and evaluations follow the trace
+picked in Traces affected (``?trace_id=``).
+ * @summary A shared Error Feed issue's sidebar, scoped to one of its traces.
+ */
+export const tracerSharedSidebarList = async (
+  token: string,
+  params?: TracerSharedSidebarListParams,
+  options?: RequestInit,
+): Promise<tracerSharedSidebarListResponse> => {
+  return apiMutator<tracerSharedSidebarListResponse>(
+    getTracerSharedSidebarListUrl(token, params),
+    {
+      ...options,
+      method: "GET",
+    },
+  );
 };
 
 export type tracerSharedTracesReadResponse200 = {

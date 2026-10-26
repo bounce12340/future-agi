@@ -46,6 +46,7 @@ from tracer.views.replay_session import ReplaySessionView
 from tracer.views.saved_view import SavedViewViewSet
 from tracer.views.shared_link import (
     SharedLinkViewSet,
+    resolve_shared_issue_sidebar,
     resolve_shared_issue_trace,
     resolve_shared_link,
 )
@@ -250,6 +251,11 @@ urlpatterns = [
         name="get-annotation-labels",
     ),
     path("shared/<str:token>/", resolve_shared_link, name="resolve-shared-link"),
+    path(
+        "shared/<str:token>/sidebar/",
+        resolve_shared_issue_sidebar,
+        name="resolve-shared-issue-sidebar",
+    ),
     path(
         "shared/<str:token>/traces/<str:trace_id>/",
         resolve_shared_issue_trace,

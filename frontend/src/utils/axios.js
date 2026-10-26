@@ -1852,6 +1852,8 @@ export const endpoints = {
         access_id: accessId,
       }),
     resolve: (token) => apiPath("/tracer/shared/{token}/", { token: token }),
+    issueSidebar: (token) =>
+      apiPath("/tracer/shared/{token}/sidebar/", { token: token }),
     issueTrace: (token, traceId) =>
       apiPath("/tracer/shared/{token}/traces/{trace_id}/", {
         token: token,

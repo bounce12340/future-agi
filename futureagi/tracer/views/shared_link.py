@@ -36,6 +36,10 @@ from tracer.serializers.shared_link import (
     SharedLinkResolveResponseSerializer,
     SharedLinkUpdateSerializer,
 )
+from tracer.serializers.feed import (
+    FeedSidebarApiResponseSerializer,
+    FeedSidebarQuerySerializer,
+)
 from tracer.serializers.trace import TraceDetailResponseSerializer
 
 logger = structlog.get_logger(__name__)
@@ -307,16 +311,64 @@ def resolve_shared_issue_trace(request, token, trace_id):
     return _gm.success_response(detail)
 
 
-def _resolve_shared_issue_trace(request, link, trace_id):
-    from types import SimpleNamespace
+@swagger_auto_schema(
+    method="get",
+    query_serializer=FeedSidebarQuerySerializer,
+    responses={
+        200: FeedSidebarApiResponseSerializer,
+        401: SharedLinkResolveErrorSerializer,
+        403: SharedLinkResolveErrorSerializer,
+        404: SharedLinkResolveErrorSerializer,
+        410: SharedLinkResolveErrorSerializer,
+    },
+)
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def resolve_shared_issue_sidebar(request, token):
+    """A shared Error Feed issue's sidebar, scoped to one of its traces.
 
+    Mirrors the issue page: AI metadata and evaluations follow the trace
+    picked in Traces affected (``?trace_id=``).
+    """
+    from tracer.serializers.feed import FeedSidebarSerializer
+    from tracer.utils import feed as feed_service
+
+    link, error = _check_shared_link_access(request, token)
+    if error is not None:
+        return error
+    if link.resource_type != ResourceType.ERROR_FEED_ISSUE.value:
+        return _gm.not_found("Shared sidebar not found")
+
+    trace_id = request.query_params.get("trace_id") or None
+
+    def _build():
+        scope = _shared_issue_scope(link, trace_id)
+        if scope is None:
+            return None
+        cluster_id, project_ids, _ = scope
+        result = feed_service.get_sidebar(cluster_id, project_ids, trace_id=trace_id)
+        return FeedSidebarSerializer(result).data if result is not None else None
+
+    try:
+        data = _in_link_workspace(link, _build)
+    except Exception:
+        logger.exception("shared_issue_sidebar_failed", link_id=str(link.id))
+        data = None
+    if data is None:
+        return _gm.not_found("Shared sidebar not found")
+    return _gm.success_response(data)
+
+
+def _shared_issue_scope(link, trace_id=None):
+    """The shared issue behind a link, as ``(cluster_id, project_ids, group)``.
+
+    ``None`` when the sharer lost the licence, the issue is gone, or
+    ``trace_id`` is given and is not one of the issue's traces.
+    """
     from tfc.ee_gating import EEFeature, FeatureUnavailable, check_ee_feature
     from tracer.models.trace_error_analysis import TraceErrorGroup
     from tracer.queries.feed import _cluster_has_trace
     from tracer.queries.grouping_redirect import resolve_issue_redirect
-    from tracer.services.clickhouse.v2.query_builders import trace_detail
-    from tracer.services.clickhouse.v2.query_service import V2AnalyticsQueryService
-    from tracer.views.trace import TraceView
 
     try:
         check_ee_feature(EEFeature.ERROR_FEED, org_id=str(link.organization_id))
@@ -330,7 +382,7 @@ def _resolve_shared_issue_trace(request, link, trace_id):
     if redirect is None:
         return None
     cluster_id = redirect["resolved_cluster_id"]
-    if not _cluster_has_trace(cluster_id, trace_id, project_ids):
+    if trace_id and not _cluster_has_trace(cluster_id, trace_id, project_ids):
         return None
     group = TraceErrorGroup.objects.filter(
         cluster_id=cluster_id,
@@ -340,6 +392,20 @@ def _resolve_shared_issue_trace(request, link, trace_id):
     ).first()
     if group is None:
         return None
+    return cluster_id, project_ids, group
+
+
+def _resolve_shared_issue_trace(request, link, trace_id):
+    from types import SimpleNamespace
+
+    from tracer.services.clickhouse.v2.query_builders import trace_detail
+    from tracer.services.clickhouse.v2.query_service import V2AnalyticsQueryService
+    from tracer.views.trace import TraceView
+
+    scope = _shared_issue_scope(link, trace_id)
+    if scope is None:
+        return None
+    _, _, group = scope
 
     # Read as the link sees it: its organization and workspace, the
     # issue's project, never the viewer's own scope.
@@ -582,7 +648,8 @@ def _resolve_shared_error_issue(link):
             "traces",
             TracesTabResponseSerializer,
             feed_service.get_traces_tab,
-            limit=50,
+            # Same page size the issue page's Traces tab asks for.
+            limit=200,
             offset=0,
         ),
         "trends": _tab(

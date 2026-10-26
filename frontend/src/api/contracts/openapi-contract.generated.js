@@ -5,7 +5,7 @@
 export const OPENAPI_CONTRACT = Object.freeze({
   generatedFrom: "api_contracts/openapi/swagger.json",
   swaggerVersion: "2.0",
-  endpointCount: 1074,
+  endpointCount: 1075,
   endpoints: {
     "/accounts/2fa/recovery-codes/": {
       get: {
@@ -38510,6 +38510,43 @@ export const OPENAPI_CONTRACT = Object.freeze({
         responses: {
           200: {
             $ref: "#/definitions/SharedLinkResolveResponse",
+          },
+          401: {
+            $ref: "#/definitions/SharedLinkResolveError",
+          },
+          403: {
+            $ref: "#/definitions/SharedLinkResolveError",
+          },
+          404: {
+            $ref: "#/definitions/SharedLinkResolveError",
+          },
+          410: {
+            $ref: "#/definitions/SharedLinkResolveError",
+          },
+          default: {
+            $ref: "#/definitions/ManagementAPIErrorResponse",
+          },
+        },
+      },
+    },
+    "/tracer/shared/{token}/sidebar/": {
+      get: {
+        operationId: "tracer_shared_sidebar_list",
+        runtimeRequestValidation: false,
+        runtimeResponseValidation: false,
+        requestBody: null,
+        queryParameters: {
+          trace_id: {
+            required: false,
+            schema: {
+              type: "string",
+              minLength: 1,
+            },
+          },
+        },
+        responses: {
+          200: {
+            $ref: "#/definitions/FeedSidebarApiResponse",
           },
           401: {
             $ref: "#/definitions/SharedLinkResolveError",
