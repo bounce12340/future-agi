@@ -1,7 +1,11 @@
 /* eslint-disable react/prop-types */
 import React from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { MutationCache, QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import {
+  MutationCache,
+  QueryClient,
+  QueryClientProvider,
+} from "@tanstack/react-query";
 import { handleError } from "src/utils/queryErrorHandler";
 import { render, screen, userEvent, waitFor } from "src/utils/test-utils";
 import InviteUserDrawer from "../InviteUserDrawer";
