@@ -152126,7 +152126,8 @@
                         "eval_run",
                         "dataset",
                         "project",
-                        "call_execution"
+                        "call_execution",
+                        "error_feed_issue"
                     ],
                     "readOnly": true
                 },
@@ -152201,7 +152202,8 @@
                         "trace",
                         "dashboard",
                         "project",
-                        "call_execution"
+                        "call_execution",
+                        "error_feed_issue"
                     ]
                 },
                 "resource_id": {
@@ -152296,7 +152298,8 @@
                         "eval_run",
                         "dataset",
                         "project",
-                        "call_execution"
+                        "call_execution",
+                        "error_feed_issue"
                     ],
                     "readOnly": true
                 },
@@ -152563,6 +152566,21 @@
                 "widget_count": {
                     "title": "Widget count",
                     "type": "integer"
+                },
+                "issue": {
+                    "$ref": "#/definitions/FeedDetailCore"
+                },
+                "overview": {
+                    "$ref": "#/definitions/OverviewResponse"
+                },
+                "traces": {
+                    "$ref": "#/definitions/TracesTabResponse"
+                },
+                "trends": {
+                    "$ref": "#/definitions/TrendsTabResponse"
+                },
+                "sidebar": {
+                    "$ref": "#/definitions/FeedSidebar"
                 }
             }
         },
@@ -152584,7 +152602,8 @@
                         "eval_run",
                         "dataset",
                         "project",
-                        "call_execution"
+                        "call_execution",
+                        "error_feed_issue"
                     ]
                 },
                 "resource_id": {
