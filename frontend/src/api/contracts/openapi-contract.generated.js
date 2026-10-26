@@ -76645,7 +76645,13 @@ export const OPENAPI_CONTRACT = Object.freeze({
         resource_type: {
           title: "Resource type",
           type: "string",
-          enum: ["trace", "dashboard", "project", "call_execution"],
+          enum: [
+            "trace",
+            "dashboard",
+            "project",
+            "call_execution",
+            "error_feed_issue",
+          ],
         },
         resource_id: {
           title: "Resource id",
@@ -76696,6 +76702,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
             "dataset",
             "project",
             "call_execution",
+            "error_feed_issue",
           ],
           readOnly: true,
         },
@@ -76774,6 +76781,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
             "dataset",
             "project",
             "call_execution",
+            "error_feed_issue",
           ],
           readOnly: true,
         },
@@ -76918,6 +76926,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
             "dataset",
             "project",
             "call_execution",
+            "error_feed_issue",
           ],
         },
         resource_id: {
@@ -103103,6 +103112,21 @@ export const OPENAPI_CONTRACT = Object.freeze({
         widget_count: {
           title: "Widget count",
           type: "integer",
+        },
+        issue: {
+          $ref: "#/definitions/FeedDetailCore",
+        },
+        overview: {
+          $ref: "#/definitions/OverviewResponse",
+        },
+        traces: {
+          $ref: "#/definitions/TracesTabResponse",
+        },
+        trends: {
+          $ref: "#/definitions/TrendsTabResponse",
+        },
+        sidebar: {
+          $ref: "#/definitions/FeedSidebar",
         },
       },
     },

@@ -29232,6 +29232,7 @@ export const SharedLinkListApiResourceType = {
   dataset: "dataset",
   project: "project",
   call_execution: "call_execution",
+  error_feed_issue: "error_feed_issue",
 } as const;
 
 export type SharedLinkListApiAccessType =
@@ -29266,6 +29267,7 @@ export const SharedLinkCreateApiResourceType = {
   dashboard: "dashboard",
   project: "project",
   call_execution: "call_execution",
+  error_feed_issue: "error_feed_issue",
 } as const;
 
 export type SharedLinkCreateApiAccessType =
@@ -29299,6 +29301,7 @@ export const SharedLinkDetailApiResourceType = {
   dataset: "dataset",
   project: "project",
   call_execution: "call_execution",
+  error_feed_issue: "error_feed_issue",
 } as const;
 
 export type SharedLinkDetailApiAccessType =
@@ -29366,6 +29369,7 @@ export const SharedLinkResolveResponseApiResourceType = {
   dataset: "dataset",
   project: "project",
   call_execution: "call_execution",
+  error_feed_issue: "error_feed_issue",
 } as const;
 
 export type SharedLinkResolveResponseApiAccessType =
@@ -29451,6 +29455,11 @@ export interface SharedLinkResolvedDataApi {
   updated_at?: string;
   widgets?: SharedLinkResolvedDataApiWidgetsItem[];
   widget_count?: number;
+  issue?: FeedDetailCoreApi;
+  overview?: OverviewResponseApi;
+  traces?: TracesTabResponseApi;
+  trends?: TrendsTabResponseApi;
+  sidebar?: FeedSidebarApi;
 }
 
 export interface SharedLinkResolveResponseApi {

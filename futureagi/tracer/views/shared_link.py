@@ -45,6 +45,7 @@ SUPPORTED_SHARED_RESOURCE_TYPES = {
     ResourceType.DASHBOARD.value,
     ResourceType.PROJECT.value,
     ResourceType.CALL_EXECUTION.value,
+    ResourceType.ERROR_FEED_ISSUE.value,
 }
 
 
@@ -331,6 +332,9 @@ def _resolve_resource(link):
         elif link.resource_type == ResourceType.CALL_EXECUTION.value:
             return _in_link_workspace(link, _resolve_shared_call_execution, link)
 
+        elif link.resource_type == ResourceType.ERROR_FEED_ISSUE.value:
+            return _in_link_workspace(link, _resolve_shared_error_issue, link)
+
         # Extend for other resource types as needed
         return None
 
@@ -399,6 +403,90 @@ def _get_shared_link_by_token(token):
     return SharedLink.no_workspace_objects.get(token=token, deleted=False)
 
 
+def _shared_feed_project_ids(organization, workspace):
+    from tracer.models.project import Project
+
+    projects = Project.no_workspace_objects.filter(
+        organization=organization
+    ).filter(_workspace_scope_q(workspace, "workspace"))
+    return [str(pid) for pid in projects.values_list("id", flat=True)]
+
+
+def _get_shared_error_issue(cluster_id, organization, workspace):
+    from tracer.utils import feed as feed_service
+
+    project_ids = _shared_feed_project_ids(organization, workspace)
+    if not project_ids:
+        return None
+    return feed_service.get_feed_detail(cluster_id, project_ids)
+
+
+def _resolve_shared_error_issue(link):
+    # The sharer's org must hold the licence; the viewer's entitlement is
+    # irrelevant, like every other property of the link.
+    from tfc.ee_gating import EEFeature, FeatureUnavailable, check_ee_feature
+    from tracer.queries.grouping_redirect import resolve_issue_redirect
+    from tracer.serializers.feed import (
+        FeedDetailCoreSerializer,
+        FeedSidebarSerializer,
+        OverviewResponseSerializer,
+        TracesTabResponseSerializer,
+        TrendsTabResponseSerializer,
+    )
+    from tracer.utils import feed as feed_service
+
+    try:
+        check_ee_feature(EEFeature.ERROR_FEED, org_id=str(link.organization_id))
+    except FeatureUnavailable:
+        return None
+
+    project_ids = _shared_feed_project_ids(link.organization, link.workspace)
+    if not project_ids:
+        return None
+    # A merged issue keeps its link working by following the merge.
+    redirect = resolve_issue_redirect(link.resource_id, project_ids)
+    if redirect is None:
+        return None
+    cluster_id = redirect["resolved_cluster_id"]
+
+    detail = feed_service.get_feed_detail(cluster_id, project_ids)
+    if detail is None:
+        return None
+
+    # Each tab builds on its own: one failing read (overview's vector store,
+    # say) leaves that tab empty instead of taking the whole link down.
+    def _tab(name, serializer_class, build, **kwargs):
+        try:
+            value = build(cluster_id, project_ids, **kwargs)
+        except Exception:
+            logger.exception(
+                "shared_error_issue_tab_failed", link_id=str(link.id), tab=name
+            )
+            return None
+        return serializer_class(value).data if value is not None else None
+
+    return {
+        "issue": FeedDetailCoreSerializer(detail).data,
+        "overview": _tab(
+            "overview",
+            OverviewResponseSerializer,
+            feed_service.get_overview_tab,
+            rep_limit=20,
+        ),
+        "traces": _tab(
+            "traces",
+            TracesTabResponseSerializer,
+            feed_service.get_traces_tab,
+            limit=50,
+            offset=0,
+        ),
+        "trends": _tab(
+            "trends", TrendsTabResponseSerializer, feed_service.get_trends_tab, days=14
+        ),
+        "sidebar": _tab("sidebar", FeedSidebarSerializer, feed_service.get_sidebar),
+    }
+
+
 def _shared_resource_exists(resource_type, resource_id, organization, workspace):
     try:
         if resource_type == ResourceType.TRACE.value:
@@ -415,6 +503,11 @@ def _shared_resource_exists(resource_type, resource_id, organization, workspace)
         if resource_type == ResourceType.CALL_EXECUTION.value:
             return (
                 _get_shared_call_execution(resource_id, organization, workspace)
+                is not None
+            )
+        if resource_type == ResourceType.ERROR_FEED_ISSUE.value:
+            return (
+                _get_shared_error_issue(resource_id, organization, workspace)
                 is not None
             )
     except (TypeError, ValueError, ValidationError):
