@@ -391,48 +391,82 @@ def _rows_held(
 ) -> list[HostedHarnessScenario | None]:
     """The existing row each scenario writes, or ``None`` for a new one.
 
-    A scenario takes the row holding its key first; only scenarios left over fall back to
-    a row their key or name spells, and never to one already used (a renamed scenario
-    keeps its key). A key names one scenario for the environment's life, so a dropped
-    scenario's key brings back that scenario's row and run history.
+    A key names one scenario, so a scenario takes the row holding its key. When several
+    repeat a key, the one under that row's name keeps it and the others take the rows
+    they were given before (``<key>-2`` and on). Only an older scenario without a key is
+    matched by name, and never to a row already taken.
     """
     from simulate.services.hosted_harness_gateway import _scenario_token
 
-    active_first = sorted(rows, key=lambda row: not row.deleted)
-    by_token = {
-        token: row
-        for row in active_first
-        for token in (_scenario_token(row.scenario_key), _scenario_token(row.name))
-        if token
-    }
-    by_key_token = {
-        _scenario_token(row.scenario_key): row
-        for row in active_first
-        if row.scenario_key
-    }
-    held_rows: list[HostedHarnessScenario | None] = []
+    by_key: dict[str, HostedHarnessScenario] = {}
+    by_key_token: dict[str, HostedHarnessScenario] = {}
+    by_token: dict[str, HostedHarnessScenario] = {}
+    for row in sorted(rows, key=lambda row: row.deleted):
+        if row.scenario_key:
+            by_key.setdefault(row.scenario_key, row)
+            by_key_token.setdefault(_scenario_token(row.scenario_key), row)
+        for token in (_scenario_token(row.scenario_key), _scenario_token(row.name)):
+            if token:
+                by_token.setdefault(token, row)
+
+    def key_of(doc: dict[str, Any]) -> str:
+        return str(doc.get("scenario_key") or "").strip()
+
+    held_rows: list[HostedHarnessScenario | None] = [None] * len(docs)
     used: set[Any] = set()
-    for doc in docs:
-        row = by_key_token.get(_scenario_token(doc.get("scenario_key")))
-        # A key repeated in one suite keeps its row for the first scenario only.
-        if row is not None and row.id in used:
-            row = None
-        if row is not None:
+
+    def take(index: int, row: HostedHarnessScenario | None) -> None:
+        if row is not None and row.id not in used:
+            held_rows[index] = row
             used.add(row.id)
-        held_rows.append(row)
+
+    # The row's own name first, so the order of a repeated key never swaps two scenarios.
+    for index in sorted(
+        range(len(docs)),
+        key=lambda index: (
+            getattr(by_key.get(key_of(docs[index])), "name", None)
+            != docs[index].get("name")
+        ),
+    ):
+        take(index, by_key.get(key_of(docs[index])))
+    owner = {
+        key_of(doc): doc.get("name")
+        for doc, row in zip(docs, held_rows)
+        if row is not None
+    }
     for index, doc in enumerate(docs):
-        if held_rows[index] is not None:
+        key = key_of(doc)
+        # The same scenario listed twice writes its one row (``index_scenarios``).
+        if (
+            held_rows[index] is not None
+            or key not in by_key
+            or owner.get(key) == doc.get("name")
+        ):
             continue
-        for value in (doc.get("scenario_key"), doc.get("name")):
-            row = by_token.get(_scenario_token(value))
-            if row is not None and row.id not in used:
-                held_rows[index] = row
-                used.add(row.id)
+        repeats = sorted(
+            (
+                row
+                for given, row in by_key.items()
+                if given.startswith(f"{key}-") and given[len(key) + 1 :].isdigit()
+            ),
+            key=lambda row: (
+                row.name != doc.get("name"),
+                int(row.scenario_key.rsplit("-", 1)[1]),
+            ),
+        )
+        for row in repeats:
+            if row.id not in used:
+                take(index, row)
                 break
-        if held_rows[index] is None and not doc.get("scenario_key"):
-            # An older scenario without a key that repeats a name writes over the
-            # row holding that name as its key.
-            held_rows[index] = by_key_token.get(_scenario_token(doc.get("name")))
+    for index, doc in enumerate(docs):
+        if held_rows[index] is None:
+            # Older outputs spelled keys and folders differently.
+            take(
+                index,
+                by_key_token.get(_scenario_token(key_of(doc)))
+                if key_of(doc)
+                else by_token.get(_scenario_token(doc.get("name"))),
+            )
     return held_rows
 
 
@@ -453,6 +487,8 @@ def index_scenarios(
     seen: set[str] = set()
     held_rows = _rows_held(rows, docs)
     keys = {row.scenario_key for row in rows}
+    # Every key given out, by a row or by this suite, so a repeat gets one nobody holds.
+    given = keys | {str(doc.get("scenario_key") or "").strip() for doc in docs}
     # Each key written so far, with the name it was written under and its row.
     holder: dict[str, tuple[str, HostedHarnessScenario]] = {}
     for position, (doc, held) in enumerate(zip(docs, held_rows, strict=True), start=1):
@@ -464,18 +500,14 @@ def index_scenarios(
         if not key:
             continue
         name = str(doc.get("name") or key)[:255]
-        if (
-            held is None
-            and key in holder
-            and (not doc.get("scenario_key") or holder[key][0] == name)
-        ):
+        if held is None and key in holder and holder[key][0] == name:
             # The same scenario listed twice: both write the one row.
             held = holder[key][1]
         elif held is None and (key in keys or key in seen):
             # Another scenario in this suite already holds this key: this one gets its
             # own, so neither is lost and the key stays unique.
             key = next(
-                f"{key}-{n}" for n in count(2) if f"{key}-{n}" not in keys | seen
+                f"{key}-{n}" for n in count(2) if f"{key}-{n}" not in given | seen
             )
         seen.add(key)
         if held is not None and held.number is not None:

@@ -308,6 +308,101 @@ class TestScenarioNumbersSurviveADeletion:
         row = HostedHarnessScenario.all_objects.get(job=job, scenario_key="two")
         assert (row.number, row.name, row.deleted) == (2, "two-new", False)
 
+    def test_a_new_scenario_named_like_a_dropped_one_gets_its_own_row(
+        self, user, workspace
+    ):
+        from simulate.models import HostedHarnessScenario
+        from simulate.services.harness_scenarios import index_scenarios
+
+        suite = [
+            {"name": name, "scenario_key": name, "tests": "t"}
+            for name in ("one", "two")
+        ]
+        job = _job(user, workspace, suite)
+        index_scenarios(job, suite)
+        index_scenarios(job, [suite[0]], prune=True)
+        # The harness never gives a used key to a new scenario, so it arrives with its own.
+        index_scenarios(
+            job,
+            [suite[0], {"name": "two", "scenario_key": "two-2", "tests": "other"}],
+            prune=True,
+        )
+        rows = {
+            row.scenario_key: (row.number, row.name, row.deleted)
+            for row in HostedHarnessScenario.all_objects.filter(job=job)
+        }
+        assert rows == {
+            "one": (1, "one", False),
+            "two": (2, "two", True),
+            "two-2": (3, "two", False),
+        }
+
+    def test_keys_that_differ_only_in_case_or_separator_keep_their_rows(
+        self, user, workspace
+    ):
+        from simulate.services.harness_scenarios import index_scenarios
+
+        suite = [
+            {"name": "A", "scenario_key": "a_b", "tests": "t"},
+            {"name": "B", "scenario_key": "a-b", "tests": "t"},
+            {"name": "C", "scenario_key": "Key", "tests": "t"},
+            {"name": "D", "scenario_key": "key", "tests": "t"},
+        ]
+        job = _job(user, workspace, suite)
+        index_scenarios(job, suite)
+        first = self._rows(job)
+        for _ in range(2):
+            index_scenarios(job, suite, prune=True)
+        assert self._rows(job) == first
+        assert first == {
+            "a_b": (1, "A"),
+            "a-b": (2, "B"),
+            "Key": (3, "C"),
+            "key": (4, "D"),
+        }
+
+    def test_repeated_keys_keep_each_scenario_on_its_row_in_any_order(
+        self, user, workspace
+    ):
+        from simulate.services.harness_scenarios import index_scenarios
+
+        suite = [
+            {"name": "A", "scenario_key": "k", "tests": "t"},
+            {"name": "B", "scenario_key": "k", "tests": "t"},
+            {"name": "C", "scenario_key": "k-2", "tests": "t"},
+        ]
+        job = _job(user, workspace, suite)
+        index_scenarios(job, suite)
+        rows = self._rows(job)
+        assert rows == {"k": (1, "A"), "k-3": (2, "B"), "k-2": (3, "C")}
+        index_scenarios(job, list(reversed(suite)), prune=True)
+        assert self._rows(job) == rows
+        # The second holder renamed under its old key keeps its row.
+        index_scenarios(
+            job, [suite[0], {**suite[1], "name": "B2"}, suite[2]], prune=True
+        )
+        assert self._rows(job) == {"k": (1, "A"), "k-3": (2, "B2"), "k-2": (3, "C")}
+
+    def test_a_scenario_without_a_key_never_writes_over_a_keyed_one(
+        self, user, workspace
+    ):
+        from simulate.services.harness_scenarios import index_scenarios
+
+        suite = [{"name": "first", "scenario_key": "k", "tests": "t"}]
+        job = _job(user, workspace, suite)
+        index_scenarios(job, suite)
+        index_scenarios(job, [suite[0], {"name": "k", "tests": "t"}], prune=True)
+        assert self._rows(job) == {"k": (1, "first"), "k-2": (2, "k")}
+
+    @staticmethod
+    def _rows(job):
+        from simulate.models import HostedHarnessScenario
+
+        return {
+            row.scenario_key: (row.number, row.name)
+            for row in HostedHarnessScenario.no_workspace_objects.filter(job=job)
+        }
+
     def test_a_number_means_the_row_the_table_shows(self, user, workspace):
         from simulate.services.harness_provider import scenarios_meant
         from simulate.services.harness_scenarios import index_scenarios
@@ -438,3 +533,17 @@ def test_an_archive_that_cannot_take_the_edit_leaves_everything_unchanged(
     output = HostedHarnessStageOutput.no_workspace_objects.get(job=job, kind="scenarios")
     assert [one["name"] for one in output.data] == ["one", "two"]
     pushed.assert_not_called()
+
+
+def test_the_harness_is_sent_every_key_the_environment_has_used(user, workspace):
+    from simulate.services.harness_scenarios import index_scenarios
+    from simulate.services.hosted_harness_gateway import _with_used_scenario_keys
+
+    suite = [
+        {"name": name, "scenario_key": name, "tests": "t"} for name in ("one", "two")
+    ]
+    job = _job(user, workspace, suite)
+    index_scenarios(job, suite)
+    index_scenarios(job, [suite[0]], prune=True)
+    document = _with_used_scenario_keys({"metadata": {"name": "x"}}, job)
+    assert document["metadata"] == {"name": "x", "used_scenario_keys": ["one", "two"]}
