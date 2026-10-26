@@ -60,7 +60,12 @@ def assert_created_response(response):
     assert response.data["status"] is True
     contract = TeamCreateResponseSerializer(data=response.data)
     assert contract.is_valid(), contract.errors
-    return response.data["result"]["created_members"]
+    created = response.data["result"]["created_members"]
+    assert [member.get("invite_email_warning") for member in created] == [
+        member.get("invite_email_warning")
+        for member in contract.validated_data["result"]["created_members"]
+    ]
+    return created
 
 
 @pytest.mark.integration
