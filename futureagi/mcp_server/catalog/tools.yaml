@@ -330,7 +330,7 @@ tools:
     access: read
   - name: get_error_cluster_overview
     group: error_feed
-    description: Return a cluster's pattern summary - the statistical insights that separate its failing traces from the passing baseline - plus its daily error counts and representative traces with their evidence and agent flow. Representative traces carry full inputs and outputs, so pass rep_limit=1 to 3; larger pages exceed the MCP response size limit.
+    description: Return a cluster's pattern summary - the statistical insights that separate its failing traces from the passing baseline - plus its daily error counts and representative traces with their evidence and agent flow. Representative traces carry full inputs, outputs and conversation reels, so pass rep_limit=1 to 3; the contract's own default of 20 exceeds the MCP response size limit. If even rep_limit=1 is too large, which happens for long conversations, read list_error_cluster_traces and get_error_cluster_root_cause instead - the pattern summary is not available in a smaller form.
     operation: {method: GET, path: "/tracer/feed/issues/{cluster_id}/overview/"}
     access: read
     pagination:
