@@ -5,7 +5,7 @@
 export const API_SURFACE_CONTRACT = Object.freeze({
   generatedFrom: "api_contracts/openapi/swagger.json",
   swaggerVersion: "2.0",
-  endpointCount: 1073,
+  endpointCount: 1074,
   groups: {
     accounts: {
       "/accounts/2fa/recovery-codes/": ["get"],
@@ -1208,6 +1208,7 @@ export const API_SURFACE_CONTRACT = Object.freeze({
       "/tracer/shared-links/{id}/access/": ["post"],
       "/tracer/shared-links/{id}/access/{access_id}/": ["delete"],
       "/tracer/shared/{token}/": ["get"],
+      "/tracer/shared/{token}/traces/{trace_id}/": ["get"],
       "/tracer/trace-annotation/get_annotation_values/": ["get"],
       "/tracer/trace-error-analysis/{trace_id}/": ["get"],
       "/tracer/trace-error-task/{project_id}/": ["get", "post"],
@@ -2493,6 +2494,7 @@ export const API_SURFACE_PATHS = Object.freeze({
   "/tracer/shared-links/{id}/access/": ["post"],
   "/tracer/shared-links/{id}/access/{access_id}/": ["delete"],
   "/tracer/shared/{token}/": ["get"],
+  "/tracer/shared/{token}/traces/{trace_id}/": ["get"],
   "/tracer/trace-annotation/get_annotation_values/": ["get"],
   "/tracer/trace-error-analysis/{trace_id}/": ["get"],
   "/tracer/trace-error-task/{project_id}/": ["get", "post"],

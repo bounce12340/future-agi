@@ -68537,6 +68537,69 @@
                 }
             ]
         },
+        "/tracer/shared/{token}/traces/{trace_id}/": {
+            "get": {
+                "operationId": "tracer_shared_traces_read",
+                "summary": "One trace of a shared Error Feed issue, under the issue link's rules.",
+                "description": "Only traces linked to the shared issue are readable through its token.",
+                "parameters": [],
+                "responses": {
+                    "200": {
+                        "description": "",
+                        "schema": {
+                            "$ref": "#/definitions/TraceDetailResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "",
+                        "schema": {
+                            "$ref": "#/definitions/SharedLinkResolveError"
+                        }
+                    },
+                    "403": {
+                        "description": "",
+                        "schema": {
+                            "$ref": "#/definitions/SharedLinkResolveError"
+                        }
+                    },
+                    "404": {
+                        "description": "",
+                        "schema": {
+                            "$ref": "#/definitions/SharedLinkResolveError"
+                        }
+                    },
+                    "410": {
+                        "description": "",
+                        "schema": {
+                            "$ref": "#/definitions/SharedLinkResolveError"
+                        }
+                    },
+                    "default": {
+                        "description": "Default error response",
+                        "schema": {
+                            "$ref": "#/definitions/ManagementAPIErrorResponse"
+                        }
+                    }
+                },
+                "tags": [
+                    "tracer"
+                ]
+            },
+            "parameters": [
+                {
+                    "name": "token",
+                    "in": "path",
+                    "required": true,
+                    "type": "string"
+                },
+                {
+                    "name": "trace_id",
+                    "in": "path",
+                    "required": true,
+                    "type": "string"
+                }
+            ]
+        },
         "/tracer/trace-annotation/get_annotation_values/": {
             "get": {
                 "operationId": "tracer_trace-annotation_get_annotation_values",

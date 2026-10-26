@@ -1245,3 +1245,122 @@ def test_error_issue_link_still_resolves_when_a_tab_fails(
     assert data["issue"]["row"]["cluster_id"] == "E-SHARE01"
     assert data["overview"] is None
     assert data["traces"]["total"] == 2
+
+
+def _member_trace_id(group):
+    from tracer.models.trace_error_analysis import ErrorClusterTraces
+
+    return str(
+        ErrorClusterTraces.objects.filter(cluster=group)
+        .order_by("created_at")
+        .first()
+        .trace_id
+    )
+
+
+@pytest.fixture
+def fake_trace_detail():
+    from unittest.mock import patch
+
+    def _detail(view, request, trace_id, analytics, *, project_id=None, **_):
+        return {"trace": {"id": str(trace_id), "project_id": project_id}}
+
+    with patch(
+        "tracer.services.clickhouse.v2.query_builders.trace_detail."
+        "retrieve_trace_detail_ch",
+        side_effect=_detail,
+    ) as fake:
+        yield fake
+
+
+@pytest.mark.django_db
+def test_shared_issue_trace_returns_trace_detail_for_member_trace(
+    api_client, auth_client, error_issue, error_feed_licensed, fake_trace_detail
+):
+    token = _share_error_issue(auth_client, "E-SHARE01").json()["result"]["token"]
+    trace_id = _member_trace_id(error_issue)
+
+    response = api_client.get(f"/tracer/shared/{token}/traces/{trace_id}/")
+
+    assert response.status_code == status.HTTP_200_OK, response.json()
+    result = response.json()["result"]
+    assert result["trace"]["id"] == trace_id
+    assert result["trace"]["project_id"] == str(error_issue.project_id)
+    scoped_request = fake_trace_detail.call_args.args[1]
+    assert scoped_request.organization == error_issue.project.organization
+
+
+@pytest.mark.django_db
+def test_shared_issue_trace_404_for_trace_outside_cluster(
+    api_client, auth_client, error_issue, error_feed_licensed, fake_trace_detail
+):
+    token = _share_error_issue(auth_client, "E-SHARE01").json()["result"]["token"]
+
+    response = api_client.get(f"/tracer/shared/{token}/traces/{uuid.uuid4()}/")
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+    fake_trace_detail.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_shared_issue_trace_enforces_restricted_acl(
+    api_client,
+    auth_client,
+    organization,
+    error_issue,
+    error_feed_licensed,
+    fake_trace_detail,
+):
+    token = _share_error_issue(
+        auth_client,
+        "E-SHARE01",
+        access_type="restricted",
+        emails=["trace-viewer@example.com"],
+    ).json()["result"]["token"]
+    url = f"/tracer/shared/{token}/traces/{_member_trace_id(error_issue)}/"
+
+    assert api_client.get(url).status_code == status.HTTP_401_UNAUTHORIZED
+    outsider = User.objects.create_user(
+        email="trace-outsider@example.com",
+        password="testpassword123",
+        name="Not On The List",
+        organization=organization,
+        organization_role=OrganizationRoles.MEMBER,
+    )
+    api_client.force_authenticate(user=outsider)
+    assert api_client.get(url).status_code == status.HTTP_403_FORBIDDEN
+    fake_trace_detail.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_shared_issue_trace_404_on_trace_link_token(
+    api_client, auth_client, trace, observation_span, fake_trace_detail
+):
+    token = auth_client.post(
+        "/tracer/shared-links/",
+        data={
+            "resource_type": "trace",
+            "resource_id": str(trace.id),
+            "access_type": "public",
+        },
+        format="json",
+    ).json()["result"]["token"]
+
+    response = api_client.get(f"/tracer/shared/{token}/traces/{trace.id}/")
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+    fake_trace_detail.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_shared_issue_trace_410_after_revoke(
+    api_client, auth_client, error_issue, error_feed_licensed, fake_trace_detail
+):
+    link = _share_error_issue(auth_client, "E-SHARE01").json()["result"]
+    auth_client.delete(f"/tracer/shared-links/{link['id']}/")
+
+    response = api_client.get(
+        f"/tracer/shared/{link['token']}/traces/{_member_trace_id(error_issue)}/"
+    )
+
+    assert response.status_code == status.HTTP_410_GONE
