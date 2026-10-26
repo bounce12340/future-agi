@@ -15,6 +15,7 @@ import {
 import PropTypes from "prop-types";
 import { useNavigate, useParams } from "react-router-dom";
 import Iconify from "src/components/iconify";
+import { ShareDialog } from "src/components/share-dialog";
 import {
   useErrorFeedDetail,
   useErrorFeedRedirect,
@@ -100,6 +101,7 @@ export default function ErrorFeedDetailView() {
   const navigate = useNavigate();
   const { activeTab, setActiveTab } = useErrorFeedStore();
   const [linearPickerOpen, setLinearPickerOpen] = useState(false);
+  const [shareDialogOpen, setShareDialogOpen] = useState(false);
   const setAnalyzePendingStart = useErrorFeedStore(
     (s) => s.setAnalyzePendingStart,
   );
@@ -321,6 +323,7 @@ export default function ErrorFeedDetailView() {
               <Tooltip title="Share" arrow>
                 <IconButton
                   size="small"
+                  onClick={() => setShareDialogOpen(true)}
                   sx={{
                     borderRadius: 1,
                     border: "1px solid",
@@ -514,6 +517,12 @@ export default function ErrorFeedDetailView() {
         onClose={() => setLinearPickerOpen(false)}
         clusterId={currentError?.cluster_id}
         traceId={null}
+      />
+      <ShareDialog
+        open={shareDialogOpen}
+        onClose={() => setShareDialogOpen(false)}
+        resourceType="error_feed_issue"
+        resourceId={currentError.cluster_id}
       />
     </Box>
   );
