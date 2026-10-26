@@ -1,4 +1,5 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { enqueueSnackbar } from "notistack";
 import axios, { endpoints } from "src/utils/axios";
 
 import {
@@ -75,6 +76,14 @@ export function useRerunCallsInRun(executionId) {
         rerun_type: "call_and_eval",
         call_execution_ids: callIds,
       }),
+    // The global handler toasts only `{ result }` errors; a run's refusal arrives
+    // as `{ error, message }`, and the menu has already closed.
+    onError: (error) => {
+      if (error?.result) return;
+      enqueueSnackbar(error?.message || "Couldn't re-run the selected calls", {
+        variant: "error",
+      });
+    },
     onSettled: () => {
       queryClient.invalidateQueries({ queryKey: runResultsKey(executionId) });
       queryClient.invalidateQueries({ queryKey: runAnalyticsKey(executionId) });

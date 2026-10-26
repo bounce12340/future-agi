@@ -560,7 +560,10 @@ def rerun_calls_in_run(
         PREALLOCATED_CALL_METADATA_KEYS,
     )
     from simulate.services.call_rerun import clear_call_for_rerun
-    from simulate.temporal.client import start_hosted_harness_gateway_workflow
+    from simulate.temporal.client import (
+        hosted_harness_gateway_workflow_running,
+        start_hosted_harness_gateway_workflow,
+    )
 
     base_url = str(getattr(settings, "HARNESS_PUBLIC_BASE_URL", "") or "").rstrip("/")
     if not base_url:
@@ -573,18 +576,38 @@ def rerun_calls_in_run(
         raise HostedHarnessError(
             "call_selection_empty", "select at least one call", status_code=400
         )
-    with transaction.atomic():
-        job = (
-            HostedHarnessJob.no_workspace_objects.select_for_update()
-            .filter(test_execution_id=test_execution.id)
-            .first()
+    job_id = (
+        HostedHarnessJob.no_workspace_objects.filter(
+            test_execution_id=test_execution.id
         )
-        if job is None:
-            raise HostedHarnessError(
-                "run_not_rerunnable",
-                "this run has no saved harness job to re-run",
-                status_code=409,
-            )
+        .values_list("id", flat=True)
+        .first()
+    )
+    if job_id is None:
+        raise HostedHarnessError(
+            "run_not_rerunnable",
+            "this run has no saved harness job to re-run",
+            status_code=409,
+        )
+    # The job and run turn terminal before the previous gateway workflow returns, and
+    # starting its id again while it is still exiting would attach to it, not launch.
+    try:
+        workflow_running = hosted_harness_gateway_workflow_running(str(job_id))
+    except Exception as exc:
+        raise HostedHarnessError(
+            "scheduler_unavailable",
+            "Hosted rerun could not be scheduled",
+            status_code=503,
+            retryable=True,
+        ) from exc
+    if workflow_running:
+        raise HostedHarnessError(
+            "rerun_in_progress",
+            "this run is still running or grading; re-run its calls once it finishes",
+            status_code=409,
+        )
+    with transaction.atomic():
+        job = HostedHarnessJob.no_workspace_objects.select_for_update().get(id=job_id)
         execution = TestExecution.no_workspace_objects.select_for_update().get(
             id=test_execution.id
         )
@@ -622,6 +645,8 @@ def rerun_calls_in_run(
             RERUN_EXECUTION_KEYS: sorted(
                 allocation.execution_key for allocation in allocations
             ),
+            # The re-run gets the infrastructure retry budget of a new Run.
+            "attempt_cycle_start": job.current_attempt_number + 1,
         }
         job.payload = payload
         job.state = HostedHarnessJob.State.QUEUED
@@ -658,32 +683,37 @@ def rerun_calls_in_run(
             retry_cfg["initial_backoff_seconds"],
             retry_cfg["max_backoff_seconds"],
         )
-    except Exception:
-        now = timezone.now()
-        HostedHarnessJob.no_workspace_objects.filter(id=job.id).update(
-            state=HostedHarnessJob.State.FAILED,
-            current_stage="failed",
-            terminal_at=now,
-            failure={
+    except Exception as exc:
+        with transaction.atomic():
+            job = HostedHarnessJob.no_workspace_objects.select_for_update().get(
+                id=job.id
+            )
+            now = timezone.now()
+            job.state = HostedHarnessJob.State.FAILED
+            job.current_stage = "failed"
+            job.terminal_at = now
+            job.failure = {
                 "domain": "infrastructure",
                 "stage": "queued",
                 "code": "scheduler_unavailable",
                 "message": "Hosted rerun could not be scheduled",
-            },
-        )
-        TestExecution.no_workspace_objects.filter(id=execution.id).update(
-            status=TestExecution.ExecutionStatus.FAILED,
-            completed_at=now,
-            error_reason="Hosted rerun could not be scheduled",
-        )
-        CallExecution.no_workspace_objects.filter(
-            id__in=[allocation.call_execution_id for allocation in allocations]
-        ).update(
-            status=CallExecution.CallStatus.FAILED,
-            completed_at=now,
-            ended_reason="Rerun could not be scheduled",
-        )
-        raise
+            }
+            job.save(
+                update_fields=[
+                    "state",
+                    "current_stage",
+                    "terminal_at",
+                    "failure",
+                    "updated_at",
+                ]
+            )
+            project_terminal_job_onto_run(job, now)
+        raise HostedHarnessError(
+            "scheduler_unavailable",
+            "Hosted rerun could not be scheduled",
+            status_code=503,
+            retryable=True,
+        ) from exc
     return job
 
 
@@ -1788,56 +1818,7 @@ def record_cleanup(
             transaction.on_commit(
                 lambda: _ask_builder_to_check(built_job_id, built_attempt_id)
             )
-        if job.test_execution_id:
-            execution_status = {
-                HostedHarnessJob.State.COMPLETED: TestExecution.ExecutionStatus.COMPLETED,
-                HostedHarnessJob.State.CANCELED: TestExecution.ExecutionStatus.CANCELLED,
-                HostedHarnessJob.State.FAILED: TestExecution.ExecutionStatus.FAILED,
-            }[job.state]
-            if execution_status == TestExecution.ExecutionStatus.COMPLETED:
-                # Transport finished, scoring may not have: only a run still in
-                # transport is moved, and only the settle decides it is done.
-                in_transport = TestExecution.no_workspace_objects.filter(
-                    id=job.test_execution_id, status__in=TRANSPORT_RUN_STATUSES
-                )
-                if CallExecution.no_workspace_objects.filter(
-                    test_execution_id=job.test_execution_id,
-                    status=CallExecution.CallStatus.COMPLETED,
-                ).exists():
-                    in_transport.update(
-                        status=TestExecution.ExecutionStatus.EVALUATING,
-                        error_reason=None,
-                    )
-                    settle_run_after_commit(job.test_execution_id)
-                else:
-                    in_transport.update(
-                        status=execution_status, completed_at=now, error_reason=None
-                    )
-            else:
-                TestExecution.no_workspace_objects.filter(
-                    id=job.test_execution_id
-                ).update(
-                    status=execution_status,
-                    completed_at=now,
-                    error_reason=(
-                        (attempt.terminal_failure or {}).get("message")
-                        if job.state == HostedHarnessJob.State.FAILED
-                        else None
-                    ),
-                )
-            remaining_status = (
-                CallExecution.CallStatus.CANCELLED
-                if job.state == HostedHarnessJob.State.CANCELED
-                else CallExecution.CallStatus.FAILED
-            )
-            CallExecution.no_workspace_objects.filter(
-                test_execution_id=job.test_execution_id,
-                status__in=(
-                    CallExecution.CallStatus.PENDING,
-                    CallExecution.CallStatus.REGISTERED,
-                    CallExecution.CallStatus.ONGOING,
-                ),
-            ).update(status=remaining_status, completed_at=now)
+        project_terminal_job_onto_run(job, now)
         return job
 
 
@@ -1860,6 +1841,65 @@ def _ask_builder_to_check(job_id: str, attempt_id: str) -> None:
         )
     except Exception:
         logger.exception("builder_check_request_failed", job_id=job_id)
+
+
+def project_terminal_job_onto_run(job: HostedHarnessJob, now: datetime) -> None:
+    """Move a terminal job's Run, and the calls it left open, to their end states."""
+    if not job.test_execution_id:
+        return
+    message = (job.failure or {}).get("message")
+    calls = CallExecution.no_workspace_objects.filter(
+        test_execution_id=job.test_execution_id
+    )
+    calls.filter(
+        status__in=(
+            CallExecution.CallStatus.PENDING,
+            CallExecution.CallStatus.REGISTERED,
+            CallExecution.CallStatus.ONGOING,
+        )
+    ).update(
+        status=(
+            CallExecution.CallStatus.CANCELLED
+            if job.state == HostedHarnessJob.State.CANCELED
+            else CallExecution.CallStatus.FAILED
+        ),
+        completed_at=now,
+        **({"ended_reason": message} if message else {}),
+    )
+    execution_status = {
+        HostedHarnessJob.State.COMPLETED: TestExecution.ExecutionStatus.COMPLETED,
+        HostedHarnessJob.State.CANCELED: TestExecution.ExecutionStatus.CANCELLED,
+        HostedHarnessJob.State.FAILED: TestExecution.ExecutionStatus.FAILED,
+    }[job.state]
+    has_completed_calls = calls.filter(
+        status=CallExecution.CallStatus.COMPLETED
+    ).exists()
+    # An in-run re-run stops only its chosen calls; the Run's other calls already
+    # finished, so the Run settles from its calls whatever ended the re-run.
+    rerun = bool((job.payload.get("metadata") or {}).get(RERUN_EXECUTION_KEYS))
+    if execution_status == TestExecution.ExecutionStatus.COMPLETED or (
+        rerun and has_completed_calls
+    ):
+        # Transport finished, scoring may not have: only a run still in
+        # transport is moved, and only the settle decides it is done.
+        in_transport = TestExecution.no_workspace_objects.filter(
+            id=job.test_execution_id, status__in=TRANSPORT_RUN_STATUSES
+        )
+        if has_completed_calls:
+            in_transport.update(
+                status=TestExecution.ExecutionStatus.EVALUATING, error_reason=None
+            )
+            settle_run_after_commit(job.test_execution_id)
+        else:
+            in_transport.update(
+                status=execution_status, completed_at=now, error_reason=None
+            )
+        return
+    TestExecution.no_workspace_objects.filter(id=job.test_execution_id).update(
+        status=execution_status,
+        completed_at=now,
+        error_reason=message if job.state == HostedHarnessJob.State.FAILED else None,
+    )
 
 
 def update_execution_counts(job: HostedHarnessJob) -> None:
