@@ -33,7 +33,11 @@ const member = {
 const response = (members) => ({
   data: {
     status: true,
-    result: { org_name: "Test organization", results: members, total: members.length },
+    result: {
+      org_name: "Test organization",
+      results: members,
+      total: members.length,
+    },
   },
 });
 
@@ -78,7 +82,10 @@ describe("Manage Team member response", () => {
     expect(screen.queryByText(member.email)).not.toBeInTheDocument();
 
     await act(async () => {
-      await client.invalidateQueries({ queryKey: ["member-list"], type: "all" });
+      await client.invalidateQueries({
+        queryKey: ["member-list"],
+        type: "all",
+      });
     });
 
     expect(await screen.findByText(member.email)).toBeVisible();
