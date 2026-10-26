@@ -363,7 +363,8 @@ def _shared_issue_scope(link, trace_id=None):
     """The shared issue behind a link, as ``(cluster_id, project_ids, group)``.
 
     ``None`` when the sharer lost the licence, the issue is gone, or
-    ``trace_id`` is given and is not one of the issue's traces.
+    ``trace_id`` is given and is neither one of the issue's traces nor its
+    working (passing) trace.
     """
     from tfc.ee_gating import EEFeature, FeatureUnavailable, check_ee_feature
     from tracer.models.trace_error_analysis import TraceErrorGroup
@@ -382,8 +383,6 @@ def _shared_issue_scope(link, trace_id=None):
     if redirect is None:
         return None
     cluster_id = redirect["resolved_cluster_id"]
-    if trace_id and not _cluster_has_trace(cluster_id, trace_id, project_ids):
-        return None
     group = TraceErrorGroup.objects.filter(
         cluster_id=cluster_id,
         project_id__in=project_ids,
@@ -392,7 +391,29 @@ def _shared_issue_scope(link, trace_id=None):
     ).first()
     if group is None:
         return None
+    if (
+        trace_id
+        and not _cluster_has_trace(cluster_id, trace_id, project_ids)
+        and str(trace_id) != _shared_issue_working_trace_id(group, project_ids)
+    ):
+        return None
     return cluster_id, project_ids, group
+
+
+def _shared_issue_working_trace_id(group, project_ids):
+    """The passing trace the issue page compares against, or ``None``.
+
+    It is not one of the issue's traces by construction, so the shared trace
+    read admits this one id besides the members.
+    """
+    from tracer.utils import feed as feed_service
+
+    if group.success_trace_id:
+        return str(group.success_trace_id)
+    detail = feed_service.get_feed_detail(group.cluster_id, project_ids)
+    if detail is None or detail.success_trace is None:
+        return None
+    return str(detail.success_trace.trace_id)
 
 
 def _resolve_shared_issue_trace(request, link, trace_id):

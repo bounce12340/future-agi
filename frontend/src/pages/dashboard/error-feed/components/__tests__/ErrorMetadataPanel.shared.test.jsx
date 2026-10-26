@@ -94,4 +94,41 @@ describe("ErrorMetadataPanel on a shared issue", () => {
     expect(screen.getByText("claude-haiku")).toBeInTheDocument();
     expect(screen.queryByText("gpt-4o-mini")).not.toBeInTheDocument();
   });
+
+  it("does not show the first trace's metadata while the picked trace loads", () => {
+    useErrorFeedStore.setState({
+      selectedTraceIdByCluster: { "E-1": "trace-3" },
+    });
+    mocks.useSharedIssueSidebar.mockReturnValue({
+      data: undefined,
+      isLoading: true,
+    });
+
+    render(
+      <SharedIssueContext.Provider value={shared}>
+        <ErrorMetadataPanel error={error} />
+      </SharedIssueContext.Provider>,
+    );
+
+    expect(screen.queryByText("gpt-4o-mini")).not.toBeInTheDocument();
+  });
+
+  it("never links a Linear URL that is not http or https", () => {
+    render(
+      <SharedIssueContext.Provider value={shared}>
+        <ErrorMetadataPanel
+          // Assembled so the lint rule against script URLs stays quiet.
+          error={{
+            ...error,
+            external_issue_url: ["javascript", "alert(1)"].join(":"),
+          }}
+        />
+      </SharedIssueContext.Provider>,
+    );
+
+    expect(
+      screen.queryByRole("link", { name: /TH-1/ }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("TH-1")).toBeInTheDocument();
+  });
 });

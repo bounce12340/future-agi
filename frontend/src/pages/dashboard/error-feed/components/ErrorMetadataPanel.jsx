@@ -31,7 +31,7 @@ import {
 import { useOrgMembers } from "src/api/annotation-queues/annotation-queues";
 import { useOrganization } from "src/contexts/OrganizationContext";
 import { useSharedIssueSidebar } from "src/api/shared-links";
-import openExternal from "../openExternal";
+import openExternal, { safeExternalUrl } from "../openExternal";
 import { useErrorFeedStore } from "../store";
 import { useSharedIssue } from "../sharedIssueContext";
 import ErrorStatusChip from "./ErrorStatusChip";
@@ -1111,6 +1111,14 @@ ConnectorRow.propTypes = {
 };
 
 function SharedLinearLink({ url, issueId }) {
+  const href = safeExternalUrl(url);
+  if (url && !href) {
+    return (
+      <Typography fontSize="12px" color="text.secondary">
+        {issueId || "Linear issue"}
+      </Typography>
+    );
+  }
   if (!url) {
     return (
       <Typography fontSize="12px" color="text.disabled">
@@ -1122,7 +1130,7 @@ function SharedLinearLink({ url, issueId }) {
     <Stack direction="row" alignItems="center" gap={0.75}>
       <Iconify icon="simple-icons:linear" width={12} />
       <Link
-        href={url}
+        href={href}
         target="_blank"
         rel="noopener noreferrer"
         underline="hover"
@@ -1263,10 +1271,16 @@ export default function ErrorMetadataPanel({ error }) {
     shared?.token,
     shared ? selectedTraceId : null,
   );
+  // The share's own sidebar is the default trace's; once a trace is picked,
+  // show only that trace's sidebar, never the default's in its place.
   const sidebar = shared
-    ? sharedTraceSidebar.data ?? shared.sidebar
+    ? selectedTraceId
+      ? sharedTraceSidebar.data
+      : shared.sidebar
     : fetchedSidebar.data;
-  const isSidebarLoading = shared ? false : fetchedSidebar.isLoading;
+  const isSidebarLoading = shared
+    ? !!selectedTraceId && sharedTraceSidebar.isLoading
+    : fetchedSidebar.isLoading;
   const sidebarPending = isSidebarLoading && !sidebar;
   // Must match OverviewTab's trace source or the two read different cache entries.
   const effectiveTraceId =
