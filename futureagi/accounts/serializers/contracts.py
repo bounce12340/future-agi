@@ -922,6 +922,9 @@ class TeamCreateErrorItemSerializer(serializers.Serializer):
 
 
 class TeamCreatedMemberResponseSerializer(AccountUserItemResponseSerializer):
+    goals = serializers.ListField(
+        child=serializers.CharField(), required=False, allow_null=True
+    )
     invite_email_warning = serializers.CharField(
         required=False,
         help_text="Member was added, but the invitation email could not be sent.",

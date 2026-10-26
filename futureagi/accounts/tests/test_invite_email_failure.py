@@ -65,6 +65,10 @@ def assert_created_response(response):
     contract = TeamCreateResponseSerializer(data=response.data)
     assert contract.is_valid(), contract.errors
     created = response.data["result"]["created_members"]
+    assert all(member["goals"] is None for member in created)
+    assert [
+        member["goals"] for member in contract.data["result"]["created_members"]
+    ] == [None] * len(created)
     assert [member.get("invite_email_warning") for member in created] == [
         member.get("invite_email_warning")
         for member in contract.validated_data["result"]["created_members"]
