@@ -8,6 +8,7 @@ from rest_framework import status
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.views import APIView
 from rest_framework.viewsets import ModelViewSet
 
 from accounts.models.user import User
@@ -18,6 +19,7 @@ from tfc.middleware.workspace_context import (
     get_current_workspace,
     set_workspace_context,
 )
+from tfc.utils.api_contracts import validated_request
 from tfc.utils.base_viewset import BaseModelViewSetMixin
 from tfc.utils.general_methods import GeneralMethods
 from tracer.models.shared_link import (
@@ -311,52 +313,55 @@ def resolve_shared_issue_trace(request, token, trace_id):
     return _gm.success_response(detail)
 
 
-@swagger_auto_schema(
-    method="get",
-    query_serializer=FeedSidebarQuerySerializer,
-    responses={
-        200: FeedSidebarApiResponseSerializer,
-        401: SharedLinkResolveErrorSerializer,
-        403: SharedLinkResolveErrorSerializer,
-        404: SharedLinkResolveErrorSerializer,
-        410: SharedLinkResolveErrorSerializer,
-    },
-)
-@api_view(["GET"])
-@permission_classes([AllowAny])
-def resolve_shared_issue_sidebar(request, token):
+class SharedIssueSidebarView(APIView):
     """A shared Error Feed issue's sidebar, scoped to one of its traces.
 
     Mirrors the issue page: AI metadata and evaluations follow the trace
     picked in Traces affected (``?trace_id=``).
     """
-    from tracer.serializers.feed import FeedSidebarSerializer
-    from tracer.utils import feed as feed_service
 
-    link, error = _check_shared_link_access(request, token)
-    if error is not None:
-        return error
-    if link.resource_type != ResourceType.ERROR_FEED_ISSUE.value:
-        return _gm.not_found("Shared sidebar not found")
+    permission_classes = [AllowAny]
 
-    trace_id = request.query_params.get("trace_id") or None
+    @validated_request(
+        query_serializer=FeedSidebarQuerySerializer,
+        responses={
+            200: FeedSidebarApiResponseSerializer,
+            401: SharedLinkResolveErrorSerializer,
+            403: SharedLinkResolveErrorSerializer,
+            404: SharedLinkResolveErrorSerializer,
+            410: SharedLinkResolveErrorSerializer,
+        },
+    )
+    def get(self, request, token):
+        from tracer.serializers.feed import FeedSidebarSerializer
+        from tracer.utils import feed as feed_service
 
-    def _build():
-        scope = _shared_issue_scope(link, trace_id)
-        if scope is None:
-            return None
-        cluster_id, project_ids, _ = scope
-        result = feed_service.get_sidebar(cluster_id, project_ids, trace_id=trace_id)
-        return FeedSidebarSerializer(result).data if result is not None else None
+        link, error = _check_shared_link_access(request, token)
+        if error is not None:
+            return error
+        if link.resource_type != ResourceType.ERROR_FEED_ISSUE.value:
+            return _gm.not_found("Shared sidebar not found")
 
-    try:
-        data = _in_link_workspace(link, _build)
-    except Exception:
-        logger.exception("shared_issue_sidebar_failed", link_id=str(link.id))
-        data = None
-    if data is None:
-        return _gm.not_found("Shared sidebar not found")
-    return _gm.success_response(data)
+        trace_id = request.validated_query_data.get("trace_id") or None
+
+        def _build():
+            scope = _shared_issue_scope(link, trace_id)
+            if scope is None:
+                return None
+            cluster_id, project_ids, _ = scope
+            result = feed_service.get_sidebar(
+                cluster_id, project_ids, trace_id=trace_id
+            )
+            return FeedSidebarSerializer(result).data if result is not None else None
+
+        try:
+            data = _in_link_workspace(link, _build)
+        except Exception:
+            logger.exception("shared_issue_sidebar_failed", link_id=str(link.id))
+            data = None
+        if data is None:
+            return _gm.not_found("Shared sidebar not found")
+        return _gm.success_response(data)
 
 
 def _shared_issue_scope(link, trace_id=None):

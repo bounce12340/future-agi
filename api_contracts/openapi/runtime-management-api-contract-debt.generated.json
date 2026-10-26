@@ -19,39 +19,19 @@
     "futureagi/saml2_auth/views.py"
   ],
   "summary": {
-    "runtime_backed_validated_request_decorators": 421,
-    "direct_swagger_auto_schema_decorators": 136,
-    "doc_only_input_contract_decorators": 1,
+    "runtime_backed_validated_request_decorators": 422,
+    "direct_swagger_auto_schema_decorators": 135,
+    "doc_only_input_contract_decorators": 0,
     "broad_request_contract_decorators": 0
   },
   "app_wide_summary": {
-    "runtime_backed_validated_request_decorators": 585,
-    "direct_swagger_auto_schema_decorators": 260,
-    "doc_only_input_contract_decorators": 1,
+    "runtime_backed_validated_request_decorators": 586,
+    "direct_swagger_auto_schema_decorators": 259,
+    "doc_only_input_contract_decorators": 0,
     "broad_request_contract_decorators": 0
   },
-  "doc_only_input_contract_decorators": [
-    {
-      "path": "futureagi/tracer/views/shared_link.py",
-      "line": 314,
-      "class": null,
-      "function": "resolve_shared_issue_sidebar",
-      "serializers": [
-        "FeedSidebarQuerySerializer"
-      ]
-    }
-  ],
+  "doc_only_input_contract_decorators": [],
   "broad_request_contract_decorators": [],
-  "app_wide_doc_only_input_contract_decorators": [
-    {
-      "path": "futureagi/tracer/views/shared_link.py",
-      "line": 314,
-      "class": null,
-      "function": "resolve_shared_issue_sidebar",
-      "serializers": [
-        "FeedSidebarQuerySerializer"
-      ]
-    }
-  ],
+  "app_wide_doc_only_input_contract_decorators": [],
   "app_wide_broad_request_contract_decorators": []
 }
