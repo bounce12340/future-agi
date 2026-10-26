@@ -569,6 +569,16 @@ export default function TrendsTab({ error }) {
   const data = shared ? shared.trends : fetched.data;
   const isLoading = shared ? false : fetched.isLoading;
 
+  if (shared && !data) {
+    return (
+      <Stack alignItems="center" justifyContent="center" sx={{ py: 6 }}>
+        <Typography fontSize="13px" color="text.disabled">
+          No trend data for this issue.
+        </Typography>
+      </Stack>
+    );
+  }
+
   if (isLoading || !data) {
     return (
       <Stack alignItems="center" justifyContent="center" sx={{ py: 6 }}>

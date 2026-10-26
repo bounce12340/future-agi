@@ -145,6 +145,22 @@ axiosInstance.interceptors.response.use(
       window.location.pathname.startsWith("/shared/") &&
       (!getRememberMe() || !getRefreshToken());
 
+    // A dead session token on a shared link (nothing to refresh it with)
+    // turns even a public link into a 401. Drop the session and ask once
+    // more without it; a restricted link then answers 401 on its own.
+    if (
+      status === RESPONSE_CODES.UNAUTHORIZED &&
+      signedOutOnSharedLink &&
+      originalRequest?.headers?.Authorization &&
+      !originalRequest._sharedRetry
+    ) {
+      setSession(null);
+      clearTokens();
+      originalRequest._sharedRetry = true;
+      delete originalRequest.headers.Authorization;
+      return axiosInstance(originalRequest);
+    }
+
     // Handle 401 and try refresh
     if (
       status === RESPONSE_CODES.UNAUTHORIZED &&

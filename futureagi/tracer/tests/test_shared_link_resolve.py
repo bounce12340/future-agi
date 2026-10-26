@@ -1436,3 +1436,19 @@ def test_shared_issue_sidebar_enforces_restricted_acl(
     )
 
     assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+
+@pytest.mark.django_db
+def test_shared_issue_trace_serves_the_issues_working_trace(
+    api_client, auth_client, error_issue_project, error_feed_licensed, fake_trace_detail
+):
+    working = str(uuid.uuid4())
+    _make_error_issue(error_issue_project, success_trace_id=working)
+    token = _share_error_issue(auth_client, "E-SHARE01").json()["result"]["token"]
+
+    response = api_client.get(f"/tracer/shared/{token}/traces/{working}/")
+
+    assert response.status_code == status.HTTP_200_OK, response.json()
+    assert response.json()["result"]["trace"]["id"] == working
+    other = api_client.get(f"/tracer/shared/{token}/traces/{uuid.uuid4()}/")
+    assert other.status_code == status.HTTP_404_NOT_FOUND

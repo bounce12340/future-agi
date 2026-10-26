@@ -62,6 +62,19 @@ describe("Error Feed tabs on a shared issue", () => {
     }
   });
 
+  it("shows an empty Trends tab, not a spinner, when the share has no trends", () => {
+    render(
+      <SharedIssueContext.Provider value={{ ...shared, trends: null }}>
+        <TrendsTab error={{ cluster_id: "E-1" }} />
+      </SharedIssueContext.Provider>,
+    );
+
+    expect(
+      screen.getByText("No trend data for this issue."),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+  });
+
   it("renders Overview from the shared payload without fetching", () => {
     inShared(<OverviewTab _error={{ cluster_id: "E-1" }} />);
 
