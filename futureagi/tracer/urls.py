@@ -45,8 +45,8 @@ from tracer.views.project_version import ProjectVersionView
 from tracer.views.replay_session import ReplaySessionView
 from tracer.views.saved_view import SavedViewViewSet
 from tracer.views.shared_link import (
+    SharedIssueSidebarView,
     SharedLinkViewSet,
-    resolve_shared_issue_sidebar,
     resolve_shared_issue_trace,
     resolve_shared_link,
 )
@@ -253,7 +253,7 @@ urlpatterns = [
     path("shared/<str:token>/", resolve_shared_link, name="resolve-shared-link"),
     path(
         "shared/<str:token>/sidebar/",
-        resolve_shared_issue_sidebar,
+        SharedIssueSidebarView.as_view(),
         name="resolve-shared-issue-sidebar",
     ),
     path(

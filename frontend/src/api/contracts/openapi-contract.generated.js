@@ -38532,8 +38532,8 @@ export const OPENAPI_CONTRACT = Object.freeze({
     "/tracer/shared/{token}/sidebar/": {
       get: {
         operationId: "tracer_shared_sidebar_list",
-        runtimeRequestValidation: false,
-        runtimeResponseValidation: false,
+        runtimeRequestValidation: true,
+        runtimeResponseValidation: true,
         requestBody: null,
         queryParameters: {
           trace_id: {
