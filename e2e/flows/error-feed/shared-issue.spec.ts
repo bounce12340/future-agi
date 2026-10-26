@@ -44,7 +44,7 @@ base(
         "the browser never calls the signed-in Error Feed endpoints (/tracer/feed/issues/)",
         "picking a trace reads the sidebar through the share token for exactly that trace",
         "opening a trace reads it through the share token and shows its spans",
-        "a restricted link shows Sign in required and stays on the shared URL",
+        "a restricted link shows Sign in required, with no error toast, and stays on the shared URL",
       ],
     }),
   },
@@ -203,6 +203,9 @@ base(
           page.getByRole("heading", { name: "Sign in required" }),
         ).toBeVisible({ timeout: UI_READY });
         expect(new URL(page.url()).pathname).toBe(`/shared/${restrictedToken}`);
+        // The page's own screen is the whole answer: no generic error toast.
+        await page.waitForLoadState("networkidle");
+        await expect(page.getByText("Something went wrong")).toHaveCount(0);
       },
       { timeout: UI_READY * 2 },
     );
