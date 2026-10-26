@@ -79,6 +79,7 @@ const avoidRedirect = [
   "/mcp/authorize",
   "/auth/jwt/two-factor",
   "/auth/jwt/org-removed",
+  "/shared/",
 ];
 
 axiosInstance.interceptors.request.use((config) =>
@@ -138,8 +139,18 @@ axiosInstance.interceptors.response.use(
       );
     }
 
+    // A signed-out viewer of a shared link has no session to refresh or end:
+    // let the page show its own "Sign in required" screen.
+    const signedOutOnSharedLink =
+      window.location.pathname.startsWith("/shared/") &&
+      (!getRememberMe() || !getRefreshToken());
+
     // Handle 401 and try refresh
-    if (status === RESPONSE_CODES.UNAUTHORIZED && !originalRequest?._retry) {
+    if (
+      status === RESPONSE_CODES.UNAUTHORIZED &&
+      !originalRequest?._retry &&
+      !signedOutOnSharedLink
+    ) {
       const refreshToken = getRefreshToken();
       const rememberMe = getRememberMe();
 

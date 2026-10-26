@@ -30,6 +30,13 @@ function getSpan(entry) {
   return entry?.observation_span || entry?.observationSpan || {};
 }
 
+const SHARED_LINK_ERROR_COPY = {
+  401: "Sign in with an account that has access to view this.",
+  403: "Ask the person who shared this to add your email.",
+  404: "This link doesn't exist or the item was deleted.",
+  410: "This link was revoked or has expired.",
+};
+
 export default function SharedView() {
   const { token } = useParams();
   const [selectedSpanId, setSelectedSpanId] = useState(null);
@@ -119,8 +126,9 @@ export default function SharedView() {
 
   // Error states
   if (isError) {
-    const status = error?.response?.status;
-    const msg = error?.response?.data?.error;
+    // The axios interceptor rejects with { ...body, statusCode }, not an
+    // axios error. Server text is never shown, only fixed copy per status.
+    const status = error?.statusCode ?? error?.response?.status;
     return (
       <>
         <Helmet>
@@ -155,8 +163,7 @@ export default function SharedView() {
               {![401, 403, 404, 410].includes(status) && "Something went wrong"}
             </Typography>
             <Typography variant="body2" color="text.secondary">
-              {msg ||
-                "This shared link may have been revoked or is no longer available."}
+              {SHARED_LINK_ERROR_COPY[status] ?? "Try again in a moment."}
             </Typography>
             {status === 401 && (
               <Typography

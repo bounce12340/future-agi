@@ -310,3 +310,31 @@ describe("SharedView Error Feed issue", () => {
     expect(screen.getByText("View only")).toBeInTheDocument();
   });
 });
+
+describe("SharedView error states", () => {
+  beforeEach(() => {
+    mocks.useResolveSharedLink.mockReset();
+  });
+
+  it.each([
+    [401, "Sign in required"],
+    [403, "Access denied"],
+    [404, "Link not found"],
+    [410, "Link expired"],
+  ])(
+    "shows the %s screen from the interceptor's status",
+    (statusCode, title) => {
+      mocks.useResolveSharedLink.mockReturnValue({
+        data: undefined,
+        isLoading: false,
+        isError: true,
+        error: { statusCode, message: "<b>server text</b>", error: "raw" },
+      });
+
+      render(<SharedView />);
+
+      expect(screen.getByText(title)).toBeInTheDocument();
+      expect(screen.queryByText(/server text|raw/)).not.toBeInTheDocument();
+    },
+  );
+});
