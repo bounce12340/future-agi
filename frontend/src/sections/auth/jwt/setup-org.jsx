@@ -8,6 +8,7 @@ import {
   styled,
   MobileStepper,
   Button,
+  Alert,
 } from "@mui/material";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSnackbar } from "src/components/snackbar";
@@ -230,6 +231,7 @@ const useOrganizationInitialData = (isOwner, seedPlaceholderMember = true) => {
 
 const SetupOrganization = ({ getStarted = false }) => {
   const queryClient = useQueryClient();
+  const [inviteEmailWarnings, setInviteEmailWarnings] = useState([]);
   const [searchParams, setSearchParams] = useSearchParams();
   const activeStep = parseInt(searchParams.get("step") || "0", 10);
   // Where to land once org setup finishes — honor an internal `returnTo`
@@ -431,6 +433,14 @@ const SetupOrganization = ({ getStarted = false }) => {
     return { prefilledMembers: prefilled, newMembers: newOnes };
   }, [fields]);
 
+  const continueToDashboard = () => {
+    if (returnTo) {
+      localStorage.setItem("initial-render", "done");
+      localStorage.removeItem("redirectUrl");
+    }
+    window.location.href = returnTo || paths.dashboard.getstarted;
+  };
+
   const { mutate: createOrg, isPending: isCreating } = useMutation({
     mutationFn: async (data) => {
       const membersToSend = data.members
@@ -454,11 +464,14 @@ const SetupOrganization = ({ getStarted = false }) => {
       );
 
       if (response.status === 200 || response.status === 201) {
-        const message =
-          response.data?.result?.created_members?.length === 0
-            ? "Organization Setup Successfully."
-            : "Invite sent successfully.";
-        enqueueSnackbar(message, { variant: "success" });
+        const members = response.data?.result?.created_members || [];
+        if (!members.some((member) => member.invite_email_warning)) {
+          const message =
+            members.length === 0
+              ? "Organization Setup Successfully."
+              : "Invite sent successfully.";
+          enqueueSnackbar(message, { variant: "success" });
+        }
       } else {
         const errors = response.data?.result?.errors;
         if (Array.isArray(errors) && errors.length > 0) {
@@ -479,7 +492,7 @@ const SetupOrganization = ({ getStarted = false }) => {
     },
     meta: { errorHandled: true },
 
-    onSuccess: (_, variables) => {
+    onSuccess: (response, variables) => {
       refetchInvites();
       const membersToTrack = variables?.members?.filter(
         (m) => !m?.disabled && m?.email?.trim(),
@@ -504,13 +517,14 @@ const SetupOrganization = ({ getStarted = false }) => {
 
       orgForm.reset();
 
-      if (!getStarted) {
-        // After creating org during onboarding, redirect to get-started
-        if (returnTo) {
-          localStorage.setItem("initial-render", "done");
-          localStorage.removeItem("redirectUrl");
-        }
-        window.location.href = returnTo || paths.dashboard.getstarted;
+      const warnings = (response.data?.result?.created_members || []).filter(
+        (member) => member.invite_email_warning,
+      );
+      if (warnings.length > 0) {
+        // A hard redirect would erase a toast before the user can act on it.
+        setInviteEmailWarnings(warnings);
+      } else if (!getStarted) {
+        continueToDashboard();
       }
     },
 
@@ -586,6 +600,25 @@ const SetupOrganization = ({ getStarted = false }) => {
     };
     createOrg(processedData);
   });
+  const renderInviteWarnings = () => (
+    <Stack spacing={2}>
+      <Typography variant="subtitle1">Members added</Typography>
+      {inviteEmailWarnings.map((member) => (
+        <Alert severity="warning" key={member.id}>
+          <strong>{member.email}</strong>: {member.invite_email_warning}
+        </Alert>
+      ))}
+      <Button
+        variant="contained"
+        onClick={
+          getStarted ? () => setInviteEmailWarnings([]) : continueToDashboard
+        }
+      >
+        {getStarted ? "Done" : "Continue to dashboard"}
+      </Button>
+    </Stack>
+  );
+
   const renderOrgSetup = () => (
     <Box>
       <form onSubmit={handleOrgSubmit} style={{ width: "100%" }}>
@@ -938,7 +971,9 @@ const SetupOrganization = ({ getStarted = false }) => {
                 Make the collaboration seamless
               </Typography>
             </Box>
-            {renderOrgSetup()}
+            {inviteEmailWarnings.length > 0
+              ? renderInviteWarnings()
+              : renderOrgSetup()}
           </Stack>
         );
       default:
@@ -971,14 +1006,18 @@ const SetupOrganization = ({ getStarted = false }) => {
                 Make the collaboration seamless
               </Typography>
             </Box>
-            {renderOrgSetup()}
+            {inviteEmailWarnings.length > 0
+              ? renderInviteWarnings()
+              : renderOrgSetup()}
           </Stack>
         );
     }
   };
 
   if (getStarted) {
-    return renderOrgSetup();
+    return inviteEmailWarnings.length > 0
+      ? renderInviteWarnings()
+      : renderOrgSetup();
   }
 
   return (
