@@ -1852,6 +1852,11 @@ export const endpoints = {
         access_id: accessId,
       }),
     resolve: (token) => apiPath("/tracer/shared/{token}/", { token: token }),
+    issueTrace: (token, traceId) =>
+      apiPath("/tracer/shared/{token}/traces/{trace_id}/", {
+        token: token,
+        trace_id: traceId,
+      }),
   },
   organizations: {
     list: apiPath("/accounts/organizations/"),

@@ -36,6 +36,7 @@ from tracer.serializers.shared_link import (
     SharedLinkResolveResponseSerializer,
     SharedLinkUpdateSerializer,
 )
+from tracer.serializers.trace import TraceDetailResponseSerializer
 
 logger = structlog.get_logger(__name__)
 _gm = GeneralMethods()
@@ -186,6 +187,52 @@ class SharedLinkViewSet(BaseModelViewSetMixin, ModelViewSet):
 # --------------------------------------------------------------------------
 
 
+def _check_shared_link_access(request, token):
+    """Load a share token's link and apply its access rules.
+
+    Returns ``(link, None)`` when the caller may read it, else
+    ``(None, error_response)``.
+    """
+    try:
+        link = _get_shared_link_by_token(token)
+    except SharedLink.DoesNotExist:
+        return None, _gm.not_found("Shared link not found")
+    except DatabaseError:
+        logger.exception("shared_link_resolve_database_unavailable")
+        return None, _gm.custom_error_response(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Shared link resolver is temporarily unavailable.",
+            code="service_unavailable",
+        )
+
+    if not link.is_accessible:
+        reason = "expired" if link.is_expired else "revoked"
+        return None, _gm.custom_error_response(
+            status.HTTP_410_GONE,
+            f"This shared link has been {reason}",
+            code="gone",
+        )
+
+    # Check access for restricted links
+    if link.access_type == AccessType.RESTRICTED:
+        if not request.user or not request.user.is_authenticated:
+            return None, _gm.custom_error_response(
+                status.HTTP_401_UNAUTHORIZED,
+                "Authentication required to access this link",
+                code="not_authenticated",
+            )
+        has_access = link.access_list.filter(
+            email__iexact=request.user.email, deleted=False
+        ).exists()
+        # Also allow the creator
+        if not has_access and request.user != link.created_by:
+            return None, _gm.forbidden_response(
+                "You don't have access to this shared resource"
+            )
+
+    return link, None
+
+
 @swagger_auto_schema(
     method="get",
     responses={
@@ -204,42 +251,9 @@ def resolve_shared_link(request, token):
     - Public links: no auth needed
     - Restricted links: user must be authenticated + email in ACL
     """
-    try:
-        link = _get_shared_link_by_token(token)
-    except SharedLink.DoesNotExist:
-        return _gm.not_found("Shared link not found")
-    except DatabaseError:
-        logger.exception("shared_link_resolve_database_unavailable")
-        return _gm.custom_error_response(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            "Shared link resolver is temporarily unavailable.",
-            code="service_unavailable",
-        )
-
-    if not link.is_accessible:
-        reason = "expired" if link.is_expired else "revoked"
-        return _gm.custom_error_response(
-            status.HTTP_410_GONE,
-            f"This shared link has been {reason}",
-            code="gone",
-        )
-
-    # Check access for restricted links
-    if link.access_type == AccessType.RESTRICTED:
-        if not request.user or not request.user.is_authenticated:
-            return _gm.custom_error_response(
-                status.HTTP_401_UNAUTHORIZED,
-                "Authentication required to access this link",
-                code="not_authenticated",
-            )
-        has_access = link.access_list.filter(
-            email__iexact=request.user.email, deleted=False
-        ).exists()
-        # Also allow the creator
-        if not has_access and request.user != link.created_by:
-            return _gm.forbidden_response(
-                "You don't have access to this shared resource"
-            )
+    link, error = _check_shared_link_access(request, token)
+    if error is not None:
+        return error
 
     # Resolve the resource
     resource_data = _resolve_resource(link)
@@ -253,6 +267,97 @@ def resolve_shared_link(request, token):
             "access_type": link.access_type,
             "data": resource_data,
         }
+    )
+
+
+@swagger_auto_schema(
+    method="get",
+    responses={
+        200: TraceDetailResponseSerializer,
+        401: SharedLinkResolveErrorSerializer,
+        403: SharedLinkResolveErrorSerializer,
+        404: SharedLinkResolveErrorSerializer,
+        410: SharedLinkResolveErrorSerializer,
+    },
+)
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def resolve_shared_issue_trace(request, token, trace_id):
+    """One trace of a shared Error Feed issue, under the issue link's rules.
+
+    Only traces linked to the shared issue are readable through its token.
+    """
+    link, error = _check_shared_link_access(request, token)
+    if error is not None:
+        return error
+    if link.resource_type != ResourceType.ERROR_FEED_ISSUE.value:
+        return _gm.not_found("Shared trace not found")
+
+    try:
+        detail = _in_link_workspace(
+            link, _resolve_shared_issue_trace, request, link, trace_id
+        )
+    except Exception:
+        logger.exception(
+            "shared_issue_trace_failed", link_id=str(link.id), trace_id=trace_id
+        )
+        detail = None
+    if detail is None:
+        return _gm.not_found("Shared trace not found")
+    return _gm.success_response(detail)
+
+
+def _resolve_shared_issue_trace(request, link, trace_id):
+    from types import SimpleNamespace
+
+    from tfc.ee_gating import EEFeature, FeatureUnavailable, check_ee_feature
+    from tracer.models.trace_error_analysis import TraceErrorGroup
+    from tracer.queries.feed import _cluster_has_trace
+    from tracer.queries.grouping_redirect import resolve_issue_redirect
+    from tracer.services.clickhouse.v2.query_builders import trace_detail
+    from tracer.services.clickhouse.v2.query_service import V2AnalyticsQueryService
+    from tracer.views.trace import TraceView
+
+    try:
+        check_ee_feature(EEFeature.ERROR_FEED, org_id=str(link.organization_id))
+    except FeatureUnavailable:
+        return None
+
+    project_ids = _shared_feed_project_ids(link.organization, link.workspace)
+    if not project_ids:
+        return None
+    redirect = resolve_issue_redirect(link.resource_id, project_ids)
+    if redirect is None:
+        return None
+    cluster_id = redirect["resolved_cluster_id"]
+    if not _cluster_has_trace(cluster_id, trace_id, project_ids):
+        return None
+    group = TraceErrorGroup.objects.filter(
+        cluster_id=cluster_id,
+        project_id__in=project_ids,
+        deleted=False,
+        target_type="error_feed",
+    ).first()
+    if group is None:
+        return None
+
+    # Read as the link sees it: its organization and workspace, the
+    # issue's project, never the viewer's own scope.
+    scoped_request = SimpleNamespace(
+        organization=link.organization,
+        workspace=link.workspace,
+        user=link.created_by,
+    )
+    view = TraceView()
+    view.request = request
+    view.format_kwarg = None
+    view.kwargs = {"pk": trace_id}
+    return trace_detail.retrieve_trace_detail_ch(
+        view,
+        scoped_request,
+        trace_id,
+        V2AnalyticsQueryService(),
+        project_id=str(group.project_id),
     )
 
 

@@ -14,6 +14,7 @@ import {
   useAddSharedLinkAccess,
   useCreateSharedLink,
   useGetSharedLinks,
+  useSharedIssueTrace,
   useUpdateSharedLink,
 } from "../shared-links";
 
@@ -26,6 +27,8 @@ vi.mock("src/utils/axios", () => ({
       create: "/tracer/shared-links/",
       update: (id) => `/tracer/shared-links/${id}/`,
       addAccess: (id) => `/tracer/shared-links/${id}/access/`,
+      issueTrace: (token, traceId) =>
+        `/tracer/shared/${token}/traces/${traceId}/`,
     },
   },
 }));
@@ -116,5 +119,29 @@ describe("shared-links error reporting", () => {
       expect.any(String),
       expect.objectContaining({ variant: "error" }),
     );
+  });
+});
+
+describe("useSharedIssueTrace", () => {
+  it("reads one trace through the share token and returns its result", async () => {
+    axios.get.mockResolvedValueOnce({
+      data: { status: true, result: { trace: { id: "trace-1" } } },
+    });
+    const { Wrapper } = makeWrapper();
+    const { result } = renderHook(() => useSharedIssueTrace("tok", "trace-1"), {
+      wrapper: Wrapper,
+    });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(axios.get).toHaveBeenCalledWith(
+      "/tracer/shared/tok/traces/trace-1/",
+    );
+    expect(result.current.data).toEqual({ trace: { id: "trace-1" } });
+  });
+
+  it("stays idle until a trace is picked", () => {
+    const { Wrapper } = makeWrapper();
+    renderHook(() => useSharedIssueTrace("tok", null), { wrapper: Wrapper });
+    expect(axios.get).not.toHaveBeenCalled();
   });
 });
