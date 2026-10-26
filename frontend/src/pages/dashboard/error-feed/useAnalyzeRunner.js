@@ -56,10 +56,10 @@ export function useAnalyzeRunner(clusterId, error, { enabled = true } = {}) {
 
   // Auto-fire when pending-start flag flips on.
   useEffect(() => {
-    if (!clusterId || !pendingStart) return;
+    if (!enabled || !clusterId || !pendingStart) return;
     removeAnalyzePendingStart(clusterId);
     startRun();
-  }, [clusterId, pendingStart, removeAnalyzePendingStart, startRun]);
+  }, [enabled, clusterId, pendingStart, removeAnalyzePendingStart, startRun]);
 
   return { startRun };
 }

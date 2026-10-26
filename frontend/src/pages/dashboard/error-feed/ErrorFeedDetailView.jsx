@@ -31,7 +31,6 @@ import TracesTab from "./components/TracesTab";
 import TrendsTab from "./components/TrendsTab";
 import ClusterHeadlineCard from "./components/ClusterHeadlineCard";
 import AnalyzeTab from "./components/AnalyzeTab";
-import SavedAnalysis from "./components/SavedAnalysis";
 import { useSharedIssue } from "./sharedIssueContext";
 import { useErrorFeedStore } from "./store";
 import { useAnalyzeRunner } from "./useAnalyzeRunner";
@@ -140,7 +139,9 @@ export default function ErrorFeedDetailView() {
     };
   }, [detail]);
 
-  useAnalyzeRunner(shared ? null : currentError?.cluster_id, currentError, {
+  // On a shared issue the runner only seeds the saved analysis for the Fix
+  // tab; it never opens Falcon or starts a run.
+  useAnalyzeRunner(currentError?.cluster_id, currentError, {
     enabled: !shared,
   });
 
@@ -501,11 +502,7 @@ export default function ErrorFeedDetailView() {
                 flexDirection: "column",
               }}
             >
-              {shared ? (
-                <SavedAnalysis rca={currentError.rca} />
-              ) : (
-                <AnalyzeTab error={currentError} />
-              )}
+              <AnalyzeTab error={currentError} />
             </Box>
           ) : (
             <Box sx={{ flex: 1, minHeight: 0, overflowY: "auto" }}>

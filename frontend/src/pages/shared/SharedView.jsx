@@ -269,7 +269,9 @@ export default function SharedView() {
                   color: "text.disabled",
                 }}
               >
-                {resourceId.substring(0, 12)}...
+                {resourceId.length > 12
+                  ? `${resourceId.substring(0, 12)}...`
+                  : resourceId}
               </Typography>
             )}
           </Box>

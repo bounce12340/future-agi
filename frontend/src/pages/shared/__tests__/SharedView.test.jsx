@@ -307,6 +307,8 @@ describe("SharedView Error Feed issue", () => {
     expect(page).toHaveTextContent("Agent promises refunds");
     expect(page).toHaveAttribute("data-token", "share-token");
     expect(screen.getByText("Shared issue")).toBeInTheDocument();
+    expect(screen.getByText("E-LOCAL01")).toBeInTheDocument();
+    expect(screen.queryByText("E-LOCAL01...")).not.toBeInTheDocument();
     expect(screen.getByText("View only")).toBeInTheDocument();
   });
 });
