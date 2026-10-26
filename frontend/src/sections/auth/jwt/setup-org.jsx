@@ -18,6 +18,7 @@ import PropTypes from "prop-types";
 import { paths } from "src/routes/paths";
 import { FormSearchSelectFieldState } from "src/components/FromSearchSelectField";
 import RightSectionAuth from "./RightSectionAuth";
+import { useDeploymentMode } from "src/hooks/useDeploymentMode";
 import { Controller, useForm, useFieldArray, useWatch } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import RadioField from "src/components/RadioField/RadioField";
@@ -172,7 +173,14 @@ MemberRow.propTypes = {
   onRemove: PropTypes.func,
 };
 
-const useOrganizationInitialData = (isOwner) => {
+const placeholderMembers = (seed) =>
+  seed
+    ? [{ email: "", name: "", organization_role: "Owner", disabled: false }]
+    : [];
+
+// Never seed on self-hosted: the member block is hidden there, so a seeded row
+// with an empty email fails validation with nothing on screen to fix.
+const useOrganizationInitialData = (isOwner, seedPlaceholderMember = true) => {
   const { enqueueSnackbar } = useSnackbar();
   const [isLoading, setIsLoading] = useState(true);
   const [initialData, setInitialData] = useState(null);
@@ -192,14 +200,7 @@ const useOrganizationInitialData = (isOwner) => {
                 organization_role: member.organization_role,
                 disabled: true,
               }))
-            : [
-                {
-                  email: "",
-                  name: "",
-                  organization_role: "Owner",
-                  disabled: false,
-                },
-              ];
+            : placeholderMembers(seedPlaceholderMember);
 
         setInitialData({
           orgName: orgDetails.org_name,
@@ -211,14 +212,7 @@ const useOrganizationInitialData = (isOwner) => {
         });
         setInitialData({
           orgName: "",
-          members: [
-            {
-              email: "",
-              name: "",
-              organization_role: "Owner",
-              disabled: false,
-            },
-          ],
+          members: placeholderMembers(seedPlaceholderMember),
         });
       } finally {
         setIsLoading(false);
@@ -238,6 +232,12 @@ const SetupOrganization = ({ getStarted = false }) => {
   const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
   const activeStep = parseInt(searchParams.get("step") || "0", 10);
+  // Where to land once org setup finishes — honor an internal `returnTo`
+  // persisted in localStorage over the default dashboard page.
+  const returnTo = (() => {
+    const rt = localStorage.getItem("redirectUrl");
+    return rt && rt.startsWith("/") && !rt.startsWith("//") ? rt : null;
+  })();
 
   const setActiveStep = useCallback(
     (newStep) => {
@@ -250,8 +250,12 @@ const SetupOrganization = ({ getStarted = false }) => {
   const { enqueueSnackbar } = useSnackbar();
   const { user } = useAuthContext();
   const isOwner = user?.organization_role === "Owner";
+  // Confirmed reads only — a failed deployment-info probe must not hide the
+  // invite step from a cloud user.
+  const { isOSS: ossMode, isSuccess: modeConfirmed } = useDeploymentMode();
+  const isOSS = modeConfirmed && ossMode;
   const { initialData, isLoading: isFetchingInitialData } =
-    useOrganizationInitialData(isOwner);
+    useOrganizationInitialData(isOwner, !isOSS);
 
   const { data: invitesData, refetch: refetchInvites } = useQuery({
     queryKey: ["owner-org-invites"],
@@ -326,7 +330,11 @@ const SetupOrganization = ({ getStarted = false }) => {
       } else {
         // Non-owners (invited users) should go straight to dashboard
         // They're already part of an org, no need for additional onboarding
-        window.location.href = paths.dashboard.develop;
+        if (returnTo) {
+          localStorage.setItem("initial-render", "done");
+          localStorage.removeItem("redirectUrl");
+        }
+        window.location.href = returnTo || paths.dashboard.develop;
       }
     },
     onError: (error) => {
@@ -498,7 +506,11 @@ const SetupOrganization = ({ getStarted = false }) => {
 
       if (!getStarted) {
         // After creating org during onboarding, redirect to get-started
-        window.location.href = paths.dashboard.getstarted;
+        if (returnTo) {
+          localStorage.setItem("initial-render", "done");
+          localStorage.removeItem("redirectUrl");
+        }
+        window.location.href = returnTo || paths.dashboard.getstarted;
       }
     },
 
@@ -596,106 +608,116 @@ const SetupOrganization = ({ getStarted = false }) => {
             />
           )}
 
-          <Typography variant="m2" fontWeight="fontWeightMedium">
-            Invite people to collaborate in FutureAGI
-          </Typography>
+          {/* Hidden on self-hosted: invites need email delivery, so teammates
+              are added later from inside the product. */}
+          {!isOSS && (
+            <>
+              <Typography variant="m2" fontWeight="fontWeightMedium">
+                Invite people to collaborate in FutureAGI
+              </Typography>
 
-          <Box
-            sx={{
-              width: "100%",
-              height: getStarted ? "250px" : "220px",
-              bgcolor: "background.paper",
-              overflowY: "auto",
-              scrollbarWidth: "none",
-              scrollBehavior: "auto",
-              "&::-webkit-scrollbar": {
-                display: "none",
-              },
-              msOverflowStyle: "none",
-            }}
-          >
-            {/* Prefilled members */}
-            {prefilledMembers.length > 0 && (
-              <Box mt={2}>
-                {prefilledMembers.map((member) => {
+              <Box
+                sx={{
+                  width: "100%",
+                  height: getStarted ? "250px" : "220px",
+                  bgcolor: "background.paper",
+                  overflowY: "auto",
+                  scrollbarWidth: "none",
+                  scrollBehavior: "auto",
+                  "&::-webkit-scrollbar": {
+                    display: "none",
+                  },
+                  msOverflowStyle: "none",
+                }}
+              >
+                {/* Prefilled members */}
+                {prefilledMembers.length > 0 && (
+                  <Box mt={2}>
+                    {prefilledMembers.map((member) => {
+                      const originalIndex = fields.findIndex(
+                        (f) => f.id === member.id,
+                      );
+                      return (
+                        <MemberRow
+                          key={member.id}
+                          member={member}
+                          index={originalIndex}
+                          getStarted={getStarted}
+                          editable={false}
+                          control={orgForm.control}
+                        />
+                      );
+                    })}
+                  </Box>
+                )}
+
+                {/* Invited members from API */}
+                {invitesData?.results?.length > 0 && (
+                  <Box mt={2}>
+                    {invitesData.results.map((member) => (
+                      <MemberRow
+                        key={`invite-${member.id}`}
+                        member={member}
+                        getStarted={getStarted}
+                        editable={false}
+                      />
+                    ))}
+                  </Box>
+                )}
+
+                {newMembers.map((member) => {
                   const originalIndex = fields.findIndex(
                     (f) => f.id === member.id,
                   );
                   return (
-                    <MemberRow
-                      key={member.id}
-                      member={member}
-                      index={originalIndex}
-                      getStarted={getStarted}
-                      editable={false}
-                      control={orgForm.control}
-                    />
+                    <Box mt={2} key={member.id}>
+                      <MemberRow
+                        member={member}
+                        index={originalIndex}
+                        getStarted={getStarted}
+                        editable
+                        control={orgForm.control}
+                        onRemove={removeMember}
+                        errors={
+                          orgForm.formState.errors.members?.[originalIndex]
+                        }
+                      />
+                    </Box>
                   );
                 })}
-              </Box>
-            )}
 
-            {/* Invited members from API */}
-            {invitesData?.results?.length > 0 && (
-              <Box mt={2}>
-                {invitesData.results.map((member) => (
-                  <MemberRow
-                    key={`invite-${member.id}`}
-                    member={member}
-                    getStarted={getStarted}
-                    editable={false}
-                  />
-                ))}
-              </Box>
-            )}
+                <Box sx={{ mt: 2 }}>
+                  <Typography
+                    variant={getStarted ? "body2" : "s1.2"}
+                    sx={{
+                      color: "primary.main",
+                      cursor: "pointer",
+                      display: "inline-flex",
+                      alignItems: "center",
+                      border: "1px solid",
+                      borderColor: "primary.main",
+                      borderRadius: getStarted ? 1 : 0.5,
+                      padding: "4px 10px",
+                      transition: "all 0.2s",
+                      fontWeight: !getStarted && 500,
+                      "&:hover": { bgcolor: "action.hover" },
+                    }}
+                    onClick={addMember}
+                    disable={!getStarted && memberToadd?.length > 3}
+                  >
+                    <SvgColor
+                      src="/assets/icons/ic_add.svg"
+                      width={15}
+                      height={15}
+                      sx={{ mr: 1 }}
+                    />
 
-            {newMembers.map((member) => {
-              const originalIndex = fields.findIndex((f) => f.id === member.id);
-              return (
-                <Box mt={2} key={member.id}>
-                  <MemberRow
-                    member={member}
-                    index={originalIndex}
-                    getStarted={getStarted}
-                    editable
-                    control={orgForm.control}
-                    onRemove={removeMember}
-                    errors={orgForm.formState.errors.members?.[originalIndex]}
-                  />
+                    {getStarted ? "Add members" : "Add"}
+                  </Typography>
                 </Box>
-              );
-            })}
-
-            <Box sx={{ mt: 2 }}>
-              <Typography
-                variant={getStarted ? "body2" : "s1.2"}
-                sx={{
-                  color: "primary.main",
-                  cursor: "pointer",
-                  display: "inline-flex",
-                  alignItems: "center",
-                  border: "1px solid",
-                  borderColor: "primary.main",
-                  borderRadius: getStarted ? 1 : 0.5,
-                  padding: "4px 10px",
-                  transition: "all 0.2s",
-                  fontWeight: !getStarted && 500,
-                  "&:hover": { bgcolor: "action.hover" },
-                }}
-                onClick={addMember}
-                disable={!getStarted && memberToadd?.length > 3}
-              >
-                <SvgColor
-                  src="/assets/icons/ic_add.svg"
-                  width={15}
-                  height={15}
-                  sx={{ mr: 1 }}
-                />
-
-                {getStarted ? "Add members" : "Add"}
-              </Typography>
-            </Box>
-          </Box>
+              </Box>
+            </>
+          )}
 
           <LoadingButton
             fullWidth
