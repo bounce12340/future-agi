@@ -1,7 +1,8 @@
 /* eslint-disable react/prop-types */
 import React from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { MutationCache, QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { handleError } from "src/utils/queryErrorHandler";
 import { render, screen, userEvent, waitFor } from "src/utils/test-utils";
 import InviteUserDrawer from "../InviteUserDrawer";
 
@@ -13,6 +14,7 @@ vi.mock("src/utils/axios", () => ({
 vi.mock("src/components/snackbar", () => ({
   useSnackbar: () => ({ enqueueSnackbar: mocks.enqueueSnackbar }),
 }));
+vi.mock("notistack", () => ({ enqueueSnackbar: mocks.enqueueSnackbar }));
 vi.mock("src/components/iconify", () => ({ default: () => null }));
 vi.mock("src/components/FormTextField/FormTextFieldV2", async () => {
   const { Controller } = await import("react-hook-form");
@@ -72,6 +74,7 @@ const warning =
 async function submitInvite() {
   const onClose = vi.fn();
   const client = new QueryClient({
+    mutationCache: new MutationCache({ onError: handleError }),
     defaultOptions: { mutations: { retry: false } },
   });
   const invalidate = vi.spyOn(client, "invalidateQueries");
@@ -182,6 +185,7 @@ describe("Manage Team invite delivery", () => {
     expect(mocks.enqueueSnackbar).toHaveBeenCalledWith(memberError, {
       variant: "error",
     });
+    expect(mocks.enqueueSnackbar).toHaveBeenCalledTimes(1);
     expect(onClose).not.toHaveBeenCalled();
     expect(invalidate).not.toHaveBeenCalled();
   });

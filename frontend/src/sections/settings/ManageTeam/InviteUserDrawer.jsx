@@ -27,6 +27,7 @@ const InviteUserDrawerForm = ({ onClose }) => {
   const { enqueueSnackbar } = useSnackbar();
 
   const { mutate, isPending } = useMutation({
+    meta: { errorHandled: true },
     mutationFn: (data) =>
       axios.post(endpoints.settings.teams.inviteMember, data),
     onSuccess: (response) => {
