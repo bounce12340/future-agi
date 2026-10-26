@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, userEvent } from "src/utils/test-utils";
+import { render, screen, userEvent, waitFor } from "src/utils/test-utils";
 import { copyToClipboard } from "src/utils/utils";
 import { enqueueSnackbar } from "notistack";
 import ErrorFeedDetailView from "../ErrorFeedDetailView";
@@ -59,7 +59,7 @@ describe("Error Feed detail: Copy cluster ID", () => {
     vi.mocked(enqueueSnackbar).mockReset();
   });
 
-  it("copies the cluster ID and confirms it", async () => {
+  it("copies the cluster ID and briefly turns the button into a check", async () => {
     vi.mocked(copyToClipboard).mockResolvedValue(true);
     render(<ErrorFeedDetailView />);
 
@@ -68,9 +68,17 @@ describe("Error Feed detail: Copy cluster ID", () => {
     );
 
     expect(copyToClipboard).toHaveBeenCalledWith(CLUSTER_ID);
-    expect(enqueueSnackbar).toHaveBeenCalledWith("Cluster ID copied", {
-      variant: "success",
-    });
+    expect(
+      await screen.findByRole("button", { name: "Copied" }),
+    ).toBeInTheDocument();
+    expect(enqueueSnackbar).not.toHaveBeenCalled();
+    await waitFor(
+      () =>
+        expect(
+          screen.getByRole("button", { name: "Copy cluster ID" }),
+        ).toBeInTheDocument(),
+      { timeout: 3000 },
+    );
   });
 
   it("says so when the copy fails", async () => {
