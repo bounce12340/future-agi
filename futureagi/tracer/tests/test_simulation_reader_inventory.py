@@ -49,8 +49,8 @@ SPAN_TABLES = (
     "observation_span",
 )
 
-# The open-source tree has no ``ee`` package, so its readers cannot be missing there.
-ENTERPRISE_PREFIX = "ee."
+# Public ``ee`` code is always scanned; only the private cloud checkout is optional.
+CLOUD_PREFIX = "ee.cloud."
 
 # ---------------------------------------------------------------------------
 # The categories
@@ -2213,12 +2213,12 @@ def test_every_spans_reading_function_is_filed():
         "tracer.services.clickhouse.v2.span_reader:CHSpanReader.get" in readers
     ), "the scan did not reach the code it is meant to cover"
 
-    enterprise_present = (FUTUREAGI / ENTERPRISE_PREFIX.rstrip(".")).is_dir()
+    cloud_present = (FUTUREAGI / "ee" / "cloud").is_dir()
     unfiled = sorted(set(readers) - set(FILED))
     stale = sorted(
         key
         for key in set(FILED) - set(readers)
-        if enterprise_present or not key.startswith(ENTERPRISE_PREFIX)
+        if cloud_present or not key.startswith(CLOUD_PREFIX)
     )
     assert not unfiled, (
         "these functions or templates read a span table and nobody filed them; "
@@ -2244,6 +2244,40 @@ def test_every_spans_reading_function_is_filed():
     ), f"categories nothing is filed under: {sorted(set(BUCKETS) - used)}"
     claims = _filing_problems(readers)
     assert not claims, "\n".join(claims)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("cloud_present", [False, True])
+@pytest.mark.parametrize(
+    "missing_reader",
+    [
+        "ee.cloud.tasks.retention:missing_reader",
+        "ee.usage.tasks:missing_reader",
+        "ee.cloudlike.tasks:missing_reader",
+        "tracer.tasks:missing_reader",
+    ],
+)
+def test_reader_inventory_only_exempts_absent_private_cloud(
+    monkeypatch, tmp_path, cloud_present, missing_reader
+):
+    (tmp_path / "ee").mkdir()
+    if cloud_present:
+        (tmp_path / "ee" / "cloud").mkdir()
+
+    # Isolate checkout detection from the AST scan and the filings' own claims.
+    readers = dict.fromkeys(FILED)
+    filings = dict(FILED)
+    filings[missing_reader] = next(iter(FILED.values()))
+    monkeypatch.setitem(globals(), "FUTUREAGI", tmp_path)
+    monkeypatch.setitem(globals(), "FILED", filings)
+    monkeypatch.setitem(globals(), "scan_readers", lambda: (readers, 1001))
+    monkeypatch.setitem(globals(), "_filing_problems", lambda readers: [])
+
+    if cloud_present or not missing_reader.startswith("ee.cloud."):
+        with pytest.raises(AssertionError, match=re.escape(missing_reader)):
+            test_every_spans_reading_function_is_filed()
+    else:
+        test_every_spans_reading_function_is_filed()
 
 
 @pytest.mark.unit
