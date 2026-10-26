@@ -2237,9 +2237,8 @@ class ManageTeamView(APIView):
                             #     )
                             #     continue
 
-                        # Create new user and workspace membership atomically.
-                        # Email is sent AFTER the commit so a transient mail
-                        # failure never prevents the user from being added.
+                        # Keep the member, membership and accept-invite record
+                        # together. Email failure must not roll back these records.
                         with transaction.atomic():
                             new_member = User.objects.create(
                                 email=member_data["email"],
@@ -2261,20 +2260,19 @@ class ManageTeamView(APIView):
                                 request.user,
                             )
 
-                        created_members.append(UserSerializer(new_member).data)
+                            persist_pending_org_invite(
+                                organization=organization,
+                                target_email=member_data["email"],
+                                org_role=org_role,
+                                workspace_role=workspace_role,
+                                workspaces=[workspace],
+                                invited_by=request.user,
+                            )
 
-                        persist_pending_org_invite(
-                            organization=organization,
-                            target_email=member_data["email"],
-                            org_role=org_role,
-                            workspace_role=workspace_role,
-                            workspaces=[workspace],
-                            invited_by=request.user,
-                        )
-
-                        token = default_token_generator.make_token(new_member)
-                        uidb64 = urlsafe_base64_encode(force_bytes(new_member.pk))
+                        member_response = UserSerializer(new_member).data
                         try:
+                            token = default_token_generator.make_token(new_member)
+                            uidb64 = urlsafe_base64_encode(force_bytes(new_member.pk))
                             email_helper(
                                 f"You are invited by {organization.display_name if organization.display_name else organization.name} - Future AGI",
                                 "member_invite.html",
@@ -2289,13 +2287,18 @@ class ManageTeamView(APIView):
                                 },
                                 [member_data["email"]],
                             )
-                        except Exception as email_exc:
+                        except Exception:
+                            # Mail exceptions can contain credentials or invite links.
                             logger.warning(
                                 "invite_email_failed",
                                 user_id=str(new_member.id),
-                                email=member_data["email"],
-                                error=str(email_exc),
                             )
+                            member_response["invite_email_warning"] = (
+                                "Member added, but the invitation email could not be sent. "
+                                "Open Members to resend the invite or copy an invite link "
+                                "if available."
+                            )
+                        created_members.append(member_response)
 
                     except IntegrityError:
                         errors.append(
