@@ -200,7 +200,9 @@ class TestInviteEmailFailureDecoupled:
         created = assert_created_response(response)
         assert [member["email"] for member in created] == emails
         assert [member.get("invite_email_warning") for member in created] == [
-            None, WARNING, None
+            None,
+            WARNING,
+            None,
         ]
         for email in emails:
             assert_pending_member(email, organization, workspace, user)
@@ -223,18 +225,21 @@ class TestInviteEmailFailureDecoupled:
 
         response = auth_client.post(
             ADD_TEAM_USER_URL,
-            {"members": [
-                member_payload(),
-                member_payload(duplicate.email),
-                member_payload(last_email),
-            ]},
+            {
+                "members": [
+                    member_payload(),
+                    member_payload(duplicate.email),
+                    member_payload(last_email),
+                ]
+            },
             format="json",
         )
 
         result = assert_partial_response(response)
         assert result["workspace"]["id"] == str(workspace.id)
         assert [item["email"] for item in result["created_members"]] == [
-            NEW_EMAIL, last_email
+            NEW_EMAIL,
+            last_email,
         ]
         assert result["created_members"][0]["invite_email_warning"] == WARNING
         assert "invite_email_warning" not in result["created_members"][1]
@@ -271,17 +276,20 @@ class TestInviteEmailFailureDecoupled:
         self.email.side_effect = [RuntimeError("smtp down"), None]
         response = auth_client.post(
             ADD_TEAM_USER_URL,
-            {"members": [
-                member_payload(),
-                member_payload(failed_email),
-                member_payload(last_email),
-            ]},
+            {
+                "members": [
+                    member_payload(),
+                    member_payload(failed_email),
+                    member_payload(last_email),
+                ]
+            },
             format="json",
         )
 
         result = assert_partial_response(response)
         assert [item["email"] for item in result["created_members"]] == [
-            NEW_EMAIL, last_email
+            NEW_EMAIL,
+            last_email,
         ]
         assert result["created_members"][0]["invite_email_warning"] == WARNING
         assert len(result["errors"]) == 1
