@@ -9,11 +9,15 @@ import pytest
 from django.db import IntegrityError
 from rest_framework import status
 
+from accounts.models.organization import Organization
 from accounts.models.organization_invite import InviteStatus, OrganizationInvite
 from accounts.models.organization_membership import OrganizationMembership
 from accounts.models.user import User
 from accounts.models.workspace import WorkspaceMembership
-from accounts.serializers.contracts import TeamCreateResponseSerializer
+from accounts.serializers.contracts import (
+    TeamCreateErrorResponseSerializer,
+    TeamCreateResponseSerializer,
+)
 from accounts.views import workspace_management
 from tfc.constants.levels import Level
 
@@ -66,6 +70,22 @@ def assert_created_response(response):
         for member in contract.validated_data["result"]["created_members"]
     ]
     return created
+
+
+def assert_partial_response(response):
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    body = response.json()
+    message = "Some members could not be added. Correct the errors and try again."
+    assert body["status"] is False
+    assert body["type"] == "validation_error"
+    assert body["code"] == "invalid"
+    assert body["message"] == body["detail"] == body["error"] == message
+    assert isinstance(body["result"], dict)
+    assert body["result"]["message"] == message
+    contract = TeamCreateErrorResponseSerializer(data=body)
+    assert contract.is_valid(), contract.errors
+    assert contract.validated_data["result"] == body["result"]
+    return body["result"]
 
 
 @pytest.mark.integration
@@ -186,3 +206,97 @@ class TestInviteEmailFailureDecoupled:
             assert_pending_member(email, organization, workspace, user)
         assert self.email.call_count == 3
         assert self.logger.warning.call_count == 1
+
+    @pytest.mark.parametrize("duplicate_org", ["same", "different"])
+    def test_partial_batch_preserves_delivery_warning_after_duplicate(
+        self, auth_client, user, organization, workspace, duplicate_org
+    ):
+        duplicate = user
+        if duplicate_org == "different":
+            duplicate = User.objects.create(
+                email="other-org-member@futureagi.com",
+                name="Existing member",
+                organization=Organization.objects.create(name="Other organization"),
+            )
+        last_email = "after-duplicate@futureagi.com"
+        self.email.side_effect = [RuntimeError("smtp down"), None]
+
+        response = auth_client.post(
+            ADD_TEAM_USER_URL,
+            {"members": [
+                member_payload(),
+                member_payload(duplicate.email),
+                member_payload(last_email),
+            ]},
+            format="json",
+        )
+
+        result = assert_partial_response(response)
+        assert result["workspace"]["id"] == str(workspace.id)
+        assert [item["email"] for item in result["created_members"]] == [
+            NEW_EMAIL, last_email
+        ]
+        assert result["created_members"][0]["invite_email_warning"] == WARNING
+        assert "invite_email_warning" not in result["created_members"][1]
+        assert len(result["errors"]) == 1
+        assert result["errors"][0]["index"] == 1
+        assert result["errors"][0]["email"] == duplicate.email
+        assert result["errors"][0]["error"]
+        if duplicate_org == "same":
+            assert result["errors"][0]["error"] == (
+                "User is already a member of this organization"
+            )
+        assert_pending_member(NEW_EMAIL, organization, workspace, user)
+        assert_pending_member(last_email, organization, workspace, user)
+        assert not OrganizationInvite.objects.filter(
+            organization=organization, target_email=duplicate.email
+        ).exists()
+        assert self.email.call_count == 2
+
+    def test_partial_batch_preserves_warning_and_rolls_back_failed_invite(
+        self, auth_client, user, organization, workspace, monkeypatch
+    ):
+        failed_email = "persistence-failure@futureagi.com"
+        last_email = "after-persistence-failure@futureagi.com"
+        persist = workspace_management.persist_pending_org_invite
+
+        def fail_one_invite(**kwargs):
+            persist(**kwargs)
+            if kwargs["target_email"] == failed_email:
+                raise IntegrityError("injected persistence failure")
+
+        monkeypatch.setattr(
+            workspace_management, "persist_pending_org_invite", fail_one_invite
+        )
+        self.email.side_effect = [RuntimeError("smtp down"), None]
+        response = auth_client.post(
+            ADD_TEAM_USER_URL,
+            {"members": [
+                member_payload(),
+                member_payload(failed_email),
+                member_payload(last_email),
+            ]},
+            format="json",
+        )
+
+        result = assert_partial_response(response)
+        assert [item["email"] for item in result["created_members"]] == [
+            NEW_EMAIL, last_email
+        ]
+        assert result["created_members"][0]["invite_email_warning"] == WARNING
+        assert len(result["errors"]) == 1
+        assert result["errors"][0]["email"] == failed_email
+        assert result["errors"][0]["index"] == 1
+        assert_pending_member(NEW_EMAIL, organization, workspace, user)
+        assert_pending_member(last_email, organization, workspace, user)
+        assert not User.objects.filter(email=failed_email).exists()
+        assert not WorkspaceMembership.all_objects.filter(
+            user__email=failed_email
+        ).exists()
+        assert not OrganizationMembership.all_objects.filter(
+            user__email=failed_email
+        ).exists()
+        assert not OrganizationInvite.all_objects.filter(
+            target_email=failed_email
+        ).exists()
+        assert self.email.call_count == 2

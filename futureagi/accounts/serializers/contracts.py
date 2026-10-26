@@ -939,6 +939,31 @@ class TeamCreateResponseSerializer(serializers.Serializer):
     result = TeamCreateResultSerializer()
 
 
+class TeamCreateErrorResultField(AccountsErrorResultField):
+    """Preserve validation strings and structured per-member partial outcomes."""
+
+    class Meta:
+        swagger_schema_fields = {
+            **ACCOUNTS_ERROR_RESULT_SCHEMA,
+            "properties": {
+                **ACCOUNTS_ERROR_RESULT_SCHEMA["properties"],
+                "created_members": {
+                    "type": "array",
+                    "items": {"$ref": "#/definitions/TeamCreatedMemberResponse"},
+                },
+                "workspace": {"$ref": "#/definitions/WorkspaceSummary"},
+                "errors": {
+                    "type": "array",
+                    "items": {"$ref": "#/definitions/TeamCreateErrorItem"},
+                },
+            },
+        }
+
+
+class TeamCreateErrorResponseSerializer(AccountsErrorResponseSerializer):
+    result = TeamCreateErrorResultField(required=False, allow_null=True)
+
+
 class TeamRemoveResultSerializer(serializers.Serializer):
     message = serializers.CharField()
     removed_from = serializers.CharField()

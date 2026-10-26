@@ -32,7 +32,7 @@ import {
   ROLE_OPTIONS,
 } from "./constants";
 import { organizationSchema, userDataSchema } from "./zodSchema";
-import { generateNameFromEmail } from "./common";
+import { generateNameFromEmail, redirectAfterOrgSetup } from "./common";
 import FormTextFieldV2 from "src/components/FormTextField/FormTextFieldV2";
 import SvgColor from "src/components/svg-color";
 import { useSearchParams } from "react-router-dom";
@@ -232,6 +232,7 @@ const useOrganizationInitialData = (isOwner, seedPlaceholderMember = true) => {
 const SetupOrganization = ({ getStarted = false }) => {
   const queryClient = useQueryClient();
   const [inviteEmailWarnings, setInviteEmailWarnings] = useState([]);
+  const [hasInviteErrors, setHasInviteErrors] = useState(false);
   const [searchParams, setSearchParams] = useSearchParams();
   const activeStep = parseInt(searchParams.get("step") || "0", 10);
   // Where to land once org setup finishes — honor an internal `returnTo`
@@ -438,8 +439,18 @@ const SetupOrganization = ({ getStarted = false }) => {
       localStorage.setItem("initial-render", "done");
       localStorage.removeItem("redirectUrl");
     }
-    window.location.href = returnTo || paths.dashboard.getstarted;
+    redirectAfterOrgSetup(returnTo || paths.dashboard.getstarted);
   };
+
+  const mergeInviteWarnings = (members = []) =>
+    Array.from(
+      new Map(
+        [
+          ...inviteEmailWarnings,
+          ...members.filter((member) => member.invite_email_warning),
+        ].map((member) => [member.id, member]),
+      ).values(),
+    );
 
   const { mutate: createOrg, isPending: isCreating } = useMutation({
     mutationFn: async (data) => {
@@ -465,7 +476,7 @@ const SetupOrganization = ({ getStarted = false }) => {
 
       if (response.status === 200 || response.status === 201) {
         const members = response.data?.result?.created_members || [];
-        if (!members.some((member) => member.invite_email_warning)) {
+        if (mergeInviteWarnings(members).length === 0) {
           const message =
             members.length === 0
               ? "Organization Setup Successfully."
@@ -517,8 +528,9 @@ const SetupOrganization = ({ getStarted = false }) => {
 
       orgForm.reset();
 
-      const warnings = (response.data?.result?.created_members || []).filter(
-        (member) => member.invite_email_warning,
+      setHasInviteErrors(false);
+      const warnings = mergeInviteWarnings(
+        response.data?.result?.created_members,
       );
       if (warnings.length > 0) {
         // A hard redirect would erase a toast before the user can act on it.
@@ -529,13 +541,15 @@ const SetupOrganization = ({ getStarted = false }) => {
     },
 
     onError: (error) => {
-      const apiErrors = error?.result?.errors || [];
+      const result = error?.result;
+      const apiErrors = result?.errors || [];
       const members = orgForm.getValues("members");
+      setInviteEmailWarnings(mergeInviteWarnings(result?.created_members));
+      setHasInviteErrors(true);
       if (!apiErrors.length) {
-        enqueueSnackbar(error?.result || "Something went wrong.", {
+        enqueueSnackbar(result?.message || result || "Something went wrong.", {
           variant: "error",
         });
-        orgForm.reset();
         return;
       }
 
@@ -544,7 +558,7 @@ const SetupOrganization = ({ getStarted = false }) => {
       );
 
       if (hasMemberErrors) {
-        queryClient.invalidateQueries("owner-org-invites");
+        queryClient.invalidateQueries({ queryKey: ["owner-org-invites"] });
 
         const errorEmails = apiErrors
           .map((err) => err.email?.trim().toLowerCase())
@@ -576,9 +590,11 @@ const SetupOrganization = ({ getStarted = false }) => {
           });
         }, 0);
 
-        enqueueSnackbar("Some users already exist in another organisation", {
-          variant: "error",
-        });
+        enqueueSnackbar(
+          result?.message ||
+            "Some members could not be added. Correct the errors and try again.",
+          { variant: "error" },
+        );
       } else {
         apiErrors.forEach((err, index) => {
           enqueueSnackbar(err.error || "Something went wrong", {
@@ -608,14 +624,16 @@ const SetupOrganization = ({ getStarted = false }) => {
           <strong>{member.email}</strong>: {member.invite_email_warning}
         </Alert>
       ))}
-      <Button
-        variant="contained"
-        onClick={
-          getStarted ? () => setInviteEmailWarnings([]) : continueToDashboard
-        }
-      >
-        {getStarted ? "Done" : "Continue to dashboard"}
-      </Button>
+      {!hasInviteErrors && (
+        <Button
+          variant="contained"
+          onClick={
+            getStarted ? () => setInviteEmailWarnings([]) : continueToDashboard
+          }
+        >
+          {getStarted ? "Done" : "Continue to dashboard"}
+        </Button>
+      )}
     </Stack>
   );
 
@@ -623,6 +641,9 @@ const SetupOrganization = ({ getStarted = false }) => {
     <Box>
       <form onSubmit={handleOrgSubmit} style={{ width: "100%" }}>
         <Stack spacing={2} sx={{ mx: "auto", pb: getStarted ? "16px" : "0" }}>
+          {hasInviteErrors &&
+            inviteEmailWarnings.length > 0 &&
+            renderInviteWarnings()}
           {!getStarted && (
             <FormTextFieldV2
               control={orgForm.control}
@@ -971,7 +992,7 @@ const SetupOrganization = ({ getStarted = false }) => {
                 Make the collaboration seamless
               </Typography>
             </Box>
-            {inviteEmailWarnings.length > 0
+            {inviteEmailWarnings.length > 0 && !hasInviteErrors
               ? renderInviteWarnings()
               : renderOrgSetup()}
           </Stack>
@@ -1006,7 +1027,7 @@ const SetupOrganization = ({ getStarted = false }) => {
                 Make the collaboration seamless
               </Typography>
             </Box>
-            {inviteEmailWarnings.length > 0
+            {inviteEmailWarnings.length > 0 && !hasInviteErrors
               ? renderInviteWarnings()
               : renderOrgSetup()}
           </Stack>
@@ -1015,7 +1036,7 @@ const SetupOrganization = ({ getStarted = false }) => {
   };
 
   if (getStarted) {
-    return inviteEmailWarnings.length > 0
+    return inviteEmailWarnings.length > 0 && !hasInviteErrors
       ? renderInviteWarnings()
       : renderOrgSetup();
   }

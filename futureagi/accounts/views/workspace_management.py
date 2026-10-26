@@ -37,6 +37,7 @@ from accounts.serializers.contracts import (
     DeleteUserResponseSerializer,
     ResendInviteResponseSerializer,
     SwitchWorkspaceResponseSerializer,
+    TeamCreateErrorResponseSerializer,
     TeamCreateResponseSerializer,
     TeamRemoveResponseSerializer,
     TeamUsersResponseSerializer,
@@ -1932,7 +1933,11 @@ class ManageTeamView(APIView):
 
     @validated_request(
         request_serializer=TeamCreateRequestSerializer,
-        responses={201: TeamCreateResponseSerializer, **ACCOUNTS_ERROR_RESPONSES},
+        responses={
+            201: TeamCreateResponseSerializer,
+            **ACCOUNTS_ERROR_RESPONSES,
+            400: TeamCreateErrorResponseSerializer,
+        },
         reject_unknown_fields=True,
     )
     def post(self, request, *args, **kwargs):
@@ -2154,9 +2159,14 @@ class ManageTeamView(APIView):
                         ).first()
 
                         if existing_user:
-                            return self._gm.bad_request(
-                                "User is already a member of this organization"
+                            errors.append(
+                                {
+                                    "index": index,
+                                    "email": member_data["email"],
+                                    "error": "User is already a member of this organization",
+                                }
                             )
+                            continue
 
                         # Check if user exists in other organizations
                         user_in_other_org = (
@@ -2332,6 +2342,9 @@ class ManageTeamView(APIView):
             track_mixpanel_event(MixpanelEvents.SET_UP_ORG.value, properties)
 
             if errors:
+                response_data["message"] = (
+                    "Some members could not be added. Correct the errors and try again."
+                )
                 response_data["errors"] = errors
                 return self._gm.bad_request(response_data)
 

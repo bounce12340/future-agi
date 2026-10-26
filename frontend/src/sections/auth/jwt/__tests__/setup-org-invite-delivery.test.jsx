@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   get: vi.fn(),
   post: vi.fn(),
   enqueueSnackbar: vi.fn(),
+  redirectAfterOrgSetup: vi.fn(),
 }));
 
 vi.mock("src/utils/axios", () => ({
@@ -38,6 +39,10 @@ vi.mock("src/hooks/useDeploymentMode", () => ({
 vi.mock("src/utils/Mixpanel", () => ({
   Events: {}, PropertyName: {}, trackEvent: vi.fn(),
 }));
+vi.mock("../common", async (importOriginal) => ({
+  ...(await importOriginal()),
+  redirectAfterOrgSetup: mocks.redirectAfterOrgSetup,
+}));
 vi.mock("../RightSectionAuth", () => ({ default: () => null }));
 vi.mock("src/components/svg-color", () => ({ default: () => null }));
 vi.mock("src/components/RadioField/RadioField", () => ({ default: () => null }));
@@ -46,8 +51,11 @@ vi.mock("src/components/FormCheckboxField", () => ({ FormCheckboxField: () => nu
 vi.mock("src/components/FormTextField/FormTextFieldV2", async () => {
   const { Controller } = await import("react-hook-form");
   return { default: ({ control, fieldName, label }) => (
-    <Controller control={control} name={fieldName} render={({ field }) => (
-      <label>{label}<input {...field} value={field.value ?? ""} /></label>
+    <Controller control={control} name={fieldName} render={({ field, fieldState }) => (
+      <>
+        <label>{label}<input {...field} value={field.value ?? ""} /></label>
+        {fieldState.error && <span>{fieldState.error.message}</span>}
+      </>
     )} />
   ) };
 });
@@ -126,6 +134,7 @@ function respondWith(members) {
 describe("organization setup invitation delivery", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.post.mockReset();
     localStorage.clear();
     window.history.replaceState({}, "", "/auth/jwt/setup-org?step=2");
     mocks.get.mockImplementation(async (url, config) => ({
@@ -174,19 +183,29 @@ describe("organization setup invitation delivery", () => {
     expect(mocks.post).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps onboarding warnings visible until the user continues to the dashboard", async () => {
-    respondWith([{ ...createdMember, invite_email_warning: warning }]);
-    const user = userEvent.setup();
-    await renderSetup(false);
-    await addMember(user, email, false);
-    await submit(user);
+  it.each([null, "/dashboard/settings/members"])(
+    "navigates only after warning acknowledgment (returnTo=%s)",
+    async (returnTo) => {
+      if (returnTo) localStorage.setItem("redirectUrl", returnTo);
+      respondWith([{ ...createdMember, invite_email_warning: warning }]);
+      const user = userEvent.setup();
+      await renderSetup(false);
+      await addMember(user, email, false);
+      await submit(user);
 
-    expect(await screen.findByRole("alert")).toHaveTextContent(warning);
-    expect(screen.getByRole("button", { name: "Continue to dashboard" })).toBeEnabled();
-    expect(window.location.pathname).toBe("/auth/jwt/setup-org");
-    expect(screen.queryByRole("button", { name: "Continue", exact: true })).not.toBeInTheDocument();
-    expect(mocks.post).toHaveBeenCalledTimes(1);
-  });
+      expect(await screen.findByRole("alert")).toHaveTextContent(warning);
+      expect(mocks.redirectAfterOrgSetup).not.toHaveBeenCalled();
+      expect(screen.queryByRole("button", { name: "Continue", exact: true })).not.toBeInTheDocument();
+      await user.click(screen.getByRole("button", { name: "Continue to dashboard" }));
+      expect(mocks.redirectAfterOrgSetup).toHaveBeenCalledTimes(1);
+      expect(mocks.redirectAfterOrgSetup).toHaveBeenCalledWith(
+        returnTo || "/dashboard/get-started",
+      );
+      expect(localStorage.getItem("redirectUrl")).toBeNull();
+      if (returnTo) expect(localStorage.getItem("initial-render")).toBe("done");
+      expect(mocks.post).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("identifies only the failed delivery in a mixed bulk result", async () => {
     respondWith([
@@ -203,6 +222,71 @@ describe("organization setup invitation delivery", () => {
     expect(alert).toHaveTextContent(`failed@example.com: ${warning}`);
     expect(alert).not.toHaveTextContent(email);
     expect(screen.getAllByRole("alert")).toHaveLength(1);
+    expect(mocks.enqueueSnackbar).not.toHaveBeenCalledWith(
+      "Invite sent successfully.", expect.anything(),
+    );
+  });
+
+  it.each([
+    "User is already a member of this organization",
+    "User already exists in the other organization.",
+  ])("retains delivery warnings and retries only corrected rows: %s", async (memberError) => {
+    const failedEmail = "duplicate@example.com";
+    const correctedEmail = "corrected@example.com";
+    const message = "Some members could not be added. Correct the errors and try again.";
+    // Axios rejects with the normalized response body plus statusCode, not an
+    // Axios response wrapper. GeneralMethods must preserve result as an object.
+    mocks.post.mockRejectedValueOnce({
+      status: false,
+      statusCode: 400,
+      type: "validation_error",
+      code: "invalid",
+      detail: message,
+      message,
+      error: message,
+      result: {
+        message,
+        workspace: { id: "workspace-1", name: "default", display_name: "Default Workspace" },
+        created_members: [{ ...createdMember, invite_email_warning: warning }],
+        errors: [{ index: 1, email: failedEmail, error: memberError }],
+      },
+    }).mockResolvedValueOnce({
+      status: 201,
+      data: { status: true, result: {
+        created_members: [{ id: "member-2", email: correctedEmail }],
+      } },
+    });
+    const user = userEvent.setup();
+    await renderSetup(false);
+    await addMember(user, email, false);
+    await addMember(user, failedEmail, false);
+    await submit(user);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(`${email}: ${warning}`);
+    expect(await screen.findByText(memberError)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Continue", exact: true })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Continue to dashboard" })).not.toBeInTheDocument();
+    expect(mocks.redirectAfterOrgSetup).not.toHaveBeenCalled();
+    expect(screen.queryByDisplayValue(email)).not.toBeInTheDocument();
+    const retryInput = screen.getByDisplayValue(failedEmail);
+    expect(retryInput).toBeEnabled();
+    expect(screen.getAllByRole("textbox", { name: "Email" }).filter((field) => !field.disabled)).toEqual([retryInput]);
+    await user.clear(retryInput);
+    await user.type(retryInput, correctedEmail);
+    await submit(user);
+
+    await screen.findByRole("button", { name: "Continue to dashboard" });
+    expect(mocks.post).toHaveBeenCalledTimes(2);
+    expect(mocks.post.mock.calls[0][1].members.map((member) => member.email)).toEqual([email, failedEmail]);
+    expect(mocks.post.mock.calls[1][1].members.map((member) => member.email)).toEqual([correctedEmail]);
+    // The earlier mail failure is still actionable after the retry succeeds.
+    expect(screen.getByRole("alert")).toHaveTextContent(`${email}: ${warning}`);
+    expect(screen.getAllByRole("alert")).toHaveLength(1);
+    expect(mocks.redirectAfterOrgSetup).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Continue to dashboard" }));
+    expect(mocks.redirectAfterOrgSetup).toHaveBeenCalledTimes(1);
+    expect(mocks.redirectAfterOrgSetup).toHaveBeenCalledWith("/dashboard/get-started");
+    expect(mocks.post).toHaveBeenCalledTimes(2);
     expect(mocks.enqueueSnackbar).not.toHaveBeenCalledWith(
       "Invite sent successfully.", expect.anything(),
     );
