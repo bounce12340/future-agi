@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from itertools import count
 from typing import Any
 from uuid import UUID
 
@@ -385,41 +386,40 @@ def _orm_path(field: str) -> str:
     return _ALIASES.get(head, head)
 
 
-def index_scenarios(
-    job: HostedHarnessJob, docs: list[dict[str, Any]], prune: bool = False
-) -> int:
-    """Persist the authored suite so it can be queried, and return how many rows it holds."""
-    if not docs:
-        return 0
+def _rows_held(
+    rows: list[HostedHarnessScenario], docs: list[dict[str, Any]]
+) -> list[HostedHarnessScenario | None]:
+    """The existing row each scenario writes, or ``None`` for a new one.
+
+    A scenario takes the row holding its key first; only scenarios left over fall back to
+    a row their key or name spells, and never to one already used (a renamed scenario
+    keeps its key). A key names one scenario for the environment's life, so a dropped
+    scenario's key brings back that scenario's row and run history.
+    """
     from simulate.services.hosted_harness_gateway import _scenario_token
 
-    # Dropped rows are hidden, not deleted: a run's history still points at them.
-    rows = list(HostedHarnessScenario.all_objects.filter(job=job))
-    existing = {row.scenario_key: row for row in rows}
+    active_first = sorted(rows, key=lambda row: not row.deleted)
     by_token = {
         token: row
-        for row in sorted(rows, key=lambda row: not row.deleted)
+        for row in active_first
         for token in (_scenario_token(row.scenario_key), _scenario_token(row.name))
         if token
     }
-    # Numbers are stable across re-indexing; only a new row gets the next free number.
-    taken = max(
-        (row.number for row in existing.values() if row.number is not None), default=0
-    )
-    written = 0
-    seen: set[str] = set()
-    # A scenario takes the row holding its key first; only scenarios left over fall
-    # back to a row their key or name spells, and never to one already used (a renamed
-    # scenario keeps its key).
     by_key_token = {
         _scenario_token(row.scenario_key): row
-        for row in sorted(rows, key=lambda row: not row.deleted)
+        for row in active_first
         if row.scenario_key
     }
-    held_rows = [
-        by_key_token.get(_scenario_token(doc.get("scenario_key"))) for doc in docs
-    ]
-    used = {row.id for row in held_rows if row is not None}
+    held_rows: list[HostedHarnessScenario | None] = []
+    used: set[Any] = set()
+    for doc in docs:
+        row = by_key_token.get(_scenario_token(doc.get("scenario_key")))
+        # A key repeated in one suite keeps its row for the first scenario only.
+        if row is not None and row.id in used:
+            row = None
+        if row is not None:
+            used.add(row.id)
+        held_rows.append(row)
     for index, doc in enumerate(docs):
         if held_rows[index] is not None:
             continue
@@ -429,12 +429,32 @@ def index_scenarios(
                 held_rows[index] = row
                 used.add(row.id)
                 break
-        if held_rows[index] is None:
-            # A key is never created twice: a scenario without one that repeats a
-            # name writes over the row holding that name as its key.
-            held_rows[index] = by_key_token.get(
-                _scenario_token(doc.get("scenario_key") or doc.get("name"))
-            )
+        if held_rows[index] is None and not doc.get("scenario_key"):
+            # An older scenario without a key that repeats a name writes over the
+            # row holding that name as its key.
+            held_rows[index] = by_key_token.get(_scenario_token(doc.get("name")))
+    return held_rows
+
+
+def index_scenarios(
+    job: HostedHarnessJob, docs: list[dict[str, Any]], prune: bool = False
+) -> int:
+    """Persist the authored suite so it can be queried, and return how many rows it holds."""
+    if not docs:
+        return 0
+    # Dropped rows are hidden, not deleted: a run's history still points at them.
+    rows = list(HostedHarnessScenario.all_objects.filter(job=job))
+    existing = {row.scenario_key: row for row in rows}
+    # Numbers are stable across re-indexing; only a new row gets the next free number.
+    taken = max(
+        (row.number for row in existing.values() if row.number is not None), default=0
+    )
+    written = 0
+    seen: set[str] = set()
+    held_rows = _rows_held(rows, docs)
+    keys = {row.scenario_key for row in rows}
+    # Each key written so far, with the name it was written under and its row.
+    holder: dict[str, tuple[str, HostedHarnessScenario]] = {}
     for position, (doc, held) in enumerate(zip(docs, held_rows, strict=True), start=1):
         key = (
             held.scenario_key
@@ -443,6 +463,20 @@ def index_scenarios(
         )
         if not key:
             continue
+        name = str(doc.get("name") or key)[:255]
+        if (
+            held is None
+            and key in holder
+            and (not doc.get("scenario_key") or holder[key][0] == name)
+        ):
+            # The same scenario listed twice: both write the one row.
+            held = holder[key][1]
+        elif held is None and (key in keys or key in seen):
+            # Another scenario in this suite already holds this key: this one gets its
+            # own, so neither is lost and the key stays unique.
+            key = next(
+                f"{key}-{n}" for n in count(2) if f"{key}-{n}" not in keys | seen
+            )
         seen.add(key)
         if held is not None and held.number is not None:
             number = held.number
@@ -454,7 +488,7 @@ def index_scenarios(
         noise = doc.get("background_noise")
         fields = {
             "number": number,
-            "name": str(doc.get("name") or key)[:255],
+            "name": name,
             "instruction": str(doc.get("instruction") or ""),
             "use_case": str(doc.get("use_case") or "")[:255],
             "branch": str(doc.get("branch") or ""),
@@ -480,14 +514,15 @@ def index_scenarios(
         }
         row = held
         if row is None:
-            HostedHarnessScenario.no_workspace_objects.create(
+            row = HostedHarnessScenario.no_workspace_objects.create(
                 job=job, scenario_key=key, **fields
             )
         else:
             fields.update(deleted=False, deleted_at=None)
-            for name, value in fields.items():
-                setattr(row, name, value)
+            for field, value in fields.items():
+                setattr(row, field, value)
             row.save(update_fields=[*fields, "updated_at"])
+        holder[key] = (name, row)
         written += 1
     # Only an amend prunes: a short suite on a poll may still be mid-write. The row is
     # soft-deleted even when history points at it, so old Runs retain their foreign key

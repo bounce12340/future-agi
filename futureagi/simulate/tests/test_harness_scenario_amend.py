@@ -228,6 +228,86 @@ class TestScenarioNumbersSurviveADeletion:
         index_scenarios(job, [suite[0], {"name": "one", "tests": "u"}], prune=True)
         assert self._numbers(job) == {"one": 1}
 
+    def test_two_scenarios_with_one_key_each_keep_a_row(self, user, workspace):
+        from simulate.models import HostedHarnessScenario
+        from simulate.services.harness_scenarios import index_scenarios
+
+        suite = [
+            {"name": "ödeme sorusu", "scenario_key": "k", "tests": "t"},
+            {"name": "ödeme iadesi", "scenario_key": "k", "tests": "t"},
+        ]
+        job = _job(user, workspace, suite)
+        assert index_scenarios(job, suite) == 2
+
+        def rows():
+            return {
+                row.scenario_key: (row.number, row.name)
+                for row in HostedHarnessScenario.no_workspace_objects.filter(job=job)
+            }
+
+        assert rows() == {"k": (1, "ödeme sorusu"), "k-2": (2, "ödeme iadesi")}
+        index_scenarios(job, suite, prune=True)
+        assert rows() == {"k": (1, "ödeme sorusu"), "k-2": (2, "ödeme iadesi")}
+
+    def test_a_repeated_key_never_takes_the_row_of_the_scenario_holding_it(
+        self, user, workspace
+    ):
+        from simulate.models import HostedHarnessScenario
+        from simulate.services.harness_scenarios import index_scenarios
+
+        suite = [{"name": "one", "scenario_key": "one", "tests": "t"}]
+        job = _job(user, workspace, suite)
+        index_scenarios(job, suite)
+        repeated = {"name": "other", "scenario_key": "one", "tests": "t"}
+        index_scenarios(job, [suite[0], repeated], prune=True)
+
+        rows = {
+            row.scenario_key: (row.number, row.name)
+            for row in HostedHarnessScenario.no_workspace_objects.filter(job=job)
+        }
+        assert rows == {"one": (1, "one"), "one-2": (2, "other")}
+
+    def test_a_scenario_listed_twice_writes_one_row_every_time(self, user, workspace):
+        from simulate.services.harness_scenarios import index_scenarios
+
+        doc = {"name": "one", "scenario_key": "k", "tests": "t"}
+        job = _job(user, workspace, [doc, dict(doc)])
+        for _ in range(2):
+            index_scenarios(job, [doc, dict(doc)], prune=True)
+        assert self._numbers(job) == {"k": 1}
+
+    def test_a_new_suite_that_repeats_a_name_without_keys_saves_one_row(
+        self, user, workspace
+    ):
+        from simulate.services.harness_scenarios import index_scenarios
+
+        suite = [{"name": "one", "tests": "t"}, {"name": "one", "tests": "u"}]
+        job = _job(user, workspace, suite)
+        index_scenarios(job, suite)
+        assert self._numbers(job) == {"one": 1}
+
+    def test_adding_a_dropped_scenarios_key_again_brings_its_row_back(
+        self, user, workspace
+    ):
+        from simulate.models import HostedHarnessScenario
+        from simulate.services.harness_scenarios import index_scenarios
+
+        suite = [
+            {"name": name, "scenario_key": name, "tests": "t"}
+            for name in ("one", "two")
+        ]
+        job = _job(user, workspace, suite)
+        index_scenarios(job, suite)
+        index_scenarios(job, [suite[0]], prune=True)
+        index_scenarios(
+            job,
+            [suite[0], {"name": "two-new", "scenario_key": "two", "tests": "t"}],
+            prune=True,
+        )
+
+        row = HostedHarnessScenario.all_objects.get(job=job, scenario_key="two")
+        assert (row.number, row.name, row.deleted) == (2, "two-new", False)
+
     def test_a_number_means_the_row_the_table_shows(self, user, workspace):
         from simulate.services.harness_provider import scenarios_meant
         from simulate.services.harness_scenarios import index_scenarios
