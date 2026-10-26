@@ -61,7 +61,9 @@ const InviteUserDrawerForm = ({ onClose }) => {
     },
     onError: (e, variables) => {
       const result = e?.result;
-      const submittedEmail = variables?.members?.[0]?.email?.trim().toLowerCase();
+      const submittedEmail = variables?.members?.[0]?.email
+        ?.trim()
+        .toLowerCase();
       const memberError = Array.isArray(result?.errors)
         ? result.errors.find(
             (error) =>
