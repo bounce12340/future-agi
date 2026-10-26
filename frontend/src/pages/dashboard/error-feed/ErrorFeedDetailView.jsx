@@ -109,6 +109,7 @@ export default function ErrorFeedDetailView() {
   const { activeTab, setActiveTab } = useErrorFeedStore();
   const [linearPickerOpen, setLinearPickerOpen] = useState(false);
   const [shareDialogOpen, setShareDialogOpen] = useState(false);
+  const [clusterIdCopied, setClusterIdCopied] = useState(false);
   const setAnalyzePendingStart = useErrorFeedStore(
     (s) => s.setAnalyzePendingStart,
   );
@@ -168,12 +169,14 @@ export default function ErrorFeedDetailView() {
   const activeTabKey = TABS[safeTabIndex].key;
 
   const handleCopyClusterId = async () => {
-    const copied = await copyToClipboard(currentError.cluster_id);
-    if (copied) {
-      enqueueSnackbar("Cluster ID copied", { variant: "success" });
-    } else {
+    // Same inline feedback as the product's other copy buttons: the icon
+    // turns into a check for a moment; only a failure gets a toast.
+    if (!(await copyToClipboard(currentError.cluster_id))) {
       enqueueSnackbar("Couldn't copy the cluster ID", { variant: "error" });
+      return;
     }
+    setClusterIdCopied(true);
+    setTimeout(() => setClusterIdCopied(false), 1500);
   };
 
   return (
@@ -339,7 +342,10 @@ export default function ErrorFeedDetailView() {
               gap={0.75}
               flexShrink={0}
             >
-              <Tooltip title="Copy cluster ID" arrow>
+              <Tooltip
+                title={clusterIdCopied ? "Copied" : "Copy cluster ID"}
+                arrow
+              >
                 <IconButton
                   size="small"
                   onClick={handleCopyClusterId}
@@ -349,7 +355,10 @@ export default function ErrorFeedDetailView() {
                     borderColor: "divider",
                   }}
                 >
-                  <Iconify icon="mdi:content-copy" width={14} />
+                  <Iconify
+                    icon={clusterIdCopied ? "mdi:check" : "mdi:content-copy"}
+                    width={14}
+                  />
                 </IconButton>
               </Tooltip>
               {!shared && (

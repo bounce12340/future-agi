@@ -29,7 +29,7 @@ vi.mock("src/pages/dashboard/error-feed/ErrorFeedDetailView", async () => {
     "src/pages/dashboard/error-feed/sharedIssueContext"
   );
   return {
-    default: () => {
+    default: function MockIssuePage() {
       const shared = useSharedIssue();
       return (
         <div data-testid="issue-page" data-token={shared?.token}>

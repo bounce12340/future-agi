@@ -118,7 +118,6 @@ function NotAnalyzedState({ onAnalyze, readOnly = false }) {
   );
 }
 NotAnalyzedState.propTypes = {
-  readOnly: PropTypes.bool,
   onAnalyze: PropTypes.func,
   readOnly: PropTypes.bool,
 };
@@ -342,6 +341,7 @@ AnalyzedState.propTypes = {
   }),
   onCreateLinear: PropTypes.func,
   onOpenAnalyze: PropTypes.func,
+  readOnly: PropTypes.bool,
 };
 
 // ── Main: ClusterHeadlineCard ────────────────────────────────────────────────
