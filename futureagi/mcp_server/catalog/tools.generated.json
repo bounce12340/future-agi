@@ -2,7 +2,7 @@
   "schema_version": 1,
   "source_contract": "swagger.json",
   "source_contract_sha256": "6e8772ff979be41f435b0a066a824965c83c484182d35c107bbd8d38d0284be1",
-  "tool_count": 105,
+  "tool_count": 109,
   "tools": [
     {
       "name": "whoami",
@@ -5733,6 +5733,209 @@
       },
       "source": {
         "operationId": "tracer_feed_issues_read"
+      }
+    },
+    {
+      "name": "get_error_cluster_overview",
+      "description": "Return a cluster's pattern summary - the statistical insights that separate its failing traces from the passing baseline - plus its daily error counts and representative traces with their evidence and agent flow. Representative traces carry full inputs and outputs, so pass rep_limit=1 to 3; larger pages exceed the MCP response size limit.",
+      "group": "error_feed",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "cluster_id": {
+            "type": "string"
+          },
+          "rep_limit": {
+            "type": "integer",
+            "default": 20,
+            "minimum": 1,
+            "maximum": 20
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "cluster_id"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "request": {
+        "method": "GET",
+        "path": "/tracer/feed/issues/{cluster_id}/overview/",
+        "parameters": {
+          "path": [
+            "cluster_id"
+          ],
+          "query": [
+            "rep_limit"
+          ],
+          "body": []
+        }
+      },
+      "response": {
+        "unwrap": "result"
+      },
+      "source": {
+        "operationId": "tracer_feed_issues_overview_list"
+      }
+    },
+    {
+      "name": "list_error_cluster_traces",
+      "description": "List the traces grouped into a cluster with each one's score, latency, tokens and cost, alongside cluster-wide aggregates. Use the returned trace ids with get_trace, get_error_cluster_root_cause or analyze_error_cluster_trace.",
+      "group": "error_feed",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "cluster_id": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "integer",
+            "default": 50,
+            "minimum": 1,
+            "maximum": 100
+          },
+          "offset": {
+            "type": "integer",
+            "default": 0,
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "cluster_id"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "request": {
+        "method": "GET",
+        "path": "/tracer/feed/issues/{cluster_id}/traces/",
+        "parameters": {
+          "path": [
+            "cluster_id"
+          ],
+          "query": [
+            "limit",
+            "offset"
+          ],
+          "body": []
+        }
+      },
+      "response": {
+        "unwrap": "result"
+      },
+      "source": {
+        "operationId": "tracer_feed_issues_traces_list"
+      }
+    },
+    {
+      "name": "get_error_cluster_root_cause",
+      "description": "Read the stored deep analysis for one trace of a cluster - ranked root causes, recommendations and the immediate fix. `status` is idle until analyze_error_cluster_trace has been run on that trace, running while it runs, then done (results included) or failed. Take trace_id from list_error_cluster_traces or get_error_cluster_overview; a trace outside the cluster is a 404, not an empty analysis.",
+      "group": "error_feed",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "cluster_id": {
+            "type": "string"
+          },
+          "trace_id": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "cluster_id",
+          "trace_id"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      },
+      "request": {
+        "method": "GET",
+        "path": "/tracer/feed/issues/{cluster_id}/root-cause/",
+        "parameters": {
+          "path": [
+            "cluster_id"
+          ],
+          "query": [
+            "trace_id"
+          ],
+          "body": []
+        }
+      },
+      "response": {
+        "unwrap": "result"
+      },
+      "source": {
+        "operationId": "tracer_feed_issues_root-cause_list"
+      }
+    },
+    {
+      "name": "analyze_error_cluster_trace",
+      "description": "Run deep root-cause analysis on one trace of a cluster. This dispatches asynchronous model work and can incur usage charges; it returns a receipt, not the analysis, so poll get_error_cluster_root_cause until its status is done or failed. Omit force to reuse a stored analysis instead of re-running it; force=true DELETES the stored analysis for that trace and starts again.",
+      "group": "error_feed",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "cluster_id": {
+            "type": "string"
+          },
+          "trace_id": {
+            "title": "Trace id",
+            "type": "string",
+            "minLength": 1
+          },
+          "force": {
+            "title": "Force",
+            "type": "boolean",
+            "default": false
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "cluster_id",
+          "trace_id"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "request": {
+        "method": "POST",
+        "path": "/tracer/feed/issues/{cluster_id}/deep-analysis/",
+        "parameters": {
+          "path": [
+            "cluster_id"
+          ],
+          "query": [],
+          "body": [
+            "trace_id",
+            "force"
+          ]
+        }
+      },
+      "response": {
+        "unwrap": "result"
+      },
+      "source": {
+        "operationId": "tracer_feed_issues_deep-analysis_create"
       }
     },
     {

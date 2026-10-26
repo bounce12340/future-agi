@@ -1,5 +1,5 @@
 version: 1
-expected_tool_count: 105
+expected_tool_count: 109
 
 # Pagination is an MCP-only page-size ceiling, so an oversized page is rejected
 # before the REST view queries and serializes it. The generator keeps a stricter
@@ -328,6 +328,31 @@ tools:
     description: Return an error issue and its grouped trace information.
     operation: {method: GET, path: "/tracer/feed/issues/{cluster_id}/"}
     access: read
+  - name: get_error_cluster_overview
+    group: error_feed
+    description: Return a cluster's pattern summary - the statistical insights that separate its failing traces from the passing baseline - plus its daily error counts and representative traces with their evidence and agent flow. Representative traces carry full inputs and outputs, so pass rep_limit=1 to 3; larger pages exceed the MCP response size limit.
+    operation: {method: GET, path: "/tracer/feed/issues/{cluster_id}/overview/"}
+    access: read
+    pagination:
+      rep_limit: {maximum: 20}
+  - name: list_error_cluster_traces
+    group: error_feed
+    description: List the traces grouped into a cluster with each one's score, latency, tokens and cost, alongside cluster-wide aggregates. Use the returned trace ids with get_trace, get_error_cluster_root_cause or analyze_error_cluster_trace.
+    operation: {method: GET, path: "/tracer/feed/issues/{cluster_id}/traces/"}
+    access: read
+    pagination:
+      limit: {maximum: 100}
+  - name: get_error_cluster_root_cause
+    group: error_feed
+    description: Read the stored deep analysis for one trace of a cluster - ranked root causes, recommendations and the immediate fix. `status` is idle until analyze_error_cluster_trace has been run on that trace, running while it runs, then done (results included) or failed. Take trace_id from list_error_cluster_traces or get_error_cluster_overview; a trace outside the cluster is a 404, not an empty analysis.
+    operation: {method: GET, path: "/tracer/feed/issues/{cluster_id}/root-cause/"}
+    access: read
+  - name: analyze_error_cluster_trace
+    group: error_feed
+    description: Run deep root-cause analysis on one trace of a cluster. This dispatches asynchronous model work and can incur usage charges; it returns a receipt, not the analysis, so poll get_error_cluster_root_cause until its status is done or failed. Omit force to reuse a stored analysis instead of re-running it; force=true DELETES the stored analysis for that trace and starts again.
+    operation: {method: POST, path: "/tracer/feed/issues/{cluster_id}/deep-analysis/"}
+    access: destructive
+    open_world: true
   # annotations
   - name: list_annotation_queues
     group: annotations
