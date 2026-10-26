@@ -184,9 +184,9 @@ const analytics = {
     pass_rate_interval: {
       low: 12.5,
       high: 95.1,
+      effective_n: 3,
       scenarios: 2,
       evaluated: 3,
-      resamples: 2000,
     },
     rows: [
       {

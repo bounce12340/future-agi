@@ -2512,6 +2512,12 @@ class TestRunResultsV3Views:
         assert reliability["pass_hat_k_scenarios"] == 2
         # Three scenarios are too few for a range worth acting on.
         assert reliability["pass_rate_interval"] is None
+        # The run header reads the same block without the full analytics payload.
+        headline = auth_client.get(
+            f"/simulate/v3/test-executions/{test_execution.id}/reliability/"
+        )
+        assert headline.status_code == status.HTTP_200_OK
+        assert headline.json() == reliability
         evaluation = next(
             row for row in body["evaluations"] if row["id"] == "policy-check"
         )

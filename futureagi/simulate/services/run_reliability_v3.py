@@ -2,55 +2,57 @@
 
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from typing import Any
 
-import numpy as np
 from django.db.models import QuerySet
 
 from simulate.services.run_results_v3 import OUTCOME_LABELS
 
 # Fewer scenarios than this give a range too wide to act on; show counts only.
 MIN_INTERVAL_SCENARIOS = 10
-_RESAMPLES = 2000
-# A fixed seed keeps a run's range stable across page loads.
-_SEED = 0
-# Bounds the (resamples x scenarios) index matrix drawn at once.
-_MAX_DRAW_CELLS = 1_000_000
+_Z = 1.96
 
 
-def scenario_bootstrap_interval(
-    clusters: list[tuple[int, int]],
-) -> dict[str, Any] | None:
-    """95% range for pass^1 by resampling scenarios with their trials nested inside.
+def _wilson(p: float, n: float) -> tuple[float, float]:
+    denominator = 1 + _Z * _Z / n
+    centre = (p + _Z * _Z / (2 * n)) / denominator
+    half = _Z * math.sqrt(p * (1 - p) / n + _Z * _Z / (4 * n * n)) / denominator
+    return max(0.0, centre - half) * 100, min(1.0, centre + half) * 100
+
+
+def scenario_interval(clusters: list[tuple[int, int]]) -> dict[str, Any] | None:
+    """95% range for pass^1 with scenarios, not trials, as the sampling unit.
 
     Trials of one scenario share its script, persona and world, so they are not
-    independent draws: the bootstrap resamples whole scenarios, never single
-    trials. ``clusters`` holds (passed, evaluated) per scenario; scenarios with no
-    conclusive trial are left out.
+    independent draws. The spread of per-scenario rates (the variance a resample
+    of whole scenarios would show) sets the effective sample size, and a Wilson
+    interval on that keeps its width at 0% and 100%, where a percentile bootstrap
+    collapses to a point. ``clusters`` holds (passed, evaluated) per scenario;
+    scenarios with no conclusive trial are left out.
     """
     clusters = [(passed, evaluated) for passed, evaluated in clusters if evaluated]
     scenarios = len(clusters)
     if scenarios < MIN_INTERVAL_SCENARIOS:
         return None
-    rates = np.array([passed / evaluated for passed, evaluated in clusters])
-    rng = np.random.default_rng(_SEED)
-    chunk = max(1, _MAX_DRAW_CELLS // scenarios)
-    means = np.concatenate(
-        [
-            rates[rng.integers(0, scenarios, size=(min(chunk, left), scenarios))].mean(
-                axis=1
-            )
-            for left in range(_RESAMPLES, 0, -chunk)
-        ]
-    )
-    low, high = np.percentile(means, [2.5, 97.5]) * 100
+    evaluated = sum(n for _, n in clusters)
+    rates = [passed / n for passed, n in clusters]
+    p = sum(rates) / scenarios
+    variance = sum((rate - p) ** 2 for rate in rates) / (scenarios - 1) / scenarios
+    # Identical scenario rates carry no spread to measure, so fall back to one
+    # independent verdict per scenario. The tolerance absorbs float residue
+    # (e.g. ten 2/3 rates), which would otherwise read as near-infinite n.
+    effective_n = float(scenarios)
+    if variance > 1e-12 and 0 < p < 1:
+        effective_n = min(float(evaluated), max(1.0, p * (1 - p) / variance))
+    low, high = _wilson(p, effective_n)
     return {
-        "low": round(float(low), 2),
-        "high": round(float(high), 2),
+        "low": round(low, 2),
+        "high": round(high, 2),
+        "effective_n": round(effective_n, 2),
         "scenarios": scenarios,
-        "evaluated": sum(evaluated for _, evaluated in clusters),
-        "resamples": _RESAMPLES,
+        "evaluated": evaluated,
     }
 
 
@@ -105,6 +107,7 @@ def build_reliability(queryset: QuerySet, trials: int) -> dict[str, Any]:
     pass_hat_k_shown = bool(k and k > 1)
     # A scenario with an inconclusive trial cannot show k of k passing.
     complete = [row for row in rows if pass_hat_k_shown and row["evaluated"] == k]
+    all_passed = sum(row["passed"] == k for row in complete)
     return {
         "trials": trials,
         "scenarios": len(rows),
@@ -131,12 +134,16 @@ def build_reliability(queryset: QuerySet, trials: int) -> dict[str, Any]:
             else None
         ),
         "pass_hat_k": (
-            round(sum(row["passed"] == k for row in complete) * 100 / len(complete), 2)
-            if complete
-            else None
+            round(all_passed * 100 / len(complete), 2) if complete else None
         ),
         "pass_hat_k_scenarios": len(complete),
-        "pass_rate_interval": scenario_bootstrap_interval(
+        "pass_hat_k_passed": all_passed,
+        # Scenarios pass^k could not judge, so the header can say what it covers.
+        "pass_hat_k_excluded": len(rows) - len(complete) if pass_hat_k_shown else 0,
+        # Pooled counts for runs too small for rates, so the header need not sum rows.
+        "trials_passed": sum(row["passed"] for row in conclusive),
+        "trials_evaluated": sum(row["evaluated"] for row in conclusive),
+        "pass_rate_interval": scenario_interval(
             [(row["passed"], row["evaluated"]) for row in rows]
         ),
         "rows": rows,

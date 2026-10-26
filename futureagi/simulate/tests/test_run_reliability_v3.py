@@ -1,12 +1,13 @@
-"""Regression tests for pass^1 / pass^k and the scenario-resampled interval."""
+"""Regression tests for pass^1 / pass^k and the scenario-clustered interval."""
 
+import random
 from unittest.mock import MagicMock
 
 import pytest
 
 from simulate.services.run_reliability_v3 import (
     build_reliability,
-    scenario_bootstrap_interval,
+    scenario_interval,
 )
 
 
@@ -22,16 +23,16 @@ def _reliability(calls, trials):
 
 
 def test_interval_is_withheld_below_ten_scenarios():
-    assert scenario_bootstrap_interval([(1, 3)] * 9) is None
-    assert scenario_bootstrap_interval([(1, 3)] * 9 + [(0, 0)]) is None
-    assert scenario_bootstrap_interval([(1, 3)] * 10) is not None
+    assert scenario_interval([(1, 3)] * 9) is None
+    assert scenario_interval([(1, 3)] * 9 + [(0, 0)]) is None
+    assert scenario_interval([(1, 3)] * 10) is not None
 
 
-def test_interval_resamples_scenarios_not_trials():
+def test_interval_counts_scenarios_not_trials():
     # Same 60 verdicts and pooled rate, split across 20 vs 60 scenarios. Fewer,
     # all-or-nothing scenarios carry less information, so their range is wider.
-    clustered = scenario_bootstrap_interval([(3, 3)] * 12 + [(0, 3)] * 8)
-    spread = scenario_bootstrap_interval([(1, 1)] * 36 + [(0, 1)] * 24)
+    clustered = scenario_interval([(3, 3)] * 12 + [(0, 3)] * 8)
+    spread = scenario_interval([(1, 1)] * 36 + [(0, 1)] * 24)
     assert clustered["low"] < 60.0 < clustered["high"]
     assert spread["low"] < 60.0 < spread["high"]
     assert clustered["high"] - clustered["low"] > spread["high"] - spread["low"]
@@ -39,13 +40,33 @@ def test_interval_resamples_scenarios_not_trials():
     assert clustered["evaluated"] == 60
 
 
-def test_interval_is_repeatable_and_degenerate_when_every_scenario_agrees():
-    clusters = [(2, 3), (3, 3), (1, 3), (0, 3)] * 5
-    assert scenario_bootstrap_interval(clusters) == scenario_bootstrap_interval(
-        clusters
-    )
-    flat = scenario_bootstrap_interval([(3, 3)] * 12)
-    assert (flat["low"], flat["high"]) == (100.0, 100.0)
+@pytest.mark.parametrize(
+    "clusters",
+    [[(3, 3)] * 12, [(2, 3)] * 10, [(0, 3)] * 10],
+    ids=["all-pass", "all-two-of-three", "all-fail"],
+)
+def test_interval_keeps_width_when_every_scenario_agrees(clusters):
+    interval = scenario_interval(clusters)
+    assert interval["high"] - interval["low"] > 10
+    # No spread between scenarios: one verdict per scenario, not per trial.
+    assert interval["effective_n"] == len(clusters)
+
+
+@pytest.mark.parametrize("scenarios", [10, 20, 50])
+def test_interval_covers_a_near_perfect_agent(scenarios):
+    # Near-perfect agents are where people read this number hardest, and where a
+    # range built only from the observed scenario rates collapses.
+    rng = random.Random(scenarios)
+    true_rate, k, runs = 0.99, 3, 400
+    covered = 0
+    for _ in range(runs):
+        clusters = [
+            (sum(rng.random() < true_rate for _ in range(k)), k)
+            for _ in range(scenarios)
+        ]
+        interval = scenario_interval(clusters)
+        covered += interval["low"] <= true_rate * 100 <= interval["high"]
+    assert covered / runs >= 0.9
 
 
 def test_pass_hat_metrics_leave_inconclusive_trials_out():
@@ -72,7 +93,12 @@ def test_pass_hat_metrics_leave_inconclusive_trials_out():
     assert result["pass_hat_1"] == 88.89
     # Only scenarios whose 3 trials were all conclusive can show 3 of 3 passing.
     assert result["pass_hat_k_scenarios"] == 2
+    assert result["pass_hat_k_passed"] == 1
     assert result["pass_hat_k"] == 50.0
+    # pass^k drops pass-error and all-error, so the header must say so.
+    assert result["pass_hat_k_excluded"] == 2
+    # Below the interval floor the header shows pooled counts, sent as such.
+    assert (result["trials_passed"], result["trials_evaluated"]) == (7, 8)
     assert result["pass_rate_interval"] is None
     rows = {row["scenario_key"]: row for row in result["rows"]}
     assert (rows["pass-error"]["passed"], rows["pass-error"]["evaluated"]) == (2, 2)

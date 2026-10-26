@@ -2,12 +2,26 @@ import { useQuery } from "@tanstack/react-query";
 
 import axios, { endpoints } from "src/utils/axios";
 
-export function useRunAnalytics(executionId, { enabled = true } = {}) {
+export function useRunAnalytics(executionId) {
   return useQuery({
     queryKey: ["simulation-run-analytics-v3", executionId],
     queryFn: () =>
       axios
         .get(endpoints.runResultsV3.analytics(executionId))
+        .then((response) => response.data),
+    enabled: !!executionId,
+    staleTime: 1000 * 60 * 5,
+  });
+}
+
+// The run header's reliability numbers, without the full analytics payload.
+// Keyed under the analytics key so every analytics invalidation refreshes it.
+export function useRunReliability(executionId, { enabled = true } = {}) {
+  return useQuery({
+    queryKey: ["simulation-run-analytics-v3", executionId, "reliability"],
+    queryFn: () =>
+      axios
+        .get(endpoints.runResultsV3.reliability(executionId))
         .then((response) => response.data),
     enabled: !!executionId && enabled,
     staleTime: 1000 * 60 * 5,

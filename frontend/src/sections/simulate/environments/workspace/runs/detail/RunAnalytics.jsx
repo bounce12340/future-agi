@@ -327,10 +327,9 @@ function AnalyticsDashboard({ executionId, onOpenCall, onOpenCalls }) {
       label: "Calls passed",
       value: format(passRate?.value, "percent"),
       reported: passRate?.value != null,
-      // The range brackets pass^1 (scenario-averaged), not the pooled rate above.
-      detail: interval
-        ? `pass^1 95% ${number(interval.low)}–${number(interval.high)}%`
-        : null,
+      // No range here: pass^1's range brackets the scenario average, which this
+      // pooled rate need not sit inside.
+      detail: null,
       coverage: `${passRate?.measured ?? 0} / ${passRate?.total ?? 0} evaluated`,
       note: passRate?.note,
     },
