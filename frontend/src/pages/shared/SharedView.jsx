@@ -23,6 +23,7 @@ import {
 import Iconify from "src/components/iconify";
 import SharedVoiceView from "./SharedVoiceView";
 import SharedSimulationCallView from "./SharedSimulationCallView";
+import SharedErrorIssueView from "./SharedErrorIssueView";
 import { isVoiceCall, simulationCallKind } from "./sharedViewHelpers";
 
 function getSpan(entry) {
@@ -55,6 +56,7 @@ export default function SharedView() {
     [isTrace, resourceData],
   );
   const isCallExecution = resourceType === "call_execution";
+  const isErrorIssue = resourceType === "error_feed_issue";
   // A shared call resolves to the same payload as the in-app call detail.
   const sharedCall = isCallExecution ? resourceData || null : null;
   const isChatCall =
@@ -185,13 +187,15 @@ export default function SharedView() {
             ? `Shared Voice Call — ${resourceId?.substring(0, 8) || "..."}`
             : isChatCall
               ? `Shared Chat — ${resourceId?.substring(0, 8) || "..."}`
-              : isTrace
-                ? `Shared Trace — ${resourceId?.substring(0, 8) || "..."}`
-                : resourceType === "dashboard"
-                  ? `Shared Dashboard — ${resourceData?.name || resourceId?.substring(0, 8) || "..."}`
-                  : resourceType === "project"
-                    ? `Shared Project — ${resourceData?.name || resourceId?.substring(0, 8) || "..."}`
-                    : "Shared Resource"}
+              : isErrorIssue
+                ? `Shared Issue — ${resourceData?.issue?.row?.error?.name || resourceId || "..."}`
+                : isTrace
+                  ? `Shared Trace — ${resourceId?.substring(0, 8) || "..."}`
+                  : resourceType === "dashboard"
+                    ? `Shared Dashboard — ${resourceData?.name || resourceId?.substring(0, 8) || "..."}`
+                    : resourceType === "project"
+                      ? `Shared Project — ${resourceData?.name || resourceId?.substring(0, 8) || "..."}`
+                      : "Shared Resource"}
         </title>
       </Helmet>
 
@@ -224,11 +228,13 @@ export default function SharedView() {
                   ? "mdi:phone-outline"
                   : isChatCall
                     ? "mdi:message-text-outline"
-                    : resourceType === "dashboard"
-                      ? "mdi:view-dashboard-outline"
-                      : resourceType === "project"
-                        ? "mdi:folder-outline"
-                        : "mdi:share-variant-outline"
+                    : isErrorIssue
+                      ? "mdi:bug-outline"
+                      : resourceType === "dashboard"
+                        ? "mdi:view-dashboard-outline"
+                        : resourceType === "project"
+                          ? "mdi:folder-outline"
+                          : "mdi:share-variant-outline"
               }
               width={20}
               sx={{ color: "primary.main" }}
@@ -240,11 +246,13 @@ export default function SharedView() {
                 ? "Shared voice call"
                 : isChatCall
                   ? "Shared chat"
-                  : resourceType === "dashboard"
-                    ? "Shared dashboard"
-                    : resourceType === "project"
-                      ? "Shared project"
-                      : `Shared ${resourceType || "resource"}`}
+                  : isErrorIssue
+                    ? "Shared issue"
+                    : resourceType === "dashboard"
+                      ? "Shared dashboard"
+                      : resourceType === "project"
+                        ? "Shared project"
+                        : `Shared ${resourceType || "resource"}`}
             </Typography>
             {resourceId && (
               <Typography
@@ -275,6 +283,8 @@ export default function SharedView() {
           >
             <CircularProgress size={32} />
           </Box>
+        ) : isErrorIssue ? (
+          <SharedErrorIssueView token={token} data={resourceData} />
         ) : isCallExecution ? (
           <SharedSimulationCallView call={sharedCall} />
         ) : isVoice ? (

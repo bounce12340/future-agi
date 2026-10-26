@@ -37075,6 +37075,13 @@ export type TracerSharedLinksList200 = {
   results: SharedLinkListApi[];
 };
 
+export type TracerSharedSidebarListParams = {
+  /**
+   * @minLength 1
+   */
+  trace_id?: string;
+};
+
 export type TracerTraceAnnotationGetAnnotationValuesParams = {
   /**
    * A page number within the paginated result set.

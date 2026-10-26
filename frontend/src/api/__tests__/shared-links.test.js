@@ -14,6 +14,7 @@ import {
   useAddSharedLinkAccess,
   useCreateSharedLink,
   useGetSharedLinks,
+  useSharedIssueSidebar,
   useSharedIssueTrace,
   useUpdateSharedLink,
 } from "../shared-links";
@@ -27,6 +28,7 @@ vi.mock("src/utils/axios", () => ({
       create: "/tracer/shared-links/",
       update: (id) => `/tracer/shared-links/${id}/`,
       addAccess: (id) => `/tracer/shared-links/${id}/access/`,
+      issueSidebar: (token) => `/tracer/shared/${token}/sidebar/`,
       issueTrace: (token, traceId) =>
         `/tracer/shared/${token}/traces/${traceId}/`,
     },
@@ -143,5 +145,24 @@ describe("useSharedIssueTrace", () => {
     const { Wrapper } = makeWrapper();
     renderHook(() => useSharedIssueTrace("tok", null), { wrapper: Wrapper });
     expect(axios.get).not.toHaveBeenCalled();
+  });
+});
+
+describe("useSharedIssueSidebar", () => {
+  it("reads the sidebar for the picked trace through the share token", async () => {
+    axios.get.mockResolvedValueOnce({
+      data: { status: true, result: { timeline: {} } },
+    });
+    const { Wrapper } = makeWrapper();
+    const { result } = renderHook(
+      () => useSharedIssueSidebar("tok", "trace-2"),
+      { wrapper: Wrapper },
+    );
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(axios.get).toHaveBeenCalledWith("/tracer/shared/tok/sidebar/", {
+      params: { trace_id: "trace-2" },
+    });
+    expect(result.current.data).toEqual({ timeline: {} });
   });
 });
