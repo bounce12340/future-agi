@@ -59,14 +59,26 @@ const InviteUserDrawerForm = ({ onClose }) => {
       onClose();
       queryClient.invalidateQueries({ queryKey: ["member-list"], type: "all" });
     },
-    onError: (e) => {
-      // Handle actual HTTP errors (network issues, 500 errors, etc.)
-      const errorMessage = e?.message || "Failed to send invite";
+    onError: (e, variables) => {
+      const result = e?.result;
+      const submittedEmail = variables?.members?.[0]?.email?.trim().toLowerCase();
+      const memberError = Array.isArray(result?.errors)
+        ? result.errors.find(
+            (error) =>
+              typeof error?.email === "string" &&
+              error.email.trim().toLowerCase() === submittedEmail,
+          )
+        : null;
+      const errorMessage =
+        [
+          memberError?.error,
+          result?.message,
+          typeof result === "string" ? result : null,
+          e?.message,
+        ].find((message) => typeof message === "string" && message.trim()) ||
+        "Failed to send invite";
       enqueueSnackbar(errorMessage, { variant: "error" });
-
-      if (e?.result) {
-        setError("email", { message: e?.result });
-      }
+      setError("email", { message: errorMessage });
     },
   });
 

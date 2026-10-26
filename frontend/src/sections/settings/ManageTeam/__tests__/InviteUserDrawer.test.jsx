@@ -17,8 +17,15 @@ vi.mock("src/components/iconify", () => ({ default: () => null }));
 vi.mock("src/components/FormTextField/FormTextFieldV2", async () => {
   const { Controller } = await import("react-hook-form");
   return { default: ({ control, fieldName, label }) => (
-    <Controller control={control} name={fieldName} render={({ field }) => (
-      <label>{label}<input {...field} value={field.value ?? ""} /></label>
+    <Controller control={control} name={fieldName} render={({ field, fieldState }) => (
+      <>
+        <label>
+          {label}
+          <input {...field} value={field.value ?? ""} aria-describedby={`${fieldName}-error`} />
+        </label>
+        {/* Match FormTextFieldV2: render the message directly, never stringify it. */}
+        <span id={`${fieldName}-error`}>{fieldState.error?.message}</span>
+      </>
     )} />
   ) };
 });
@@ -89,6 +96,60 @@ describe("Manage Team invite delivery", () => {
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["member-list"], type: "all" });
   });
 
+  it("renders the matching member error from a structured 400 response", async () => {
+    const memberError = "User is already a member of this organization";
+    const message = "Some members could not be added. Correct the errors and try again.";
+    mocks.post.mockRejectedValue({
+      status: false,
+      statusCode: 400,
+      type: "validation_error",
+      code: "invalid",
+      detail: message,
+      message,
+      error: message,
+      result: {
+        message,
+        created_members: [],
+        workspace: { id: "workspace-1", name: "default", display_name: "Default Workspace" },
+        errors: [
+          { index: 0, email: "someone-else@example.com", error: "Unrelated member error" },
+          { index: 1, email: email.toUpperCase(), error: memberError },
+        ],
+      },
+    });
+    const { onClose, invalidate } = await submitInvite();
+
+    expect(await screen.findByText(memberError)).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "User Email" })).toHaveAccessibleDescription(memberError);
+    expect(mocks.enqueueSnackbar).toHaveBeenCalledWith(memberError, { variant: "error" });
+    expect(onClose).not.toHaveBeenCalled();
+    expect(invalidate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["generic string", "Error in managing users"],
+    ["structured message", {
+      message: "Error in managing users",
+      errors: [{ email: "someone-else@example.com", error: { detail: "Not a string" } }],
+    }],
+  ])("renders a %s 400 error without passing an object to the field", async (_, result) => {
+    mocks.post.mockRejectedValue({
+      status: false,
+      statusCode: 400,
+      type: "validation_error",
+      code: "invalid",
+      message: "Generic transport message",
+      result,
+    });
+    const { onClose, invalidate } = await submitInvite();
+
+    expect(await screen.findByText("Error in managing users")).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "User Email" })).toHaveAccessibleDescription("Error in managing users");
+    expect(mocks.enqueueSnackbar).toHaveBeenCalledWith("Error in managing users", { variant: "error" });
+    expect(onClose).not.toHaveBeenCalled();
+    expect(invalidate).not.toHaveBeenCalled();
+  });
+
   it("does not close or claim success when member creation fails", async () => {
     mocks.post.mockRejectedValue({ message: "Error in managing users" });
     const { onClose, invalidate } = await submitInvite();
@@ -96,6 +157,7 @@ describe("Manage Team invite delivery", () => {
     await waitFor(() => expect(mocks.enqueueSnackbar).toHaveBeenCalledWith(
       "Error in managing users", { variant: "error" },
     ));
+    expect(await screen.findByText("Error in managing users")).toBeInTheDocument();
     expect(onClose).not.toHaveBeenCalled();
     expect(invalidate).not.toHaveBeenCalled();
   });
