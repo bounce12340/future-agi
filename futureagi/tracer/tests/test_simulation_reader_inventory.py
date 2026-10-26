@@ -1633,6 +1633,7 @@ _FILED_BY_MODULE: dict[str, dict[str, Filing]] = {
         "_TraceListQueryBuilderV2Core.build_span_attributes_query": _STATEMENT_BY_IDS,
         "_TraceListQueryBuilderV2Core.build_user_id_query": _STATEMENT_BY_IDS,
         "_TraceRootReplayV2._root_replay_query": _STATEMENT_BY_IDS,
+        "_TraceRootReplayV2._trace_rollup_join_sql": _STATEMENT_BY_IDS,
     },
     "tracer.services.clickhouse.v2.query_builders.user_time_series": {
         "UserDetailTimeSeriesQueryBuilderV2.build": _SESSION_OR_USER,

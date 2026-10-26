@@ -64,6 +64,14 @@ def build_session_detail_aggregate_query(project_id, session_group_ids):
 
 
 def build_session_detail_traces_query(project_id, session_group_ids, *, limit, offset):
+    """One page of a session's traces, with each trace's message pair.
+
+    A trace's messages come from its root (or, with no member root, its
+    earliest member span), exactly as before, whenever that span carries any
+    content. When it carries none, the first LLM span with content supplies
+    them instead: OpenRouter Broadcast sends an empty root whose generation
+    child holds the prompt and completion.
+    """
     if type(limit) is not int or limit <= 0 or type(offset) is not int or offset < 0:
         raise ValueError(
             "Session detail pagination must be positive limit/nonnegative offset"
@@ -81,6 +89,19 @@ def build_session_detail_traces_query(project_id, session_group_ids, *, limit, o
                 tuple(input, output),
                 tuple(if(parent_span_id IS NULL OR parent_span_id = '', 0, 1),
                       start_time, id, observation_type, service_name)
+            ) AS root_messages,
+            argMinIf(
+                tuple(input, output),
+                tuple(start_time, id, observation_type, service_name),
+                observation_type = 'llm' AND (input != '' OR output != '')
+            ) AS first_llm_messages,
+            if(
+                root_messages.1 != '' OR root_messages.2 != ''
+                    OR countIf(
+                        observation_type = 'llm' AND (input != '' OR output != '')
+                    ) = 0,
+                root_messages,
+                first_llm_messages
             ) AS trace_messages,
             min(CASE WHEN parent_span_id IS NULL OR parent_span_id = ''
                      THEN latency_ms ELSE NULL END) AS root_latency_ms,

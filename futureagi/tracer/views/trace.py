@@ -4652,6 +4652,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
         """
         from tracer.services.clickhouse.v2.query_builders.trace_list import (
             TraceListQueryBuilderV2,
+            apply_trace_rollup,
         )
 
         read_deadline = read_deadline or ReadDeadline.start(TRACE_LIST_WALL_DEADLINE_MS)
@@ -5212,6 +5213,9 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                     root_identities=builder.content_root_identities_for_rows(
                         chunk_rows
                     ),
+                    # Whole-trace usage and the first LLM span's content, for
+                    # traces whose root carries neither (OpenRouter Broadcast).
+                    include_trace_rollup=True,
                 )
             except ValueError:
                 # Never publish a cursor checkpoint for roots that cannot be
@@ -5405,6 +5409,7 @@ class TraceView(BaseModelViewSetMixin, ModelViewSet):
                 ),
                 {},
             )
+            apply_trace_rollup(row, content)
             raw_meta = content.get("metadata", "{}")
             if isinstance(raw_meta, str):
                 try:
