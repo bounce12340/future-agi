@@ -784,6 +784,29 @@
 - successful reconnect preserves the same workspace connection ID
 - disconnect removes the connection from the scoped integrations API
 
+### ERR-E2E-004 — a shared issue opens read-only for someone who is not signed in
+
+**Goal:** Someone who is not signed in opens a shared Error Feed issue and reads it without being able to change it  
+**Spec:** `flows/error-feed/shared-issue.spec.ts:25`  
+**Tags:** —
+
+**User steps:**
+
+1. open the issue's public share link while signed out
+2. read the issue on Overview
+3. pick another trace in Traces affected
+4. open a trace from the Traces tab
+5. open the Trends and Fix tabs
+6. open a restricted share link while signed out
+
+**Browser observations:**
+
+- the page shows the issue title and View only, with no Resolve, Acknowledge, Ignore, Share, Debug or Create Linear issue action
+- the browser never calls the signed-in Error Feed endpoints (/tracer/feed/issues/)
+- picking a trace reads the sidebar through the share token for exactly that trace
+- opening a trace reads it through the share token and shows its spans
+- a restricted link shows Sign in required and stays on the shared URL
+
 ### FEED-E2E-001 — an old issue URL opens the surviving issue
 
 **Goal:** A saved link to a retired issue opens its surviving issue  
