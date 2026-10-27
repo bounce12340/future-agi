@@ -786,8 +786,8 @@
 
 ### ERR-E2E-004 — an issue's traces download as a dataset-ready CSV
 
-**Goal:** A developer downloads an issue's traces from the issue page as a dataset-ready CSV (overview response stubbed; dataset upload not exercised)  
-**Spec:** `flows/error-feed/export-traces-csv.spec.ts:29`  
+**Goal:** A developer downloads an issue's traces from the issue page and uploads the file unchanged as a dataset (overview response stubbed)  
+**Spec:** `flows/error-feed/export-traces-csv.spec.ts:33`  
 **Tags:** —
 
 **User steps:**
@@ -795,6 +795,12 @@
 1. open the issue page
 2. click Export
 3. save the downloaded CSV
+4. upload the downloaded CSV using the Add Dataset form
+
+**Backend state verified:**
+
+- the imported dataset has exactly the 12 export columns
+- each exported trace becomes one dataset row, with its quoted multiline input and leading-symbol output stored unchanged
 
 **Browser observations:**
 
@@ -802,6 +808,7 @@
 - the file is named error-feed-<issue>-traces.csv and its header is exactly the 12 export columns
 - the file has exactly one row per stubbed trace, with quoted cells intact and no formula prefix
 - the snackbar reports exactly the exported trace count
+- the uploaded dataset's grid shows exactly the exported trace ids
 
 ### FEED-E2E-001 — an old issue URL opens the surviving issue
 
