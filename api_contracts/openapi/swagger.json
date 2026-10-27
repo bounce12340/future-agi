@@ -4619,7 +4619,7 @@
                     "400": {
                         "description": "",
                         "schema": {
-                            "$ref": "#/definitions/AccountsErrorResponse"
+                            "$ref": "#/definitions/TeamCreateErrorResponse"
                         }
                     },
                     "401": {
@@ -4791,7 +4791,7 @@
                     "400": {
                         "description": "",
                         "schema": {
-                            "$ref": "#/definitions/AccountsErrorResponse"
+                            "$ref": "#/definitions/TeamCreateErrorResponse"
                         }
                     },
                     "401": {
@@ -58303,7 +58303,19 @@
                             "$ref": "#/definitions/ErrorResponse"
                         }
                     },
+                    "409": {
+                        "description": "",
+                        "schema": {
+                            "$ref": "#/definitions/ErrorResponse"
+                        }
+                    },
                     "500": {
+                        "description": "",
+                        "schema": {
+                            "$ref": "#/definitions/ErrorResponse"
+                        }
+                    },
+                    "503": {
                         "description": "",
                         "schema": {
                             "$ref": "#/definitions/ErrorResponse"
@@ -58585,6 +58597,38 @@
                 ],
                 "x-runtime-request-validation": true,
                 "x-runtime-response-validation": true
+            },
+            "parameters": [
+                {
+                    "name": "test_execution_id",
+                    "in": "path",
+                    "required": true,
+                    "type": "string"
+                }
+            ]
+        },
+        "/simulate/v3/test-executions/{test_execution_id}/reliability/": {
+            "get": {
+                "operationId": "simulate_v3_test_execution_reliability",
+                "description": "The reliability block alone, for the run header.",
+                "parameters": [],
+                "responses": {
+                    "200": {
+                        "description": "",
+                        "schema": {
+                            "$ref": "#/definitions/Reliability"
+                        }
+                    },
+                    "default": {
+                        "description": "Default error response",
+                        "schema": {
+                            "$ref": "#/definitions/ManagementAPIErrorResponse"
+                        }
+                    }
+                },
+                "tags": [
+                    "simulate"
+                ]
             },
             "parameters": [
                 {
@@ -70741,6 +70785,14 @@
                 "operationId": "tracer_trace_list_traces_of_session",
                 "description": "List traces filtered by project ID with optimized queries.",
                 "parameters": [
+                    {
+                        "name": "sort_params",
+                        "in": "query",
+                        "required": false,
+                        "type": "string",
+                        "default": "[]",
+                        "minLength": 1
+                    },
                     {
                         "name": "project_id",
                         "in": "query",
@@ -84313,6 +84365,74 @@
                 }
             }
         },
+        "TeamCreatedMemberResponse": {
+            "required": [
+                "id",
+                "email",
+                "name",
+                "organization_role",
+                "organization",
+                "created_at",
+                "status",
+                "role"
+            ],
+            "type": "object",
+            "properties": {
+                "id": {
+                    "title": "Id",
+                    "type": "string",
+                    "format": "uuid"
+                },
+                "email": {
+                    "title": "Email",
+                    "type": "string",
+                    "format": "email",
+                    "minLength": 1
+                },
+                "name": {
+                    "title": "Name",
+                    "type": "string",
+                    "x-nullable": true
+                },
+                "organization_role": {
+                    "title": "Organization role",
+                    "type": "string",
+                    "x-nullable": true
+                },
+                "organization": {
+                    "$ref": "#/definitions/AccountOrganizationDetail"
+                },
+                "created_at": {
+                    "title": "Created at",
+                    "type": "string",
+                    "format": "date-time"
+                },
+                "status": {
+                    "title": "Status",
+                    "type": "string",
+                    "minLength": 1
+                },
+                "role": {
+                    "title": "Role",
+                    "type": "string",
+                    "x-nullable": true
+                },
+                "goals": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "minLength": 1
+                    },
+                    "x-nullable": true
+                },
+                "invite_email_warning": {
+                    "title": "Invite email warning",
+                    "description": "Member was added, but the invitation email could not be sent.",
+                    "type": "string",
+                    "minLength": 1
+                }
+            }
+        },
         "TeamCreateErrorItem": {
             "required": [
                 "error"
@@ -84346,7 +84466,7 @@
                 "created_members": {
                     "type": "array",
                     "items": {
-                        "$ref": "#/definitions/AccountUserItemResponse"
+                        "$ref": "#/definitions/TeamCreatedMemberResponse"
                     }
                 },
                 "workspace": {
@@ -84373,6 +84493,117 @@
                 },
                 "result": {
                     "$ref": "#/definitions/TeamCreateResult"
+                }
+            }
+        },
+        "TeamCreateErrorResponse": {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "title": "Status",
+                    "type": "boolean",
+                    "default": false
+                },
+                "type": {
+                    "title": "Type",
+                    "type": "string",
+                    "enum": [
+                        "validation_error",
+                        "authentication_error",
+                        "payment_required",
+                        "entitlement_error",
+                        "permission_error",
+                        "not_found",
+                        "conflict",
+                        "client_error",
+                        "rate_limit",
+                        "server_error",
+                        "service_unavailable",
+                        "timeout",
+                        "api_error"
+                    ],
+                    "x-nullable": true
+                },
+                "code": {
+                    "title": "Code",
+                    "type": "string",
+                    "x-nullable": true
+                },
+                "detail": {
+                    "title": "Detail",
+                    "type": "string",
+                    "x-nullable": true
+                },
+                "result": {
+                    "title": "Result",
+                    "type": "object",
+                    "x-nullable": true,
+                    "description": "String error message or structured account/login error metadata.",
+                    "x-string-or-object": true,
+                    "properties": {
+                        "error": {
+                            "type": "string"
+                        },
+                        "error_code": {
+                            "type": "string"
+                        },
+                        "message": {
+                            "type": "string"
+                        },
+                        "blocked": {
+                            "type": "boolean"
+                        },
+                        "remaining_attempts": {
+                            "type": "integer"
+                        },
+                        "block_time": {
+                            "type": "integer"
+                        },
+                        "block_time_remaining": {
+                            "type": "integer"
+                        },
+                        "created_members": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/TeamCreatedMemberResponse"
+                            }
+                        },
+                        "workspace": {
+                            "$ref": "#/definitions/WorkspaceSummary"
+                        },
+                        "errors": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/TeamCreateErrorItem"
+                            }
+                        }
+                    }
+                },
+                "message": {
+                    "title": "Message",
+                    "type": "string",
+                    "x-nullable": true
+                },
+                "error": {
+                    "title": "Error",
+                    "type": "string",
+                    "x-nullable": true
+                },
+                "attr": {
+                    "title": "Attr",
+                    "type": "string",
+                    "x-nullable": true
+                },
+                "details": {
+                    "title": "Details",
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "minLength": 1
+                        }
+                    }
                 }
             }
         },
@@ -84604,7 +84835,8 @@
                 "default_workspace_role",
                 "org_level",
                 "ws_level",
-                "effective_level"
+                "effective_level",
+                "restrict_simulate_to_environments"
             ],
             "type": "object",
             "properties": {
@@ -84725,6 +84957,10 @@
                     "title": "Org 2fa grace ends at",
                     "type": "string",
                     "format": "date-time"
+                },
+                "restrict_simulate_to_environments": {
+                    "title": "Restrict simulate to environments",
+                    "type": "boolean"
                 }
             }
         },
@@ -138776,8 +139012,8 @@
                 "low",
                 "high",
                 "effective_n",
-                "evaluated",
-                "clusters"
+                "scenarios",
+                "evaluated"
             ],
             "type": "object",
             "properties": {
@@ -138793,12 +139029,12 @@
                     "title": "Effective n",
                     "type": "number"
                 },
-                "evaluated": {
-                    "title": "Evaluated",
+                "scenarios": {
+                    "title": "Scenarios",
                     "type": "integer"
                 },
-                "clusters": {
-                    "title": "Clusters",
+                "evaluated": {
+                    "title": "Evaluated",
                     "type": "integer"
                 }
             },
@@ -138817,7 +139053,8 @@
                 "runs",
                 "evaluated",
                 "pass_rate",
-                "verdict"
+                "verdict",
+                "call_ids"
             ],
             "type": "object",
             "properties": {
@@ -138877,6 +139114,13 @@
                         "flaky",
                         "not_evaluated"
                     ]
+                },
+                "call_ids": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "minLength": 1
+                    }
                 }
             }
         },
@@ -138889,6 +139133,15 @@
                 "repeated",
                 "flaky",
                 "flip_rate",
+                "k",
+                "inconclusive",
+                "pass_hat_1",
+                "pass_hat_k",
+                "pass_hat_k_scenarios",
+                "pass_hat_k_passed",
+                "pass_hat_k_excluded",
+                "trials_passed",
+                "trials_evaluated",
                 "pass_rate_interval",
                 "rows"
             ],
@@ -138922,6 +139175,45 @@
                     "title": "Flip rate",
                     "type": "number",
                     "x-nullable": true
+                },
+                "k": {
+                    "title": "K",
+                    "type": "integer",
+                    "x-nullable": true
+                },
+                "inconclusive": {
+                    "title": "Inconclusive",
+                    "type": "integer"
+                },
+                "pass_hat_1": {
+                    "title": "Pass hat 1",
+                    "type": "number",
+                    "x-nullable": true
+                },
+                "pass_hat_k": {
+                    "title": "Pass hat k",
+                    "type": "number",
+                    "x-nullable": true
+                },
+                "pass_hat_k_scenarios": {
+                    "title": "Pass hat k scenarios",
+                    "type": "integer"
+                },
+                "pass_hat_k_passed": {
+                    "title": "Pass hat k passed",
+                    "type": "integer"
+                },
+                "pass_hat_k_excluded": {
+                    "title": "Pass hat k excluded",
+                    "type": "integer"
+                },
+                "trials_passed": {
+                    "title": "Trials passed",
+                    "type": "integer"
+                },
+                "trials_evaluated": {
+                    "title": "Trials evaluated",
+                    "type": "integer"
                 },
                 "pass_rate_interval": {
                     "$ref": "#/definitions/ReliabilityInterval"
@@ -155272,6 +155564,13 @@
         "TraceObserveListQuery": {
             "type": "object",
             "properties": {
+                "sort_params": {
+                    "title": "Sort params",
+                    "type": "string",
+                    "default": "[]",
+                    "minLength": 1,
+                    "description": "JSON-encoded list of sort params."
+                },
                 "project_id": {
                     "title": "Project id",
                     "type": "string",

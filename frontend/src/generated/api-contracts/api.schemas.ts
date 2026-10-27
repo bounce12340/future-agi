@@ -1196,6 +1196,25 @@ export interface TeamCreateRequestApi {
   members?: CreateMemberApi[];
 }
 
+export interface TeamCreatedMemberResponseApi {
+  id: string;
+  /** @minLength 1 */
+  email: string;
+  name: string;
+  organization_role: string;
+  organization: AccountOrganizationDetailApi;
+  created_at: string;
+  /** @minLength 1 */
+  status: string;
+  role: string;
+  goals?: string[];
+  /**
+   * Member was added, but the invitation email could not be sent.
+   * @minLength 1
+   */
+  invite_email_warning?: string;
+}
+
 export interface TeamCreateErrorItemApi {
   index?: number;
   /** @minLength 1 */
@@ -1205,7 +1224,7 @@ export interface TeamCreateErrorItemApi {
 }
 
 export interface TeamCreateResultApi {
-  created_members: AccountUserItemResponseApi[];
+  created_members: TeamCreatedMemberResponseApi[];
   workspace: WorkspaceSummaryApi;
   errors?: TeamCreateErrorItemApi[];
 }
@@ -1213,6 +1232,56 @@ export interface TeamCreateResultApi {
 export interface TeamCreateResponseApi {
   status: boolean;
   result: TeamCreateResultApi;
+}
+
+export type TeamCreateErrorResponseApiType =
+  (typeof TeamCreateErrorResponseApiType)[keyof typeof TeamCreateErrorResponseApiType];
+
+export const TeamCreateErrorResponseApiType = {
+  validation_error: "validation_error",
+  authentication_error: "authentication_error",
+  payment_required: "payment_required",
+  entitlement_error: "entitlement_error",
+  permission_error: "permission_error",
+  not_found: "not_found",
+  conflict: "conflict",
+  client_error: "client_error",
+  rate_limit: "rate_limit",
+  server_error: "server_error",
+  service_unavailable: "service_unavailable",
+  timeout: "timeout",
+  api_error: "api_error",
+} as const;
+
+/**
+ * String error message or structured account/login error metadata.
+ */
+export type TeamCreateErrorResponseApiResult = {
+  error?: string;
+  error_code?: string;
+  message?: string;
+  blocked?: boolean;
+  remaining_attempts?: number;
+  block_time?: number;
+  block_time_remaining?: number;
+  created_members?: TeamCreatedMemberResponseApi[];
+  workspace?: WorkspaceSummaryApi;
+  errors?: TeamCreateErrorItemApi[];
+};
+
+export type TeamCreateErrorResponseApiDetails = { [key: string]: string[] };
+
+export interface TeamCreateErrorResponseApi {
+  status?: boolean;
+  type?: TeamCreateErrorResponseApiType;
+  code?: string;
+  detail?: string;
+  /** String error message or structured account/login error metadata. */
+  result?: TeamCreateErrorResponseApiResult;
+  message?: string;
+  error?: string;
+  attr?: string;
+  details?: TeamCreateErrorResponseApiDetails;
 }
 
 export interface TeamRemoveResultApi {
@@ -1321,6 +1390,7 @@ export interface UserInfoResponseApi {
   two_factor_methods?: UserInfoTwoFactorMethodsApi;
   org_2fa_required?: boolean;
   org_2fa_grace_ends_at?: string;
+  restrict_simulate_to_environments: boolean;
 }
 
 export interface DeactivateUserApi {
@@ -23394,8 +23464,8 @@ export interface ReliabilityIntervalApi {
   low: number;
   high: number;
   effective_n: number;
+  scenarios: number;
   evaluated: number;
-  clusters: number;
 }
 
 export type ReliabilityRowApiVerdict =
@@ -23423,6 +23493,7 @@ export interface ReliabilityRowApi {
   evaluated: number;
   pass_rate: number;
   verdict: ReliabilityRowApiVerdict;
+  call_ids: string[];
 }
 
 export interface ReliabilityApi {
@@ -23433,6 +23504,15 @@ export interface ReliabilityApi {
   repeated: number;
   flaky: number;
   flip_rate: number;
+  k: number;
+  inconclusive: number;
+  pass_hat_1: number;
+  pass_hat_k: number;
+  pass_hat_k_scenarios: number;
+  pass_hat_k_passed: number;
+  pass_hat_k_excluded: number;
+  trials_passed: number;
+  trials_evaluated: number;
   pass_rate_interval: ReliabilityIntervalApi;
   rows: ReliabilityRowApi[];
 }
@@ -30599,6 +30679,11 @@ export interface TraceObserveListResponseApi {
 }
 
 export interface TraceObserveListQueryApi {
+  /**
+   * JSON-encoded list of sort params.
+   * @minLength 1
+   */
+  sort_params?: string;
   project_id?: string;
   project_version_id?: string;
   session_id?: string;
@@ -37416,6 +37501,10 @@ export type TracerTraceListTracesParams = {
 };
 
 export type TracerTraceListTracesOfSessionParams = {
+  /**
+   * @minLength 1
+   */
+  sort_params?: string;
   project_id?: string;
   project_version_id?: string;
   session_id?: string;

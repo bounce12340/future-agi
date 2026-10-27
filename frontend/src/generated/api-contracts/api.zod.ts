@@ -1732,6 +1732,7 @@ export const AccountsUserInfoListResponse = zod.object({
     .optional(),
   org_2fa_required: zod.boolean().optional(),
   org_2fa_grace_ends_at: zod.string().datetime({ offset: true }).optional(),
+  restrict_simulate_to_environments: zod.boolean(),
 });
 
 /**
@@ -47861,12 +47862,21 @@ export const SimulateV3TestExecutionAnalyticsResponse = zod.object({
     repeated: zod.number(),
     flaky: zod.number(),
     flip_rate: zod.number(),
+    k: zod.number(),
+    inconclusive: zod.number(),
+    pass_hat_1: zod.number(),
+    pass_hat_k: zod.number(),
+    pass_hat_k_scenarios: zod.number(),
+    pass_hat_k_passed: zod.number(),
+    pass_hat_k_excluded: zod.number(),
+    trials_passed: zod.number(),
+    trials_evaluated: zod.number(),
     pass_rate_interval: zod.object({
       low: zod.number(),
       high: zod.number(),
       effective_n: zod.number(),
+      scenarios: zod.number(),
       evaluated: zod.number(),
-      clusters: zod.number(),
     }),
     rows: zod.array(
       zod.object({
@@ -47882,6 +47892,7 @@ export const SimulateV3TestExecutionAnalyticsResponse = zod.object({
         evaluated: zod.number(),
         pass_rate: zod.number(),
         verdict: zod.enum(["passed", "failed", "flaky", "not_evaluated"]),
+        call_ids: zod.array(zod.string().min(1)),
       }),
     ),
   }),
@@ -48636,6 +48647,56 @@ export const SimulateV3TestExecutionExportBody = zod.object({
       "-outcome",
     ])
     .default(simulateV3TestExecutionExportBodyOrderingDefault),
+});
+
+/**
+ * The reliability block alone, for the run header.
+ */
+export const SimulateV3TestExecutionReliabilityParams = zod.object({
+  test_execution_id: zod.string(),
+});
+
+export const SimulateV3TestExecutionReliabilityResponse = zod.object({
+  trials: zod.number(),
+  scenarios: zod.number(),
+  consistent_pass: zod.number(),
+  passed_at_least_once: zod.number(),
+  repeated: zod.number(),
+  flaky: zod.number(),
+  flip_rate: zod.number(),
+  k: zod.number(),
+  inconclusive: zod.number(),
+  pass_hat_1: zod.number(),
+  pass_hat_k: zod.number(),
+  pass_hat_k_scenarios: zod.number(),
+  pass_hat_k_passed: zod.number(),
+  pass_hat_k_excluded: zod.number(),
+  trials_passed: zod.number(),
+  trials_evaluated: zod.number(),
+  pass_rate_interval: zod.object({
+    low: zod.number(),
+    high: zod.number(),
+    effective_n: zod.number(),
+    scenarios: zod.number(),
+    evaluated: zod.number(),
+  }),
+  rows: zod.array(
+    zod.object({
+      queued: zod.number(),
+      in_progress: zod.number(),
+      passed: zod.number(),
+      failed: zod.number(),
+      error: zod.number(),
+      inconclusive: zod.number(),
+      scenario: zod.string().min(1),
+      scenario_key: zod.string().min(1),
+      runs: zod.number(),
+      evaluated: zod.number(),
+      pass_rate: zod.number(),
+      verdict: zod.enum(["passed", "failed", "flaky", "not_evaluated"]),
+      call_ids: zod.array(zod.string().min(1)),
+    }),
+  ),
 });
 
 export const SimulateV3TestExecutionTracesParams = zod.object({
@@ -66303,6 +66364,8 @@ export const tracerTraceListTracesCreateResponseResultMetadataQueryAppliedFilter
 export const TracerTraceListTracesCreateResponse =
   TracerTraceListTracesResponse;
 
+export const tracerTraceListTracesOfSessionQuerySortParamsDefault = `[]`;
+
 export const tracerTraceListTracesOfSessionQueryFiltersDefault = `[]`;
 
 export const tracerTraceListTracesOfSessionQueryPageNumberDefault = 0;
@@ -66316,6 +66379,10 @@ export const tracerTraceListTracesOfSessionQueryCursorMax = 4096;
 export const tracerTraceListTracesOfSessionQueryCursorModeDefault = false;
 
 export const TracerTraceListTracesOfSessionQueryParams = zod.object({
+  sort_params: zod
+    .string()
+    .min(1)
+    .default(tracerTraceListTracesOfSessionQuerySortParamsDefault),
   project_id: zod.string().uuid().optional(),
   project_version_id: zod.string().uuid().optional(),
   session_id: zod.string().uuid().optional(),
@@ -66471,6 +66538,8 @@ export const TracerTraceListTracesOfSessionResponse = zod.object({
 /**
  * List traces filtered by project ID with optimized queries.
  */
+export const tracerTraceListTracesOfSessionCreateBodySortParamsDefault = `[]`;
+
 export const tracerTraceListTracesOfSessionCreateBodyFiltersDefault = `[]`;
 
 export const tracerTraceListTracesOfSessionCreateBodyPageNumberDefault = 0;
@@ -66484,6 +66553,11 @@ export const tracerTraceListTracesOfSessionCreateBodyCursorMax = 4096;
 export const tracerTraceListTracesOfSessionCreateBodyCursorModeDefault = false;
 
 export const TracerTraceListTracesOfSessionCreateBody = zod.object({
+  sort_params: zod
+    .string()
+    .min(1)
+    .default(tracerTraceListTracesOfSessionCreateBodySortParamsDefault)
+    .describe("JSON-encoded list of sort params."),
   project_id: zod.string().uuid().optional(),
   project_version_id: zod.string().uuid().optional(),
   session_id: zod.string().uuid().optional(),
