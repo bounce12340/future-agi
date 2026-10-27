@@ -68581,6 +68581,136 @@
                 }
             ]
         },
+        "/tracer/shared/{token}/sidebar/": {
+            "get": {
+                "operationId": "tracer_shared_sidebar_list",
+                "summary": "A shared Error Feed issue's sidebar, scoped to one of its traces.",
+                "description": "Mirrors the issue page: AI metadata and evaluations follow the trace\npicked in Traces affected (``?trace_id=``).",
+                "parameters": [
+                    {
+                        "name": "trace_id",
+                        "in": "query",
+                        "required": false,
+                        "type": "string",
+                        "minLength": 1
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "",
+                        "schema": {
+                            "$ref": "#/definitions/FeedSidebarApiResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "",
+                        "schema": {
+                            "$ref": "#/definitions/SharedLinkResolveError"
+                        }
+                    },
+                    "403": {
+                        "description": "",
+                        "schema": {
+                            "$ref": "#/definitions/SharedLinkResolveError"
+                        }
+                    },
+                    "404": {
+                        "description": "",
+                        "schema": {
+                            "$ref": "#/definitions/SharedLinkResolveError"
+                        }
+                    },
+                    "410": {
+                        "description": "",
+                        "schema": {
+                            "$ref": "#/definitions/SharedLinkResolveError"
+                        }
+                    },
+                    "default": {
+                        "description": "Default error response",
+                        "schema": {
+                            "$ref": "#/definitions/ManagementAPIErrorResponse"
+                        }
+                    }
+                },
+                "tags": [
+                    "tracer"
+                ],
+                "x-runtime-request-validation": true,
+                "x-runtime-response-validation": true
+            },
+            "parameters": [
+                {
+                    "name": "token",
+                    "in": "path",
+                    "required": true,
+                    "type": "string"
+                }
+            ]
+        },
+        "/tracer/shared/{token}/traces/{trace_id}/": {
+            "get": {
+                "operationId": "tracer_shared_traces_read",
+                "summary": "One trace of a shared Error Feed issue, under the issue link's rules.",
+                "description": "Only traces linked to the shared issue are readable through its token.",
+                "parameters": [],
+                "responses": {
+                    "200": {
+                        "description": "",
+                        "schema": {
+                            "$ref": "#/definitions/TraceDetailResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "",
+                        "schema": {
+                            "$ref": "#/definitions/SharedLinkResolveError"
+                        }
+                    },
+                    "403": {
+                        "description": "",
+                        "schema": {
+                            "$ref": "#/definitions/SharedLinkResolveError"
+                        }
+                    },
+                    "404": {
+                        "description": "",
+                        "schema": {
+                            "$ref": "#/definitions/SharedLinkResolveError"
+                        }
+                    },
+                    "410": {
+                        "description": "",
+                        "schema": {
+                            "$ref": "#/definitions/SharedLinkResolveError"
+                        }
+                    },
+                    "default": {
+                        "description": "Default error response",
+                        "schema": {
+                            "$ref": "#/definitions/ManagementAPIErrorResponse"
+                        }
+                    }
+                },
+                "tags": [
+                    "tracer"
+                ]
+            },
+            "parameters": [
+                {
+                    "name": "token",
+                    "in": "path",
+                    "required": true,
+                    "type": "string"
+                },
+                {
+                    "name": "trace_id",
+                    "in": "path",
+                    "required": true,
+                    "type": "string"
+                }
+            ]
+        },
         "/tracer/trace-annotation/get_annotation_values/": {
             "get": {
                 "operationId": "tracer_trace-annotation_get_annotation_values",
@@ -152405,7 +152535,8 @@
                         "eval_run",
                         "dataset",
                         "project",
-                        "call_execution"
+                        "call_execution",
+                        "error_feed_issue"
                     ],
                     "readOnly": true
                 },
@@ -152480,7 +152611,8 @@
                         "trace",
                         "dashboard",
                         "project",
-                        "call_execution"
+                        "call_execution",
+                        "error_feed_issue"
                     ]
                 },
                 "resource_id": {
@@ -152575,7 +152707,8 @@
                         "eval_run",
                         "dataset",
                         "project",
-                        "call_execution"
+                        "call_execution",
+                        "error_feed_issue"
                     ],
                     "readOnly": true
                 },
@@ -152842,6 +152975,21 @@
                 "widget_count": {
                     "title": "Widget count",
                     "type": "integer"
+                },
+                "issue": {
+                    "$ref": "#/definitions/FeedDetailCore"
+                },
+                "overview": {
+                    "$ref": "#/definitions/OverviewResponse"
+                },
+                "traces": {
+                    "$ref": "#/definitions/TracesTabResponse"
+                },
+                "trends": {
+                    "$ref": "#/definitions/TrendsTabResponse"
+                },
+                "sidebar": {
+                    "$ref": "#/definitions/FeedSidebar"
                 }
             }
         },
@@ -152863,7 +153011,8 @@
                         "eval_run",
                         "dataset",
                         "project",
-                        "call_execution"
+                        "call_execution",
+                        "error_feed_issue"
                     ]
                 },
                 "resource_id": {
@@ -152954,6 +153103,221 @@
                             "minLength": 1
                         }
                     }
+                }
+            }
+        },
+        "EvalRollupSpan": {
+            "required": [
+                "span_id"
+            ],
+            "type": "object",
+            "properties": {
+                "span_id": {
+                    "title": "Span id",
+                    "type": "string",
+                    "minLength": 1
+                },
+                "span_name": {
+                    "title": "Span name",
+                    "type": "string"
+                },
+                "value": {
+                    "title": "Value",
+                    "type": "object",
+                    "x-nullable": true,
+                    "x-json-value": true,
+                    "description": "Any valid JSON value."
+                },
+                "explanation": {
+                    "title": "Explanation",
+                    "type": "string",
+                    "minLength": 1,
+                    "x-nullable": true
+                },
+                "error": {
+                    "title": "Error",
+                    "type": "boolean"
+                },
+                "status": {
+                    "title": "Status",
+                    "type": "string",
+                    "minLength": 1,
+                    "x-nullable": true
+                },
+                "eval_config_id": {
+                    "title": "Eval config id",
+                    "type": "string"
+                }
+            }
+        },
+        "EvalRollupEval": {
+            "required": [
+                "eval_config_id",
+                "eval_name",
+                "aggregate",
+                "spans"
+            ],
+            "type": "object",
+            "properties": {
+                "eval_config_id": {
+                    "title": "Eval config id",
+                    "type": "string",
+                    "minLength": 1
+                },
+                "eval_name": {
+                    "title": "Eval name",
+                    "type": "string",
+                    "minLength": 1
+                },
+                "output_type": {
+                    "title": "Output type",
+                    "type": "string",
+                    "minLength": 1,
+                    "x-nullable": true
+                },
+                "template_type": {
+                    "title": "Template type",
+                    "type": "string",
+                    "minLength": 1,
+                    "x-nullable": true
+                },
+                "target_type": {
+                    "title": "Target type",
+                    "type": "string",
+                    "enum": [
+                        "span",
+                        "trace"
+                    ],
+                    "x-nullable": true
+                },
+                "choices_map": {
+                    "title": "Choices map",
+                    "type": "object",
+                    "x-nullable": true,
+                    "x-json-value": true,
+                    "description": "Any valid JSON value."
+                },
+                "aggregate": {
+                    "title": "Aggregate",
+                    "type": "object",
+                    "x-json-value": true,
+                    "description": "Any valid JSON value."
+                },
+                "spans": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/EvalRollupSpan"
+                    }
+                },
+                "error": {
+                    "title": "Error",
+                    "type": "boolean"
+                }
+            }
+        },
+        "EvalRollup": {
+            "required": [
+                "scope",
+                "evals"
+            ],
+            "type": "object",
+            "properties": {
+                "scope": {
+                    "title": "Scope",
+                    "type": "string",
+                    "enum": [
+                        "trace",
+                        "span"
+                    ]
+                },
+                "evals": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/EvalRollupEval"
+                    }
+                },
+                "error": {
+                    "title": "Error",
+                    "type": "boolean"
+                }
+            }
+        },
+        "TraceDetailSpan": {
+            "required": [
+                "observation_span"
+            ],
+            "type": "object",
+            "properties": {
+                "observation_span": {
+                    "title": "Observation span",
+                    "type": "object"
+                },
+                "children": {
+                    "type": "array",
+                    "items": {
+                        "type": "object"
+                    }
+                },
+                "eval_scores": {
+                    "description": "Raw eval rows retained for backwards-compatible array consumers.",
+                    "type": "array",
+                    "items": {
+                        "type": "object"
+                    }
+                },
+                "eval_rollup": {
+                    "$ref": "#/definitions/EvalRollup"
+                },
+                "annotations": {
+                    "type": "array",
+                    "items": {
+                        "type": "object"
+                    }
+                }
+            }
+        },
+        "TraceDetailResult": {
+            "required": [
+                "trace",
+                "observation_spans",
+                "summary",
+                "graph"
+            ],
+            "type": "object",
+            "properties": {
+                "trace": {
+                    "title": "Trace",
+                    "type": "object"
+                },
+                "observation_spans": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/TraceDetailSpan"
+                    }
+                },
+                "summary": {
+                    "title": "Summary",
+                    "type": "object"
+                },
+                "graph": {
+                    "title": "Graph",
+                    "type": "object"
+                }
+            }
+        },
+        "TraceDetailResponse": {
+            "required": [
+                "result"
+            ],
+            "type": "object",
+            "properties": {
+                "status": {
+                    "title": "Status",
+                    "type": "boolean",
+                    "default": true
+                },
+                "result": {
+                    "$ref": "#/definitions/TraceDetailResult"
                 }
             }
         },
@@ -155461,115 +155825,6 @@
                 }
             }
         },
-        "EvalRollupSpan": {
-            "required": [
-                "span_id"
-            ],
-            "type": "object",
-            "properties": {
-                "span_id": {
-                    "title": "Span id",
-                    "type": "string",
-                    "minLength": 1
-                },
-                "span_name": {
-                    "title": "Span name",
-                    "type": "string"
-                },
-                "value": {
-                    "title": "Value",
-                    "type": "object",
-                    "x-nullable": true,
-                    "x-json-value": true,
-                    "description": "Any valid JSON value."
-                },
-                "explanation": {
-                    "title": "Explanation",
-                    "type": "string",
-                    "minLength": 1,
-                    "x-nullable": true
-                },
-                "error": {
-                    "title": "Error",
-                    "type": "boolean"
-                },
-                "status": {
-                    "title": "Status",
-                    "type": "string",
-                    "minLength": 1,
-                    "x-nullable": true
-                },
-                "eval_config_id": {
-                    "title": "Eval config id",
-                    "type": "string"
-                }
-            }
-        },
-        "EvalRollupEval": {
-            "required": [
-                "eval_config_id",
-                "eval_name",
-                "aggregate",
-                "spans"
-            ],
-            "type": "object",
-            "properties": {
-                "eval_config_id": {
-                    "title": "Eval config id",
-                    "type": "string",
-                    "minLength": 1
-                },
-                "eval_name": {
-                    "title": "Eval name",
-                    "type": "string",
-                    "minLength": 1
-                },
-                "output_type": {
-                    "title": "Output type",
-                    "type": "string",
-                    "minLength": 1,
-                    "x-nullable": true
-                },
-                "template_type": {
-                    "title": "Template type",
-                    "type": "string",
-                    "minLength": 1,
-                    "x-nullable": true
-                },
-                "target_type": {
-                    "title": "Target type",
-                    "type": "string",
-                    "enum": [
-                        "span",
-                        "trace"
-                    ],
-                    "x-nullable": true
-                },
-                "choices_map": {
-                    "title": "Choices map",
-                    "type": "object",
-                    "x-nullable": true,
-                    "x-json-value": true,
-                    "description": "Any valid JSON value."
-                },
-                "aggregate": {
-                    "title": "Aggregate",
-                    "type": "object",
-                    "x-json-value": true,
-                    "description": "Any valid JSON value."
-                },
-                "spans": {
-                    "type": "array",
-                    "items": {
-                        "$ref": "#/definitions/EvalRollupSpan"
-                    }
-                },
-                "error": {
-                    "title": "Error",
-                    "type": "boolean"
-                }
-            }
-        },
         "TraceVoiceCallDetailResult": {
             "required": [
                 "id",
@@ -155941,112 +156196,6 @@
                 },
                 "result": {
                     "$ref": "#/definitions/TraceVoiceCallDetailResult"
-                }
-            }
-        },
-        "EvalRollup": {
-            "required": [
-                "scope",
-                "evals"
-            ],
-            "type": "object",
-            "properties": {
-                "scope": {
-                    "title": "Scope",
-                    "type": "string",
-                    "enum": [
-                        "trace",
-                        "span"
-                    ]
-                },
-                "evals": {
-                    "type": "array",
-                    "items": {
-                        "$ref": "#/definitions/EvalRollupEval"
-                    }
-                },
-                "error": {
-                    "title": "Error",
-                    "type": "boolean"
-                }
-            }
-        },
-        "TraceDetailSpan": {
-            "required": [
-                "observation_span"
-            ],
-            "type": "object",
-            "properties": {
-                "observation_span": {
-                    "title": "Observation span",
-                    "type": "object"
-                },
-                "children": {
-                    "type": "array",
-                    "items": {
-                        "type": "object"
-                    }
-                },
-                "eval_scores": {
-                    "description": "Raw eval rows retained for backwards-compatible array consumers.",
-                    "type": "array",
-                    "items": {
-                        "type": "object"
-                    }
-                },
-                "eval_rollup": {
-                    "$ref": "#/definitions/EvalRollup"
-                },
-                "annotations": {
-                    "type": "array",
-                    "items": {
-                        "type": "object"
-                    }
-                }
-            }
-        },
-        "TraceDetailResult": {
-            "required": [
-                "trace",
-                "observation_spans",
-                "summary",
-                "graph"
-            ],
-            "type": "object",
-            "properties": {
-                "trace": {
-                    "title": "Trace",
-                    "type": "object"
-                },
-                "observation_spans": {
-                    "type": "array",
-                    "items": {
-                        "$ref": "#/definitions/TraceDetailSpan"
-                    }
-                },
-                "summary": {
-                    "title": "Summary",
-                    "type": "object"
-                },
-                "graph": {
-                    "title": "Graph",
-                    "type": "object"
-                }
-            }
-        },
-        "TraceDetailResponse": {
-            "required": [
-                "result"
-            ],
-            "type": "object",
-            "properties": {
-                "status": {
-                    "title": "Status",
-                    "type": "boolean",
-                    "default": true
-                },
-                "result": {
-                    "$ref": "#/definitions/TraceDetailResult"
                 }
             }
         },
