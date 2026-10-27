@@ -26,11 +26,11 @@ const TOAST_SETTLE = 2_000;
 const ISSUE_TITLE = SHARED_ISSUE.issue.row.error.name;
 
 base(
-  "ERR-E2E-004: a shared issue opens read-only for someone who is not signed in",
+  "ERR-E2E-005: a shared issue opens read-only for someone who is not signed in",
   {
     tag: ["@flow"],
     annotation: flowAnnotation({
-      id: "ERR-E2E-004",
+      id: "ERR-E2E-005",
       area: "error-feed",
       userGoal:
         "Someone who is not signed in opens a shared Error Feed issue and reads it without being able to change it",

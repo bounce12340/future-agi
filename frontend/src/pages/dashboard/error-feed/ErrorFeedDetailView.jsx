@@ -14,11 +14,10 @@ import {
 } from "@mui/material";
 import PropTypes from "prop-types";
 import { useNavigate, useParams } from "react-router-dom";
-import { enqueueSnackbar } from "notistack";
 import Iconify from "src/components/iconify";
-import { useSnackbar } from "src/components/snackbar";
-import { copyToClipboard } from "src/utils/utils";
 import { ShareDialog } from "src/components/share-dialog";
+import { copyToClipboard } from "src/utils/utils";
+import { useSnackbar } from "src/components/snackbar";
 import {
   useErrorFeedDetail,
   useErrorFeedRedirect,
@@ -407,23 +406,27 @@ export default function ErrorFeedDetailView() {
                       <Iconify icon="mdi:share-variant-outline" width={14} />
                     </IconButton>
                   </Tooltip>
-                <Button
-                  size="small"
-                  variant="outlined"
-                  startIcon={<Iconify icon="mdi:download-outline" width={13} />}
-                  disabled={exportTraces.isPending || !currentError.trace_count}
-                  onClick={() => handleExportTraces(currentError.cluster_id)}
-                  sx={{
-                    height: 30,
-                    fontSize: "12px",
-                    borderRadius: "6px",
-                    textTransform: "none",
-                    borderColor: "divider",
-                    color: "text.secondary",
-                  }}
-                >
-                  Export
-                </Button>
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    startIcon={
+                      <Iconify icon="mdi:download-outline" width={13} />
+                    }
+                    disabled={
+                      exportTraces.isPending || !currentError.trace_count
+                    }
+                    onClick={() => handleExportTraces(currentError.cluster_id)}
+                    sx={{
+                      height: 30,
+                      fontSize: "12px",
+                      borderRadius: "6px",
+                      textTransform: "none",
+                      borderColor: "divider",
+                      color: "text.secondary",
+                    }}
+                  >
+                    Export
+                  </Button>
                   <Button
                     size="small"
                     variant="outlined"
