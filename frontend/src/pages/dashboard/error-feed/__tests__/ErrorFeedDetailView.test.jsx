@@ -30,6 +30,7 @@ vi.mock("src/api/errorFeed/error-feed", () => ({
     isLoading: false,
   }),
   useUpdateErrorFeedIssue: () => ({ mutate: vi.fn(), isPending: false }),
+  useExportErrorFeedTraces: () => ({ mutate: vi.fn(), isPending: false }),
 }));
 
 vi.mock("src/utils/utils", async (importOriginal) => ({
@@ -37,10 +38,14 @@ vi.mock("src/utils/utils", async (importOriginal) => ({
   copyToClipboard: vi.fn(),
 }));
 
-vi.mock("notistack", async (importOriginal) => ({
-  ...(await importOriginal()),
-  enqueueSnackbar: vi.fn(),
-}));
+vi.mock("notistack", async (importOriginal) => {
+  const enqueueSnackbar = vi.fn();
+  return {
+    ...(await importOriginal()),
+    enqueueSnackbar,
+    useSnackbar: () => ({ enqueueSnackbar }),
+  };
+});
 
 vi.mock("src/components/share-dialog", () => ({ ShareDialog: () => null }));
 vi.mock("../useAnalyzeRunner", () => ({ useAnalyzeRunner: () => {} }));

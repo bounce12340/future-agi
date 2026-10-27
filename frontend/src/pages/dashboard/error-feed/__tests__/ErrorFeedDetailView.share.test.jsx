@@ -29,6 +29,7 @@ vi.mock("src/api/errorFeed/error-feed", () => ({
     isLoading: false,
   }),
   useUpdateErrorFeedIssue: () => ({ mutate: vi.fn(), isPending: false }),
+  useExportErrorFeedTraces: () => ({ mutate: vi.fn(), isPending: false }),
 }));
 
 function FakeShareDialog({ open, resourceType, resourceId }) {

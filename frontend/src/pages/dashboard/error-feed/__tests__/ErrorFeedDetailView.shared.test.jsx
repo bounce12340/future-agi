@@ -14,6 +14,7 @@ vi.mock("src/api/errorFeed/error-feed", () => ({
   useErrorFeedRedirect: mocks.useErrorFeedRedirect,
   useErrorFeedDetail: mocks.useErrorFeedDetail,
   useUpdateErrorFeedIssue: () => ({ mutate: vi.fn(), isPending: false }),
+  useExportErrorFeedTraces: () => ({ mutate: vi.fn(), isPending: false }),
 }));
 vi.mock("../useAnalyzeRunner", () => ({
   useAnalyzeRunner: mocks.useAnalyzeRunner,

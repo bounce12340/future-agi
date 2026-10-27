@@ -784,7 +784,33 @@
 - successful reconnect preserves the same workspace connection ID
 - disconnect removes the connection from the scoped integrations API
 
-### ERR-E2E-004 — a shared issue opens read-only for someone who is not signed in
+### ERR-E2E-004 — an issue's traces download as a dataset-ready CSV
+
+**Goal:** A developer downloads an issue's traces from the issue page and uploads the file unchanged as a dataset (overview response stubbed)  
+**Spec:** `flows/error-feed/export-traces-csv.spec.ts:33`  
+**Tags:** —
+
+**User steps:**
+
+1. open the issue page
+2. click Export
+3. save the downloaded CSV
+4. upload the downloaded CSV using the Add Dataset form
+
+**Backend state verified:**
+
+- the imported dataset has exactly the 12 export columns
+- each exported trace becomes one dataset row, with its quoted multiline input and leading-symbol output stored unchanged
+
+**Browser observations:**
+
+- the export requests the issue overview once, with rep_limit=200
+- the file is named error-feed-<issue>-traces.csv and its header is exactly the 12 export columns
+- the file has exactly one row per stubbed trace, with quoted cells intact and no formula prefix
+- the snackbar reports exactly the exported trace count
+- the uploaded dataset's grid shows exactly the exported trace ids
+
+### ERR-E2E-005 — a shared issue opens read-only for someone who is not signed in
 
 **Goal:** Someone who is not signed in opens a shared Error Feed issue and reads it without being able to change it  
 **Spec:** `flows/error-feed/shared-issue.spec.ts:28`  

@@ -1,7 +1,7 @@
 // Responses of the three shared Error Feed endpoints, captured from a local
 // stack on 2026-10-26 (GET /tracer/shared/<token>/, /traces/<id>/ and
 // /sidebar/?trace_id=) for a seeded two-trace issue and trimmed. The E2E stack
-// has no Enterprise licence and no Error Feed seeder, so ERR-E2E-004 serves
+// has no Enterprise licence and no Error Feed seeder, so ERR-E2E-005 serves
 // these from the browser; the endpoints themselves are covered by
 // futureagi/tracer/tests/test_shared_link_resolve.py.
 
