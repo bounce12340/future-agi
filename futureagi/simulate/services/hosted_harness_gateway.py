@@ -46,6 +46,7 @@ from simulate.services.hosted_harness import (
     record_cleanup,
     register_attempt,
     request_cancellation,
+    scope_dispatch_to_rerun,
 )
 from simulate.services.hosted_harness_conversation import (
     ensure_conversation,
@@ -2288,7 +2289,7 @@ class HostedHarnessGateway:
 
         # The export decision needs the selected snapshot, so capacity comes first.
         try:
-            capacity = configured_capacity(payload)
+            capacity = configured_capacity(scope_dispatch_to_rerun(payload))
         except ValueError as exc:
             raise HostedHarnessError(
                 "sandbox_capacity_unavailable",
@@ -2328,8 +2329,10 @@ class HostedHarnessGateway:
         secrets_map = {**secrets_map, **dict(export_plan.secrets)}
         if export_plan.egress_domains is not None:
             allowed_domains = set(export_plan.egress_domains)
-        dispatch_payload = prepare_dispatch_payload(
-            payload, secrets_map, simulator_secrets=simulator_env, job=job
+        dispatch_payload = scope_dispatch_to_rerun(
+            prepare_dispatch_payload(
+                payload, secrets_map, simulator_secrets=simulator_env, job=job
+            )
         )
         if export_plan.secrets:
             dispatch_payload = attach_observability_export_secret_refs(
