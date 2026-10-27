@@ -79,6 +79,7 @@ const avoidRedirect = [
   "/mcp/authorize",
   "/auth/jwt/two-factor",
   "/auth/jwt/org-removed",
+  "/shared/",
 ];
 
 axiosInstance.interceptors.request.use((config) =>
@@ -138,8 +139,34 @@ axiosInstance.interceptors.response.use(
       );
     }
 
+    // A signed-out viewer of a shared link has no session to refresh or end:
+    // let the page show its own "Sign in required" screen.
+    const signedOutOnSharedLink =
+      window.location.pathname.startsWith("/shared/") &&
+      (!getRememberMe() || !getRefreshToken());
+
+    // A dead session token on a shared link (nothing to refresh it with)
+    // turns even a public link into a 401. Drop the session and ask once
+    // more without it; a restricted link then answers 401 on its own.
+    if (
+      status === RESPONSE_CODES.UNAUTHORIZED &&
+      signedOutOnSharedLink &&
+      originalRequest?.headers?.Authorization &&
+      !originalRequest._sharedRetry
+    ) {
+      setSession(null);
+      clearTokens();
+      originalRequest._sharedRetry = true;
+      delete originalRequest.headers.Authorization;
+      return axiosInstance(originalRequest);
+    }
+
     // Handle 401 and try refresh
-    if (status === RESPONSE_CODES.UNAUTHORIZED && !originalRequest?._retry) {
+    if (
+      status === RESPONSE_CODES.UNAUTHORIZED &&
+      !originalRequest?._retry &&
+      !signedOutOnSharedLink
+    ) {
       const refreshToken = getRefreshToken();
       const rememberMe = getRememberMe();
 
@@ -1852,6 +1879,13 @@ export const endpoints = {
         access_id: accessId,
       }),
     resolve: (token) => apiPath("/tracer/shared/{token}/", { token: token }),
+    issueSidebar: (token) =>
+      apiPath("/tracer/shared/{token}/sidebar/", { token: token }),
+    issueTrace: (token, traceId) =>
+      apiPath("/tracer/shared/{token}/traces/{trace_id}/", {
+        token: token,
+        trace_id: traceId,
+      }),
   },
   organizations: {
     list: apiPath("/accounts/organizations/"),

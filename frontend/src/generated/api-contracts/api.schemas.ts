@@ -29232,6 +29232,7 @@ export const SharedLinkListApiResourceType = {
   dataset: "dataset",
   project: "project",
   call_execution: "call_execution",
+  error_feed_issue: "error_feed_issue",
 } as const;
 
 export type SharedLinkListApiAccessType =
@@ -29266,6 +29267,7 @@ export const SharedLinkCreateApiResourceType = {
   dashboard: "dashboard",
   project: "project",
   call_execution: "call_execution",
+  error_feed_issue: "error_feed_issue",
 } as const;
 
 export type SharedLinkCreateApiAccessType =
@@ -29299,6 +29301,7 @@ export const SharedLinkDetailApiResourceType = {
   dataset: "dataset",
   project: "project",
   call_execution: "call_execution",
+  error_feed_issue: "error_feed_issue",
 } as const;
 
 export type SharedLinkDetailApiAccessType =
@@ -29366,6 +29369,7 @@ export const SharedLinkResolveResponseApiResourceType = {
   dataset: "dataset",
   project: "project",
   call_execution: "call_execution",
+  error_feed_issue: "error_feed_issue",
 } as const;
 
 export type SharedLinkResolveResponseApiAccessType =
@@ -29451,6 +29455,11 @@ export interface SharedLinkResolvedDataApi {
   updated_at?: string;
   widgets?: SharedLinkResolvedDataApiWidgetsItem[];
   widget_count?: number;
+  issue?: FeedDetailCoreApi;
+  overview?: OverviewResponseApi;
+  traces?: TracesTabResponseApi;
+  trends?: TrendsTabResponseApi;
+  sidebar?: FeedSidebarApi;
 }
 
 export interface SharedLinkResolveResponseApi {
@@ -29494,6 +29503,110 @@ export interface SharedLinkResolveErrorApi {
   error?: string;
   attr?: string;
   details?: SharedLinkResolveErrorApiDetails;
+}
+
+export type EvalRollupApiScope =
+  (typeof EvalRollupApiScope)[keyof typeof EvalRollupApiScope];
+
+export const EvalRollupApiScope = {
+  trace: "trace",
+  span: "span",
+} as const;
+
+export type EvalRollupEvalApiTargetType =
+  (typeof EvalRollupEvalApiTargetType)[keyof typeof EvalRollupEvalApiTargetType];
+
+export const EvalRollupEvalApiTargetType = {
+  span: "span",
+  trace: "trace",
+} as const;
+
+/**
+ * Any valid JSON value.
+ */
+export type EvalRollupSpanApiValue = JsonValueApi;
+
+export interface EvalRollupSpanApi {
+  /** @minLength 1 */
+  span_id: string;
+  span_name?: string;
+  /** Any valid JSON value. */
+  value?: EvalRollupSpanApiValue | null;
+  /** @minLength 1 */
+  explanation?: string | null;
+  error?: boolean;
+  /** @minLength 1 */
+  status?: string | null;
+  eval_config_id?: string;
+}
+
+/**
+ * Any valid JSON value.
+ */
+export type EvalRollupEvalApiChoicesMap = JsonValueApi;
+
+/**
+ * Any valid JSON value.
+ */
+export type EvalRollupEvalApiAggregate = JsonValueApi;
+
+export interface EvalRollupEvalApi {
+  /** @minLength 1 */
+  eval_config_id: string;
+  /** @minLength 1 */
+  eval_name: string;
+  /** @minLength 1 */
+  output_type?: string | null;
+  /** @minLength 1 */
+  template_type?: string | null;
+  target_type?: EvalRollupEvalApiTargetType | null;
+  /** Any valid JSON value. */
+  choices_map?: EvalRollupEvalApiChoicesMap | null;
+  /** Any valid JSON value. */
+  aggregate: EvalRollupEvalApiAggregate;
+  spans: EvalRollupSpanApi[];
+  error?: boolean;
+}
+
+export interface EvalRollupApi {
+  scope: EvalRollupApiScope;
+  evals: EvalRollupEvalApi[];
+  error?: boolean;
+}
+
+export type TraceDetailSpanApiObservationSpan = { [key: string]: unknown };
+
+export type TraceDetailSpanApiChildrenItem = { [key: string]: unknown };
+
+export type TraceDetailSpanApiEvalScoresItem = { [key: string]: unknown };
+
+export type TraceDetailSpanApiAnnotationsItem = { [key: string]: unknown };
+
+export interface TraceDetailSpanApi {
+  observation_span: TraceDetailSpanApiObservationSpan;
+  children?: TraceDetailSpanApiChildrenItem[];
+  /** Raw eval rows retained for backwards-compatible array consumers. */
+  eval_scores?: TraceDetailSpanApiEvalScoresItem[];
+  eval_rollup?: EvalRollupApi;
+  annotations?: TraceDetailSpanApiAnnotationsItem[];
+}
+
+export type TraceDetailResultApiTrace = { [key: string]: unknown };
+
+export type TraceDetailResultApiSummary = { [key: string]: unknown };
+
+export type TraceDetailResultApiGraph = { [key: string]: unknown };
+
+export interface TraceDetailResultApi {
+  trace: TraceDetailResultApiTrace;
+  observation_spans: TraceDetailSpanApi[];
+  summary: TraceDetailResultApiSummary;
+  graph: TraceDetailResultApiGraph;
+}
+
+export interface TraceDetailResponseApi {
+  status?: boolean;
+  result: TraceDetailResultApi;
 }
 
 export type TraceAnnotationValueResponseApiAnnotationValue = {
@@ -30616,61 +30729,6 @@ export const TraceVoiceCallDetailResultApiEvalRollupScope = {
   span: "span",
 } as const;
 
-export type EvalRollupEvalApiTargetType =
-  (typeof EvalRollupEvalApiTargetType)[keyof typeof EvalRollupEvalApiTargetType];
-
-export const EvalRollupEvalApiTargetType = {
-  span: "span",
-  trace: "trace",
-} as const;
-
-/**
- * Any valid JSON value.
- */
-export type EvalRollupSpanApiValue = JsonValueApi;
-
-export interface EvalRollupSpanApi {
-  /** @minLength 1 */
-  span_id: string;
-  span_name?: string;
-  /** Any valid JSON value. */
-  value?: EvalRollupSpanApiValue | null;
-  /** @minLength 1 */
-  explanation?: string | null;
-  error?: boolean;
-  /** @minLength 1 */
-  status?: string | null;
-  eval_config_id?: string;
-}
-
-/**
- * Any valid JSON value.
- */
-export type EvalRollupEvalApiChoicesMap = JsonValueApi;
-
-/**
- * Any valid JSON value.
- */
-export type EvalRollupEvalApiAggregate = JsonValueApi;
-
-export interface EvalRollupEvalApi {
-  /** @minLength 1 */
-  eval_config_id: string;
-  /** @minLength 1 */
-  eval_name: string;
-  /** @minLength 1 */
-  output_type?: string | null;
-  /** @minLength 1 */
-  template_type?: string | null;
-  target_type?: EvalRollupEvalApiTargetType | null;
-  /** Any valid JSON value. */
-  choices_map?: EvalRollupEvalApiChoicesMap | null;
-  /** Any valid JSON value. */
-  aggregate: EvalRollupEvalApiAggregate;
-  spans: EvalRollupSpanApi[];
-  error?: boolean;
-}
-
 export type TraceVoiceCallDetailResultApiCostBreakdown = {
   [key: string]: unknown;
 };
@@ -30796,55 +30854,6 @@ export interface TraceVoiceCallDetailResultApi {
 export interface TraceVoiceCallDetailResponseApi {
   status: boolean;
   result: TraceVoiceCallDetailResultApi;
-}
-
-export type EvalRollupApiScope =
-  (typeof EvalRollupApiScope)[keyof typeof EvalRollupApiScope];
-
-export const EvalRollupApiScope = {
-  trace: "trace",
-  span: "span",
-} as const;
-
-export interface EvalRollupApi {
-  scope: EvalRollupApiScope;
-  evals: EvalRollupEvalApi[];
-  error?: boolean;
-}
-
-export type TraceDetailSpanApiObservationSpan = { [key: string]: unknown };
-
-export type TraceDetailSpanApiChildrenItem = { [key: string]: unknown };
-
-export type TraceDetailSpanApiEvalScoresItem = { [key: string]: unknown };
-
-export type TraceDetailSpanApiAnnotationsItem = { [key: string]: unknown };
-
-export interface TraceDetailSpanApi {
-  observation_span: TraceDetailSpanApiObservationSpan;
-  children?: TraceDetailSpanApiChildrenItem[];
-  /** Raw eval rows retained for backwards-compatible array consumers. */
-  eval_scores?: TraceDetailSpanApiEvalScoresItem[];
-  eval_rollup?: EvalRollupApi;
-  annotations?: TraceDetailSpanApiAnnotationsItem[];
-}
-
-export type TraceDetailResultApiTrace = { [key: string]: unknown };
-
-export type TraceDetailResultApiSummary = { [key: string]: unknown };
-
-export type TraceDetailResultApiGraph = { [key: string]: unknown };
-
-export interface TraceDetailResultApi {
-  trace: TraceDetailResultApiTrace;
-  observation_spans: TraceDetailSpanApi[];
-  summary: TraceDetailResultApiSummary;
-  graph: TraceDetailResultApiGraph;
-}
-
-export interface TraceDetailResponseApi {
-  status?: boolean;
-  result: TraceDetailResultApi;
 }
 
 export interface TraceTagsUpdateApi {
@@ -37063,6 +37072,13 @@ export type TracerSharedLinksList200 = {
   next?: string;
   previous?: string;
   results: SharedLinkListApi[];
+};
+
+export type TracerSharedSidebarListParams = {
+  /**
+   * @minLength 1
+   */
+  trace_id?: string;
 };
 
 export type TracerTraceAnnotationGetAnnotationValuesParams = {
