@@ -317,6 +317,9 @@ test('OBS-E2E-052: OpenRouter-shaped traces keep coherent usage through filters,
       const drawer = page.locator('.MuiDrawer-paper:visible').filter({
         has: page.getByRole('tablist', { name: 'session drawer tabs' }),
       });
+      // The session header uses the same cost formatter as the trace drawer;
+      // 11 + 10 + 9 microdollars must not expose Float64 accumulation noise.
+      await expect(drawer.getByText('Total Cost: $0.00003', { exact: true })).toBeVisible({ timeout: UI_READY });
       for (const c of shared) {
         for (const message of [c.input, c.output]) {
           const bubble = drawer.getByText(message, { exact: true });
