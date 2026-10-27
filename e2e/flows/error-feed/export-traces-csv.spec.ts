@@ -2,11 +2,14 @@ import { readFile } from "node:fs/promises";
 import type { Route } from "@playwright/test";
 import { test, expect } from "../../lib/fixtures";
 import { flowAnnotation } from "../../lib/flow-meta";
+import { POLL } from "../../lib/state-probe";
 
 // Pinned from frontend/src/pages/dashboard/error-feed/exportTracesCsv.js (COLUMNS).
 const CSV_HEADER =
   "trace_id,timestamp,model,score,latency_ms,turns,input_tokens," +
   "output_tokens,input,output,judge_reason,failure_evidence";
+// UploadFileModal.jsx and CreateDatasetFromLocalFileRequestSerializer.
+const UPLOAD_PATH = "/model-hub/develops/create-dataset-from-local-file/";
 const UI_READY = 60_000;
 const TIMESTAMP = "2026-10-20T10:00:00Z";
 
@@ -24,8 +27,9 @@ const fulfillJson = (route: Route, json: unknown) =>
 // The E2E issue seeder creates issues without trace memberships, so the real
 // overview would return no trace cards. Stub the entitlement and the issue's
 // redirect, detail and overview responses; the CSV the browser builds from
-// them is the subject. Bodies follow FeedDetailCoreSerializer and
-// OverviewResponseSerializer (futureagi/tracer/serializers/feed.py).
+// them is the subject, and its upload runs against the real dataset import.
+// Bodies follow FeedDetailCoreSerializer and OverviewResponseSerializer
+// (futureagi/tracer/serializers/feed.py).
 test(
   "ERR-E2E-004: an issue's traces download as a dataset-ready CSV",
   {
@@ -34,19 +38,30 @@ test(
       id: "ERR-E2E-004",
       area: "error-feed",
       userGoal:
-        "A developer downloads an issue's traces from the issue page as a dataset-ready CSV (overview response stubbed; dataset upload not exercised)",
-      steps: ["open the issue page", "click Export", "save the downloaded CSV"],
+        "A developer downloads an issue's traces from the issue page and uploads the file unchanged as a dataset (overview response stubbed)",
+      steps: [
+        "open the issue page",
+        "click Export",
+        "save the downloaded CSV",
+        "upload the downloaded CSV using the Add Dataset form",
+      ],
+      backendChecks: [
+        "the imported dataset has exactly the 12 export columns",
+        "each exported trace becomes one dataset row, with its quoted multiline input and leading-symbol output stored unchanged",
+      ],
       browserChecks: [
         "the export requests the issue overview once, with rep_limit=200",
         "the file is named error-feed-<issue>-traces.csv and its header is exactly the 12 export columns",
         "the file has exactly one row per stubbed trace, with quoted cells intact and no formula prefix",
         "the snackbar reports exactly the exported trace count",
+        "the uploaded dataset's grid shows exactly the exported trace ids",
       ],
     }),
   },
-  async ({ page }, testInfo) => {
-    // Three UI_READY waits (180 s) plus navigation pass the 120 s default.
-    test.setTimeout(240_000);
+  async ({ page, probe }, testInfo) => {
+    // UI_READY waits (enabled, download, snackbar, upload, URL, grid) 360 +
+    // ASYNC_JOB 60 + clicks/navigation 60.
+    test.setTimeout(480_000);
 
     const suffix = `${testInfo.workerIndex}-${Date.now().toString(36)}`;
     const issueId = `e2e-err4-${suffix}`;
@@ -192,7 +207,8 @@ test(
     expect(download.suggestedFilename()).toBe(
       `error-feed-${issueId}-traces.csv`,
     );
-    const csv = await readFile(await download.path(), "utf8");
+    const bytes = await readFile(await download.path());
+    const csv = bytes.toString("utf8");
     expect(csv.split("\r\n")[0]).toBe(CSV_HEADER);
     expect(csv).toBe(
       [
@@ -209,5 +225,92 @@ test(
     await expect(
       page.getByText("Exported 2 traces", { exact: true }),
     ).toBeVisible({ timeout: UI_READY });
+
+    // The dataset page needs the real entitlements, not the error_feed stub.
+    await page.unroute("**/api/capabilities/");
+    const datasetName = `e2e-err4-dataset-${suffix}`;
+    await page.goto("/dashboard/develop", { waitUntil: "domcontentloaded" });
+    await page
+      .getByRole("button", { name: "Add Dataset", exact: true })
+      .first()
+      .click({ timeout: UI_READY });
+    await page
+      .getByText("Upload a file (JSON, CSV)", { exact: true })
+      .click({ timeout: UI_READY });
+    const dialog = page
+      .getByRole("dialog")
+      .filter({ has: page.getByText("Upload a File", { exact: true }) });
+    // The dropzone accepts .csv / text/csv only and download.path() has no
+    // extension, so send the downloaded bytes under the suggested name.
+    await dialog.locator('input[type="file"]').setInputFiles(
+      {
+        name: download.suggestedFilename(),
+        mimeType: "text/csv",
+        buffer: bytes,
+      },
+      { timeout: UI_READY },
+    );
+    await dialog.getByPlaceholder("Dataset Name").fill(datasetName);
+    const uploaded = page.waitForResponse(
+      (r) => r.url().endsWith(UPLOAD_PATH) && r.request().method() === "POST",
+      { timeout: UI_READY },
+    );
+    await dialog.getByRole("button", { name: "Upload", exact: true }).click();
+    const response = await uploaded;
+    expect(response.status()).toBe(200);
+    const datasetId: string = (await response.json()).result.dataset_id;
+    await testInfo.attach("uploaded-dataset", {
+      body: JSON.stringify({ datasetId, datasetName }),
+      contentType: "application/json",
+    });
+
+    const importedRows = async () => {
+      const cells = await probe.pg<{
+        row_id: string;
+        name: string;
+        value: string;
+      }>(
+        `SELECT c.row_id::text AS row_id, col.name, c.value
+           FROM model_hub_cell c JOIN model_hub_column col ON col.id = c.column_id
+          WHERE c.dataset_id = $1 AND NOT c.deleted AND NOT col.deleted
+            AND col.name IN ('trace_id', 'input', 'output')`,
+        [datasetId],
+      );
+      const rows = new Map<string, Record<string, string>>();
+      for (const { row_id, name, value } of cells) {
+        rows.set(row_id, { ...rows.get(row_id), [name]: value });
+      }
+      return [...rows.values()].sort((a, b) =>
+        (a.trace_id ?? "").localeCompare(b.trace_id ?? ""),
+      );
+    };
+    await expect.poll(importedRows, POLL.ASYNC_JOB).toEqual([
+      { trace_id: traceA, input: inputA, output: outputA },
+      {
+        trace_id: traceB,
+        input: `input b ${suffix}`,
+        output: `output b ${suffix}`,
+      },
+    ]);
+    const columns = await probe.pg<{ id: string; name: string }>(
+      "SELECT id, name FROM model_hub_column WHERE dataset_id = $1 AND NOT deleted ORDER BY name",
+      [datasetId],
+    );
+    await testInfo.attach("imported-columns", {
+      body: JSON.stringify(columns),
+      contentType: "application/json",
+    });
+    expect(columns.map((c) => c.name).sort()).toEqual(
+      CSV_HEADER.split(",").sort(),
+    );
+
+    await expect(page).toHaveURL(
+      new RegExp(`/dashboard/develop/${datasetId}`),
+      { timeout: UI_READY },
+    );
+    const traceColumnId = columns.find((c) => c.name === "trace_id")!.id;
+    await expect(
+      page.locator(`.ag-row [col-id="${traceColumnId}"]`),
+    ).toHaveText([traceA, traceB], { timeout: UI_READY });
   },
 );
