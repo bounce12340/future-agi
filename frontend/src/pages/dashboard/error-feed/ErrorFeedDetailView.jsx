@@ -15,9 +15,11 @@ import {
 import PropTypes from "prop-types";
 import { useNavigate, useParams } from "react-router-dom";
 import Iconify from "src/components/iconify";
+import { useSnackbar } from "src/components/snackbar";
 import {
   useErrorFeedDetail,
   useErrorFeedRedirect,
+  useExportErrorFeedTraces,
   useUpdateErrorFeedIssue,
 } from "src/api/errorFeed/error-feed";
 import ErrorStatusChip from "./components/ErrorStatusChip";
@@ -32,6 +34,7 @@ import ClusterHeadlineCard from "./components/ClusterHeadlineCard";
 import AnalyzeTab from "./components/AnalyzeTab";
 import { useErrorFeedStore } from "./store";
 import { useAnalyzeRunner } from "./useAnalyzeRunner";
+import { downloadCsv, tracesToCsv } from "./exportTracesCsv";
 
 // ── Detail page skeleton ─────────────────────────────────────────────────────
 function DetailSkeleton() {
@@ -119,6 +122,34 @@ export default function ErrorFeedDetailView() {
     retry: false,
   });
   const updateIssue = useUpdateErrorFeedIssue();
+  const exportTraces = useExportErrorFeedTraces();
+  const { enqueueSnackbar } = useSnackbar();
+
+  const handleExportTraces = (clusterId) =>
+    exportTraces.mutate(clusterId, {
+      onSuccess: (overview) => {
+        const traces = overview?.representative_traces ?? [];
+        if (!traces.length) {
+          enqueueSnackbar("No traces to export", { variant: "info" });
+          return;
+        }
+        downloadCsv(tracesToCsv(traces), `error-feed-${clusterId}-traces.csv`);
+        const total = overview?.representative_total ?? traces.length;
+        if (total > traces.length) {
+          enqueueSnackbar(
+            `Exported the latest ${traces.length} of ${total} traces`,
+            { variant: "warning" },
+          );
+        } else {
+          enqueueSnackbar(
+            `Exported ${traces.length} trace${traces.length === 1 ? "" : "s"}`,
+            { variant: "success" },
+          );
+        }
+      },
+      onError: () =>
+        enqueueSnackbar("Failed to export traces", { variant: "error" }),
+    });
 
   const currentError = useMemo(() => {
     if (!detail?.row) return null;
@@ -330,6 +361,23 @@ export default function ErrorFeedDetailView() {
                   <Iconify icon="mdi:share-variant-outline" width={14} />
                 </IconButton>
               </Tooltip>
+              <Button
+                size="small"
+                variant="outlined"
+                startIcon={<Iconify icon="mdi:download-outline" width={13} />}
+                disabled={exportTraces.isPending || !currentError.trace_count}
+                onClick={() => handleExportTraces(currentError.cluster_id)}
+                sx={{
+                  height: 30,
+                  fontSize: "12px",
+                  borderRadius: "6px",
+                  textTransform: "none",
+                  borderColor: "divider",
+                  color: "text.secondary",
+                }}
+              >
+                Export
+              </Button>
               <Button
                 size="small"
                 variant="outlined"
