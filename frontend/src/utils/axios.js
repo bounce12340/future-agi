@@ -1788,6 +1788,10 @@ export const endpoints = {
       apiPath("/simulate/v3/test-executions/{test_execution_id}/analytics/", {
         test_execution_id: id,
       }),
+    reliability: (id) =>
+      apiPath("/simulate/v3/test-executions/{test_execution_id}/reliability/", {
+        test_execution_id: id,
+      }),
     export: (id) =>
       apiPath("/simulate/v3/test-executions/{test_execution_id}/export/", {
         test_execution_id: id,
@@ -1898,8 +1902,13 @@ export const endpoints = {
     alerts: {
       list: apiPath("/tracer/alerts/"),
       options: apiPath("/tracer/alerts/options/"),
-      detail: (id) => apiPath("/tracer/alerts/{kind}/{alert_id}/", { kind: "error_feed", alert_id: id }),
-      test: (id) => apiPath("/tracer/alerts/error_feed/{alert_id}/test/", { alert_id: id }),
+      detail: (id) =>
+        apiPath("/tracer/alerts/{kind}/{alert_id}/", {
+          kind: "error_feed",
+          alert_id: id,
+        }),
+      test: (id) =>
+        apiPath("/tracer/alerts/error_feed/{alert_id}/test/", { alert_id: id }),
     },
     list: apiPath("/tracer/feed/issues/"),
     stats: apiPath("/tracer/feed/issues/stats/"),
@@ -2114,7 +2123,10 @@ export const endpoints = {
   integrations: {
     slack: {
       install: apiPath("/integrations/slack/install/"),
-      channels: (id) => apiPath("/integrations/connections/{connection_id}/slack/channels/", { connection_id: id }),
+      channels: (id) =>
+        apiPath("/integrations/connections/{connection_id}/slack/channels/", {
+          connection_id: id,
+        }),
     },
     connections: {
       list: apiPath("/integrations/connections/"),

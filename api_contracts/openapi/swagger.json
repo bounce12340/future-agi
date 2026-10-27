@@ -58607,6 +58607,38 @@
                 }
             ]
         },
+        "/simulate/v3/test-executions/{test_execution_id}/reliability/": {
+            "get": {
+                "operationId": "simulate_v3_test_execution_reliability",
+                "description": "The reliability block alone, for the run header.",
+                "parameters": [],
+                "responses": {
+                    "200": {
+                        "description": "",
+                        "schema": {
+                            "$ref": "#/definitions/Reliability"
+                        }
+                    },
+                    "default": {
+                        "description": "Default error response",
+                        "schema": {
+                            "$ref": "#/definitions/ManagementAPIErrorResponse"
+                        }
+                    }
+                },
+                "tags": [
+                    "simulate"
+                ]
+            },
+            "parameters": [
+                {
+                    "name": "test_execution_id",
+                    "in": "path",
+                    "required": true,
+                    "type": "string"
+                }
+            ]
+        },
         "/simulate/v3/test-executions/{test_execution_id}/traces/": {
             "get": {
                 "operationId": "simulate_v3_test_execution_traces",
@@ -138972,8 +139004,8 @@
                 "low",
                 "high",
                 "effective_n",
-                "evaluated",
-                "clusters"
+                "scenarios",
+                "evaluated"
             ],
             "type": "object",
             "properties": {
@@ -138989,12 +139021,12 @@
                     "title": "Effective n",
                     "type": "number"
                 },
-                "evaluated": {
-                    "title": "Evaluated",
+                "scenarios": {
+                    "title": "Scenarios",
                     "type": "integer"
                 },
-                "clusters": {
-                    "title": "Clusters",
+                "evaluated": {
+                    "title": "Evaluated",
                     "type": "integer"
                 }
             },
@@ -139013,7 +139045,8 @@
                 "runs",
                 "evaluated",
                 "pass_rate",
-                "verdict"
+                "verdict",
+                "call_ids"
             ],
             "type": "object",
             "properties": {
@@ -139073,6 +139106,13 @@
                         "flaky",
                         "not_evaluated"
                     ]
+                },
+                "call_ids": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "minLength": 1
+                    }
                 }
             }
         },
@@ -139085,6 +139125,15 @@
                 "repeated",
                 "flaky",
                 "flip_rate",
+                "k",
+                "inconclusive",
+                "pass_hat_1",
+                "pass_hat_k",
+                "pass_hat_k_scenarios",
+                "pass_hat_k_passed",
+                "pass_hat_k_excluded",
+                "trials_passed",
+                "trials_evaluated",
                 "pass_rate_interval",
                 "rows"
             ],
@@ -139118,6 +139167,45 @@
                     "title": "Flip rate",
                     "type": "number",
                     "x-nullable": true
+                },
+                "k": {
+                    "title": "K",
+                    "type": "integer",
+                    "x-nullable": true
+                },
+                "inconclusive": {
+                    "title": "Inconclusive",
+                    "type": "integer"
+                },
+                "pass_hat_1": {
+                    "title": "Pass hat 1",
+                    "type": "number",
+                    "x-nullable": true
+                },
+                "pass_hat_k": {
+                    "title": "Pass hat k",
+                    "type": "number",
+                    "x-nullable": true
+                },
+                "pass_hat_k_scenarios": {
+                    "title": "Pass hat k scenarios",
+                    "type": "integer"
+                },
+                "pass_hat_k_passed": {
+                    "title": "Pass hat k passed",
+                    "type": "integer"
+                },
+                "pass_hat_k_excluded": {
+                    "title": "Pass hat k excluded",
+                    "type": "integer"
+                },
+                "trials_passed": {
+                    "title": "Trials passed",
+                    "type": "integer"
+                },
+                "trials_evaluated": {
+                    "title": "Trials evaluated",
+                    "type": "integer"
                 },
                 "pass_rate_interval": {
                     "$ref": "#/definitions/ReliabilityInterval"

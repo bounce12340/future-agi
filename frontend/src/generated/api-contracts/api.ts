@@ -1021,6 +1021,7 @@ import type {
   RecoveryCodesRegenerateResponseApi,
   RecoveryCodesRemainingResponseApi,
   RedisKeyRequestApi,
+  ReliabilityApi,
   RenewGroupingFeatureApi,
   ReplaySessionApi,
   ReplaySessionListApi,
@@ -67871,6 +67872,51 @@ export const simulateV3TestExecutionExport = async (
       method: "POST",
       headers: { "Content-Type": "application/json", ...options?.headers },
       body: JSON.stringify(runExportV3RequestApi),
+    },
+  );
+};
+
+export type simulateV3TestExecutionReliabilityResponse200 = {
+  data: ReliabilityApi;
+  status: 200;
+};
+
+export type simulateV3TestExecutionReliabilityResponseDefault = {
+  data: ManagementAPIErrorResponseApi;
+  status: Exclude<HTTPStatusCodes, 200>;
+};
+
+export type simulateV3TestExecutionReliabilityResponseSuccess =
+  simulateV3TestExecutionReliabilityResponse200 & {
+    headers: Headers;
+  };
+export type simulateV3TestExecutionReliabilityResponseError =
+  simulateV3TestExecutionReliabilityResponseDefault & {
+    headers: Headers;
+  };
+
+export type simulateV3TestExecutionReliabilityResponse =
+  | simulateV3TestExecutionReliabilityResponseSuccess
+  | simulateV3TestExecutionReliabilityResponseError;
+
+export const getSimulateV3TestExecutionReliabilityUrl = (
+  testExecutionId: string,
+) => {
+  return `/simulate/v3/test-executions/${testExecutionId}/reliability/`;
+};
+
+/**
+ * The reliability block alone, for the run header.
+ */
+export const simulateV3TestExecutionReliability = async (
+  testExecutionId: string,
+  options?: RequestInit,
+): Promise<simulateV3TestExecutionReliabilityResponse> => {
+  return apiMutator<simulateV3TestExecutionReliabilityResponse>(
+    getSimulateV3TestExecutionReliabilityUrl(testExecutionId),
+    {
+      ...options,
+      method: "GET",
     },
   );
 };

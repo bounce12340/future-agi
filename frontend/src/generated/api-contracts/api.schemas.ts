@@ -23464,8 +23464,8 @@ export interface ReliabilityIntervalApi {
   low: number;
   high: number;
   effective_n: number;
+  scenarios: number;
   evaluated: number;
-  clusters: number;
 }
 
 export type ReliabilityRowApiVerdict =
@@ -23493,6 +23493,7 @@ export interface ReliabilityRowApi {
   evaluated: number;
   pass_rate: number;
   verdict: ReliabilityRowApiVerdict;
+  call_ids: string[];
 }
 
 export interface ReliabilityApi {
@@ -23503,6 +23504,15 @@ export interface ReliabilityApi {
   repeated: number;
   flaky: number;
   flip_rate: number;
+  k: number;
+  inconclusive: number;
+  pass_hat_1: number;
+  pass_hat_k: number;
+  pass_hat_k_scenarios: number;
+  pass_hat_k_passed: number;
+  pass_hat_k_excluded: number;
+  trials_passed: number;
+  trials_evaluated: number;
   pass_rate_interval: ReliabilityIntervalApi;
   rows: ReliabilityRowApi[];
 }
