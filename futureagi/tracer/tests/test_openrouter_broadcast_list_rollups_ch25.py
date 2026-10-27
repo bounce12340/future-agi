@@ -29,7 +29,14 @@ from conftest import (
     _ch_test_owned_database,
     _open_ch_test_native_client,
 )
+from tracer.services.clickhouse.query_builders.trace_detail import (
+    compute_trace_summary_and_graph,
+)
+from tracer.services.clickhouse.v2.query_builders.observe_usage import (
+    ObserveTraceListQueryBuilderV2,
+)
 from tracer.services.clickhouse.v2.query_builders.session_detail import (
+    build_session_detail_aggregate_query,
     build_session_detail_traces_query,
 )
 from tracer.services.clickhouse.v2.query_builders.session_list import (
@@ -65,7 +72,7 @@ CREATE TABLE spans
     id String,
     parent_span_id String DEFAULT '',
     name String DEFAULT '',
-    trace_name String DEFAULT '',
+    trace_name String MATERIALIZED name,
     end_time Nullable(DateTime64(6, 'UTC')),
     latency_ms Int32 DEFAULT 0,
     project_version_id Nullable(UUID),
@@ -519,4 +526,298 @@ def test_session_history_keeps_a_root_with_content(stored):
     )
     assert [(row["input"], row["output"]) for row in rows] == [
         (root["input"], root["output"])
+    ]
+
+
+def _usage_trace(stored, shape, *, cost=5.85e-6, tokens=18):
+    """R3 r6's 11+7 Pydantic shape, plus independent-call controls.
+
+    Source: r3-3611-20261026/vm-results/out/ch-dump-r6.json at
+    1b2e14baf31a7b9304dbc40e8003621e4d86c921. This is recorded/local-fake
+    instrumentation, not a live OpenRouter Broadcast export.
+    """
+    import copy
+
+    trace = copy.deepcopy(TRACES["OR4-t1"])
+    trace["trace_id"] = str(uuid4())
+    trace["shape"] = "traceai"
+    session = str(uuid4())
+    for index, span in enumerate(trace["spans"]):
+        span.update(
+            id=f"{index + 1:016x}",
+            parent_span_id="" if index == 0 else f"{index:016x}",
+            name="pydantic_ai.agent.run" if index < 2 else "ChatCompletion",
+            observation_type="unknown" if index < 2 else "llm",
+            trace_session_id=session,
+            total_tokens=tokens,
+            prompt_tokens=tokens - 7,
+            completion_tokens=7,
+            cost=cost,
+            input="" if index < 2 else "generation input",
+            output="" if index < 2 else "generation output",
+        )
+    if shape in ("siblings", "independent-root"):
+        trace["spans"][0].update(
+            name="root content", input="root wins", output="root output"
+        )
+        for span in trace["spans"][1:]:
+            span.update(
+                parent_span_id=trace["spans"][0]["id"],
+                observation_type="llm",
+                name="ChatCompletion",
+            )
+        if shape == "siblings":
+            trace["spans"][0].update(
+                cost=0, total_tokens=0, prompt_tokens=0, completion_tokens=0
+            )
+        else:
+            trace["spans"][0]["observation_type"] = "llm"
+            trace["spans"] = trace["spans"][:2]
+    elif shape == "parent-only":
+        for span in trace["spans"][1:]:
+            span.update(cost=0, total_tokens=0, prompt_tokens=0, completion_tokens=0)
+    _insert(stored.ch, _span_rows(stored.project_id, trace))
+    return trace
+
+
+@pytest.mark.parametrize(
+    "shape,total",
+    [("nested", 18), ("siblings", 36), ("independent-root", 36), ("parent-only", 18)],
+)
+def test_usage_accounting_preserves_independent_calls_and_parent_only_usage(
+    stored, shape, total
+):
+    trace = _usage_trace(stored, shape)
+    builder = ObserveTraceListQueryBuilderV2(
+        project_id=stored.project_id, filters=[_time_filter()]
+    )
+    (content,) = stored.ch.execute(
+        *builder.build_content_query(
+            [trace["trace_id"]],
+            root_identities=[_root_identity(stored.project_id, trace)],
+            include_trace_rollup=True,
+        )
+    )
+    assert content["trace_rollup_total_tokens"] == total
+    assert content["trace_rollup_cost"] == pytest.approx(
+        5.85e-6 * total / 18, abs=1e-18
+    )
+    session = trace["spans"][0]["trace_session_id"]
+    assert _session_page(stored, [session])[session]["total_tokens"] == total
+    (detail,) = stored.ch.execute(
+        *build_session_detail_aggregate_query(stored.project_id, (session,))
+    )
+    assert detail["total_tokens"] == total
+    assert detail["total_cost"] == pytest.approx(
+        content["trace_rollup_cost"], abs=1e-18
+    )
+    (history,) = stored.ch.execute(
+        *build_session_detail_traces_query(
+            stored.project_id, (session,), limit=10, offset=0
+        )
+    )
+    assert history["total_tokens"] == total
+    entries = {
+        span["id"]: {"observation_span": span, "children": []}
+        for span in trace["spans"]
+    }
+    roots = []
+    for span in trace["spans"]:
+        if span["parent_span_id"]:
+            entries[span["parent_span_id"]]["children"].append(entries[span["id"]])
+        else:
+            roots.append(entries[span["id"]])
+    summary, graph = compute_trace_summary_and_graph(roots)
+    assert summary["total_tokens"] == total
+    assert summary["total_cost"] == pytest.approx(
+        content["trace_rollup_cost"], abs=1e-18
+    )
+    assert len(graph["nodes"]) == len(trace["spans"])
+    if shape in ("siblings", "independent-root"):
+        entry = _list_entry(trace, content)
+        assert (entry["input"], entry["output"]) == ("root wins", "root output")
+
+
+def test_observe_usage_predicate_uses_canonical_totals_not_empty_roots(stored):
+    eligible = [
+        _usage_trace(stored, "siblings", tokens=18 + index) for index in range(13)
+    ]
+    excluded = _usage_trace(stored, "nested")
+    identities = [trace["trace_id"] for trace in [*eligible, excluded]]
+    usage_filter = {
+        "column_id": "total_tokens",
+        "filter_config": {
+            "col_type": "SYSTEM_METRIC",
+            "filter_type": "number",
+            "filter_op": "greater_than",
+            "filter_value": 20,
+        },
+    }
+    builder = ObserveTraceListQueryBuilderV2(
+        project_id=stored.project_id, filters=[_time_filter(), usage_filter]
+    )
+    rows = stored.ch.execute(*builder.build_filter_match_query(identities))
+    assert {row["trace_id"] for row in rows} == {
+        trace["trace_id"] for trace in eligible
+    }
+    # The real list uses the identity-only classifier, whose single-project
+    # outer projection has no project_id. Execute that path, not just the full
+    # classifier, to catch invalid membership references at the UI boundary.
+    seed_rows = [
+        {
+            "trace_id": trace["trace_id"],
+            "root_span_id": _root(trace)["id"],
+            "start_time": _ts(_root(trace)["start_time"]),
+        }
+        for trace in [*eligible, excluded]
+    ]
+    identity_rows = stored.ch.execute(
+        *builder.build_filter_identity_match_query_from_seed_rows(seed_rows)
+    )
+    assert {row["trace_id"] for row in identity_rows} == {
+        trace["trace_id"] for trace in eligible
+    }
+    # Legacy/non-Observe callers keep root usage semantics, not this opt-in.
+    legacy = TraceListQueryBuilderV2(
+        project_id=stored.project_id, filters=[_time_filter(), usage_filter]
+    )
+    assert stored.ch.execute(*legacy.build_filter_match_query(identities)) == []
+
+
+@pytest.mark.parametrize("column", ["cost", "total_tokens"])
+@pytest.mark.parametrize("direction", ["asc", "desc"])
+def test_usage_sort_is_global_stable_and_exact_across_pages(stored, column, direction):
+    isolated = SimpleNamespace(ch=stored.ch, project_id=str(uuid4()))
+    traces = [
+        _usage_trace(isolated, "siblings", tokens=18 + i // 2, cost=3e-8 * (1 + i // 2))
+        for i in range(13)
+    ]
+    _usage_trace(isolated, "nested")
+    filters = [
+        _time_filter(),
+        {
+            "column_id": "total_tokens",
+            "filter_config": {
+                "col_type": "SYSTEM_METRIC",
+                "filter_type": "number",
+                "filter_op": "greater_than",
+                "filter_value": 20,
+            },
+        },
+    ]
+    # Equal values deliberately tie: the stable secondary order is trace ID DESC.
+    expected = sorted(traces, key=lambda trace: trace["trace_id"], reverse=True)
+    expected.sort(
+        key=lambda trace: sum(span[column] for span in trace["spans"]),
+        reverse=direction == "desc",
+    )
+    pages = []
+    for number in (0, 1):
+        builder = ObserveTraceListQueryBuilderV2(
+            project_id=isolated.project_id,
+            filters=filters,
+            page_number=number,
+            page_size=10,
+        )
+        sort = [{"column_id": column, "direction": direction}]
+        rows = stored.ch.execute(*builder.build_usage_sorted_query(sort))
+        pages.extend(rows)
+        assert len(rows) == (10 if number == 0 else 3)
+        assert stored.ch.execute(
+            *builder.build_usage_sorted_query(sort, count_only=True)
+        ) == [{"total": 13}]
+        # Sorted rows retain the physical identity needed by content hydration.
+        builder.content_root_identities_for_rows(rows)
+    assert [row["trace_id"] for row in pages] == [
+        trace["trace_id"] for trace in expected
+    ]
+    assert len({row["trace_id"] for row in pages}) == 13
+
+
+@pytest.mark.parametrize("cost", [3e-8, 2.37e-5, 0.0])
+def test_session_usage_retains_subprecision_cost(stored, cost):
+    trace = _usage_trace(stored, "nested", cost=cost)
+    session = trace["spans"][0]["trace_session_id"]
+    (detail,) = stored.ch.execute(
+        *build_session_detail_aggregate_query(stored.project_id, (session,))
+    )
+    assert detail["total_cost"] == pytest.approx(cost, rel=1e-10, abs=1e-18)
+
+
+@pytest.mark.parametrize(
+    "operator,expected",
+    [
+        ("between", [0]),
+        ("not_between", [1]),
+        ("equals", [0]),
+        ("not_equals", [1]),
+        ("is_null", []),
+        ("less_than_or_equal", [0]),
+        ("greater_than", [1]),
+    ],
+)
+def test_usage_sort_keeps_half_open_microsecond_time_predicates(
+    stored, operator, expected
+):
+    isolated = SimpleNamespace(ch=stored.ch, project_id=str(uuid4()))
+    traces = [_usage_trace(isolated, "nested") for _ in range(2)]
+    start = _ts(_root(traces[0])["start_time"]) + timedelta(microseconds=123)
+    for index, trace in enumerate(traces):
+        rows = _span_rows(isolated.project_id, trace)
+        for row in rows:
+            row.update(start_time=start + timedelta(microseconds=index), _version=2)
+        _insert(stored.ch, rows)
+    value = start.isoformat()
+    if operator in ("between", "not_between"):
+        value = [value, (start + timedelta(microseconds=1)).isoformat()]
+    filters = [
+        _time_filter(),
+        {
+            "column_id": "created_at",
+            "filter_config": {
+                "col_type": "SYSTEM_METRIC",
+                "filter_type": "datetime",
+                "filter_op": operator,
+                "filter_value": value,
+            },
+        },
+    ]
+    builder = ObserveTraceListQueryBuilderV2(
+        project_id=isolated.project_id, filters=filters
+    )
+    sort = [{"column_id": "cost", "direction": "asc"}]
+    rows = stored.ch.execute(*builder.build_usage_sorted_query(sort))
+    assert {row["trace_id"] for row in rows} == {
+        traces[index]["trace_id"] for index in expected
+    }
+    assert stored.ch.execute(
+        *builder.build_usage_sorted_query(sort, count_only=True)
+    ) == [{"total": len(expected)}]
+
+
+def test_org_usage_filter_does_not_pool_identical_trace_ids_between_projects(stored):
+    first = SimpleNamespace(ch=stored.ch, project_id=str(uuid4()))
+    second = SimpleNamespace(ch=stored.ch, project_id=str(uuid4()))
+    excluded = _usage_trace(first, "nested")
+    included = _usage_trace(second, "siblings")
+    included["trace_id"] = excluded["trace_id"]
+    _insert(stored.ch, _span_rows(second.project_id, included))
+    builder = ObserveTraceListQueryBuilderV2(
+        project_ids=[first.project_id, second.project_id],
+        filters=[
+            _time_filter(),
+            {
+                "column_id": "total_tokens",
+                "filter_config": {
+                    "col_type": "SYSTEM_METRIC",
+                    "filter_type": "number",
+                    "filter_op": "greater_than",
+                    "filter_value": 20,
+                },
+            },
+        ],
+    )
+    rows = stored.ch.execute(*builder.build_filter_match_query([included["trace_id"]]))
+    assert [(str(row["project_id"]), row["trace_id"]) for row in rows] == [
+        (second.project_id, included["trace_id"])
     ]

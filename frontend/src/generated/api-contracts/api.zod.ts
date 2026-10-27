@@ -65905,6 +65905,8 @@ export const tracerTraceListTracesCreateResponseResultMetadataQueryAppliedFilter
 export const TracerTraceListTracesCreateResponse =
   TracerTraceListTracesResponse;
 
+export const tracerTraceListTracesOfSessionQuerySortParamsDefault = `[]`;
+
 export const tracerTraceListTracesOfSessionQueryFiltersDefault = `[]`;
 
 export const tracerTraceListTracesOfSessionQueryPageNumberDefault = 0;
@@ -65918,6 +65920,10 @@ export const tracerTraceListTracesOfSessionQueryCursorMax = 4096;
 export const tracerTraceListTracesOfSessionQueryCursorModeDefault = false;
 
 export const TracerTraceListTracesOfSessionQueryParams = zod.object({
+  sort_params: zod
+    .string()
+    .min(1)
+    .default(tracerTraceListTracesOfSessionQuerySortParamsDefault),
   project_id: zod.string().uuid().optional(),
   project_version_id: zod.string().uuid().optional(),
   session_id: zod.string().uuid().optional(),
@@ -66073,6 +66079,8 @@ export const TracerTraceListTracesOfSessionResponse = zod.object({
 /**
  * List traces filtered by project ID with optimized queries.
  */
+export const tracerTraceListTracesOfSessionCreateBodySortParamsDefault = `[]`;
+
 export const tracerTraceListTracesOfSessionCreateBodyFiltersDefault = `[]`;
 
 export const tracerTraceListTracesOfSessionCreateBodyPageNumberDefault = 0;
@@ -66086,6 +66094,11 @@ export const tracerTraceListTracesOfSessionCreateBodyCursorMax = 4096;
 export const tracerTraceListTracesOfSessionCreateBodyCursorModeDefault = false;
 
 export const TracerTraceListTracesOfSessionCreateBody = zod.object({
+  sort_params: zod
+    .string()
+    .min(1)
+    .default(tracerTraceListTracesOfSessionCreateBodySortParamsDefault)
+    .describe("JSON-encoded list of sort params."),
   project_id: zod.string().uuid().optional(),
   project_version_id: zod.string().uuid().optional(),
   session_id: zod.string().uuid().optional(),

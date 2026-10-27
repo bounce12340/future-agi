@@ -43,6 +43,7 @@ from tracer.services.clickhouse.query_builders.trace_list import (
     TraceListQueryBuilder,
     _unix_microseconds,
 )
+from tracer.services.clickhouse.query_builders.trace_usage import usage_aggregate_sql
 from tracer.services.clickhouse.read_budget import ReadDeadline, ReadDeadlineExceeded
 from tracer.services.clickhouse.v2.query_builders._rewrite import V2RewriteMixin
 from tracer.services.clickhouse.v2.query_builders.filters import (
@@ -529,10 +530,11 @@ class _TraceRootReplayV2:
                     SELECT
                         project_id,
                         trace_id,
-                        sum(latest_cost) AS rollup_cost,
-                        sum(latest_total_tokens) AS rollup_total_tokens,
-                        sum(latest_prompt_tokens) AS rollup_prompt_tokens,
-                        sum(latest_completion_tokens) AS rollup_completion_tokens,
+                        {usage_aggregate_sql(prefix="latest_")},
+                        usage_cost AS rollup_cost,
+                        usage_total_tokens AS rollup_total_tokens,
+                        usage_prompt_tokens AS rollup_prompt_tokens,
+                        usage_completion_tokens AS rollup_completion_tokens,
                         argMinIf(latest_model,
                             tuple(latest_start_time, id, observation_type, service_name),
                             observation_type = 'llm' AND latest_model != '')
@@ -562,8 +564,10 @@ class _TraceRootReplayV2:
                             toStartOfHour(start_time) AS start_hour,
                             argMax(tuple(start_time, cost, total_tokens, prompt_tokens,
                                 completion_tokens, model, provider, input_length,
-                                output_length, parent_span_id, is_deleted), _version)
+                                output_length, parent_span_id, is_deleted, name), _version)
                                 AS latest_span,
+                            id AS latest_id,
+                            observation_type AS latest_observation_type,
                             latest_span.1 AS latest_start_time,
                             latest_span.2 AS latest_cost,
                             latest_span.3 AS latest_total_tokens,
@@ -574,7 +578,8 @@ class _TraceRootReplayV2:
                             latest_span.8 AS latest_input_length,
                             latest_span.9 AS latest_output_length,
                             latest_span.10 AS latest_parent_span_id,
-                            latest_span.11 AS latest_is_deleted
+                            latest_span.11 AS latest_is_deleted,
+                            latest_span.12 AS latest_name
                         FROM {self.TABLE}
                         PREWHERE (toString(project_id), trace_id) IN {identities}
                           AND {project_filter}

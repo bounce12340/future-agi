@@ -30487,6 +30487,11 @@ export interface TraceObserveListResponseApi {
 }
 
 export interface TraceObserveListQueryApi {
+  /**
+   * JSON-encoded list of sort params.
+   * @minLength 1
+   */
+  sort_params?: string;
   project_id?: string;
   project_version_id?: string;
   session_id?: string;
@@ -37401,6 +37406,10 @@ export type TracerTraceListTracesParams = {
 };
 
 export type TracerTraceListTracesOfSessionParams = {
+  /**
+   * @minLength 1
+   */
+  sort_params?: string;
   project_id?: string;
   project_version_id?: string;
   session_id?: string;

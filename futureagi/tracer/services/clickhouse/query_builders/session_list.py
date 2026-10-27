@@ -46,6 +46,7 @@ from tracer.services.clickhouse.query_builders.session_filters import (
     SESSION_ID_FILTER_COLS,
     build_session_id_filter_clause,
 )
+from tracer.services.clickhouse.query_builders.trace_usage import usage_aggregate_sql
 from tracer.services.clickhouse.v2.id_remap_sql import (
     bounded_survivor_map_subquery,
     remap_left_join,
@@ -3248,6 +3249,12 @@ class SessionListQueryBuilder(BaseQueryBuilder):
             SELECT
                 {resolved_member_session} AS member_session_id,
                 {identity_names},
+                id AS latest_id,
+                latest_parent_span_id,
+                latest_name,
+                latest_observation_type,
+                latest_prompt_tokens,
+                latest_completion_tokens,
                 latest_start_time,
                 latest_cost,
                 latest_total_tokens,
@@ -3266,6 +3273,9 @@ class SessionListQueryBuilder(BaseQueryBuilder):
                     argMax(tuple(parent_span_id), _peerdb_version).1 AS latest_parent_span_id,
                     argMax(tuple(trace_session_id), _peerdb_version).1 AS latest_trace_session_id,
                     argMax(tuple(observation_type), _peerdb_version).1 AS latest_observation_type,
+                    argMax(tuple(name), _peerdb_version).1 AS latest_name,
+                    argMax(tuple(prompt_tokens), _peerdb_version).1 AS latest_prompt_tokens,
+                    argMax(tuple(completion_tokens), _peerdb_version).1 AS latest_completion_tokens,
                     argMax(tuple(cost), _peerdb_version).1 AS latest_cost,
                     argMax(tuple(total_tokens), _peerdb_version).1 AS latest_total_tokens,
                     argMax(tuple(input_length), _peerdb_version).1 AS latest_input_length,
@@ -3301,8 +3311,9 @@ class SessionListQueryBuilder(BaseQueryBuilder):
                     SELECT
                         member_session_id,
                         trace_id,
-                        sum(latest_cost) AS trace_cost,
-                        sum(latest_total_tokens) AS trace_tokens,
+                        {usage_aggregate_sql(prefix="latest_")},
+                        usage_cost AS trace_cost,
+                        usage_total_tokens AS trace_tokens,
                         minIf(latest_start_time, latest_is_root) AS trace_root_start,
                         countIf(latest_is_root) > 0 AS trace_has_root,
                         argMinIf(tuple({identity_names}),
