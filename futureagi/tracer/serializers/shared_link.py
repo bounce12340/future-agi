@@ -1,18 +1,18 @@
 from rest_framework import serializers
 
 from tfc.utils.api_serializers import ApiTextErrorResponseSerializer
+from tracer.models.shared_link import (
+    AccessType,
+    ResourceType,
+    SharedLink,
+    SharedLinkAccess,
+)
 from tracer.serializers.feed import (
     FeedDetailCoreSerializer,
     FeedSidebarSerializer,
     OverviewResponseSerializer,
     TracesTabResponseSerializer,
     TrendsTabResponseSerializer,
-)
-from tracer.models.shared_link import (
-    AccessType,
-    ResourceType,
-    SharedLink,
-    SharedLinkAccess,
 )
 
 SUPPORTED_SHARED_RESOURCE_TYPE_CHOICES = [

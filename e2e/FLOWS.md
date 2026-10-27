@@ -787,7 +787,7 @@
 ### ERR-E2E-004 — a shared issue opens read-only for someone who is not signed in
 
 **Goal:** Someone who is not signed in opens a shared Error Feed issue and reads it without being able to change it  
-**Spec:** `flows/error-feed/shared-issue.spec.ts:25`  
+**Spec:** `flows/error-feed/shared-issue.spec.ts:28`  
 **Tags:** —
 
 **User steps:**

@@ -17,6 +17,9 @@ import {
 // covered by futureagi/tracer/tests/test_shared_link_resolve.py.
 
 const UI_READY = 60_000;
+// A toast from the global query error handler lands within a moment of a
+// failed read; long enough to have seen one if it was coming.
+const TOAST_SETTLE = 2_000;
 
 // Pinned from frontend/src/pages/shared/SharedView.jsx (error copy) and
 // frontend/src/pages/dashboard/error-feed/ErrorFeedDetailView.jsx (title).
@@ -147,7 +150,9 @@ base(
         await expect(page.getByText(ISSUE_TITLE).first()).toBeVisible({
           timeout: UI_READY,
         });
-        await expect(page.getByText("View only")).toBeVisible();
+        await expect(page.getByText("View only")).toBeVisible({
+          timeout: UI_READY,
+        });
         await expect(
           page.getByRole("button", {
             name: /resolve|acknowledge|ignore issue|^share$|debug this cluster|create linear/i,
@@ -225,7 +230,7 @@ base(
         expect(new URL(page.url()).pathname).toBe(`/shared/${restrictedToken}`);
         // The page's own screen is the whole answer: no error toast. One from
         // the global query error handler lands within a moment of the 401.
-        await page.waitForTimeout(2_000);
+        await page.waitForTimeout(TOAST_SETTLE);
         expect(
           await page.evaluate(
             () => (window as unknown as { __toasts: string[] }).__toasts,
