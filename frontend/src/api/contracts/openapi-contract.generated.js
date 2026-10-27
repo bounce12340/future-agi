@@ -5,7 +5,7 @@
 export const OPENAPI_CONTRACT = Object.freeze({
   generatedFrom: "api_contracts/openapi/swagger.json",
   swaggerVersion: "2.0",
-  endpointCount: 1074,
+  endpointCount: 1076,
   endpoints: {
     "/accounts/2fa/recovery-codes/": {
       get: {
@@ -38552,6 +38552,72 @@ export const OPENAPI_CONTRACT = Object.freeze({
         },
       },
     },
+    "/tracer/shared/{token}/sidebar/": {
+      get: {
+        operationId: "tracer_shared_sidebar_list",
+        runtimeRequestValidation: true,
+        runtimeResponseValidation: true,
+        requestBody: null,
+        queryParameters: {
+          trace_id: {
+            required: false,
+            schema: {
+              type: "string",
+              minLength: 1,
+            },
+          },
+        },
+        responses: {
+          200: {
+            $ref: "#/definitions/FeedSidebarApiResponse",
+          },
+          401: {
+            $ref: "#/definitions/SharedLinkResolveError",
+          },
+          403: {
+            $ref: "#/definitions/SharedLinkResolveError",
+          },
+          404: {
+            $ref: "#/definitions/SharedLinkResolveError",
+          },
+          410: {
+            $ref: "#/definitions/SharedLinkResolveError",
+          },
+          default: {
+            $ref: "#/definitions/ManagementAPIErrorResponse",
+          },
+        },
+      },
+    },
+    "/tracer/shared/{token}/traces/{trace_id}/": {
+      get: {
+        operationId: "tracer_shared_traces_read",
+        runtimeRequestValidation: false,
+        runtimeResponseValidation: false,
+        requestBody: null,
+        queryParameters: {},
+        responses: {
+          200: {
+            $ref: "#/definitions/TraceDetailResponse",
+          },
+          401: {
+            $ref: "#/definitions/SharedLinkResolveError",
+          },
+          403: {
+            $ref: "#/definitions/SharedLinkResolveError",
+          },
+          404: {
+            $ref: "#/definitions/SharedLinkResolveError",
+          },
+          410: {
+            $ref: "#/definitions/SharedLinkResolveError",
+          },
+          default: {
+            $ref: "#/definitions/ManagementAPIErrorResponse",
+          },
+        },
+      },
+    },
     "/tracer/trace-annotation/get_annotation_values/": {
       get: {
         operationId: "tracer_trace-annotation_get_annotation_values",
@@ -76770,7 +76836,13 @@ export const OPENAPI_CONTRACT = Object.freeze({
         resource_type: {
           title: "Resource type",
           type: "string",
-          enum: ["trace", "dashboard", "project", "call_execution"],
+          enum: [
+            "trace",
+            "dashboard",
+            "project",
+            "call_execution",
+            "error_feed_issue",
+          ],
         },
         resource_id: {
           title: "Resource id",
@@ -76821,6 +76893,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
             "dataset",
             "project",
             "call_execution",
+            "error_feed_issue",
           ],
           readOnly: true,
         },
@@ -76899,6 +76972,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
             "dataset",
             "project",
             "call_execution",
+            "error_feed_issue",
           ],
           readOnly: true,
         },
@@ -77043,6 +77117,7 @@ export const OPENAPI_CONTRACT = Object.freeze({
             "dataset",
             "project",
             "call_execution",
+            "error_feed_issue",
           ],
         },
         resource_id: {
@@ -103397,6 +103472,21 @@ export const OPENAPI_CONTRACT = Object.freeze({
         widget_count: {
           title: "Widget count",
           type: "integer",
+        },
+        issue: {
+          $ref: "#/definitions/FeedDetailCore",
+        },
+        overview: {
+          $ref: "#/definitions/OverviewResponse",
+        },
+        traces: {
+          $ref: "#/definitions/TracesTabResponse",
+        },
+        trends: {
+          $ref: "#/definitions/TrendsTabResponse",
+        },
+        sidebar: {
+          $ref: "#/definitions/FeedSidebar",
         },
       },
     },
