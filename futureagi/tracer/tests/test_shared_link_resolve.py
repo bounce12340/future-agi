@@ -1452,3 +1452,49 @@ def test_shared_issue_trace_serves_the_issues_working_trace(
     assert response.json()["result"]["trace"]["id"] == working
     other = api_client.get(f"/tracer/shared/{token}/traces/{uuid.uuid4()}/")
     assert other.status_code == status.HTTP_404_NOT_FOUND
+
+
+@pytest.mark.django_db
+def test_shared_issue_trace_reads_the_real_trace_for_signed_out_and_other_org_viewers(
+    api_client, auth_client, project, trace, observation_span, error_feed_licensed
+):
+    from accounts.models.organization import Organization
+    from conftest import WorkspaceAwareAPIClient
+    from tracer.models.trace_error_analysis import ErrorClusterTraces
+
+    group = _make_error_issue(project, cluster_id="E-REALTRACE")
+    ErrorClusterTraces.objects.create(cluster=group, trace_id=str(trace.id))
+    token = _share_error_issue(auth_client, "E-REALTRACE").json()["result"]["token"]
+    url = f"/tracer/shared/{token}/traces/{trace.id}/"
+
+    signed_out = api_client.get(url)
+    assert signed_out.status_code == status.HTTP_200_OK, signed_out.json()
+    result = signed_out.json()["result"]
+    assert result["trace"]["id"] == str(trace.id)
+    span_ids = [node["observation_span"]["id"] for node in result["observation_spans"]]
+    assert span_ids == [observation_span.id]
+
+    other_org = Organization.objects.create(name="Shared Trace Viewer Org")
+    viewer = User.objects.create_user(
+        email="shared-trace-viewer@example.com",
+        password="testpassword123",
+        name="Other Org Viewer",
+        organization=other_org,
+        organization_role=OrganizationRoles.OWNER,
+    )
+    viewer_workspace = Workspace.no_workspace_objects.create(
+        name=f"Shared Trace Viewer Workspace {uuid.uuid4().hex[:8]}",
+        organization=other_org,
+        is_default=True,
+        is_active=True,
+        created_by=viewer,
+    )
+    viewer_client = WorkspaceAwareAPIClient()
+    viewer_client.force_authenticate(user=viewer)
+    viewer_client.set_workspace(viewer_workspace)
+    try:
+        other = viewer_client.get(url)
+    finally:
+        viewer_client.stop_workspace_injection()
+    assert other.status_code == status.HTTP_200_OK, other.json()
+    assert other.json()["result"]["trace"]["id"] == str(trace.id)

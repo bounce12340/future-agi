@@ -28,6 +28,15 @@ from tracer.models.shared_link import (
     SharedLink,
     SharedLinkAccess,
 )
+from tracer.serializers.feed import (
+    FeedDetailCoreSerializer,
+    FeedSidebarApiResponseSerializer,
+    FeedSidebarQuerySerializer,
+    FeedSidebarSerializer,
+    OverviewResponseSerializer,
+    TracesTabResponseSerializer,
+    TrendsTabResponseSerializer,
+)
 from tracer.serializers.shared_link import (
     AddAccessSerializer,
     SharedLinkAccessSerializer,
@@ -37,10 +46,6 @@ from tracer.serializers.shared_link import (
     SharedLinkResolveErrorSerializer,
     SharedLinkResolveResponseSerializer,
     SharedLinkUpdateSerializer,
-)
-from tracer.serializers.feed import (
-    FeedSidebarApiResponseSerializer,
-    FeedSidebarQuerySerializer,
 )
 from tracer.serializers.trace import TraceDetailResponseSerializer
 
@@ -333,7 +338,6 @@ class SharedIssueSidebarView(APIView):
         },
     )
     def get(self, request, token):
-        from tracer.serializers.feed import FeedSidebarSerializer
         from tracer.utils import feed as feed_service
 
         link, error = _check_shared_link_access(request, token)
@@ -603,9 +607,9 @@ def _get_shared_link_by_token(token):
 def _shared_feed_project_ids(organization, workspace):
     from tracer.models.project import Project
 
-    projects = Project.no_workspace_objects.filter(
-        organization=organization
-    ).filter(_workspace_scope_q(workspace, "workspace"))
+    projects = Project.no_workspace_objects.filter(organization=organization).filter(
+        _workspace_scope_q(workspace, "workspace")
+    )
     return [str(pid) for pid in projects.values_list("id", flat=True)]
 
 
@@ -619,32 +623,14 @@ def _get_shared_error_issue(cluster_id, organization, workspace):
 
 
 def _resolve_shared_error_issue(link):
-    # The sharer's org must hold the licence; the viewer's entitlement is
-    # irrelevant, like every other property of the link.
-    from tfc.ee_gating import EEFeature, FeatureUnavailable, check_ee_feature
-    from tracer.queries.grouping_redirect import resolve_issue_redirect
-    from tracer.serializers.feed import (
-        FeedDetailCoreSerializer,
-        FeedSidebarSerializer,
-        OverviewResponseSerializer,
-        TracesTabResponseSerializer,
-        TrendsTabResponseSerializer,
-    )
     from tracer.utils import feed as feed_service
 
-    try:
-        check_ee_feature(EEFeature.ERROR_FEED, org_id=str(link.organization_id))
-    except FeatureUnavailable:
+    # Same rules as the shared trace and sidebar reads: the sharer's licence,
+    # the link's projects, and a merged issue followed to its survivor.
+    scope = _shared_issue_scope(link)
+    if scope is None:
         return None
-
-    project_ids = _shared_feed_project_ids(link.organization, link.workspace)
-    if not project_ids:
-        return None
-    # A merged issue keeps its link working by following the merge.
-    redirect = resolve_issue_redirect(link.resource_id, project_ids)
-    if redirect is None:
-        return None
-    cluster_id = redirect["resolved_cluster_id"]
+    cluster_id, project_ids, _ = scope
 
     detail = feed_service.get_feed_detail(cluster_id, project_ids)
     if detail is None:
