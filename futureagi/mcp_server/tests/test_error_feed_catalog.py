@@ -1,10 +1,10 @@
-"""Contract coverage for the error feed MCP tools (TH-8798).
+"""Contract coverage for the error feed MCP tools.
 
-The feed is read first and debugged second: list the issues, pull the data
-behind one, then run and read its root-cause analysis. These tests pin the
-operations those steps map onto, the safety hints a client shows before
-calling them, and the page-size ceilings that keep a cluster's evidence
-inside the MCP response limit.
+The feed is read-only over MCP: list the issues, then pull the pattern
+summary and traces behind one. These tests pin the operations those steps
+map onto, the read-only hints a client shows before calling them, and the
+page-size ceilings that keep a cluster's evidence inside the MCP response
+limit.
 """
 
 from uuid import uuid4
@@ -12,8 +12,11 @@ from uuid import uuid4
 import pytest
 from django.urls import resolve
 from jsonschema import Draft7Validator
+from rest_framework.response import Response
 
+from mcp_server.api_executor import DjangoAPIExecutor
 from mcp_server.generated_registry import GeneratedToolRegistry
+from mcp_server.response_limits import MAX_RESPONSE_BYTES, bounded_response
 from mcp_server.tests.test_tool_generation import CATALOG_PATH, CONTRACT_PATH
 from mcp_server.tool_generation import generate_tool_manifest
 
@@ -26,16 +29,6 @@ OPERATIONS = [
         "/tracer/feed/issues/{cluster_id}/overview/",
     ),
     ("list_error_cluster_traces", "GET", "/tracer/feed/issues/{cluster_id}/traces/"),
-    (
-        "get_error_cluster_root_cause",
-        "GET",
-        "/tracer/feed/issues/{cluster_id}/root-cause/",
-    ),
-    (
-        "analyze_error_cluster_trace",
-        "POST",
-        "/tracer/feed/issues/{cluster_id}/deep-analysis/",
-    ),
 ]
 
 
@@ -52,8 +45,8 @@ def generated():
     }
 
 
-def test_error_feed_group_is_exactly_the_read_and_debug_surface(registry):
-    """Triage writes stay out: the group reads the feed and debugs a cluster.
+def test_error_feed_group_is_exactly_the_read_surface(registry):
+    """Triage writes stay out: the group only reads the feed.
 
     Changing an issue's status, severity or assignee, and filing it to
     Linear, are deliberately not exposed — an agent that could resolve an
@@ -80,46 +73,39 @@ def test_tools_reuse_mounted_feed_operations(registry, name, method, path):
     assert hasattr(cls, method.lower())
 
 
-@pytest.mark.parametrize("name,method,_path", OPERATIONS)
-def test_reading_the_feed_is_annotated_read_only(registry, name, method, _path):
+@pytest.mark.parametrize("name,_method,_path", OPERATIONS)
+def test_reading_the_feed_is_annotated_read_only(registry, name, _method, _path):
     annotations = registry.get(name).annotations
-    assert annotations["readOnlyHint"] is (method == "GET")
-    if method == "GET":
-        assert annotations["destructiveHint"] is False
-        assert annotations["openWorldHint"] is False
+    assert annotations["readOnlyHint"] is True
+    assert annotations["destructiveHint"] is False
+    assert annotations["openWorldHint"] is False
 
 
-def test_dispatching_an_analysis_declares_its_cost_and_its_overwrite(generated):
-    """The one write in the group must not look like a cached read.
-
-    POST /deep-analysis/ dispatches model work the organization pays for, and
-    `force=true` deletes the stored analysis before re-running it. A client
-    that saw a plain write hint would run it unprompted on every cluster.
+def test_cluster_detail_drops_the_rca_trail_but_keeps_the_analysis(registry):
+    """The stored investigation trail alone runs past the 64KB MCP limit on deep
+    analyses, so the tool returns the conclusion and its evidence ids only.
     """
-    tool = generated["analyze_error_cluster_trace"]
-
-    assert tool["annotations"] == {
-        "readOnlyHint": False,
-        "destructiveHint": True,
-        "idempotentHint": False,
-        "openWorldHint": True,
+    rca = {
+        "synthesis": "Tool calls time out under load",
+        "fix": "Raise the tool timeout",
+        "confidence": "H",
+        "evidence_trace_ids": [str(uuid4())],
+        "trace": [{"type": "reasoning", "text": "x" * MAX_RESPONSE_BYTES}],
     }
-    schema = tool["inputSchema"]
-    assert sorted(schema["required"]) == ["cluster_id", "trace_id"]
-    # Re-running is opt-in: omitting force must reuse the stored analysis.
-    assert schema["properties"]["force"]["default"] is False
+    tool = registry.get("get_error_cluster")
 
+    result = DjangoAPIExecutor._normalize_response(
+        tool, Response({"status": True, "result": {"row": {}, "rca": rca}})
+    )
 
-def test_root_cause_reads_are_scoped_to_one_trace(generated):
-    """A cluster groups many traces and the analysis is stored per trace.
-
-    Letting `trace_id` be optional would make the tool answer about whichever
-    trace the view happened to pick, which reads as the cluster's root cause.
-    """
-    schema = generated["get_error_cluster_root_cause"]["inputSchema"]
-
-    assert sorted(schema["required"]) == ["cluster_id", "trace_id"]
-    assert not Draft7Validator(schema).is_valid({"cluster_id": str(uuid4())})
+    assert "trace" not in result["rca"]
+    assert result["rca"]["synthesis"] == "Tool calls time out under load"
+    assert result["rca"]["evidence_trace_ids"] == rca["evidence_trace_ids"]
+    bounded_response(result)
+    # An issue nobody has analysed carries no rca block at all.
+    assert DjangoAPIExecutor._normalize_response(
+        tool, Response({"status": True, "result": {"row": {}, "rca": None}})
+    ) == {"row": {}, "rca": None}
 
 
 @pytest.mark.parametrize(
