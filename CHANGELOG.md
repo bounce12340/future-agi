@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.56.1](https://github.com/future-agi/future-agi/compare/v1.56.0...v1.56.1) (2026-10-28)
+
+
+### Bug Fixes
+
+* **gateway:** retest fixes for streams, cost, request logs, tools, providers, budgets, guardrails and alerts ([45fa428](https://github.com/future-agi/future-agi/commit/45fa4280e82a9742c64e4b0c4c73617f57a1b14b))
+* **gateway:** retest fixes for streams, cost, request logs, tools, providers, budgets, guardrails and alerts ([7d7a959](https://github.com/future-agi/future-agi/commit/7d7a95900321794fc4a176974bc0c5db3150ddad))
+
 ## [1.56.0](https://github.com/future-agi/future-agi/compare/v1.55.0...v1.56.0) (2026-10-27)
 
 
